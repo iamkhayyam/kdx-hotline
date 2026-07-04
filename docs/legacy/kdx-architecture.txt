@@ -1,0 +1,231 @@
+# KDX Modern Architecture Proposal
+
+## 1. Technology Stack
+
+### Client
+- Framework: Electron + React
+- UI: TailwindCSS
+- State Management: Redux Toolkit
+- Network: WebSocket + WebRTC for voice
+- File Transfer: Chunked uploads/downloads with resume capability
+- Encryption: TLS + Additional application layer encryption
+
+### Server
+- Runtime: Node.js
+- Framework: Express + Socket.io
+- Database: PostgreSQL
+  - User accounts
+  - Access control
+  - Server configuration
+- File Storage: Object storage (MinIO/S3 compatible)
+- Cache: Redis
+  - Session management
+  - Real-time presence
+  - Transfer state
+
+## 2. Core Systems Design
+
+### Authentication System
+```typescript
+interface Account {
+  id: string;
+  login: string;
+  passwordHash: string;
+  name: string;
+  class: AccountClass;
+  privileges: Privilege[];
+  customPrivileges?: Privilege[];  // Overrides
+}
+
+interface AccountClass {
+  id: string;
+  name: string;
+  basePrivileges: Privilege[];
+  colorCode: string;
+}
+```
+
+### File System
+```typescript
+interface FileNode {
+  id: string;
+  name: string;
+  type: 'file' | 'directory' | 'upload' | 'dropbox';
+  parentId: string | null;
+  owner: string | null;
+  access: AccessControl[];
+  metadata: FileMetadata;
+}
+
+interface AccessControl {
+  classId: string;
+  permissions: Permission[];
+}
+```
+
+### Communication Protocol
+```typescript
+interface Message {
+  type: MessageType;
+  id: string;
+  timestamp: number;
+  sender: string;
+  target: string;  // User ID or Channel ID
+  content: any;
+  encryption: EncryptionMetadata;
+}
+
+enum MessageType {
+  CHAT,
+  VOICE_DATA,
+  FILE_TRANSFER,
+  SYSTEM,
+  PRIVATE_MSG
+}
+```
+
+## 3. Security Implementation
+
+### Encryption Layers
+1. Transport Layer
+   - TLS 1.3 for all connections
+   - Certificate validation
+
+2. Application Layer
+   - End-to-end encryption for private messages
+   - File transfer encryption
+   - Voice chat encryption
+
+### Access Control
+```typescript
+interface Permission {
+  resource: string;
+  action: Action;
+  conditions?: Condition[];
+}
+
+enum Action {
+  READ,
+  WRITE,
+  DELETE,
+  EXECUTE,
+  ADMIN
+}
+```
+
+## 4. Real-time Features
+
+### Voice Chat
+- WebRTC for peer-to-peer connections
+- Configurable quality settings:
+  - Bitrate: 8kbps - 128kbps
+  - Sample rate: 8kHz - 48kHz
+  - Latency: 20ms - 500ms
+
+### Chat System
+- Public channels
+- Private rooms
+- Direct messaging
+- Rich text support
+- File sharing integration
+
+## 5. File Transfer System
+
+### Transfer Protocol
+```typescript
+interface TransferRequest {
+  fileId: string;
+  direction: 'upload' | 'download';
+  chunkSize: number;
+  resumePosition?: number;
+  encryption: EncryptionType;
+}
+
+interface TransferChunk {
+  id: string;
+  sequence: number;
+  data: Buffer;
+  checksum: string;
+}
+```
+
+### Features
+- Chunked transfer
+- Resume capability
+- Progress tracking
+- Bandwidth management
+- Queue system
+
+## 6. UI/UX Considerations
+
+### Client Interface
+- Modern, clean design
+- Dark/Light themes
+- Customizable layouts
+- Responsive design
+- Accessibility support
+
+### User Experience
+- Intuitive navigation
+- Drag-and-drop support
+- Context menus
+- Keyboard shortcuts
+- Status indicators
+
+## 7. Deployment Architecture
+
+### Server Deployment
+- Docker containerization
+- Horizontal scaling
+- Load balancing
+- Health monitoring
+- Automated backups
+
+### Client Distribution
+- Auto-updates
+- Platform-specific builds
+- Crash reporting
+- Usage analytics (optional)
+
+## 8. Migration Considerations
+
+### Data Migration
+- Account import tools
+- File system structure preservation
+- History/logs migration
+- Settings migration
+
+### Compatibility
+- Legacy protocol support
+- Backward compatible APIs
+- Feature parity verification
+
+## 9. Testing Strategy
+
+### Test Types
+- Unit tests
+- Integration tests
+- End-to-end tests
+- Security audits
+- Performance testing
+
+### Test Coverage
+- Core functionality
+- Edge cases
+- Stress testing
+- Cross-platform verification
+
+## 10. Documentation
+
+### Types
+- API documentation
+- User guides
+- Administrator guides
+- Development guides
+- Security documentation
+
+### Format
+- Markdown-based
+- Version controlled
+- Searchable
+- Multi-language support

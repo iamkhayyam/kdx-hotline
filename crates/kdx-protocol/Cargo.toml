@@ -1,0 +1,15 @@
+[package]
+name = "kdx-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+bytes = { workspace = true }
+bitflags = { workspace = true }
+crc32fast = { workspace = true }
+thiserror = { workspace = true }
+tokio-util = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

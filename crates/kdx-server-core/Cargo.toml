@@ -1,0 +1,23 @@
+[package]
+name = "kdx-server-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+kdx-protocol = { workspace = true }
+kdx-crypto = { workspace = true }
+kdx-storage = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+bytes = { workspace = true }
+dashmap = { workspace = true }
+bitvec = { workspace = true }
+uuid = { workspace = true }
+sha2 = { workspace = true }
+rand = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

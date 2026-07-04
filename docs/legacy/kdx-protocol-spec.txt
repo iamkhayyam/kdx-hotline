@@ -1,0 +1,221 @@
+# KDX Protocol Specification
+## Part 1: Packet Structure
+
+### 1. Base Packet Format
+
+```typescript
+/**
+ * KDX Packet Structure
+ * Total Header Size: 16 bytes
+ * Maximum Packet Size: 65535 bytes
+ */
+struct KDXPacket {
+    // Header (16 bytes)
+    uint8_t  magic[4];     // Magic number: "KDX\0"
+    uint8_t  version;      // Protocol version
+    uint8_t  type;        // Packet type
+    uint16_t flags;       // Packet flags
+    uint32_t sequence;    // Sequence number
+    uint16_t length;      // Payload length
+    uint16_t checksum;    // Header checksum
+    
+    // Payload (variable length)
+    uint8_t  payload[];   // Encrypted payload data
+    
+    // Footer (variable length)
+    uint8_t  signature[]; // Optional packet signature
+}
+```
+
+### 2. Packet Types
+
+```typescript
+enum PacketType {
+    // Connection Management (0x00-0x0F)
+    HANDSHAKE_REQUEST     = 0x01,
+    HANDSHAKE_RESPONSE    = 0x02,
+    PING                  = 0x03,
+    PONG                  = 0x04,
+    DISCONNECT            = 0x0F,
+    
+    // Authentication (0x10-0x1F)
+    AUTH_REQUEST          = 0x11,
+    AUTH_CHALLENGE        = 0x12,
+    AUTH_RESPONSE         = 0x13,
+    AUTH_RESULT           = 0x14,
+    
+    // File Operations (0x20-0x2F)
+    FILE_LIST_REQUEST     = 0x21,
+    FILE_LIST_RESPONSE    = 0x22,
+    FILE_TRANSFER_START   = 0x23,
+    FILE_TRANSFER_DATA    = 0x24,
+    FILE_TRANSFER_END     = 0x25,
+    
+    // Chat System (0x30-0x3F)
+    CHAT_MESSAGE          = 0x31,
+    CHAT_JOIN            = 0x32,
+    CHAT_LEAVE           = 0x33,
+    CHAT_USER_LIST       = 0x34,
+    
+    // System Messages (0xF0-0xFF)
+    ERROR                = 0xF0,
+    WARNING              = 0xF1,
+    INFO                 = 0xF2
+}
+```
+
+### 3. Flag Definitions
+
+```typescript
+enum PacketFlags {
+    // Encryption Flags (bits 0-3)
+    ENCRYPTED           = 1 << 0,
+    COMPRESSED          = 1 << 1,
+    SIGNED             = 1 << 2,
+    REQUIRES_ACK       = 1 << 3,
+    
+    // Transfer Flags (bits 4-7)
+    TRANSFER_START     = 1 << 4,
+    TRANSFER_END       = 1 << 5,
+    TRANSFER_ABORT     = 1 << 6,
+    TRANSFER_RESUME    = 1 << 7,
+    
+    // Priority Flags (bits 8-11)
+    PRIORITY_LOW       = 0 << 8,
+    PRIORITY_NORMAL    = 1 << 8,
+    PRIORITY_HIGH      = 2 << 8,
+    PRIORITY_CRITICAL  = 3 << 8,
+    
+    // Special Flags (bits 12-15)
+    FRAGMENTED        = 1 << 12,
+    MORE_FRAGMENTS    = 1 << 13,
+    SYSTEM_MESSAGE    = 1 << 14,
+    RESERVED         = 1 << 15
+}
+```
+
+### 4. Packet Processing
+
+```typescript
+class PacketProcessor {
+    /**
+     * Packet Assembly
+     */
+    function createPacket(
+        type: PacketType,
+        payload: Buffer,
+        flags: PacketFlags = 0
+    ): Buffer {
+        // 1. Create header
+        const header = Buffer.alloc(16);
+        header.write('KDX\0', 0);  // Magic number
+        header.writeUInt8(PROTOCOL_VERSION, 4);
+        header.writeUInt8(type, 5);
+        header.writeUInt16BE(flags, 6);
+        header.writeUInt32BE(this.nextSequence(), 8);
+        header.writeUInt16BE(payload.length, 12);
+        
+        // 2. Calculate header checksum
+        const checksum = calculateChecksum(header);
+        header.writeUInt16BE(checksum, 14);
+        
+        // 3. Assemble packet
+        return Buffer.concat([header, payload]);
+    }
+    
+    /**
+     * Packet Validation
+     */
+    function validatePacket(packet: Buffer): boolean {
+        // 1. Check minimum length
+        if (packet.length < 16) return false;
+        
+        // 2. Verify magic number
+        if (packet.toString('ascii', 0, 4) !== 'KDX\0') return false;
+        
+        // 3. Validate header checksum
+        const storedChecksum = packet.readUInt16BE(14);
+        const calculatedChecksum = calculateChecksum(
+            packet.slice(0, 14)
+        );
+        if (storedChecksum !== calculatedChecksum) return false;
+        
+        // 4. Validate payload length
+        const payloadLength = packet.readUInt16BE(12);
+        if (packet.length !== payloadLength + 16) return false;
+        
+        return true;
+    }
+    
+    /**
+     * Packet Parsing
+     */
+    function parsePacket(data: Buffer): KDXPacket {
+        if (!this.validatePacket(data)) {
+            throw new Error('Invalid packet');
+        }
+        
+        return {
+            version: data.readUInt8(4),
+            type: data.readUInt8(5),
+            flags: data.readUInt16BE(6),
+            sequence: data.readUInt32BE(8),
+            length: data.readUInt16BE(12),
+            payload: data.slice(16)
+        };
+    }
+}
+```
+
+### 5. Implementation Guidelines
+
+1. Packet Assembly Rules:
+   - All multi-byte integers are big-endian
+   - Headers must be exactly 16 bytes
+   - Maximum packet size is 65535 bytes
+   - Payload must be encrypted when ENCRYPTED flag is set
+
+2. Validation Requirements:
+   - Magic number must be "KDX\0"
+   - Protocol version must match
+   - Checksum must validate
+   - Payload length must match header
+
+3. Handling Guidelines:
+   - Process packets in sequence order
+   - Buffer out-of-sequence packets
+   - Acknowledge packets with REQUIRES_ACK flag
+   - Handle fragmented packets before processing
+
+4. Error Handling:
+   - Invalid packets should be dropped
+   - Log checksum failures
+   - Request retransmission of missing packets
+   - Handle version mismatches gracefully
+
+### 6. Usage Example
+
+```typescript
+// Creating a chat message packet
+const message = "Hello, World!";
+const payload = Buffer.from(message, 'utf8');
+
+const packet = packetProcessor.createPacket(
+    PacketType.CHAT_MESSAGE,
+    payload,
+    PacketFlags.ENCRYPTED | PacketFlags.REQUIRES_ACK
+);
+
+// Sending the packet
+socket.write(packet);
+
+// Receiving and processing a packet
+socket.on('data', (data) => {
+    if (packetProcessor.validatePacket(data)) {
+        const packet = packetProcessor.parsePacket(data);
+        handlePacket(packet);
+    }
+});
+```
+
+This completes Part 1 of the protocol specification. Would you like to proceed with Part 2: Encryption Implementation next?

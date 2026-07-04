@@ -1,0 +1,271 @@
+# KDX Protocol Implementation Guide
+## Part 1: Handshake & Chat Systems
+
+### 1. Handshake Protocol Implementation
+
+```cpp
+class KDXHandshake {
+public:
+    // Handshake states for clear flow control
+    enum class State {
+        INIT,           // Initial state
+        CHALLENGE,      // Server challenge issued
+        RESPONSE,       // Client response received
+        NEGOTIATING,    // Feature negotiation
+        ESTABLISHED,    // Connection established
+        FAILED          // Handshake failed
+    };
+    
+    struct HandshakeData {
+        uint8_t  protocolVersion;    // Client protocol version
+        uint16_t features;           // Supported features
+        uint8_t  encryptionMethods;  // Available encryption
+        uint32_t clientId;           // Client identifier
+        char     clientName[32];     // Client display name
+    } __attribute__((packed));
+
+    class HandshakeManager {
+    private:
+        State currentState;
+        HandshakeData localData;
+        HandshakeData remoteData;
+        
+    public:
+        // Initiate handshake process
+        std::vector<uint8_t> initiateHandshake() {
+            HandshakeData data;
+            data.protocolVersion = CURRENT_PROTOCOL_VERSION;
+            data.features = getSupportedFeatures();
+            data.encryptionMethods = getEncryptionMethods();
+            data.clientId = generateClientId();
+            
+            // Package handshake data
+            std::vector<uint8_t> payload(
+                reinterpret_cast<uint8_t*>(&data),
+                reinterpret_cast<uint8_t*>(&data) + sizeof(data)
+            );
+            
+            currentState = State::INIT;
+            return payload;
+        }
+        
+        // Process handshake response
+        void processHandshake(const KDXPacket& packet) {
+            switch (currentState) {
+                case State::INIT:
+                    handleInitialResponse(packet);
+                    break;
+                    
+                case State::CHALLENGE:
+                    handleChallenge(packet);
+                    break;
+                    
+                case State::RESPONSE:
+                    handleResponse(packet);
+                    break;
+                    
+                case State::NEGOTIATING:
+                    finalizeNegotiation(packet);
+                    break;
+            }
+        }
+        
+    protected:
+        void handleInitialResponse(const KDXPacket& packet) {
+            // Extract remote capabilities
+            memcpy(&remoteData, packet.payload.data(), 
+                   sizeof(HandshakeData));
+            
+            // Verify protocol compatibility
+            if (!isProtocolCompatible(remoteData.protocolVersion)) {
+                currentState = State::FAILED;
+                return;
+            }
+            
+            // Negotiate features
+            uint16_t commonFeatures = 
+                localData.features & remoteData.features;
+            
+            // Select encryption method
+            uint8_t selectedEncryption = 
+                selectEncryption(remoteData.encryptionMethods);
+            
+            // Move to challenge phase
+            currentState = State::CHALLENGE;
+        }
+    };
+};
+```
+
+### 2. Chat System Implementation
+
+```cpp
+class KDXChat {
+public:
+    // Message structure for chat communications
+    struct ChatMessage {
+        uint32_t timestamp;      // Message timestamp
+        uint32_t senderId;       // Sender identifier
+        uint16_t flags;          // Message flags
+        uint16_t roomId;         // Chat room identifier
+        uint16_t length;         // Message length
+        char     message[];      // Variable length message
+    } __attribute__((packed));
+    
+    // Message flags for formatting and behavior
+    enum ChatFlags {
+        MSG_NORMAL    = 0x0000,  // Standard message
+        MSG_ACTION    = 0x0001,  // Action message (/me)
+        MSG_SYSTEM    = 0x0002,  // System message
+        MSG_PRIVATE   = 0x0004,  // Private message
+        MSG_ENCRYPTED = 0x0008,  // Encrypted content
+        MSG_FORMATTED = 0x0010   // Contains formatting
+    };
+    
+    class ChatManager {
+    private:
+        std::map<uint16_t, ChatRoom> chatRooms;
+        std::vector<ChatMessage> messageBuffer;
+        
+    public:
+        // Send chat message
+        std::vector<uint8_t> createChatMessage(
+            const std::string& message,
+            uint16_t roomId,
+            uint16_t flags = MSG_NORMAL
+        ) {
+            ChatMessage msg;
+            msg.timestamp = getCurrentTime();
+            msg.senderId = localUserId;
+            msg.flags = flags;
+            msg.roomId = roomId;
+            msg.length = message.length();
+            
+            // Create packet payload
+            std::vector<uint8_t> payload(
+                sizeof(ChatMessage) + message.length()
+            );
+            
+            // Copy message structure
+            memcpy(payload.data(), &msg, sizeof(ChatMessage));
+            
+            // Copy message content
+            memcpy(payload.data() + sizeof(ChatMessage),
+                   message.c_str(), message.length());
+            
+            return payload;
+        }
+        
+        // Process received message
+        void handleChatMessage(const KDXPacket& packet) {
+            const ChatMessage* msg = reinterpret_cast<
+                const ChatMessage*>(packet.payload.data());
+            
+            // Validate message
+            if (!isValidMessage(msg)) {
+                return;
+            }
+            
+            // Extract message content
+            std::string messageText(
+                reinterpret_cast<const char*>(
+                    packet.payload.data() + sizeof(ChatMessage)
+                ),
+                msg->length
+            );
+            
+            // Process message based on flags
+            if (msg->flags & MSG_ACTION) {
+                handleActionMessage(msg, messageText);
+            }
+            else if (msg->flags & MSG_SYSTEM) {
+                handleSystemMessage(msg, messageText);
+            }
+            else if (msg->flags & MSG_PRIVATE) {
+                handlePrivateMessage(msg, messageText);
+            }
+            else {
+                handleNormalMessage(msg, messageText);
+            }
+            
+            // Update UI
+            notifyMessageReceived(msg, messageText);
+        }
+        
+    protected:
+        // Handle action messages (/me format)
+        void handleActionMessage(
+            const ChatMessage* msg,
+            const std::string& text
+        ) {
+            std::string username = getUserName(msg->senderId);
+            std::string formatted = 
+                "*** " + username + " " + text;
+            
+            displayMessage(msg->roomId, formatted,
+                         MessageStyle::Action);
+        }
+        
+        // Process message formatting
+        std::string formatMessage(
+            const std::string& text,
+            uint16_t flags
+        ) {
+            if (!(flags & MSG_FORMATTED)) {
+                return text;
+            }
+            
+            std::string formatted = text;
+            
+            // Apply KDX's classic formatting
+            applyColorCodes(formatted);
+            applyStyleCodes(formatted);
+            applyEmoticonCodes(formatted);
+            
+            return formatted;
+        }
+    };
+};
+```
+
+### Implementation Guidelines
+
+1. Handshake Protocol Best Practices:
+   - Always verify protocol version compatibility
+   - Implement timeout handling for each state
+   - Handle negotiation failures gracefully
+   - Log handshake progress for debugging
+
+2. Chat System Considerations:
+   - Buffer messages for reliability
+   - Implement flood protection
+   - Handle user presence updates
+   - Support message formatting codes
+
+3. Integration Points:
+   ```cpp
+   // Example integration in main client class
+   class KDXClient {
+       HandshakeManager handshake;
+       ChatManager chat;
+       
+       void onConnect() {
+           auto payload = handshake.initiateHandshake();
+           sendPacket(PacketType::HANDSHAKE_INIT, payload);
+       }
+       
+       void handlePacket(const KDXPacket& packet) {
+           switch (packet.header.type) {
+               case PacketType::HANDSHAKE_RESPONSE:
+                   handshake.processHandshake(packet);
+                   break;
+                   
+               case PacketType::CHAT_MESSAGE:
+                   chat.handleChatMessage(packet);
+                   break;
+           }
+       }
+   };
+   ```
+
+Ready to drill down into any specific aspect of these systems or move forward with implementation?

@@ -1,0 +1,348 @@
+# KDX File Transfer & Encryption Implementation
+## The Architecture of Digital Freedom
+
+### 1. File Transfer Protocol
+
+```cpp
+class KDXFileTransfer {
+public:
+    // Transfer states for precise tracking
+    enum class TransferState {
+        INITIALIZING,    // Setting up transfer
+        TRANSFERRING,    // Active transfer
+        PAUSED,         // Temporarily halted
+        COMPLETING,     // Final verification
+        COMPLETED,      // Successfully finished
+        FAILED          // Transfer failed
+    };
+
+    struct TransferHeader {
+        uint64_t fileId;         // Unique transfer ID
+        uint64_t fileSize;       // Total file size
+        uint32_t chunkSize;      // Size of each chunk
+        uint32_t totalChunks;    // Number of chunks
+        uint16_t flags;          // Transfer flags
+        char     fileName[256];   // File name
+        uint8_t  fileHash[32];   // SHA-256 hash
+    } __attribute__((packed));
+
+    struct ChunkHeader {
+        uint64_t fileId;         // Parent transfer ID
+        uint32_t chunkIndex;     // Current chunk number
+        uint32_t chunkSize;      // Actual chunk size
+        uint8_t  chunkHash[32];  // Chunk verification
+    } __attribute__((packed));
+
+    class TransferManager {
+    private:
+        std::map<uint64_t, TransferState> transfers;
+        std::map<uint64_t, std::set<uint32_t>> receivedChunks;
+        const uint32_t DEFAULT_CHUNK_SIZE = 32768; // 32KB chunks
+        
+    public:
+        // Initialize new transfer
+        std::vector<uint8_t> initiateTransfer(
+            const std::string& filePath,
+            uint16_t flags = 0
+        ) {
+            TransferHeader header;
+            header.fileId = generateTransferId();
+            header.fileSize = getFileSize(filePath);
+            header.chunkSize = DEFAULT_CHUNK_SIZE;
+            header.totalChunks = calculateTotalChunks(
+                header.fileSize, 
+                header.chunkSize
+            );
+            header.flags = flags;
+            
+            // Calculate file hash
+            calculateFileHash(filePath, header.fileHash);
+            
+            // Copy filename
+            strncpy(header.fileName, 
+                   getFileName(filePath).c_str(), 
+                   255);
+            
+            // Create initial packet
+            std::vector<uint8_t> payload(
+                reinterpret_cast<uint8_t*>(&header),
+                reinterpret_cast<uint8_t*>(&header) + 
+                    sizeof(header)
+            );
+            
+            transfers[header.fileId] = TransferState::INITIALIZING;
+            return payload;
+        }
+
+        // Send file chunk
+        std::vector<uint8_t> sendChunk(
+            uint64_t fileId,
+            uint32_t chunkIndex,
+            const std::vector<uint8_t>& data
+        ) {
+            ChunkHeader header;
+            header.fileId = fileId;
+            header.chunkIndex = chunkIndex;
+            header.chunkSize = data.size();
+            
+            // Calculate chunk hash
+            calculateHash(data, header.chunkHash);
+            
+            // Create chunk packet
+            std::vector<uint8_t> payload;
+            payload.reserve(sizeof(header) + data.size());
+            
+            // Add header
+            payload.insert(payload.end(),
+                reinterpret_cast<uint8_t*>(&header),
+                reinterpret_cast<uint8_t*>(&header) + 
+                    sizeof(header)
+            );
+            
+            // Add data
+            payload.insert(payload.end(),
+                data.begin(), data.end()
+            );
+            
+            return payload;
+        }
+
+        // Process received chunk
+        void handleChunk(const KDXPacket& packet) {
+            const ChunkHeader* header = reinterpret_cast<
+                const ChunkHeader*>(packet.payload.data());
+            
+            // Validate chunk
+            if (!isValidChunk(header)) {
+                requestChunkResend(
+                    header->fileId, 
+                    header->chunkIndex
+                );
+                return;
+            }
+            
+            // Extract chunk data
+            std::vector<uint8_t> chunkData(
+                packet.payload.begin() + sizeof(ChunkHeader),
+                packet.payload.end()
+            );
+            
+            // Verify hash
+            if (!verifyChunkHash(chunkData, header->chunkHash)) {
+                requestChunkResend(
+                    header->fileId, 
+                    header->chunkIndex
+                );
+                return;
+            }
+            
+            // Process chunk
+            processChunk(header->fileId, 
+                        header->chunkIndex,
+                        chunkData);
+                        
+            // Update transfer state
+            receivedChunks[header->fileId].insert(
+                header->chunkIndex
+            );
+            
+            // Check if transfer complete
+            if (isTransferComplete(header->fileId)) {
+                finalizeTransfer(header->fileId);
+            }
+        }
+    };
+};
+
+### 2. Encryption Layer
+
+```cpp
+class KDXCrypto {
+public:
+    // Encryption modes
+    enum class CryptoMode {
+        CBC,     // Cipher Block Chaining
+        CFB,     // Cipher Feedback
+        CTR      // Counter Mode
+    };
+
+    struct CryptoContext {
+        uint8_t  key[32];        // 256-bit key
+        uint8_t  iv[16];         // Initialization vector
+        CryptoMode mode;         // Encryption mode
+        bool     authenticated;   // Use authenticated encryption
+    };
+
+    class CryptoManager {
+    private:
+        CryptoContext context;
+        const uint32_t KEY_ITERATIONS = 10000;
+        
+    public:
+        // Initialize encryption
+        void initializeEncryption(
+            const std::vector<uint8_t>& key,
+            CryptoMode mode = CryptoMode::CBC
+        ) {
+            // Derive key using PBKDF2
+            uint8_t derivedKey[32];
+            pbkdf2(key.data(), key.size(),
+                  getSalt(), SALT_SIZE,
+                  KEY_ITERATIONS,
+                  derivedKey, sizeof(derivedKey));
+                  
+            memcpy(context.key, derivedKey, 32);
+            
+            // Generate IV
+            generateSecureRandom(
+                context.iv, 
+                sizeof(context.iv)
+            );
+            
+            context.mode = mode;
+            context.authenticated = true;
+        }
+
+        // Encrypt chunk
+        std::vector<uint8_t> encryptChunk(
+            const std::vector<uint8_t>& data
+        ) {
+            // Prepare output buffer
+            std::vector<uint8_t> encrypted;
+            encrypted.reserve(
+                data.size() + 
+                32 +  // Authentication tag
+                16    // IV
+            );
+            
+            // Add IV
+            encrypted.insert(encrypted.end(),
+                context.iv,
+                context.iv + 16);
+            
+            // Encrypt data
+            switch (context.mode) {
+                case CryptoMode::CBC:
+                    encryptCBC(data, encrypted);
+                    break;
+                    
+                case CryptoMode::CFB:
+                    encryptCFB(data, encrypted);
+                    break;
+                    
+                case CryptoMode::CTR:
+                    encryptCTR(data, encrypted);
+                    break;
+            }
+            
+            // Add authentication if enabled
+            if (context.authenticated) {
+                addAuthenticationTag(encrypted);
+            }
+            
+            return encrypted;
+        }
+
+        // Decrypt chunk
+        std::vector<uint8_t> decryptChunk(
+            const std::vector<uint8_t>& data
+        ) {
+            // Extract IV
+            std::vector<uint8_t> iv(
+                data.begin(),
+                data.begin() + 16
+            );
+            
+            // Verify authentication if enabled
+            if (context.authenticated) {
+                if (!verifyAuthenticationTag(data)) {
+                    throw std::runtime_error(
+                        "Authentication failed"
+                    );
+                }
+            }
+            
+            // Prepare decryption buffer
+            std::vector<uint8_t> decrypted;
+            decrypted.reserve(data.size() - 48);  // Remove IV and tag
+            
+            // Decrypt based on mode
+            switch (context.mode) {
+                case CryptoMode::CBC:
+                    decryptCBC(data, iv, decrypted);
+                    break;
+                    
+                case CryptoMode::CFB:
+                    decryptCFB(data, iv, decrypted);
+                    break;
+                    
+                case CryptoMode::CTR:
+                    decryptCTR(data, iv, decrypted);
+                    break;
+            }
+            
+            return decrypted;
+        }
+    };
+};
+```
+
+### Integration Example
+
+```cpp
+class KDXSecureTransfer {
+    TransferManager transferMgr;
+    CryptoManager cryptoMgr;
+    
+public:
+    // Initiate secure file transfer
+    void startSecureTransfer(const std::string& filePath) {
+        // Initialize transfer
+        auto transferPayload = 
+            transferMgr.initiateTransfer(filePath);
+            
+        // Initialize encryption
+        std::vector<uint8_t> key = generateTransferKey();
+        cryptoMgr.initializeEncryption(key);
+        
+        // Send encrypted transfer header
+        auto encryptedPayload = 
+            cryptoMgr.encryptChunk(transferPayload);
+            
+        sendPacket(PacketType::FILE_TRANSFER_INIT, 
+                  encryptedPayload);
+    }
+    
+    // Handle incoming encrypted chunk
+    void handleEncryptedChunk(const KDXPacket& packet) {
+        // Decrypt chunk
+        auto decryptedData = 
+            cryptoMgr.decryptChunk(packet.payload);
+            
+        // Process decrypted chunk
+        transferMgr.handleChunk(decryptedData);
+    }
+};
+```
+
+### Implementation Notes
+
+1. File Transfer:
+   - Chunk-based transfer with verification
+   - Resume capability
+   - Progress tracking
+   - Bandwidth management
+
+2. Encryption:
+   - 256-bit AES encryption
+   - Multiple operation modes
+   - Authentication support
+   - Secure key derivation
+
+3. Integration Points:
+   - Secure key exchange
+   - Transfer verification
+   - Error handling
+   - Progress reporting
+
+Would you like to focus on implementing any specific aspect of these systems?

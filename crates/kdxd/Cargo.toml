@@ -1,0 +1,24 @@
+[package]
+name = "kdxd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+kdx-protocol = { workspace = true }
+kdx-crypto = { workspace = true }
+kdx-server-core = { workspace = true }
+kdx-storage = { workspace = true }
+tokio = { workspace = true }
+tokio-rustls = { workspace = true }
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+rcgen = { workspace = true }
+serde = { workspace = true }
+toml = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

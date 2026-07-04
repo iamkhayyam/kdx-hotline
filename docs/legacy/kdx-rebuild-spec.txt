@@ -1,0 +1,266 @@
+# KDX Modern Rebuild Specification
+
+## 1. UI Architecture
+
+### Core Components
+
+```typescript
+// Window Management System
+interface KDXWindow {
+  id: string;
+  type: WindowType;
+  title: string;
+  position: Position;
+  size: Size;
+  content: ReactNode;
+  isResizable: boolean;
+  isDraggable: boolean;
+  theme: WindowTheme;
+}
+
+// Custom Window Manager
+class WindowManager {
+  windows: Map<string, KDXWindow>;
+  
+  createWindow(config: WindowConfig): string;
+  focusWindow(id: string): void;
+  arrangeWindows(layout: WindowLayout): void;
+  minimizeWindow(id: string): void;
+  maximizeWindow(id: string): void;
+}
+
+// Theme System
+interface WindowTheme {
+  primary: string;        // Red theme from screenshots
+  secondary: string;      // Dark gray/black
+  text: string;          // Lime green for chat
+  accent: string;        // Highlight colors
+  borders: BorderTheme;
+}
+```
+
+### Key UI Features
+
+1. Multi-Window System
+- Draggable/resizable windows
+- Window snapping
+- Minimize/maximize support
+- Custom window decorations
+- Window state persistence
+
+2. File Browser
+```typescript
+interface FileSystem {
+  // Hierarchical structure matching original
+  root: FileNode;
+  currentPath: string[];
+  
+  // Core operations
+  navigate(path: string): Promise<void>;
+  uploadFile(file: File, path: string): Promise<void>;
+  downloadFile(path: string): Promise<void>;
+  createDirectory(path: string): Promise<void>;
+  
+  // Special folders
+  createDropBox(config: DropBoxConfig): Promise<void>;
+  createUploadFolder(config: UploadFolderConfig): Promise<void>;
+}
+```
+
+3. Chat System
+```typescript
+interface ChatSystem {
+  // Multiple chat room support
+  rooms: Map<string, ChatRoom>;
+  
+  // Message handling
+  sendMessage(room: string, message: string): Promise<void>;
+  formatMessage(message: string): FormattedMessage;
+  
+  // User management
+  joinRoom(room: string): Promise<void>;
+  leaveRoom(room: string): Promise<void>;
+  
+  // Special features
+  setTopic(room: string, topic: string): Promise<void>;
+  sendPrivateMessage(user: string, message: string): Promise<void>;
+}
+```
+
+## 2. Network Protocol
+
+### Connection Management
+```typescript
+interface ConnectionManager {
+  // Core networking
+  connect(server: ServerConfig): Promise<Connection>;
+  disconnect(): void;
+  
+  // Authentication
+  authenticate(credentials: Credentials): Promise<Session>;
+  
+  // Transfer management
+  startTransfer(config: TransferConfig): Transfer;
+  pauseTransfer(id: string): void;
+  resumeTransfer(id: string): void;
+}
+```
+
+### Security Implementation
+```typescript
+interface SecurityManager {
+  // Encryption
+  encryptData(data: any): Buffer;
+  decryptData(data: Buffer): any;
+  
+  // Authentication
+  validateSession(session: Session): boolean;
+  refreshSession(session: Session): Promise<Session>;
+  
+  // Access control
+  checkPermission(user: User, resource: Resource): boolean;
+}
+```
+
+## 3. Server Architecture
+
+### Core Services
+```typescript
+interface KDXServer {
+  // User management
+  userManager: UserManager;
+  fileManager: FileManager;
+  chatManager: ChatManager;
+  
+  // System services
+  transferManager: TransferManager;
+  securityManager: SecurityManager;
+  logManager: LogManager;
+}
+```
+
+### Database Schema
+```sql
+-- Users and Authentication
+CREATE TABLE users (
+  id UUID PRIMARY KEY,
+  username VARCHAR(255) UNIQUE,
+  password_hash VARCHAR(255),
+  class_id UUID REFERENCES user_classes(id),
+  permissions JSONB
+);
+
+-- File System
+CREATE TABLE files (
+  id UUID PRIMARY KEY,
+  path VARCHAR(1024),
+  parent_id UUID REFERENCES files(id),
+  type VARCHAR(50),
+  metadata JSONB,
+  access_control JSONB
+);
+
+-- Chat System
+CREATE TABLE chat_rooms (
+  id UUID PRIMARY KEY,
+  name VARCHAR(255),
+  topic TEXT,
+  settings JSONB,
+  access_control JSONB
+);
+```
+
+## 4. Modern Enhancements
+
+1. Real-time Features
+- WebSocket-based communication
+- Real-time file system updates
+- Live chat with typing indicators
+- Transfer progress streaming
+
+2. UI Improvements
+- Dark/Light theme support
+- High DPI display support
+- Accessibility features
+- Modern scrolling/animations
+- Touch device support
+
+3. Security Enhancements
+- Modern encryption standards
+- Two-factor authentication
+- Rate limiting
+- Audit logging
+
+4. Development Tools
+- Hot reload support
+- Developer console
+- Network inspector
+- Performance monitoring
+
+## 5. Build & Deployment
+
+### Client Build
+```javascript
+// webpack.config.js
+module.exports = {
+  entry: './src/index.tsx',
+  module: {
+    rules: [
+      {
+        test: /\.tsx?$/,
+        use: 'ts-loader',
+        exclude: /node_modules/,
+      },
+      {
+        test: /\.scss$/,
+        use: ['style-loader', 'css-loader', 'sass-loader'],
+      }
+    ],
+  },
+  resolve: {
+    extensions: ['.tsx', '.ts', '.js'],
+  },
+};
+```
+
+### Server Build
+```dockerfile
+FROM node:18-alpine
+
+WORKDIR /app
+COPY package*.json ./
+RUN npm install
+COPY . .
+RUN npm run build
+
+EXPOSE 10700
+CMD ["npm", "start"]
+```
+
+## 6. Testing Strategy
+
+1. Unit Testing
+```typescript
+describe('WindowManager', () => {
+  it('should create new windows', () => {
+    const manager = new WindowManager();
+    const id = manager.createWindow({
+      type: 'chat',
+      title: 'Chat Room'
+    });
+    expect(manager.windows.has(id)).toBe(true);
+  });
+});
+```
+
+2. Integration Testing
+- API endpoint testing
+- WebSocket communication
+- File transfer testing
+- Authentication flow
+
+3. E2E Testing
+- Full user flows
+- Cross-platform testing
+- Performance benchmarking
+- Security testing
