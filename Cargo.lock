@@ -744,6 +744,7 @@ dependencies = [
  "argon2",
  "rand",
  "sha2",
+ "subtle",
  "thiserror",
  "zeroize",
 ]
@@ -764,6 +765,7 @@ dependencies = [
 name = "kdx-server-core"
 version = "0.1.0"
 dependencies = [
+ "bitflags",
  "bitvec",
  "bytes",
  "dashmap",
@@ -815,6 +817,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

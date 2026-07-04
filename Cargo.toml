@@ -32,6 +32,7 @@ rustls-pemfile = "2"
 rcgen = "0.13"
 argon2 = "0.5"
 sha2 = "0.10"
+subtle = "2"
 rand = "0.8"
 zeroize = { version = "1", features = ["derive"] }
 sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio", "macros", "migrate"] }

@@ -3,6 +3,7 @@
 //! over `AsyncRead + AsyncWrite` where they touch a stream, so tests can use
 //! in-memory duplex pipes instead of real sockets.
 
+pub mod auth;
 pub mod connection;
 
-pub use connection::{Connection, ConnectionError};
+pub use connection::{Connection, ConnectionError, ServerCtx};

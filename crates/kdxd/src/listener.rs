@@ -1,7 +1,9 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
-use kdx_server_core::Connection;
+use kdx_server_core::auth::AuthManager;
+use kdx_server_core::{Connection, ServerCtx};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::ServerConfig as TlsServerConfig;
 use tokio::net::TcpListener;
@@ -20,13 +22,17 @@ pub enum ServeError {
     NoKey,
     #[error("self-signed cert generation failed: {0}")]
     SelfSigned(#[from] rcgen::Error),
+    #[error("storage error: {0}")]
+    Storage(#[from] kdx_storage::StorageError),
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }
 
-/// A running server: its bound address and the accept-loop task handle.
+/// A running server: its bound address, shared context, and the accept-loop
+/// task handle.
 pub struct Server {
     pub local_addr: SocketAddr,
+    pub ctx: Arc<ServerCtx>,
     pub handle: tokio::task::JoinHandle<()>,
 }
 
@@ -35,10 +41,17 @@ pub struct Server {
 pub async fn serve(config: Config) -> Result<Server, ServeError> {
     let tls_config = build_tls_config(config.tls.as_ref())?;
     let acceptor = TlsAcceptor::from(Arc::new(tls_config));
+
+    let pool = kdx_storage::connect(&config.database).await?;
+    let ctx = Arc::new(ServerCtx {
+        auth: AuthManager::new(pool, Duration::from_secs(config.session_ttl_secs)),
+    });
+
     let listener = TcpListener::bind(config.bind).await?;
     let local_addr = listener.local_addr()?;
     info!(%local_addr, "kdxd listening");
 
+    let accept_ctx = ctx.clone();
     let handle = tokio::spawn(async move {
         loop {
             let (tcp, peer) = match listener.accept().await {
@@ -49,6 +62,7 @@ pub async fn serve(config: Config) -> Result<Server, ServeError> {
                 }
             };
             let acceptor = acceptor.clone();
+            let conn_ctx = accept_ctx.clone();
             tokio::spawn(async move {
                 let tls = match acceptor.accept(tcp).await {
                     Ok(tls) => tls,
@@ -57,14 +71,18 @@ pub async fn serve(config: Config) -> Result<Server, ServeError> {
                         return;
                     }
                 };
-                if let Err(e) = Connection::new(tls).run().await {
+                if let Err(e) = Connection::new(tls, conn_ctx).run().await {
                     warn!(%peer, error = %e, "connection ended with error");
                 }
             });
         }
     });
 
-    Ok(Server { local_addr, handle })
+    Ok(Server {
+        local_addr,
+        ctx,
+        handle,
+    })
 }
 
 fn build_tls_config(tls: Option<&TlsConfig>) -> Result<TlsServerConfig, ServeError> {

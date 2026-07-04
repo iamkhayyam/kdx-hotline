@@ -15,6 +15,20 @@ pub struct Config {
     /// for clients that verify — supply real certs in production).
     #[serde(default)]
     pub tls: Option<TlsConfig>,
+    /// SQLite database path (created if missing).
+    #[serde(default = "default_database")]
+    pub database: PathBuf,
+    /// Idle session lifetime in seconds before reauthentication is required.
+    #[serde(default = "default_session_ttl_secs")]
+    pub session_ttl_secs: u64,
+}
+
+fn default_database() -> PathBuf {
+    PathBuf::from("kdx.db")
+}
+
+fn default_session_ttl_secs() -> u64 {
+    30 * 60
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -33,6 +47,8 @@ impl Default for Config {
         Self {
             bind: default_bind(),
             tls: None,
+            database: default_database(),
+            session_ttl_secs: default_session_ttl_secs(),
         }
     }
 }
