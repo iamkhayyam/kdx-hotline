@@ -6,6 +6,7 @@ mod codec;
 mod flags;
 mod fragment;
 mod header;
+pub mod messages;
 mod packet_type;
 
 pub use codec::{KdxCodec, KdxFrame, DEFAULT_MAX_FRAME_PAYLOAD};
@@ -36,6 +37,8 @@ pub enum ProtocolError {
     FragmentInterleaved,
     #[error("reassembled payload exceeds maximum {max} bytes")]
     ReassemblyTooLarge { max: usize },
+    #[error("malformed {0} payload")]
+    MalformedPayload(&'static str),
     #[error("i/o error: {0}")]
     Io(#[from] std::io::Error),
 }

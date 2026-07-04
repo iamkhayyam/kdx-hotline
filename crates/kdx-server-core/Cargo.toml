@@ -10,6 +10,7 @@ kdx-crypto = { workspace = true }
 kdx-storage = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
+futures-util = { workspace = true }
 bytes = { workspace = true }
 dashmap = { workspace = true }
 bitvec = { workspace = true }
