@@ -809,6 +809,7 @@ dependencies = [
  "rustls",
  "rustls-pemfile",
  "serde",
+ "sha2",
  "tempfile",
  "thiserror",
  "tokio",

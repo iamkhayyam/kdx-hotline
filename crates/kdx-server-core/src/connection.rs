@@ -14,7 +14,9 @@ use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use kdx_protocol::messages::{
     AuthChallenge, AuthRequest, AuthResponse, AuthResult, ChatJoin, ChatLeave, ChatSend,
-    ChatTopic, HandshakeInit, HandshakeResp,
+    ChatTopic, FileEntry, FileListRequest, FileListResponse, HandshakeInit, HandshakeResp,
+    TransferAccept, TransferData, TransferEnd, TransferRequest, TRANSFER_HASH_MISMATCH,
+    TRANSFER_VERIFIED,
 };
 use kdx_protocol::{
     KdxCodec, KdxFrame, PacketFlags, PacketHeader, PacketType, ProtocolError, Reassembler,
@@ -28,6 +30,8 @@ use tracing::{debug, warn};
 
 use crate::auth::{AuthManager, Privileges, Session};
 use crate::chat::{Member, Outbound, RoomCommand, RoomManager};
+use crate::files::FileTree;
+use crate::transfer::{resume_id_from_wire, ActiveUpload, TransferError, TransferManager};
 
 /// How long the client has to send `HandshakeInit` after connecting.
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -51,6 +55,8 @@ pub const OUTBOUND_QUEUE: usize = 128;
 pub struct ServerCtx {
     pub auth: AuthManager,
     pub rooms: RoomManager,
+    pub tree: FileTree,
+    pub transfers: TransferManager,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -74,6 +80,8 @@ pub enum ConnectionError {
     PeerClosed,
     #[error("auth backend failure: {0}")]
     Auth(#[from] crate::auth::AuthError),
+    #[error("transfer failure: {0}")]
+    Transfer(#[from] TransferError),
 }
 
 /// Drives one client connection from handshake through active dispatch.
@@ -227,6 +235,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
         // its sender is what we hand to room actors on join.
         let (outbound_tx, mut outbound_rx) = mpsc::channel::<Outbound>(OUTBOUND_QUEUE);
         let mut joined: HashMap<String, mpsc::Sender<RoomCommand>> = HashMap::new();
+        // One upload at a time per connection; the chunk stream is inherently
+        // serialized on the socket anyway.
+        let mut upload: Option<ActiveUpload> = None;
 
         enum Next {
             Event(Outbound),
@@ -349,8 +360,131 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                         None => self.send_error("not in that room").await?,
                     }
                 }
+                PacketType::FileListRequest => {
+                    let request = FileListRequest::decode(&frame.payload)?;
+                    let session = self.session.as_ref().expect("authed");
+                    if !session.privileges.contains(Privileges::FILE_LIST) {
+                        self.send_error("missing FILE_LIST privilege").await?;
+                        continue;
+                    }
+                    match self.ctx.tree.list(&request.path, session.class).await {
+                        Ok(entries) => {
+                            let response = FileListResponse {
+                                path: request.path,
+                                entries: entries
+                                    .into_iter()
+                                    .map(|e| FileEntry {
+                                        name: e.name,
+                                        kind: e.kind.as_u8(),
+                                        size: e.size,
+                                    })
+                                    .collect(),
+                            };
+                            self.send(
+                                PacketType::FileListResponse,
+                                PacketFlags::empty(),
+                                response.encode(),
+                            )
+                            .await?;
+                        }
+                        Err(e) => self.send_error(&e.to_string()).await?,
+                    }
+                }
+                PacketType::FileTransferStart => {
+                    let request = TransferRequest::decode(&frame.payload)?;
+                    let session = self.session.as_ref().expect("authed").clone();
+                    if !session.privileges.contains(Privileges::FILE_UPLOAD) {
+                        self.send_error("missing FILE_UPLOAD privilege").await?;
+                        continue;
+                    }
+                    if upload.is_some() {
+                        self.send_error("a transfer is already active").await?;
+                        continue;
+                    }
+                    let result = self
+                        .ctx
+                        .transfers
+                        .begin_upload(
+                            &self.ctx.tree,
+                            &session,
+                            &request.path,
+                            &request.name,
+                            request.size,
+                            request.chunk_size,
+                            request.sha256,
+                            resume_id_from_wire(request.resume_id),
+                        )
+                        .await;
+                    match result {
+                        Ok((active, accept)) => {
+                            upload = Some(active);
+                            let msg = TransferAccept {
+                                transfer_id: accept.transfer_id,
+                                chunk_size: accept.chunk_size,
+                                total_chunks: accept.total_chunks,
+                                have_bitmap: accept.have_bitmap,
+                            };
+                            self.send(
+                                PacketType::FileTransferStart,
+                                PacketFlags::TRANSFER_START,
+                                msg.encode(),
+                            )
+                            .await?;
+                        }
+                        Err(e) => self.send_error(&e.to_string()).await?,
+                    }
+                }
+                PacketType::FileTransferData => {
+                    let data = TransferData::decode(&frame.payload)?;
+                    let Some(active) = upload.as_mut() else {
+                        self.send_error("no active transfer").await?;
+                        continue;
+                    };
+                    if data.transfer_id != *active.id().as_bytes() {
+                        self.send_error("unknown transfer id").await?;
+                        continue;
+                    }
+                    match self
+                        .ctx
+                        .transfers
+                        .write_chunk(active, data.chunk_index, &data.chunk_hash, &data.data)
+                        .await
+                    {
+                        Ok(false) => {} // more chunks to come
+                        Ok(true) => {
+                            let finished = upload.take().expect("active upload present");
+                            let transfer_id = *finished.id().as_bytes();
+                            let (status, message) =
+                                match self.ctx.transfers.finish(&self.ctx.tree, finished).await {
+                                    Ok(()) => (TRANSFER_VERIFIED, "verified".to_string()),
+                                    Err(TransferError::FileHashMismatch) => {
+                                        (TRANSFER_HASH_MISMATCH, "file hash mismatch".to_string())
+                                    }
+                                    Err(e) => return Err(ConnectionError::Transfer(e)),
+                                };
+                            let end = TransferEnd {
+                                transfer_id,
+                                status,
+                                message,
+                            };
+                            self.send(
+                                PacketType::FileTransferEnd,
+                                PacketFlags::TRANSFER_END,
+                                end.encode(),
+                            )
+                            .await?;
+                        }
+                        // Recoverable per-chunk problems: report, let the
+                        // client resend. Anything else is connection-fatal.
+                        Err(
+                            e @ (TransferError::ChunkHashMismatch
+                            | TransferError::BadChunkIndex
+                            | TransferError::BadChunkLength),
+                        ) => self.send_error(&e.to_string()).await?,
+                        Err(e) => return Err(ConnectionError::Transfer(e)),
+                    }
+                }
                 other => {
-                    // Later milestones route file packets here.
                     warn!(packet_type = ?other, "unhandled packet type");
                     self.send(
                         PacketType::Error,
@@ -425,9 +559,21 @@ mod tests {
             .unwrap();
         let phc = hash_password("s3cret").unwrap();
         accounts::create(&pool, "phraq", &phc, 2).await.unwrap();
+        let tree = FileTree::load(pool.clone()).await.unwrap();
+        let transfers = TransferManager::new(
+            pool.clone(),
+            crate::transfer::TransferConfig {
+                files_root: dir.path().join("files"),
+                max_upload_bytes_per_sec: 0,
+            },
+        )
+        .await
+        .unwrap();
         let ctx = Arc::new(ServerCtx {
             auth: AuthManager::new(pool, Duration::from_secs(60)),
             rooms: RoomManager::new(),
+            tree,
+            transfers,
         });
         (ctx, dir)
     }

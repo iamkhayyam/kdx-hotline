@@ -1,0 +1,318 @@
+use bytes::{Buf, BufMut, Bytes, BytesMut};
+
+use super::wire::{expect_end, get_str, put_str};
+use crate::ProtocolError;
+
+/// Node kinds on the wire (mirror kdx-storage's kind column).
+pub const KIND_DIR: u8 = 0;
+pub const KIND_FILE: u8 = 1;
+pub const KIND_DROPBOX: u8 = 2;
+pub const KIND_UPLOAD: u8 = 3;
+
+/// Transfer end/result status codes.
+pub const TRANSFER_VERIFIED: u8 = 0;
+pub const TRANSFER_HASH_MISMATCH: u8 = 1;
+pub const TRANSFER_ABORTED: u8 = 2;
+
+/// Client → server: list a directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileListRequest {
+    pub path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileEntry {
+    pub name: String,
+    pub kind: u8,
+    pub size: u64,
+}
+
+/// Server → client: directory contents.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileListResponse {
+    pub path: String,
+    pub entries: Vec<FileEntry>,
+}
+
+/// Client → server (in a FileTransferStart packet): request an upload.
+/// `resume_id` of all zeros means a fresh transfer; otherwise it names a
+/// prior transfer to resume.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransferRequest {
+    pub path: String,
+    pub name: String,
+    pub size: u64,
+    pub chunk_size: u32,
+    pub sha256: [u8; 32],
+    pub resume_id: [u8; 16],
+}
+
+/// Server → client (in a FileTransferStart packet): upload accepted.
+/// `have_bitmap` marks chunks the server already holds (LSB-first); empty
+/// for a fresh transfer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransferAccept {
+    pub transfer_id: [u8; 16],
+    pub chunk_size: u32,
+    pub total_chunks: u32,
+    pub have_bitmap: Vec<u8>,
+}
+
+/// Client → server: one chunk of file data.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransferData {
+    pub transfer_id: [u8; 16],
+    pub chunk_index: u32,
+    pub chunk_hash: [u8; 32],
+    pub data: Bytes,
+}
+
+/// Server → client: transfer outcome (see TRANSFER_* status codes).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransferEnd {
+    pub transfer_id: [u8; 16],
+    pub status: u8,
+    pub message: String,
+}
+
+impl FileListRequest {
+    pub fn encode(&self) -> Bytes {
+        let mut buf = BytesMut::with_capacity(2 + self.path.len());
+        put_str(&mut buf, &self.path);
+        buf.freeze()
+    }
+
+    pub fn decode(mut payload: &[u8]) -> Result<Self, ProtocolError> {
+        let path = get_str(&mut payload, "FileListRequest")?;
+        expect_end(payload, "FileListRequest")?;
+        Ok(Self { path })
+    }
+}
+
+impl FileListResponse {
+    pub fn encode(&self) -> Bytes {
+        let mut buf = BytesMut::new();
+        put_str(&mut buf, &self.path);
+        buf.put_u16(self.entries.len() as u16);
+        for entry in &self.entries {
+            put_str(&mut buf, &entry.name);
+            buf.put_u8(entry.kind);
+            buf.put_u64(entry.size);
+        }
+        buf.freeze()
+    }
+
+    pub fn decode(mut payload: &[u8]) -> Result<Self, ProtocolError> {
+        let path = get_str(&mut payload, "FileListResponse")?;
+        if payload.remaining() < 2 {
+            return Err(ProtocolError::MalformedPayload("FileListResponse"));
+        }
+        let count = payload.get_u16() as usize;
+        let mut entries = Vec::with_capacity(count.min(1024));
+        for _ in 0..count {
+            let name = get_str(&mut payload, "FileListResponse")?;
+            if payload.remaining() < 9 {
+                return Err(ProtocolError::MalformedPayload("FileListResponse"));
+            }
+            let kind = payload.get_u8();
+            let size = payload.get_u64();
+            entries.push(FileEntry { name, kind, size });
+        }
+        expect_end(payload, "FileListResponse")?;
+        Ok(Self { path, entries })
+    }
+}
+
+impl TransferRequest {
+    pub fn encode(&self) -> Bytes {
+        let mut buf = BytesMut::new();
+        put_str(&mut buf, &self.path);
+        put_str(&mut buf, &self.name);
+        buf.put_u64(self.size);
+        buf.put_u32(self.chunk_size);
+        buf.put_slice(&self.sha256);
+        buf.put_slice(&self.resume_id);
+        buf.freeze()
+    }
+
+    pub fn decode(mut payload: &[u8]) -> Result<Self, ProtocolError> {
+        let path = get_str(&mut payload, "TransferRequest")?;
+        let name = get_str(&mut payload, "TransferRequest")?;
+        if payload.remaining() != 8 + 4 + 32 + 16 {
+            return Err(ProtocolError::MalformedPayload("TransferRequest"));
+        }
+        let size = payload.get_u64();
+        let chunk_size = payload.get_u32();
+        let mut sha256 = [0u8; 32];
+        payload.copy_to_slice(&mut sha256);
+        let mut resume_id = [0u8; 16];
+        payload.copy_to_slice(&mut resume_id);
+        Ok(Self {
+            path,
+            name,
+            size,
+            chunk_size,
+            sha256,
+            resume_id,
+        })
+    }
+}
+
+impl TransferAccept {
+    pub fn encode(&self) -> Bytes {
+        let mut buf = BytesMut::with_capacity(16 + 4 + 4 + 2 + self.have_bitmap.len());
+        buf.put_slice(&self.transfer_id);
+        buf.put_u32(self.chunk_size);
+        buf.put_u32(self.total_chunks);
+        buf.put_u16(self.have_bitmap.len() as u16);
+        buf.put_slice(&self.have_bitmap);
+        buf.freeze()
+    }
+
+    pub fn decode(mut payload: &[u8]) -> Result<Self, ProtocolError> {
+        if payload.remaining() < 16 + 4 + 4 + 2 {
+            return Err(ProtocolError::MalformedPayload("TransferAccept"));
+        }
+        let mut transfer_id = [0u8; 16];
+        payload.copy_to_slice(&mut transfer_id);
+        let chunk_size = payload.get_u32();
+        let total_chunks = payload.get_u32();
+        let bitmap_len = payload.get_u16() as usize;
+        if payload.remaining() != bitmap_len {
+            return Err(ProtocolError::MalformedPayload("TransferAccept"));
+        }
+        Ok(Self {
+            transfer_id,
+            chunk_size,
+            total_chunks,
+            have_bitmap: payload[..bitmap_len].to_vec(),
+        })
+    }
+}
+
+impl TransferData {
+    pub fn encode(&self) -> Bytes {
+        let mut buf = BytesMut::with_capacity(16 + 4 + 32 + self.data.len());
+        buf.put_slice(&self.transfer_id);
+        buf.put_u32(self.chunk_index);
+        buf.put_slice(&self.chunk_hash);
+        buf.put_slice(&self.data);
+        buf.freeze()
+    }
+
+    pub fn decode(mut payload: &[u8]) -> Result<Self, ProtocolError> {
+        if payload.remaining() < 16 + 4 + 32 {
+            return Err(ProtocolError::MalformedPayload("TransferData"));
+        }
+        let mut transfer_id = [0u8; 16];
+        payload.copy_to_slice(&mut transfer_id);
+        let chunk_index = payload.get_u32();
+        let mut chunk_hash = [0u8; 32];
+        payload.copy_to_slice(&mut chunk_hash);
+        Ok(Self {
+            transfer_id,
+            chunk_index,
+            chunk_hash,
+            data: Bytes::copy_from_slice(payload),
+        })
+    }
+}
+
+impl TransferEnd {
+    pub fn encode(&self) -> Bytes {
+        let mut buf = BytesMut::with_capacity(16 + 1 + 2 + self.message.len());
+        buf.put_slice(&self.transfer_id);
+        buf.put_u8(self.status);
+        put_str(&mut buf, &self.message);
+        buf.freeze()
+    }
+
+    pub fn decode(mut payload: &[u8]) -> Result<Self, ProtocolError> {
+        if payload.remaining() < 16 + 1 + 2 {
+            return Err(ProtocolError::MalformedPayload("TransferEnd"));
+        }
+        let mut transfer_id = [0u8; 16];
+        payload.copy_to_slice(&mut transfer_id);
+        let status = payload.get_u8();
+        let message = get_str(&mut payload, "TransferEnd")?;
+        expect_end(payload, "TransferEnd")?;
+        Ok(Self {
+            transfer_id,
+            status,
+            message,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn all_round_trip() {
+        let list_req = FileListRequest {
+            path: "/warez".into(),
+        };
+        assert_eq!(FileListRequest::decode(&list_req.encode()).unwrap(), list_req);
+
+        let list_resp = FileListResponse {
+            path: "/".into(),
+            entries: vec![
+                FileEntry {
+                    name: "docs".into(),
+                    kind: KIND_DIR,
+                    size: 0,
+                },
+                FileEntry {
+                    name: "kdx.iso".into(),
+                    kind: KIND_FILE,
+                    size: 123_456_789,
+                },
+            ],
+        };
+        assert_eq!(
+            FileListResponse::decode(&list_resp.encode()).unwrap(),
+            list_resp
+        );
+
+        let request = TransferRequest {
+            path: "/incoming".into(),
+            name: "payload.bin".into(),
+            size: 1 << 20,
+            chunk_size: 32 * 1024,
+            sha256: [5u8; 32],
+            resume_id: [0u8; 16],
+        };
+        assert_eq!(TransferRequest::decode(&request.encode()).unwrap(), request);
+
+        let accept = TransferAccept {
+            transfer_id: [9u8; 16],
+            chunk_size: 32 * 1024,
+            total_chunks: 32,
+            have_bitmap: vec![0b1010_1010],
+        };
+        assert_eq!(TransferAccept::decode(&accept.encode()).unwrap(), accept);
+
+        let data = TransferData {
+            transfer_id: [9u8; 16],
+            chunk_index: 7,
+            chunk_hash: [3u8; 32],
+            data: Bytes::from_static(b"chunk bytes"),
+        };
+        assert_eq!(TransferData::decode(&data.encode()).unwrap(), data);
+
+        let end = TransferEnd {
+            transfer_id: [9u8; 16],
+            status: TRANSFER_VERIFIED,
+            message: "ok".into(),
+        };
+        assert_eq!(TransferEnd::decode(&end.encode()).unwrap(), end);
+    }
+
+    #[test]
+    fn rejects_malformed() {
+        assert!(FileListRequest::decode(&[9]).is_err());
+        assert!(TransferRequest::decode(&[0, 0]).is_err());
+        assert!(TransferData::decode(&[0u8; 20]).is_err());
+    }
+}

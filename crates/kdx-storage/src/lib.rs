@@ -4,6 +4,8 @@
 
 pub mod accounts;
 pub mod db;
+pub mod file_tree;
+pub mod transfer_state;
 
 pub use db::connect;
 pub use sqlx::SqlitePool;

@@ -21,6 +21,16 @@ pub struct Config {
     /// Idle session lifetime in seconds before reauthentication is required.
     #[serde(default = "default_session_ttl_secs")]
     pub session_ttl_secs: u64,
+    /// Directory where served file bytes are stored (created if missing).
+    #[serde(default = "default_files_root")]
+    pub files_root: PathBuf,
+    /// Per-transfer upload throttle in bytes/sec. 0 = unlimited.
+    #[serde(default)]
+    pub max_upload_bytes_per_sec: u64,
+}
+
+fn default_files_root() -> PathBuf {
+    PathBuf::from("files")
 }
 
 fn default_database() -> PathBuf {
@@ -49,6 +59,8 @@ impl Default for Config {
             tls: None,
             database: default_database(),
             session_ttl_secs: default_session_ttl_secs(),
+            files_root: default_files_root(),
+            max_upload_bytes_per_sec: 0,
         }
     }
 }

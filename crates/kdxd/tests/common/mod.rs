@@ -72,6 +72,7 @@ pub fn test_config(dir: &tempfile::TempDir) -> Config {
     Config {
         bind: "127.0.0.1:0".parse().unwrap(),
         database: dir.path().join("kdx.db"),
+        files_root: dir.path().join("files"),
         ..Config::default()
     }
 }

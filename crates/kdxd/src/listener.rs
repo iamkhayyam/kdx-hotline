@@ -4,6 +4,8 @@ use std::time::Duration;
 
 use kdx_server_core::auth::AuthManager;
 use kdx_server_core::chat::RoomManager;
+use kdx_server_core::files::FileTree;
+use kdx_server_core::transfer::{TransferConfig, TransferManager};
 use kdx_server_core::{Connection, ServerCtx};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::ServerConfig as TlsServerConfig;
@@ -25,6 +27,8 @@ pub enum ServeError {
     SelfSigned(#[from] rcgen::Error),
     #[error("storage error: {0}")]
     Storage(#[from] kdx_storage::StorageError),
+    #[error("initialization failed: {0}")]
+    Init(String),
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }
@@ -44,9 +48,23 @@ pub async fn serve(config: Config) -> Result<Server, ServeError> {
     let acceptor = TlsAcceptor::from(Arc::new(tls_config));
 
     let pool = kdx_storage::connect(&config.database).await?;
+    let tree = FileTree::load(pool.clone())
+        .await
+        .map_err(|e| ServeError::Init(e.to_string()))?;
+    let transfers = TransferManager::new(
+        pool.clone(),
+        TransferConfig {
+            files_root: config.files_root.clone(),
+            max_upload_bytes_per_sec: config.max_upload_bytes_per_sec,
+        },
+    )
+    .await
+    .map_err(|e| ServeError::Init(e.to_string()))?;
     let ctx = Arc::new(ServerCtx {
         auth: AuthManager::new(pool, Duration::from_secs(config.session_ttl_secs)),
         rooms: RoomManager::new(),
+        tree,
+        transfers,
     });
 
     let listener = TcpListener::bind(config.bind).await?;
