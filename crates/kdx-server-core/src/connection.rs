@@ -6,24 +6,28 @@
 //! dispatch. Ping/Pong and Disconnect work in every phase after the
 //! handshake; everything else requires a live session.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use kdx_protocol::messages::{
-    AuthChallenge, AuthRequest, AuthResponse, AuthResult, HandshakeInit, HandshakeResp,
+    AuthChallenge, AuthRequest, AuthResponse, AuthResult, ChatJoin, ChatLeave, ChatSend,
+    ChatTopic, HandshakeInit, HandshakeResp,
 };
 use kdx_protocol::{
     KdxCodec, KdxFrame, PacketFlags, PacketHeader, PacketType, ProtocolError, Reassembler,
     PROTOCOL_VERSION,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::sync::{mpsc, oneshot};
 use tokio::time::timeout;
 use tokio_util::codec::Framed;
 use tracing::{debug, warn};
 
-use crate::auth::{AuthManager, Session};
+use crate::auth::{AuthManager, Privileges, Session};
+use crate::chat::{Member, Outbound, RoomCommand, RoomManager};
 
 /// How long the client has to send `HandshakeInit` after connecting.
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -39,9 +43,14 @@ pub const SERVER_FEATURES: u16 = 0;
 /// Failed login attempts allowed before the connection is dropped.
 pub const MAX_AUTH_ATTEMPTS: u8 = 3;
 
+/// Depth of a connection's outbound event queue. Room broadcasts to a full
+/// queue are dropped for that member rather than stalling the room.
+pub const OUTBOUND_QUEUE: usize = 128;
+
 /// Shared server-wide services handed to every connection.
 pub struct ServerCtx {
     pub auth: AuthManager,
+    pub rooms: RoomManager,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -214,28 +223,57 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
     }
 
     async fn dispatch_loop(&mut self) -> Result<(), ConnectionError> {
-        loop {
-            let next = if self.reassembler.is_reassembling() {
-                // A fragment group is open: the peer must finish it promptly.
-                match timeout(REASSEMBLY_TIMEOUT, self.framed.next()).await {
-                    Err(_) => {
-                        self.reassembler.abort();
-                        return Err(ConnectionError::ReassemblyTimeout);
-                    }
-                    Ok(item) => item,
+        // Outbound events (room broadcasts etc.) flow through this channel;
+        // its sender is what we hand to room actors on join.
+        let (outbound_tx, mut outbound_rx) = mpsc::channel::<Outbound>(OUTBOUND_QUEUE);
+        let mut joined: HashMap<String, mpsc::Sender<RoomCommand>> = HashMap::new();
+
+        enum Next {
+            Event(Outbound),
+            Frame(Option<Result<KdxFrame, ProtocolError>>),
+            ReassemblyTimedOut,
+        }
+
+        let result = loop {
+            let next = {
+                let reassembling = self.reassembler.is_reassembling();
+                let framed = &mut self.framed;
+                tokio::select! {
+                    biased;
+                    // Senders never all drop while we hold outbound_tx.
+                    event = outbound_rx.recv() => Next::Event(event.expect("outbound channel open")),
+                    next = async {
+                        if reassembling {
+                            // A fragment group is open: the peer must finish
+                            // it promptly.
+                            match timeout(REASSEMBLY_TIMEOUT, framed.next()).await {
+                                Ok(item) => Next::Frame(item),
+                                Err(_) => Next::ReassemblyTimedOut,
+                            }
+                        } else {
+                            Next::Frame(framed.next().await)
+                        }
+                    } => next,
                 }
-            } else {
-                self.framed.next().await
             };
 
-            let Some(frame) = next.transpose()? else {
-                return Ok(()); // clean EOF
+            let frame_or_eof = match next {
+                Next::Event(event) => {
+                    self.send(event.packet_type, event.flags, event.payload).await?;
+                    continue;
+                }
+                Next::ReassemblyTimedOut => {
+                    self.reassembler.abort();
+                    break Err(ConnectionError::ReassemblyTimeout);
+                }
+                Next::Frame(item) => item,
             };
 
-            let Some(frame) = self
-                .reassembler
-                .push(frame, MAX_REASSEMBLED_PAYLOAD)?
-            else {
+            let Some(frame) = frame_or_eof.transpose()? else {
+                break Ok(()); // clean EOF
+            };
+
+            let Some(frame) = self.reassembler.push(frame, MAX_REASSEMBLED_PAYLOAD)? else {
                 continue; // mid-group fragment
             };
 
@@ -245,14 +283,74 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                         .await?;
                 }
                 PacketType::Disconnect => {
-                    if let Some(session) = &self.session {
-                        self.ctx.auth.end_session(session.id);
-                    }
                     debug!("client disconnected cleanly");
-                    return Ok(());
+                    break Ok(());
+                }
+                PacketType::ChatJoin => {
+                    let join = ChatJoin::decode(&frame.payload)?;
+                    let session = self.session.as_ref().expect("authed in dispatch");
+                    let member = Member {
+                        session_id: session.id,
+                        username: session.username.clone(),
+                        privileges: session.privileges,
+                        tx: outbound_tx.clone(),
+                    };
+                    match self.ctx.rooms.join(&join.room, member).await {
+                        Ok(handle) => {
+                            joined.insert(join.room, handle);
+                        }
+                        Err(e) => self.send_error(&e.to_string()).await?,
+                    }
+                }
+                PacketType::ChatLeave => {
+                    let leave = ChatLeave::decode(&frame.payload)?;
+                    let session_id = self.session.as_ref().expect("authed").id;
+                    if let Some(handle) = joined.remove(&leave.room) {
+                        let _ = handle.send(RoomCommand::Leave { session_id }).await;
+                    }
+                }
+                PacketType::ChatMessage => {
+                    let send = ChatSend::decode(&frame.payload)?;
+                    let session = self.session.as_ref().expect("authed");
+                    if !session.privileges.contains(Privileges::CHAT_SEND) {
+                        self.send_error("missing CHAT_SEND privilege").await?;
+                        continue;
+                    }
+                    match joined.get(&send.room) {
+                        Some(handle) => {
+                            let _ = handle
+                                .send(RoomCommand::Message {
+                                    session_id: session.id,
+                                    flags: send.flags,
+                                    text: send.text,
+                                })
+                                .await;
+                        }
+                        None => self.send_error("not in that room").await?,
+                    }
+                }
+                PacketType::ChatTopicSet => {
+                    let topic = ChatTopic::decode(&frame.payload)?;
+                    let session_id = self.session.as_ref().expect("authed").id;
+                    match joined.get(&topic.room) {
+                        Some(handle) => {
+                            let (reply, rx) = oneshot::channel();
+                            let _ = handle
+                                .send(RoomCommand::SetTopic {
+                                    session_id,
+                                    topic: topic.topic,
+                                    reply,
+                                })
+                                .await;
+                            if let Ok(Err(e)) = rx.await {
+                                self.send_error(&e.to_string()).await?;
+                            }
+                        }
+                        None => self.send_error("not in that room").await?,
+                    }
                 }
                 other => {
-                    // Later milestones route chat/file packets here.
+                    // Later milestones route file packets here.
                     warn!(packet_type = ?other, "unhandled packet type");
                     self.send(
                         PacketType::Error,
@@ -262,7 +360,30 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                     .await?;
                 }
             }
+        };
+
+        // Cleanup regardless of how the loop ended: leave rooms, end session.
+        if let Some(session) = &self.session {
+            for (room, handle) in joined {
+                let _ = handle
+                    .send(RoomCommand::Leave {
+                        session_id: session.id,
+                    })
+                    .await;
+                debug!(room, "left on disconnect");
+            }
+            self.ctx.auth.end_session(session.id);
         }
+        result
+    }
+
+    async fn send_error(&mut self, message: &str) -> Result<(), ProtocolError> {
+        self.send(
+            PacketType::Error,
+            PacketFlags::SYSTEM_MESSAGE,
+            Bytes::copy_from_slice(message.as_bytes()),
+        )
+        .await
     }
 
     async fn send(
@@ -306,6 +427,7 @@ mod tests {
         accounts::create(&pool, "phraq", &phc, 2).await.unwrap();
         let ctx = Arc::new(ServerCtx {
             auth: AuthManager::new(pool, Duration::from_secs(60)),
+            rooms: RoomManager::new(),
         });
         (ctx, dir)
     }

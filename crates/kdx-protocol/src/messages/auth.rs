@@ -1,5 +1,6 @@
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
+use super::wire::{get_str, put_str};
 use crate::ProtocolError;
 
 /// Client → server: begin authentication for `username`.
@@ -34,25 +35,6 @@ pub struct AuthResult {
     pub session_id: [u8; 16],
     pub class: u8,
     pub message: String,
-}
-
-fn put_str(buf: &mut BytesMut, s: &str) {
-    buf.put_u16(s.len() as u16);
-    buf.put_slice(s.as_bytes());
-}
-
-fn get_str(buf: &mut &[u8], context: &'static str) -> Result<String, ProtocolError> {
-    if buf.remaining() < 2 {
-        return Err(ProtocolError::MalformedPayload(context));
-    }
-    let len = buf.get_u16() as usize;
-    if buf.remaining() < len {
-        return Err(ProtocolError::MalformedPayload(context));
-    }
-    let s = String::from_utf8(buf[..len].to_vec())
-        .map_err(|_| ProtocolError::MalformedPayload(context))?;
-    buf.advance(len);
-    Ok(s)
 }
 
 impl AuthRequest {

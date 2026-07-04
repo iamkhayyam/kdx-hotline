@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use kdx_server_core::auth::AuthManager;
+use kdx_server_core::chat::RoomManager;
 use kdx_server_core::{Connection, ServerCtx};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::ServerConfig as TlsServerConfig;
@@ -45,6 +46,7 @@ pub async fn serve(config: Config) -> Result<Server, ServeError> {
     let pool = kdx_storage::connect(&config.database).await?;
     let ctx = Arc::new(ServerCtx {
         auth: AuthManager::new(pool, Duration::from_secs(config.session_ttl_secs)),
+        rooms: RoomManager::new(),
     });
 
     let listener = TcpListener::bind(config.bind).await?;

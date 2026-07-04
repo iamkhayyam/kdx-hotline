@@ -4,6 +4,7 @@
 //! in-memory duplex pipes instead of real sockets.
 
 pub mod auth;
+pub mod chat;
 pub mod connection;
 
 pub use connection::{Connection, ConnectionError, ServerCtx};
