@@ -44,7 +44,14 @@ pub struct Server {
 /// Bind the listener and spawn the accept loop. Returns once bound, so
 /// callers (including tests) know the server is reachable and on which port.
 pub async fn serve(config: Config) -> Result<Server, ServeError> {
-    let tls_config = build_tls_config(config.tls.as_ref())?;
+    // Cache the dev cert next to the database so restarts keep the same
+    // server identity (clients that pinned it stay trusted).
+    let cert_cache = config
+        .database
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let tls_config = build_tls_config(config.tls.as_ref(), &cert_cache)?;
     let acceptor = TlsAcceptor::from(Arc::new(tls_config));
 
     let pool = kdx_storage::connect(&config.database).await?;
@@ -106,13 +113,13 @@ pub async fn serve(config: Config) -> Result<Server, ServeError> {
     })
 }
 
-fn build_tls_config(tls: Option<&TlsConfig>) -> Result<TlsServerConfig, ServeError> {
+fn build_tls_config(
+    tls: Option<&TlsConfig>,
+    cert_cache: &std::path::Path,
+) -> Result<TlsServerConfig, ServeError> {
     let (certs, key) = match tls {
         Some(paths) => load_pem(paths)?,
-        None => {
-            warn!("no TLS certs configured; generating self-signed dev certificate");
-            self_signed()?
-        }
+        None => self_signed(cert_cache)?,
     };
     let config = TlsServerConfig::builder()
         .with_no_client_auth()
@@ -134,10 +141,32 @@ fn load_pem(
     Ok((certs, key))
 }
 
-fn self_signed() -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>), ServeError> {
+/// Load a cached self-signed dev cert from `cache_dir`, or generate one and
+/// persist it there. Persisting keeps the server's identity stable across
+/// restarts, so clients that pinned it (trust-on-first-use) stay trusted.
+fn self_signed(
+    cache_dir: &std::path::Path,
+) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>), ServeError> {
+    let cert_path = cache_dir.join("dev-cert.der");
+    let key_path = cache_dir.join("dev-key.der");
+
+    if let (Ok(cert_bytes), Ok(key_bytes)) =
+        (std::fs::read(&cert_path), std::fs::read(&key_path))
+    {
+        if let Ok(key) = PrivateKeyDer::try_from(key_bytes) {
+            info!("reusing cached dev certificate");
+            return Ok((vec![CertificateDer::from(cert_bytes)], key));
+        }
+    }
+
+    warn!("generating self-signed dev certificate (cached for future restarts)");
     let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])?;
-    let cert = certified.cert.der().clone();
-    let key = PrivateKeyDer::try_from(certified.key_pair.serialize_der())
-        .expect("rcgen emits valid pkcs8");
-    Ok((vec![cert], key))
+    let cert_der = certified.cert.der().to_vec();
+    let key_der = certified.key_pair.serialize_der();
+    let _ = std::fs::create_dir_all(cache_dir);
+    let _ = std::fs::write(&cert_path, &cert_der);
+    let _ = std::fs::write(&key_path, &key_der);
+
+    let key = PrivateKeyDer::try_from(key_der).expect("rcgen emits valid pkcs8");
+    Ok((vec![CertificateDer::from(cert_der)], key))
 }
