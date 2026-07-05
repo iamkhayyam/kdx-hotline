@@ -7,6 +7,10 @@ rooms with flood protection, a virtual file tree with drop boxes, and
 resumable chunked file transfers in both directions. The desktop client is a
 Tauri app in the classic KDX black / blood-red / phosphor-green aesthetic.
 
+A full GUI & feature walkthrough — every window, the command/event bridge,
+and the machinery behind each feature — lives in
+[docs/handoff.html](docs/handoff.html) (open it in a browser).
+
 ## Workspace
 
 ```
