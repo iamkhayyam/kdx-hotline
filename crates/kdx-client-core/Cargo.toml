@@ -1,0 +1,34 @@
+[package]
+name = "kdx-client-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+# Test-only: trust any server certificate. Never enable in a shipped client.
+dangerous = []
+
+[dependencies]
+kdx-protocol = { workspace = true }
+kdx-crypto = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tokio-rustls = { workspace = true }
+rustls = { workspace = true }
+futures-util = { workspace = true }
+bytes = { workspace = true }
+bitvec = { workspace = true }
+sha2 = { workspace = true }
+uuid = { workspace = true }
+serde = { workspace = true }
+base64 = { workspace = true }
+zeroize = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+kdxd = { path = "../kdxd" }
+kdx-storage = { workspace = true }
+tempfile = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["full", "test-util"] }

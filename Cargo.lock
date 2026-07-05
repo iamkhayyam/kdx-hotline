@@ -738,6 +738,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "kdx-client-core"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "bitvec",
+ "bytes",
+ "futures-util",
+ "kdx-crypto",
+ "kdx-protocol",
+ "kdx-storage",
+ "kdxd",
+ "rustls",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tokio-rustls",
+ "tokio-util",
+ "tracing",
+ "uuid",
+ "zeroize",
+]
+
+[[package]]
 name = "kdx-crypto"
 version = "0.1.0"
 dependencies = [
