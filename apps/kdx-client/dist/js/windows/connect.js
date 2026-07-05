@@ -28,6 +28,14 @@ export function buildConnect(onLoggedIn) {
   const tofuBox = $("#c-tofu");
   const go = $("#c-go");
 
+  // Restore the last server/login the user connected to.
+  try {
+    const saved = JSON.parse(localStorage.getItem("kdx.lastServer") || "{}");
+    if (saved.host) $("#c-host").value = saved.host;
+    if (saved.port) $("#c-port").value = saved.port;
+    if (saved.username) $("#c-user").value = saved.username;
+  } catch (_) {}
+
   function setStatus(msg, cls) {
     status.textContent = msg;
     status.className = "status " + (cls || "");
@@ -61,6 +69,9 @@ export function buildConnect(onLoggedIn) {
   async function finishLogin(host, port, username, password) {
     setStatus("authenticating…");
     const klass = await invoke("login", { username, password });
+    try {
+      localStorage.setItem("kdx.lastServer", JSON.stringify({ host, port, username }));
+    } catch (_) {}
     update({ connection: "online", session: { class: klass }, server: { host, port } });
     setStatus(`logged in as ${username} (${CLASSES[klass] || "?"})`, "ok");
     go.disabled = false;
