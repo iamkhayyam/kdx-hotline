@@ -50,6 +50,9 @@ export function register(opts) {
   });
 }
 
+export function isRegistered(id) {
+  return registry.has(id);
+}
 export function isOpen(id) {
   const e = registry.get(id);
   return !!e && e.state === "open";

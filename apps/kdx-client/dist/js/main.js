@@ -1,14 +1,13 @@
-import { onKdxEvent } from "./bridge.js";
-import { initDesktop, register, open, toggle, isOpen } from "./wm.js";
-import { getState, subscribe, update } from "./store.js";
+import { invoke, onKdxEvent } from "./bridge.js";
+import { initDesktop, register, open, toggle, isOpen, onChange } from "./wm.js";
+import { getState, subscribe, update, updateTransfer } from "./store.js";
+import { buildButtonBar } from "./buttonbar.js";
 import { buildConnect } from "./windows/connect.js";
 import { buildChat } from "./windows/chat.js";
 import { buildFiles } from "./windows/files.js";
 import { buildTransfers } from "./windows/transfers.js";
 
 const desktop = document.getElementById("desktop");
-const connStatus = document.getElementById("conn-status");
-const footLeft = document.getElementById("foot-left");
 
 initDesktop(desktop);
 
@@ -49,10 +48,18 @@ register({
   build: () => ({ body: transfers.body }),
 });
 
-// Temporary top launcher (replaced by the Button Bar in R2).
-document.querySelectorAll(".menubar .item[data-win]").forEach((item) => {
-  item.style.cursor = "pointer";
-  item.addEventListener("click", () => toggle(item.dataset.win));
+// The Button Bar — the always-present launcher.
+const buttonBar = buildButtonBar(document.getElementById("bb-mount"), {
+  onAction: (name) => {
+    if (name === "disconnect") {
+      invoke("disconnect").catch(() => {});
+      update({ connection: "offline", session: null });
+    } else if (name === "server") {
+      toggle("connect");
+    } else if (name === "exit") {
+      if (window.__TAURI__) window.__TAURI__.window.getCurrentWindow().close();
+    }
+  },
 });
 
 // Open the Connect window on start.
@@ -63,19 +70,11 @@ function onLoggedIn() {
   chat.focusEntry();
 }
 
-// Menubar status chip + footer.
-subscribe((s) => {
-  connStatus.dataset.state = s.connection;
-  if (s.connection === "online" && s.server) {
-    connStatus.textContent = `TLS 1.3 · kdx://${s.server.host}:${s.server.port}`;
-    footLeft.textContent = `connected as class ${s.session ? s.session.class : "?"}`;
-  } else if (s.connection === "connecting") {
-    connStatus.textContent = "connecting…";
-  } else {
-    connStatus.textContent = "offline";
-    footLeft.textContent = "not connected";
-  }
-});
+// Reflect connection + window state in the Button Bar (on store changes and
+// on window open/close/minimize).
+subscribe((s) => buttonBar.update(s));
+onChange(() => buttonBar.update(getState()));
+buttonBar.update(getState());
 
 // Route server events into the windows (instances always exist).
 onKdxEvent((ev) => {
@@ -95,10 +94,12 @@ onKdxEvent((ev) => {
       break;
     case "transfer_progress":
       transfers.onProgress(ev);
+      updateTransfer(ev.id, { done: ev.done, total: ev.total });
       if (!isOpen("transfers")) open("transfers");
       break;
     case "transfer_complete":
       transfers.onComplete(ev);
+      updateTransfer(ev.id, { status: ev.status });
       if (ev.direction === "upload" || ev.direction === "download") files.refresh();
       break;
     case "server_warning":
