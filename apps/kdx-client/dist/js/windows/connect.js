@@ -120,7 +120,15 @@ export function buildConnect(onLoggedIn) {
     if (e.key === "Enter") attempt();
   });
 
-  return body;
+  // Exposed so the Address Book can pre-fill and connect from a bookmark.
+  function fill(fields) {
+    if (fields.host != null) $("#c-host").value = fields.host;
+    if (fields.port != null) $("#c-port").value = fields.port;
+    if (fields.login != null) $("#c-user").value = fields.login;
+    if (fields.password != null) $("#c-pass").value = fields.password;
+  }
+
+  return { body, fill, submit: attempt };
 }
 
 function errMsg(err) {

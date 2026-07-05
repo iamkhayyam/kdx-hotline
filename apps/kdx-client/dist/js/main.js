@@ -6,10 +6,14 @@ import { buildConnect } from "./windows/connect.js";
 import { buildChat } from "./windows/chat.js";
 import { buildFiles } from "./windows/files.js";
 import { buildTransfers } from "./windows/transfers.js";
+import { buildAddressBook } from "./windows/addressbook.js";
+import { buildSettings, applySettings, loadSettings } from "./windows/settings.js";
+import { buildAbout } from "./windows/about.js";
 
 const desktop = document.getElementById("desktop");
 
 initDesktop(desktop);
+applySettings(loadSettings()); // apply saved theme/prefs at startup
 
 // Build feature instances eagerly (cheap DOM); the window manager wraps each
 // in floating chrome lazily on first open. Events route to these instances
@@ -17,7 +21,10 @@ initDesktop(desktop);
 const chat = buildChat();
 const files = buildFiles();
 const transfers = buildTransfers();
-const connectBody = buildConnect(onLoggedIn);
+const connectApi = buildConnect(onLoggedIn);
+const addressbook = buildAddressBook(connectApi, () => open("connect"));
+const settings = buildSettings();
+const about = buildAbout();
 
 // Default window positions clear the floating Button Bar (top-left).
 register({
@@ -25,7 +32,7 @@ register({
   title: "Connect",
   rect: { x: 200, y: 24, w: 300 },
   resizable: false,
-  build: () => ({ body: connectBody }),
+  build: () => ({ body: connectApi.body }),
 });
 register({
   id: "chat",
@@ -47,6 +54,26 @@ register({
   title: "File Transfers",
   rect: { x: 790, y: 24, w: 320, h: 360 },
   build: () => ({ body: transfers.body }),
+});
+register({
+  id: "addressbook",
+  title: "Address Book",
+  rect: { x: 200, y: 90, w: 460, h: 320 },
+  build: () => ({ body: addressbook.body }),
+});
+register({
+  id: "settings",
+  title: "Settings",
+  rect: { x: 240, y: 120, w: 360 },
+  resizable: false,
+  build: () => ({ body: settings.body }),
+});
+register({
+  id: "about",
+  title: "About KDX",
+  rect: { x: 280, y: 150, w: 360 },
+  resizable: false,
+  build: () => ({ body: about.body }),
 });
 
 // The Button Bar — the always-present launcher, itself a floating window on
