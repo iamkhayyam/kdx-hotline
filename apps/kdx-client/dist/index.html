@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1" />
+  <title>KDX</title>
+  <link rel="stylesheet" href="css/kdx.css" />
+</head>
+<body>
+  <header class="menubar">
+    <span class="brand">KDX</span>
+    <span class="item">File</span>
+    <span class="item">Chat</span>
+    <span class="item">Transfers</span>
+    <span class="spacer"></span>
+    <span class="conn" id="conn-status" data-state="offline">offline</span>
+  </header>
+
+  <main class="desktop" id="desktop"></main>
+
+  <footer class="deskfoot">
+    <span id="foot-left">not connected</span>
+    <span class="right">20-byte frames · TLS 1.3 · argon2id · chunk-bitmap resume</span>
+  </footer>
+
+  <script type="module" src="js/main.js"></script>
+</body>
+</html>

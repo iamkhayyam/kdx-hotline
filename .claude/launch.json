@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "kdx-client-dist",
+      "runtimeExecutable": "python3",
+      "runtimeArgs": ["-m", "http.server", "5177", "--directory", "apps/kdx-client/dist"],
+      "port": 5177
+    }
+  ]
+}

@@ -2,3 +2,6 @@
 *.db
 *.db-shm
 *.db-wal
+
+# Tauri build artifacts
+apps/kdx-client/src-tauri/gen/

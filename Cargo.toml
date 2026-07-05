@@ -7,6 +7,7 @@ members = [
     "crates/kdx-storage",
     "crates/kdx-client-core",
     "crates/kdxd",
+    "apps/kdx-client/src-tauri",
 ]
 
 [workspace.package]
@@ -20,6 +21,7 @@ kdx-protocol = { path = "crates/kdx-protocol" }
 kdx-crypto = { path = "crates/kdx-crypto" }
 kdx-server-core = { path = "crates/kdx-server-core" }
 kdx-storage = { path = "crates/kdx-storage" }
+kdx-client-core = { path = "crates/kdx-client-core" }
 
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["codec"] }
