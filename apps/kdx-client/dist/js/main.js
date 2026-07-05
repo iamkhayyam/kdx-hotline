@@ -19,10 +19,11 @@ const files = buildFiles();
 const transfers = buildTransfers();
 const connectBody = buildConnect(onLoggedIn);
 
+// Default window positions clear the floating Button Bar (top-left).
 register({
   id: "connect",
   title: "Connect",
-  rect: { x: 24, y: 24, w: 300 },
+  rect: { x: 200, y: 24, w: 300 },
   resizable: false,
   build: () => ({ body: connectBody }),
 });
@@ -30,26 +31,27 @@ register({
   id: "chat",
   title: "Public Chat",
   tag: "0 users",
-  rect: { x: 340, y: 24, w: 560, h: 380 },
+  rect: { x: 200, y: 24, w: 560, h: 380 },
   build: () => ({ body: chat.body, api: chat }),
 });
 register({
   id: "files",
   title: "Files",
   tag: "/",
-  rect: { x: 340, y: 430, w: 440, h: 300 },
+  rect: { x: 200, y: 430, w: 440, h: 300 },
   build: () => ({ body: files.body }),
   onOpen: () => files.refresh(),
 });
 register({
   id: "transfers",
   title: "File Transfers",
-  rect: { x: 930, y: 24, w: 320, h: 360 },
+  rect: { x: 790, y: 24, w: 320, h: 360 },
   build: () => ({ body: transfers.body }),
 });
 
-// The Button Bar — the always-present launcher.
-const buttonBar = buildButtonBar(document.getElementById("bb-mount"), {
+// The Button Bar — the always-present launcher, itself a floating window on
+// the desktop.
+const buttonBar = buildButtonBar(desktop, {
   onAction: (name) => {
     if (name === "disconnect") {
       invoke("disconnect").catch(() => {});

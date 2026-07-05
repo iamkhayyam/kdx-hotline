@@ -57,17 +57,27 @@ body::before {
 .conn[data-state="online"]::before { color: var(--green); animation: pulse 2.4s ease-in-out infinite; }
 @keyframes pulse { 0%,100% { opacity: 1 } 50% { opacity: .35 } }
 
-.app { flex: 1 1 auto; display: flex; min-height: 0; }
-#bb-mount { flex: 0 0 auto; display: flex; }
 .desktop { position: relative; flex: 1 1 auto; overflow: hidden; }
 
-/* Button Bar — the vertical launcher */
+/* Button Bar — a floating window on the desktop, sized to its content */
 .buttonbar {
-  width: 156px; flex: 0 0 156px;
+  position: absolute; z-index: 6;
+  width: 158px;
   display: flex; flex-direction: column;
+  max-height: calc(100% - 24px);
   background: linear-gradient(#160909, #0c0606);
-  border-right: 1px solid var(--chrome);
+  border: 1px solid var(--chrome);
+  box-shadow: 0 0 0 1px #000, 0 14px 40px rgba(0,0,0,.7), 0 0 20px rgba(122,10,10,.2);
 }
+.bb-titlebar {
+  display: flex; align-items: center;
+  padding: 3px 7px;
+  background: linear-gradient(#5c0d0d, #340808);
+  border-bottom: 1px solid var(--chrome);
+  cursor: grab;
+}
+.bb-titlebar:active { cursor: grabbing; }
+.bb-brand { color: var(--alert); font-family: var(--mono); font-weight: 700; letter-spacing: .26em; font-size: 12px; }
 .bb-header { padding: 8px 8px 6px; border-bottom: 1px solid var(--chrome-dim); }
 .bb-banner {
   height: 40px; margin-bottom: 6px; display: none;

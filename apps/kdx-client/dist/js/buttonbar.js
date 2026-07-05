@@ -33,6 +33,15 @@ const FEATURES = [
 export function buildButtonBar(mount, handlers) {
   const bar = document.createElement("nav");
   bar.className = "buttonbar";
+  // A floating window on the desktop — positioned, not a fixed rail.
+  const pos = loadPos();
+  bar.style.left = pos.x + "px";
+  bar.style.top = pos.y + "px";
+
+  const titlebar = document.createElement("div");
+  titlebar.className = "bb-titlebar";
+  titlebar.innerHTML = '<span class="bb-brand">KDX</span>';
+  makeDraggable(bar, titlebar, mount);
 
   const header = document.createElement("div");
   header.className = "bb-header";
@@ -74,6 +83,7 @@ export function buildButtonBar(mount, handlers) {
     '<span class="bb-count" id="bb-c-rooms" title="rooms">[0]</span>' +
     '<span class="bb-count" id="bb-c-xfer" title="active transfers">[0]</span>';
 
+  bar.appendChild(titlebar);
   bar.appendChild(header);
   bar.appendChild(list);
   bar.appendChild(footer);
@@ -122,4 +132,41 @@ export function buildButtonBar(mount, handlers) {
   }
 
   return { update, setLed };
+}
+
+function loadPos() {
+  try {
+    const p = JSON.parse(localStorage.getItem("kdx.win.buttonbar") || "null");
+    if (p && typeof p.x === "number") return p;
+  } catch (_) {}
+  return { x: 12, y: 12 };
+}
+
+function makeDraggable(el, handle, desk) {
+  handle.addEventListener("pointerdown", (e) => {
+    if (e.target.closest("button")) return;
+    e.preventDefault();
+    const rect = el.getBoundingClientRect();
+    const deskRect = desk.getBoundingClientRect();
+    const offX = e.clientX - rect.left;
+    const offY = e.clientY - rect.top;
+    const move = (ev) => {
+      const x = Math.min(Math.max(0, ev.clientX - deskRect.left - offX), deskRect.width - 60);
+      const y = Math.min(Math.max(0, ev.clientY - deskRect.top - offY), deskRect.height - 24);
+      el.style.left = x + "px";
+      el.style.top = y + "px";
+    };
+    const up = () => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", up);
+      try {
+        localStorage.setItem(
+          "kdx.win.buttonbar",
+          JSON.stringify({ x: parseInt(el.style.left, 10) || 0, y: parseInt(el.style.top, 10) || 0 })
+        );
+      } catch (_) {}
+    };
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", up);
+  });
 }
