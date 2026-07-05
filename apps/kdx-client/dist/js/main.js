@@ -55,6 +55,21 @@ createWindow(desktop, {
 
 chatWin.focus();
 
+// Menubar items focus (and un-hide) their window.
+document.querySelectorAll(".menubar .item").forEach((item) => {
+  const target = item.textContent.trim().toLowerCase();
+  const id = { file: "files", chat: "chat", transfers: "transfers" }[target];
+  if (!id) return;
+  item.style.cursor = "pointer";
+  item.addEventListener("click", () => {
+    const w = getWindow(id);
+    if (w) {
+      w.el.classList.remove("hidden");
+      w.focus();
+    }
+  });
+});
+
 function onLoggedIn() {
   getWindow("chat").focus();
   chat.focusEntry();
@@ -110,7 +125,9 @@ onKdxEvent((ev) => {
       break;
     case "disconnected":
       update({ connection: "offline", session: null });
-      chat.onError("disconnected: " + ev.reason);
+      chat.onError("disconnected: " + ev.reason + " — reconnect from the Connect window");
+      getWindow("chat").setTag("offline");
+      getWindow("connect").focus();
       break;
     default:
       console.warn("unhandled event", ev);
