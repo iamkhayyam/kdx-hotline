@@ -1,5 +1,5 @@
 import { onKdxEvent } from "./bridge.js";
-import { createWindow, getWindow } from "./wm.js";
+import { initDesktop, register, open, toggle, isOpen } from "./wm.js";
 import { getState, subscribe, update } from "./store.js";
 import { buildConnect } from "./windows/connect.js";
 import { buildChat } from "./windows/chat.js";
@@ -10,73 +10,60 @@ const desktop = document.getElementById("desktop");
 const connStatus = document.getElementById("conn-status");
 const footLeft = document.getElementById("foot-left");
 
-// Build windows.
+initDesktop(desktop);
+
+// Build feature instances eagerly (cheap DOM); the window manager wraps each
+// in floating chrome lazily on first open. Events route to these instances
+// whether or not their window is currently open.
 const chat = buildChat();
 const files = buildFiles();
 const transfers = buildTransfers();
+const connectBody = buildConnect(onLoggedIn);
 
-createWindow(desktop, {
+register({
   id: "connect",
   title: "Connect",
-  x: 24,
-  y: 24,
-  width: 300,
-  body: buildConnect(onLoggedIn),
+  rect: { x: 24, y: 24, w: 300 },
+  resizable: false,
+  build: () => ({ body: connectBody }),
 });
-const chatWin = createWindow(desktop, {
+register({
   id: "chat",
-  title: "Chat — #lobby",
+  title: "Public Chat",
   tag: "0 users",
-  x: 348,
-  y: 24,
-  width: 560,
-  height: 380,
-  body: chat.body,
+  rect: { x: 340, y: 24, w: 560, h: 380 },
+  build: () => ({ body: chat.body, api: chat }),
 });
-createWindow(desktop, {
+register({
   id: "files",
   title: "Files",
   tag: "/",
-  x: 348,
-  y: 430,
-  width: 420,
-  height: 300,
-  body: files.body,
+  rect: { x: 340, y: 430, w: 440, h: 300 },
+  build: () => ({ body: files.body }),
+  onOpen: () => files.refresh(),
 });
-createWindow(desktop, {
+register({
   id: "transfers",
-  title: "Transfers",
-  x: 930,
-  y: 24,
-  width: 320,
-  height: 360,
-  body: transfers.body,
+  title: "File Transfers",
+  rect: { x: 930, y: 24, w: 320, h: 360 },
+  build: () => ({ body: transfers.body }),
 });
 
-chatWin.focus();
-
-// Menubar items focus (and un-hide) their window.
-document.querySelectorAll(".menubar .item").forEach((item) => {
-  const target = item.textContent.trim().toLowerCase();
-  const id = { file: "files", chat: "chat", transfers: "transfers" }[target];
-  if (!id) return;
+// Temporary top launcher (replaced by the Button Bar in R2).
+document.querySelectorAll(".menubar .item[data-win]").forEach((item) => {
   item.style.cursor = "pointer";
-  item.addEventListener("click", () => {
-    const w = getWindow(id);
-    if (w) {
-      w.el.classList.remove("hidden");
-      w.focus();
-    }
-  });
+  item.addEventListener("click", () => toggle(item.dataset.win));
 });
+
+// Open the Connect window on start.
+open("connect");
 
 function onLoggedIn() {
-  getWindow("chat").focus();
+  open("chat");
   chat.focusEntry();
-  files.refresh();
 }
 
-// Reflect connection state in the menubar + footer.
+// Menubar status chip + footer.
 subscribe((s) => {
   connStatus.dataset.state = s.connection;
   if (s.connection === "online" && s.server) {
@@ -90,7 +77,7 @@ subscribe((s) => {
   }
 });
 
-// Route server events into the windows.
+// Route server events into the windows (instances always exist).
 onKdxEvent((ev) => {
   switch (ev.type) {
     case "connected":
@@ -100,7 +87,7 @@ onKdxEvent((ev) => {
       break;
     case "user_list":
       chat.onUsers(ev.users);
-      getWindow("chat").setTag(`${ev.users.length} user${ev.users.length === 1 ? "" : "s"}`);
+      setChatTag(ev.users.length);
       update({ users: ev.users });
       break;
     case "topic":
@@ -108,7 +95,7 @@ onKdxEvent((ev) => {
       break;
     case "transfer_progress":
       transfers.onProgress(ev);
-      getWindow("transfers").focus();
+      if (!isOpen("transfers")) open("transfers");
       break;
     case "transfer_complete":
       transfers.onComplete(ev);
@@ -126,10 +113,15 @@ onKdxEvent((ev) => {
     case "disconnected":
       update({ connection: "offline", session: null });
       chat.onError("disconnected: " + ev.reason + " — reconnect from the Connect window");
-      getWindow("chat").setTag("offline");
-      getWindow("connect").focus();
+      setChatTag(0);
+      open("connect");
       break;
     default:
       console.warn("unhandled event", ev);
   }
 });
+
+function setChatTag(n) {
+  const el = document.querySelector('.win[data-id="chat"] .titlebar .tag');
+  if (el) el.textContent = `${n} user${n === 1 ? "" : "s"}`;
+}
