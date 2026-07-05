@@ -15,6 +15,7 @@ mod error;
 mod event;
 mod handle;
 mod tls;
+mod transfer;
 
 use std::sync::Arc;
 

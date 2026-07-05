@@ -1,32 +1,41 @@
 //! The connection actor: one task owning the TLS socket. It is the sole
 //! reader and writer of the stream, owns the sequence counter, correlates
 //! request/response pairs (the wire has no request IDs, so correlation is
-//! FIFO-per-response-type), and turns unsolicited server frames into events.
+//! FIFO-per-response-type), drives the one active transfer, and turns
+//! unsolicited server frames into events.
 
 use std::collections::VecDeque;
 use std::io;
+use std::path::PathBuf;
 
+use bitvec::prelude::*;
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
+use kdx_crypto::KdfParams;
 use kdx_protocol::messages::{
-    AuthChallenge, AuthRequest, AuthResponse, AuthResult, ChatJoin, ChatLeave, ChatSend, ChatTopic,
-    ChatUserList, FileListRequest, FileListResponse,
+    AuthChallenge, AuthRequest, AuthResponse, AuthResult, ChatEvent, ChatJoin, ChatLeave, ChatSend,
+    ChatTopic, ChatUserList, FileListRequest, FileListResponse, TransferAccept, TransferData,
+    TransferEnd, TransferRequest, DIRECTION_DOWNLOAD, DIRECTION_UPLOAD, TRANSFER_VERIFIED,
 };
 use kdx_protocol::{
-    KdxCodec, KdxFrame, PacketFlags, PacketHeader, PacketType, PROTOCOL_VERSION,
+    KdxCodec, KdxFrame, PacketFlags, PacketHeader, PacketType, Reassembler, PROTOCOL_VERSION,
 };
-use kdx_crypto::KdfParams;
+use sha2::{Digest, Sha256};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{interval, Duration};
 use tokio_util::codec::Framed;
 use tracing::{debug, warn};
+use uuid::Uuid;
 
 use crate::error::ClientError;
-use crate::event::Event;
+use crate::event::{Direction, Event};
 use crate::handle::{Command, Session};
+use crate::transfer::{chunk_len, total_chunks, ChunkBitmap, Sidecar, DEFAULT_CHUNK_SIZE};
 
 const KEEPALIVE: Duration = Duration::from_secs(30);
+const MAX_REASSEMBLED: usize = 4 * 1024 * 1024;
 
 /// A login in flight: which step we're waiting for and who to answer.
 struct PendingLogin {
@@ -40,14 +49,44 @@ enum LoginPhase {
     AwaitingResult,
 }
 
+/// The single active transfer, if any.
+enum Transfer {
+    Upload(UploadJob),
+    Download(DownloadJob),
+}
+
+struct UploadJob {
+    id: [u8; 16],
+    data: Vec<u8>,
+    size: u64,
+    chunk_size: u32,
+    total: u32,
+    accepted: bool,
+    reply: Option<oneshot::Sender<Result<(), ClientError>>>,
+}
+
+struct DownloadJob {
+    id: [u8; 16],
+    local: PathBuf,
+    part_path: PathBuf,
+    file: Option<tokio::fs::File>,
+    size: u64,
+    chunk_size: u32,
+    total: u32,
+    sha256: [u8; 32],
+    have: ChunkBitmap,
+    reply: Option<oneshot::Sender<Result<(), ClientError>>>,
+}
+
 pub(crate) struct Actor<S> {
     framed: Framed<S, KdxCodec>,
     commands: mpsc::Receiver<Command>,
     events: mpsc::Sender<Event>,
+    reasm: Reassembler,
     seq: u32,
     login: Option<PendingLogin>,
-    /// FIFO of pending file-list requests awaiting a response.
     list_waiters: VecDeque<oneshot::Sender<Result<FileListResponse, ClientError>>>,
+    transfer: Option<Transfer>,
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
@@ -60,9 +99,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
             framed,
             commands,
             events,
+            reasm: Reassembler::default(),
             seq: 0,
             login: None,
             list_waiters: VecDeque::new(),
+            transfer: None,
         }
     }
 
@@ -88,8 +129,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
                 frame = self.framed.next() => {
                     match frame {
                         Some(Ok(frame)) => {
-                            if let Err(e) = self.handle_frame(frame).await {
-                                break format!("protocol error: {e}");
+                            match self.reasm.push(frame, MAX_REASSEMBLED) {
+                                Ok(Some(full)) => {
+                                    if let Err(e) = self.handle_frame(full).await {
+                                        break format!("protocol error: {e}");
+                                    }
+                                }
+                                Ok(None) => {} // mid-fragment
+                                Err(e) => break format!("framing error: {e}"),
                             }
                         }
                         Some(Err(e)) => break format!("stream error: {e}"),
@@ -110,6 +157,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
         }
         for waiter in self.list_waiters.drain(..) {
             let _ = waiter.send(Err(ClientError::Disconnected));
+        }
+        if let Some(reply) = self.transfer.take().and_then(transfer_reply) {
+            let _ = reply.send(Err(ClientError::Disconnected));
         }
         let _ = self.events.send(Event::Disconnected { reason }).await;
     }
@@ -134,15 +184,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
                 });
             }
             Command::Join { room, reply } => {
-                let r = self
-                    .send(PacketType::ChatJoin, ChatJoin { room }.encode())
-                    .await;
+                let r = self.send(PacketType::ChatJoin, ChatJoin { room }.encode()).await;
                 let _ = reply.send(r.map_err(Into::into));
             }
             Command::Leave { room, reply } => {
-                let r = self
-                    .send(PacketType::ChatLeave, ChatLeave { room }.encode())
-                    .await;
+                let r = self.send(PacketType::ChatLeave, ChatLeave { room }.encode()).await;
                 let _ = reply.send(r.map_err(Into::into));
             }
             Command::SendChat {
@@ -173,8 +219,118 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
                     }
                 }
             }
+            Command::Upload {
+                local,
+                remote_dir,
+                reply,
+            } => self.start_upload(local, remote_dir, reply).await?,
+            Command::Download {
+                remote_path,
+                local,
+                reply,
+            } => self.start_download(remote_path, local, reply).await?,
             Command::Disconnect => unreachable!("handled in run loop"),
         }
+        Ok(())
+    }
+
+    async fn start_upload(
+        &mut self,
+        local: PathBuf,
+        remote_dir: String,
+        reply: oneshot::Sender<Result<(), ClientError>>,
+    ) -> io::Result<()> {
+        if self.transfer.is_some() {
+            let _ = reply.send(Err(ClientError::Transfer("a transfer is already active".into())));
+            return Ok(());
+        }
+        let name = match local.file_name().and_then(|n| n.to_str()) {
+            Some(n) => n.to_string(),
+            None => {
+                let _ = reply.send(Err(ClientError::Transfer("invalid local file name".into())));
+                return Ok(());
+            }
+        };
+        let data = match tokio::fs::read(&local).await {
+            Ok(d) => d,
+            Err(e) => {
+                let _ = reply.send(Err(ClientError::Io(e)));
+                return Ok(());
+            }
+        };
+        let size = data.len() as u64;
+        let chunk_size = DEFAULT_CHUNK_SIZE;
+        let total = total_chunks(size, chunk_size);
+        let sha256: [u8; 32] = Sha256::digest(&data).into();
+
+        let request = TransferRequest {
+            direction: DIRECTION_UPLOAD,
+            path: remote_dir,
+            name,
+            size,
+            chunk_size,
+            sha256,
+            resume_id: [0u8; 16],
+            have_bitmap: vec![],
+        };
+        self.send(PacketType::FileTransferStart, request.encode()).await?;
+        self.transfer = Some(Transfer::Upload(UploadJob {
+            id: [0u8; 16],
+            data,
+            size,
+            chunk_size,
+            total,
+            accepted: false,
+            reply: Some(reply),
+        }));
+        Ok(())
+    }
+
+    async fn start_download(
+        &mut self,
+        remote_path: String,
+        local: PathBuf,
+        reply: oneshot::Sender<Result<(), ClientError>>,
+    ) -> io::Result<()> {
+        if self.transfer.is_some() {
+            let _ = reply.send(Err(ClientError::Transfer("a transfer is already active".into())));
+            return Ok(());
+        }
+        let (dir, name) = split_remote(&remote_path);
+        let chunk_size = DEFAULT_CHUNK_SIZE;
+
+        // Resume from a sidecar if one matches this local target.
+        let sidecar = Sidecar::read(&local);
+        let (resume_id, have_bitmap) = match &sidecar {
+            Some(sc) if sc.chunk_size == chunk_size => (sc.transfer_id, sc.bitmap.clone()),
+            _ => ([0u8; 16], vec![]),
+        };
+
+        let request = TransferRequest {
+            direction: DIRECTION_DOWNLOAD,
+            path: dir,
+            name,
+            size: 0,
+            chunk_size,
+            sha256: [0u8; 32],
+            resume_id,
+            have_bitmap,
+        };
+        self.send(PacketType::FileTransferStart, request.encode()).await?;
+
+        let part_path = with_part_suffix(&local);
+        self.transfer = Some(Transfer::Download(DownloadJob {
+            id: [0u8; 16],
+            local,
+            part_path,
+            file: None,
+            size: 0,
+            chunk_size,
+            total: 0,
+            sha256: [0u8; 32],
+            have: BitVec::new(),
+            reply: Some(reply),
+        }));
         Ok(())
     }
 
@@ -183,7 +339,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
             PacketType::AuthChallenge => self.on_auth_challenge(&frame.payload).await?,
             PacketType::AuthResult => self.on_auth_result(&frame.payload)?,
             PacketType::ChatMessage => {
-                let ev = kdx_protocol::messages::ChatEvent::decode(&frame.payload)?;
+                let ev = ChatEvent::decode(&frame.payload)?;
                 self.emit(Event::Chat {
                     room: ev.room,
                     sender: ev.sender,
@@ -215,31 +371,199 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
                     let _ = waiter.send(Ok(response));
                 }
             }
+            PacketType::FileTransferStart => self.on_transfer_accept(&frame.payload).await?,
+            PacketType::FileTransferData => self.on_transfer_data(&frame.payload).await?,
+            PacketType::FileTransferEnd => self.on_transfer_end(&frame.payload).await?,
             PacketType::Warning => {
                 self.emit(Event::ServerWarning {
                     text: String::from_utf8_lossy(&frame.payload).into_owned(),
                 })
                 .await;
             }
-            PacketType::Error => {
-                self.emit(Event::ServerError {
-                    text: String::from_utf8_lossy(&frame.payload).into_owned(),
-                })
-                .await;
-            }
+            PacketType::Error => self.on_error(&frame.payload).await,
             PacketType::Info => {
                 self.emit(Event::ServerInfo {
                     text: String::from_utf8_lossy(&frame.payload).into_owned(),
                 })
                 .await;
             }
-            PacketType::Pong => { /* keepalive echo */ }
+            PacketType::Pong => {}
+            other => debug!(packet_type = ?other, "unhandled inbound packet"),
+        }
+        Ok(())
+    }
+
+    /// The server accepted our transfer. For an upload, stream the missing
+    /// chunks; for a download, allocate the file and wait for data.
+    async fn on_transfer_accept(&mut self, payload: &[u8]) -> Result<(), ClientError> {
+        let accept = TransferAccept::decode(payload)?;
+        match self.transfer.take() {
+            Some(Transfer::Upload(mut job)) => {
+                job.id = accept.transfer_id;
+                job.accepted = true;
+                let have = BitVec::<u8, Lsb0>::from_vec(accept.have_bitmap);
+                // Send every chunk the server doesn't already have.
+                for index in 0..job.total {
+                    if have.get(index as usize).map(|b| *b).unwrap_or(false) {
+                        continue;
+                    }
+                    let len = chunk_len(job.size, job.chunk_size, index, job.total);
+                    let offset = index as usize * job.chunk_size as usize;
+                    let slice = &job.data[offset..offset + len];
+                    let data = TransferData {
+                        transfer_id: job.id,
+                        chunk_index: index,
+                        chunk_hash: Sha256::digest(slice).into(),
+                        data: Bytes::copy_from_slice(slice),
+                    };
+                    self.send_fragmented(PacketType::FileTransferData, data.encode())
+                        .await?;
+                    self.emit_progress(job.id, Direction::Upload, index + 1, job.total, &have)
+                        .await;
+                }
+                self.transfer = Some(Transfer::Upload(job));
+            }
+            Some(Transfer::Download(mut job)) => {
+                job.id = accept.transfer_id;
+                job.size = accept.size;
+                job.chunk_size = accept.chunk_size;
+                job.total = accept.total_chunks;
+                job.sha256 = accept.sha256;
+                let mut have = BitVec::<u8, Lsb0>::from_vec(accept.have_bitmap);
+                have.resize(job.total as usize, false);
+                job.have = have;
+
+                // Open (or reopen) the partial file, sized to the full length.
+                let file = tokio::fs::OpenOptions::new()
+                    .create(true)
+                    .read(true)
+                    .write(true)
+                    .truncate(false)
+                    .open(&job.part_path)
+                    .await?;
+                file.set_len(job.size).await?;
+                job.file = Some(file);
+                self.transfer = Some(Transfer::Download(job));
+            }
             other => {
-                // FileTransfer* handled in C2; ignore for now.
-                debug!(packet_type = ?other, "unhandled inbound packet");
+                // Stray accept with no matching transfer; restore state.
+                self.transfer = other;
+                warn!("unexpected TransferAccept");
             }
         }
         Ok(())
+    }
+
+    async fn on_transfer_data(&mut self, payload: &[u8]) -> Result<(), ClientError> {
+        let data = TransferData::decode(payload)?;
+        let Some(Transfer::Download(job)) = self.transfer.as_mut() else {
+            return Ok(()); // not downloading; ignore
+        };
+        if data.transfer_id != job.id || data.chunk_index >= job.total {
+            return Ok(());
+        }
+        let actual: [u8; 32] = Sha256::digest(&data.data).into();
+        if actual != data.chunk_hash {
+            return Err(ClientError::Transfer(format!(
+                "chunk {} hash mismatch",
+                data.chunk_index
+            )));
+        }
+        let offset = data.chunk_index as u64 * job.chunk_size as u64;
+        let file = job.file.as_mut().expect("file opened on accept");
+        file.seek(io::SeekFrom::Start(offset)).await?;
+        file.write_all(&data.data).await?;
+        job.have.set(data.chunk_index as usize, true);
+
+        // Persist resume state after every accepted chunk.
+        let sidecar = Sidecar {
+            transfer_id: job.id,
+            size: job.size,
+            chunk_size: job.chunk_size,
+            sha256: job.sha256,
+            bitmap: job.have.clone().into_vec(),
+        };
+        let _ = sidecar.write(&job.local);
+
+        let done = job.have.count_ones() as u32;
+        let (id, total, bitmap) = (job.id, job.total, job.have.clone());
+        self.emit_progress(id, Direction::Download, done, total, &bitmap).await;
+        Ok(())
+    }
+
+    async fn on_transfer_end(&mut self, payload: &[u8]) -> Result<(), ClientError> {
+        let end = TransferEnd::decode(payload)?;
+        match self.transfer.take() {
+            Some(Transfer::Upload(mut job)) => {
+                let verified = end.status == TRANSFER_VERIFIED;
+                self.emit(Event::TransferComplete {
+                    id: Uuid::from_bytes(job.id).to_string(),
+                    direction: Direction::Upload,
+                    status: end.status,
+                    message: end.message.clone(),
+                })
+                .await;
+                if let Some(reply) = job.reply.take() {
+                    let _ = reply.send(if verified {
+                        Ok(())
+                    } else {
+                        Err(ClientError::Transfer(end.message))
+                    });
+                }
+            }
+            Some(Transfer::Download(mut job)) => {
+                let result = self.finish_download(&mut job).await;
+                self.emit(Event::TransferComplete {
+                    id: Uuid::from_bytes(job.id).to_string(),
+                    direction: Direction::Download,
+                    status: if result.is_ok() { TRANSFER_VERIFIED } else { 1 },
+                    message: match &result {
+                        Ok(()) => "verified".into(),
+                        Err(e) => e.to_string(),
+                    },
+                })
+                .await;
+                if let Some(reply) = job.reply.take() {
+                    let _ = reply.send(result);
+                }
+            }
+            None => warn!("TransferEnd with no active transfer"),
+        }
+        Ok(())
+    }
+
+    /// Verify the downloaded file's whole-file hash, then promote `.part` to
+    /// the final path and drop the resume sidecar.
+    async fn finish_download(&self, job: &mut DownloadJob) -> Result<(), ClientError> {
+        let mut file = job.file.take().expect("file opened on accept");
+        file.flush().await?;
+        file.seek(io::SeekFrom::Start(0)).await?;
+        let mut hasher = Sha256::new();
+        let mut buf = vec![0u8; 128 * 1024];
+        loop {
+            let n = file.read(&mut buf).await?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+        }
+        let actual: [u8; 32] = hasher.finalize().into();
+        if actual != job.sha256 {
+            return Err(ClientError::Transfer("downloaded file hash mismatch".into()));
+        }
+        drop(file);
+        tokio::fs::rename(&job.part_path, &job.local).await?;
+        Sidecar::remove(&job.local);
+        Ok(())
+    }
+
+    async fn on_error(&mut self, payload: &[u8]) {
+        let text = String::from_utf8_lossy(payload).into_owned();
+        // If a transfer is mid-negotiation, an Error frame aborts it.
+        if let Some(reply) = self.transfer.take().and_then(transfer_reply) {
+            let _ = reply.send(Err(ClientError::Transfer(text.clone())));
+        }
+        self.emit(Event::ServerError { text }).await;
     }
 
     async fn on_auth_challenge(&mut self, payload: &[u8]) -> Result<(), ClientError> {
@@ -279,10 +603,27 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
                 class: result.class,
             }));
         } else {
-            // Login state is already cleared (take()), so a retry can begin.
             let _ = login.reply.send(Err(ClientError::AuthFailed(result.message)));
         }
         Ok(())
+    }
+
+    async fn emit_progress(
+        &self,
+        id: [u8; 16],
+        direction: Direction,
+        done: u32,
+        total: u32,
+        bitmap: &ChunkBitmap,
+    ) {
+        self.emit(Event::TransferProgress {
+            id: Uuid::from_bytes(id).to_string(),
+            direction,
+            done,
+            total,
+            bitmap: bitmap.clone().into_vec(),
+        })
+        .await;
     }
 
     async fn emit(&self, event: Event) {
@@ -298,12 +639,60 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
             length: payload.len() as u32,
         };
         self.seq = self.seq.wrapping_add(1);
-        self.framed
-            .send(KdxFrame { header, payload })
-            .await
-            .map_err(|e| match e {
-                kdx_protocol::ProtocolError::Io(e) => e,
-                other => io::Error::other(other),
-            })
+        self.write_frame(KdxFrame { header, payload }).await
     }
+
+    /// Send a payload, fragmenting when it exceeds the frame cap.
+    async fn send_fragmented(&mut self, packet_type: PacketType, payload: Bytes) -> io::Result<()> {
+        let mut seq = self.seq;
+        let frames = kdx_protocol::fragment(
+            packet_type,
+            PacketFlags::empty(),
+            payload,
+            kdx_protocol::DEFAULT_MAX_FRAME_PAYLOAD,
+            || {
+                let s = seq;
+                seq = seq.wrapping_add(1);
+                s
+            },
+        );
+        self.seq = seq;
+        for frame in frames {
+            self.write_frame(frame).await?;
+        }
+        Ok(())
+    }
+
+    async fn write_frame(&mut self, frame: KdxFrame) -> io::Result<()> {
+        self.framed.send(frame).await.map_err(|e| match e {
+            kdx_protocol::ProtocolError::Io(e) => e,
+            other => io::Error::other(other),
+        })
+    }
+}
+
+/// Extract a transfer's reply channel for failure on teardown.
+fn transfer_reply(t: Transfer) -> Option<oneshot::Sender<Result<(), ClientError>>> {
+    match t {
+        Transfer::Upload(mut j) => j.reply.take(),
+        Transfer::Download(mut j) => j.reply.take(),
+    }
+}
+
+/// Split a `/dir/sub/name` remote path into (`/dir/sub`, `name`).
+fn split_remote(path: &str) -> (String, String) {
+    let trimmed = path.trim_end_matches('/');
+    match trimmed.rsplit_once('/') {
+        Some((dir, name)) => {
+            let dir = if dir.is_empty() { "/".to_string() } else { dir.to_string() };
+            (dir, name.to_string())
+        }
+        None => ("/".to_string(), trimmed.to_string()),
+    }
+}
+
+fn with_part_suffix(local: &std::path::Path) -> PathBuf {
+    let mut s = local.as_os_str().to_owned();
+    s.push(".part");
+    PathBuf::from(s)
 }

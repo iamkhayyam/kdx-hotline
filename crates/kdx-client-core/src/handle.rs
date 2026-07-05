@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use tokio::sync::{mpsc, oneshot};
 
 use kdx_protocol::messages::FileListResponse;
@@ -42,6 +44,16 @@ pub(crate) enum Command {
     ListFiles {
         path: String,
         reply: oneshot::Sender<Result<FileListResponse, ClientError>>,
+    },
+    Upload {
+        local: PathBuf,
+        remote_dir: String,
+        reply: oneshot::Sender<Result<(), ClientError>>,
+    },
+    Download {
+        remote_path: String,
+        local: PathBuf,
+        reply: oneshot::Sender<Result<(), ClientError>>,
     },
     Disconnect,
 }
@@ -114,6 +126,29 @@ impl ClientHandle {
     pub async fn list_files(&self, path: &str) -> Result<FileListResponse, ClientError> {
         self.send(|reply| Command::ListFiles {
             path: path.to_owned(),
+            reply,
+        })
+        .await
+    }
+
+    /// Upload a local file into `remote_dir`; the remote name is the local
+    /// file's basename. Resolves when the transfer verifies (or fails);
+    /// `Event::TransferProgress` is emitted throughout.
+    pub async fn upload(&self, local: PathBuf, remote_dir: &str) -> Result<(), ClientError> {
+        self.send(|reply| Command::Upload {
+            local,
+            remote_dir: remote_dir.to_owned(),
+            reply,
+        })
+        .await
+    }
+
+    /// Download `remote_path` (a `/dir/file` path) to `local`, resuming from a
+    /// `.kdxpart` sidecar if one is present. Resolves on completion.
+    pub async fn download(&self, remote_path: &str, local: PathBuf) -> Result<(), ClientError> {
+        self.send(|reply| Command::Download {
+            remote_path: remote_path.to_owned(),
+            local,
             reply,
         })
         .await

@@ -23,12 +23,19 @@ pub struct TestServer {
 
 impl TestServer {
     pub async fn start() -> Self {
+        Self::start_with_download_throttle(0).await
+    }
+
+    /// Start with a per-transfer download throttle (bytes/sec; 0 = unlimited),
+    /// so tests can interrupt a slow download deterministically.
+    pub async fn start_with_download_throttle(download_bps: u64) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("kdx.db");
         let config = Config {
             bind: "127.0.0.1:0".parse().unwrap(),
             database: db_path.clone(),
             files_root: dir.path().join("files"),
+            max_download_bytes_per_sec: download_bps,
             ..Config::default()
         };
         let server = serve(config).await.unwrap();
