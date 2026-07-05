@@ -14,6 +14,10 @@ pub const TRANSFER_VERIFIED: u8 = 0;
 pub const TRANSFER_HASH_MISMATCH: u8 = 1;
 pub const TRANSFER_ABORTED: u8 = 2;
 
+/// Transfer direction (in `TransferRequest`).
+pub const DIRECTION_UPLOAD: u8 = 0;
+pub const DIRECTION_DOWNLOAD: u8 = 1;
+
 /// Client → server: list a directory.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileListRequest {
@@ -34,27 +38,40 @@ pub struct FileListResponse {
     pub entries: Vec<FileEntry>,
 }
 
-/// Client → server (in a FileTransferStart packet): request an upload.
-/// `resume_id` of all zeros means a fresh transfer; otherwise it names a
-/// prior transfer to resume.
+/// Client → server (in a FileTransferStart packet): request a transfer.
+///
+/// `direction` selects upload or download. For an **upload**, `size`/`sha256`
+/// describe the file being sent and `have_bitmap` is empty. For a
+/// **download**, `size`/`sha256` are zero (the server reports them in the
+/// accept) and `have_bitmap` carries the chunks the client already holds so
+/// a resumed download only re-fetches the rest. `resume_id` of all zeros
+/// means a fresh transfer; otherwise it names a prior transfer to resume.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransferRequest {
+    pub direction: u8,
     pub path: String,
     pub name: String,
     pub size: u64,
     pub chunk_size: u32,
     pub sha256: [u8; 32],
     pub resume_id: [u8; 16],
+    pub have_bitmap: Vec<u8>,
 }
 
-/// Server → client (in a FileTransferStart packet): upload accepted.
-/// `have_bitmap` marks chunks the server already holds (LSB-first); empty
-/// for a fresh transfer.
+/// Server → client (in a FileTransferStart packet): transfer accepted.
+///
+/// For an upload, `size`/`sha256` echo the request and `have_bitmap` marks
+/// chunks the server already holds (LSB-first, empty for a fresh transfer).
+/// For a download, `size`/`sha256` tell the client the file's true size and
+/// hash to allocate and verify against, and `have_bitmap` echoes the chunks
+/// the server will skip (those the client reported having).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransferAccept {
     pub transfer_id: [u8; 16],
     pub chunk_size: u32,
     pub total_chunks: u32,
+    pub size: u64,
+    pub sha256: [u8; 32],
     pub have_bitmap: Vec<u8>,
 }
 
@@ -126,19 +143,26 @@ impl FileListResponse {
 impl TransferRequest {
     pub fn encode(&self) -> Bytes {
         let mut buf = BytesMut::new();
+        buf.put_u8(self.direction);
         put_str(&mut buf, &self.path);
         put_str(&mut buf, &self.name);
         buf.put_u64(self.size);
         buf.put_u32(self.chunk_size);
         buf.put_slice(&self.sha256);
         buf.put_slice(&self.resume_id);
+        buf.put_u16(self.have_bitmap.len() as u16);
+        buf.put_slice(&self.have_bitmap);
         buf.freeze()
     }
 
     pub fn decode(mut payload: &[u8]) -> Result<Self, ProtocolError> {
+        if payload.remaining() < 1 {
+            return Err(ProtocolError::MalformedPayload("TransferRequest"));
+        }
+        let direction = payload.get_u8();
         let path = get_str(&mut payload, "TransferRequest")?;
         let name = get_str(&mut payload, "TransferRequest")?;
-        if payload.remaining() != 8 + 4 + 32 + 16 {
+        if payload.remaining() < 8 + 4 + 32 + 16 + 2 {
             return Err(ProtocolError::MalformedPayload("TransferRequest"));
         }
         let size = payload.get_u64();
@@ -147,36 +171,47 @@ impl TransferRequest {
         payload.copy_to_slice(&mut sha256);
         let mut resume_id = [0u8; 16];
         payload.copy_to_slice(&mut resume_id);
+        let bitmap_len = payload.get_u16() as usize;
+        if payload.remaining() != bitmap_len {
+            return Err(ProtocolError::MalformedPayload("TransferRequest"));
+        }
         Ok(Self {
+            direction,
             path,
             name,
             size,
             chunk_size,
             sha256,
             resume_id,
+            have_bitmap: payload[..bitmap_len].to_vec(),
         })
     }
 }
 
 impl TransferAccept {
     pub fn encode(&self) -> Bytes {
-        let mut buf = BytesMut::with_capacity(16 + 4 + 4 + 2 + self.have_bitmap.len());
+        let mut buf = BytesMut::with_capacity(16 + 4 + 4 + 8 + 32 + 2 + self.have_bitmap.len());
         buf.put_slice(&self.transfer_id);
         buf.put_u32(self.chunk_size);
         buf.put_u32(self.total_chunks);
+        buf.put_u64(self.size);
+        buf.put_slice(&self.sha256);
         buf.put_u16(self.have_bitmap.len() as u16);
         buf.put_slice(&self.have_bitmap);
         buf.freeze()
     }
 
     pub fn decode(mut payload: &[u8]) -> Result<Self, ProtocolError> {
-        if payload.remaining() < 16 + 4 + 4 + 2 {
+        if payload.remaining() < 16 + 4 + 4 + 8 + 32 + 2 {
             return Err(ProtocolError::MalformedPayload("TransferAccept"));
         }
         let mut transfer_id = [0u8; 16];
         payload.copy_to_slice(&mut transfer_id);
         let chunk_size = payload.get_u32();
         let total_chunks = payload.get_u32();
+        let size = payload.get_u64();
+        let mut sha256 = [0u8; 32];
+        payload.copy_to_slice(&mut sha256);
         let bitmap_len = payload.get_u16() as usize;
         if payload.remaining() != bitmap_len {
             return Err(ProtocolError::MalformedPayload("TransferAccept"));
@@ -185,6 +220,8 @@ impl TransferAccept {
             transfer_id,
             chunk_size,
             total_chunks,
+            size,
+            sha256,
             have_bitmap: payload[..bitmap_len].to_vec(),
         })
     }
@@ -276,19 +313,38 @@ mod tests {
         );
 
         let request = TransferRequest {
+            direction: DIRECTION_UPLOAD,
             path: "/incoming".into(),
             name: "payload.bin".into(),
             size: 1 << 20,
             chunk_size: 32 * 1024,
             sha256: [5u8; 32],
             resume_id: [0u8; 16],
+            have_bitmap: vec![],
         };
         assert_eq!(TransferRequest::decode(&request.encode()).unwrap(), request);
+
+        let download_req = TransferRequest {
+            direction: DIRECTION_DOWNLOAD,
+            path: "/pub".into(),
+            name: "big.iso".into(),
+            size: 0,
+            chunk_size: 32 * 1024,
+            sha256: [0u8; 32],
+            resume_id: [7u8; 16],
+            have_bitmap: vec![0b0000_1111],
+        };
+        assert_eq!(
+            TransferRequest::decode(&download_req.encode()).unwrap(),
+            download_req
+        );
 
         let accept = TransferAccept {
             transfer_id: [9u8; 16],
             chunk_size: 32 * 1024,
             total_chunks: 32,
+            size: 1 << 20,
+            sha256: [5u8; 32],
             have_bitmap: vec![0b1010_1010],
         };
         assert_eq!(TransferAccept::decode(&accept.encode()).unwrap(), accept);

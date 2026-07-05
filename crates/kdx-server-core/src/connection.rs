@@ -390,6 +390,50 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                         Err(e) => self.send_error(&e.to_string()).await?,
                     }
                 }
+                PacketType::FileTransferStart if is_download(&frame.payload) => {
+                    let request = TransferRequest::decode(&frame.payload)?;
+                    let session = self.session.as_ref().expect("authed").clone();
+                    if !session.privileges.contains(Privileges::FILE_DOWNLOAD) {
+                        self.send_error("missing FILE_DOWNLOAD privilege").await?;
+                        continue;
+                    }
+                    let remote = format!(
+                        "{}/{}",
+                        request.path.trim_end_matches('/'),
+                        request.name
+                    );
+                    match self
+                        .ctx
+                        .transfers
+                        .begin_download(
+                            &self.ctx.tree,
+                            &session,
+                            &remote,
+                            request.chunk_size,
+                            &request.have_bitmap,
+                        )
+                        .await
+                    {
+                        Ok((mut stream, accept)) => {
+                            let msg = TransferAccept {
+                                transfer_id: accept.transfer_id,
+                                chunk_size: accept.chunk_size,
+                                total_chunks: accept.total_chunks,
+                                size: accept.size,
+                                sha256: accept.sha256,
+                                have_bitmap: accept.have_bitmap,
+                            };
+                            self.send(
+                                PacketType::FileTransferStart,
+                                PacketFlags::TRANSFER_START,
+                                msg.encode(),
+                            )
+                            .await?;
+                            self.stream_download(&mut stream).await?;
+                        }
+                        Err(e) => self.send_error(&e.to_string()).await?,
+                    }
+                }
                 PacketType::FileTransferStart => {
                     let request = TransferRequest::decode(&frame.payload)?;
                     let session = self.session.as_ref().expect("authed").clone();
@@ -422,6 +466,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                                 transfer_id: accept.transfer_id,
                                 chunk_size: accept.chunk_size,
                                 total_chunks: accept.total_chunks,
+                                size: accept.size,
+                                sha256: accept.sha256,
                                 have_bitmap: accept.have_bitmap,
                             };
                             self.send(
@@ -520,6 +566,61 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
         .await
     }
 
+    /// Stream every chunk the client still needs, then the terminal
+    /// `TransferEnd`. Runs inline in the dispatch loop — one transfer at a
+    /// time per connection, matching the upload model.
+    async fn stream_download(
+        &mut self,
+        stream: &mut crate::transfer::ActiveDownload,
+    ) -> Result<(), ConnectionError> {
+        let transfer_id = *stream.id().as_bytes();
+        while let Some(chunk) = stream.next_chunk().await? {
+            let data = TransferData {
+                transfer_id,
+                chunk_index: chunk.index,
+                chunk_hash: chunk.hash,
+                data: chunk.data,
+            };
+            self.send_fragmented(PacketType::FileTransferData, PacketFlags::empty(), data.encode())
+                .await?;
+        }
+        let end = TransferEnd {
+            transfer_id,
+            status: TRANSFER_VERIFIED,
+            message: "verified".into(),
+        };
+        self.send(PacketType::FileTransferEnd, PacketFlags::TRANSFER_END, end.encode())
+            .await?;
+        Ok(())
+    }
+
+    /// Send a payload, fragmenting it across frames when it exceeds the frame
+    /// cap (download chunks can be larger than one frame).
+    async fn send_fragmented(
+        &mut self,
+        packet_type: PacketType,
+        flags: PacketFlags,
+        payload: Bytes,
+    ) -> Result<(), ProtocolError> {
+        let mut seq = self.next_sequence;
+        let frames = kdx_protocol::fragment(
+            packet_type,
+            flags,
+            payload,
+            kdx_protocol::DEFAULT_MAX_FRAME_PAYLOAD,
+            || {
+                let s = seq;
+                seq = seq.wrapping_add(1);
+                s
+            },
+        );
+        self.next_sequence = seq;
+        for frame in frames {
+            self.framed.send(frame).await?;
+        }
+        Ok(())
+    }
+
     async fn send(
         &mut self,
         packet_type: PacketType,
@@ -545,6 +646,13 @@ async fn timeout_at<F: std::future::Future>(
     tokio::time::timeout_at(deadline, future).await
 }
 
+/// Peek a `FileTransferStart` payload's direction byte without a full decode,
+/// so dispatch can branch upload vs download. The direction is the first
+/// payload byte (see `TransferRequest::encode`).
+fn is_download(payload: &[u8]) -> bool {
+    payload.first() == Some(&kdx_protocol::messages::DIRECTION_DOWNLOAD)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -565,6 +673,7 @@ mod tests {
             crate::transfer::TransferConfig {
                 files_root: dir.path().join("files"),
                 max_upload_bytes_per_sec: 0,
+                max_download_bytes_per_sec: 0,
             },
         )
         .await

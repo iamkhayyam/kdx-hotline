@@ -56,6 +56,7 @@ pub async fn serve(config: Config) -> Result<Server, ServeError> {
         TransferConfig {
             files_root: config.files_root.clone(),
             max_upload_bytes_per_sec: config.max_upload_bytes_per_sec,
+            max_download_bytes_per_sec: config.max_download_bytes_per_sec,
         },
     )
     .await

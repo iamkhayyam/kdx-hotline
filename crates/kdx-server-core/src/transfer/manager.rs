@@ -64,6 +64,8 @@ pub struct TransferConfig {
     pub files_root: PathBuf,
     /// Per-transfer upload throttle, bytes/sec. 0 = unlimited.
     pub max_upload_bytes_per_sec: u64,
+    /// Per-transfer download throttle, bytes/sec. 0 = unlimited.
+    pub max_download_bytes_per_sec: u64,
 }
 
 pub struct TransferManager {
@@ -92,6 +94,8 @@ pub struct AcceptInfo {
     pub transfer_id: [u8; 16],
     pub chunk_size: u32,
     pub total_chunks: u32,
+    pub size: u64,
+    pub sha256: [u8; 32],
     pub have_bitmap: Vec<u8>,
 }
 
@@ -107,6 +111,11 @@ impl TransferManager {
     pub async fn new(pool: SqlitePool, config: TransferConfig) -> Result<Self, TransferError> {
         tokio::fs::create_dir_all(&config.files_root).await?;
         Ok(Self { pool, config })
+    }
+
+    /// Configured download throttle in bytes/sec (0 = unlimited).
+    pub(crate) fn download_rate(&self) -> u64 {
+        self.config.max_download_bytes_per_sec
     }
 
     /// Begin (or resume) an upload into `path`/`name` for `session`.
@@ -168,6 +177,8 @@ impl TransferManager {
             transfer_id: *id.as_bytes(),
             chunk_size,
             total_chunks: chunks,
+            size,
+            sha256,
             have_bitmap: Vec::new(),
         };
         Ok((
@@ -226,6 +237,8 @@ impl TransferManager {
             transfer_id: *resume_id.as_bytes(),
             chunk_size,
             total_chunks: chunks,
+            size,
+            sha256,
             have_bitmap: bitmap.clone().into_vec(),
         };
         Ok((
@@ -393,6 +406,7 @@ mod tests {
             TransferConfig {
                 files_root: dir.path().join("files"),
                 max_upload_bytes_per_sec: rate,
+                max_download_bytes_per_sec: 0,
             },
         )
         .await

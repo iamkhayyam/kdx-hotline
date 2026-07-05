@@ -66,9 +66,14 @@ impl Tracker {
                                 );
                             }
                             TrackerCommand::Query { filter, reply } => {
+                                // Evict lazily at read time too, so a query
+                                // never returns an entry past its TTL even if
+                                // the periodic sweep hasn't fired yet.
+                                let now = Instant::now();
                                 let needle = filter.map(|f| f.to_lowercase());
                                 let mut result: Vec<ServerEntry> = entries
                                     .values()
+                                    .filter(|(_, seen)| now.duration_since(*seen) < ttl)
                                     .filter(|(entry, _)| match &needle {
                                         Some(n) => entry.name.to_lowercase().contains(n),
                                         None => true,

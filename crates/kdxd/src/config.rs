@@ -27,6 +27,9 @@ pub struct Config {
     /// Per-transfer upload throttle in bytes/sec. 0 = unlimited.
     #[serde(default)]
     pub max_upload_bytes_per_sec: u64,
+    /// Per-transfer download throttle in bytes/sec. 0 = unlimited.
+    #[serde(default)]
+    pub max_download_bytes_per_sec: u64,
 }
 
 fn default_files_root() -> PathBuf {
@@ -61,6 +64,7 @@ impl Default for Config {
             session_ttl_secs: default_session_ttl_secs(),
             files_root: default_files_root(),
             max_upload_bytes_per_sec: 0,
+            max_download_bytes_per_sec: 0,
         }
     }
 }

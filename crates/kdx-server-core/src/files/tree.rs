@@ -71,6 +71,8 @@ pub enum TreeError {
     NotFound,
     #[error("not a folder")]
     NotAFolder,
+    #[error("not a file")]
+    NotAFile,
     #[error("name already exists")]
     Exists,
     #[error(transparent)]
@@ -185,6 +187,25 @@ impl FileTree {
                 return Err(TreeError::Exists);
             }
         }
+        Ok(node.clone())
+    }
+
+    /// Resolve a file for download, enforcing read access on its containing
+    /// folder. A file inside a DropBox is refused (write-only is structural,
+    /// same rule as listing), as is a file in a folder the class can't read.
+    pub async fn open_for_read(&self, path: &str, class: BaseClass) -> Result<Node, TreeError> {
+        let state = self.state.read().await;
+        let node = state.resolve(path)?;
+        if node.kind != NodeKind::File {
+            return Err(TreeError::NotAFile);
+        }
+        // A file always has a parent; apply the parent folder's read ACL.
+        let parent = node
+            .parent_id
+            .as_ref()
+            .and_then(|id| state.nodes.get(id))
+            .ok_or(TreeError::NotFound)?;
+        acl::check_list(parent.kind, parent.min_class_read, class)?;
         Ok(node.clone())
     }
 

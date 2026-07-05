@@ -101,12 +101,14 @@ async fn start_upload(
     resume_id: [u8; 16],
 ) -> TransferAccept {
     let request = TransferRequest {
+        direction: kdx_protocol::messages::DIRECTION_UPLOAD,
         path: path.into(),
         name: name.into(),
         size: data.len() as u64,
         chunk_size: CHUNK as u32,
         sha256: Sha256::digest(data).into(),
         resume_id,
+        have_bitmap: vec![],
     };
     client
         .send(frame(PacketType::FileTransferStart, bump(seq), request.encode()))
