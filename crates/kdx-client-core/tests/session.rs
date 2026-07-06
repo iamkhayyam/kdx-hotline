@@ -392,6 +392,62 @@ async fn sysop_disconnects_and_bans_a_user() {
 }
 
 #[tokio::test]
+async fn sysop_creates_and_edits_an_account() {
+    let ts = TestServer::start().await;
+    ts.seed_account("sysop", "pw", 3).await; // Admin: has USER_ADMIN
+
+    let (sysop, mut es, _d1) = ts.connect_client().await;
+    next_event(&mut es).await;
+    sysop.login("sysop", "pw").await.unwrap();
+
+    // Create a new account with one granted override (CHAT_SET_TOPIC = 1<<3).
+    let granted = 1u32 << 3;
+    let accounts = sysop
+        .create_account("newbie", "letmein", 1, granted, 0)
+        .await
+        .unwrap();
+    let created = accounts.iter().find(|a| a.username == "newbie").expect("listed");
+    assert_eq!(created.base_class, 1);
+    assert_eq!(created.granted, granted);
+
+    // The freshly-minted account can log in with its initial password.
+    let (newbie, mut en, _d2) = ts.connect_client().await;
+    next_event(&mut en).await;
+    let session = newbie.login("newbie", "letmein").await.unwrap();
+    assert_eq!(session.class, 1);
+
+    // Editing promotes the account to power user and drops the override.
+    let accounts = sysop.update_account("newbie", 2, 0, 0).await.unwrap();
+    let edited = accounts.iter().find(|a| a.username == "newbie").unwrap();
+    assert_eq!(edited.base_class, 2);
+    assert_eq!(edited.granted, 0);
+
+    // A duplicate username is refused.
+    let dup = sysop.create_account("newbie", "x", 1, 0, 0).await;
+    assert!(matches!(dup, Err(ClientError::Server(_))));
+
+    ts.stop();
+}
+
+#[tokio::test]
+async fn plain_user_cannot_manage_accounts() {
+    let ts = TestServer::start().await;
+    ts.seed_account("plain", "pw", 1).await; // no USER_ADMIN
+
+    let (client, mut events, _dd) = ts.connect_client().await;
+    next_event(&mut events).await;
+    client.login("plain", "pw").await.unwrap();
+
+    assert!(matches!(client.list_accounts().await, Err(ClientError::Server(_))));
+    assert!(matches!(
+        client.create_account("sneaky", "pw", 3, 0, 0).await,
+        Err(ClientError::Server(_))
+    ));
+
+    ts.stop();
+}
+
+#[tokio::test]
 async fn plain_user_cannot_disconnect_others() {
     let ts = TestServer::start().await;
     ts.seed_account("nobody", "pw", 1).await; // no USER_KICK

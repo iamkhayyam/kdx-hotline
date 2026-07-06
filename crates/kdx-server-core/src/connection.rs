@@ -13,8 +13,10 @@ use std::time::Duration;
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use kdx_protocol::messages::{
-    AccountRolesRequest, AccountRolesResponse, AdminDisconnect, AuthChallenge, AuthRequest,
-    AuthResponse, AuthResult, ChatJoin, ChatLeave, ChatSend, ChatTopic, FileEntry, FileListRequest,
+    AccountCreate, AccountListRequest, AccountListResponse, AccountRolesRequest,
+    AccountRolesResponse, AccountSummary, AccountUpdate, AdminDisconnect, AuthChallenge,
+    AuthRequest, AuthResponse, AuthResult, ChatJoin, ChatLeave, ChatSend, ChatTopic, FileEntry,
+    FileListRequest,
     FileListResponse, HandshakeInit, HandshakeResp, PresenceListRequest, PresenceListResponse,
     PrivateMessage, PrivateSend, RoleAssign, RoleCreate, RoleDelete, RoleInfo, RoleListRequest,
     RoleListResponse, RoleUnassign, RoleUpdate, TransferAccept, TransferData, TransferEnd,
@@ -801,6 +803,81 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                         None => self.send_error("no such account").await?,
                     }
                 }
+                PacketType::AccountListRequest => {
+                    AccountListRequest::decode(&frame.payload)?;
+                    let session = self.session.as_ref().expect("authed");
+                    if !session.privileges.contains(Privileges::USER_ADMIN) {
+                        self.send_error("missing USER_ADMIN privilege").await?;
+                        continue;
+                    }
+                    self.reply_account_list().await?;
+                }
+                PacketType::AccountCreate => {
+                    let create = AccountCreate::decode(&frame.payload)?;
+                    let (admin_class, privs) = {
+                        let s = self.session.as_ref().expect("authed");
+                        (s.class as u8, s.privileges)
+                    };
+                    if !privs.contains(Privileges::USER_ADMIN) {
+                        self.send_error("missing USER_ADMIN privilege").await?;
+                        continue;
+                    }
+                    // Can't mint an account outranking yourself.
+                    if create.base_class > admin_class {
+                        self.send_error("cannot create an account above your own class")
+                            .await?;
+                        continue;
+                    }
+                    if create.username.is_empty() || create.password.is_empty() {
+                        self.send_error("username and password are required").await?;
+                        continue;
+                    }
+                    match self
+                        .ctx
+                        .auth
+                        .create_account(
+                            &create.username,
+                            &create.password,
+                            create.base_class as i64,
+                            create.granted as i64,
+                            create.revoked as i64,
+                        )
+                        .await
+                    {
+                        Ok(()) => self.reply_account_list().await?,
+                        Err(e) => self.send_error(&e.to_string()).await?,
+                    }
+                }
+                PacketType::AccountUpdate => {
+                    let update = AccountUpdate::decode(&frame.payload)?;
+                    let (admin_class, privs) = {
+                        let s = self.session.as_ref().expect("authed");
+                        (s.class as u8, s.privileges)
+                    };
+                    if !privs.contains(Privileges::USER_ADMIN) {
+                        self.send_error("missing USER_ADMIN privilege").await?;
+                        continue;
+                    }
+                    if update.base_class > admin_class {
+                        self.send_error("cannot raise an account above your own class")
+                            .await?;
+                        continue;
+                    }
+                    match self
+                        .ctx
+                        .auth
+                        .update_account(
+                            &update.username,
+                            update.base_class as i64,
+                            update.granted as i64,
+                            update.revoked as i64,
+                        )
+                        .await
+                    {
+                        Ok(()) => self.reply_account_list().await?,
+                        Err(e) => self.send_error(&e.to_string()).await?,
+                    }
+                }
                 PacketType::AdminDisconnect => {
                     let req = AdminDisconnect::decode(&frame.payload)?;
                     // Pull what we need as owned values so we don't hold a
@@ -933,6 +1010,35 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                 };
                 self.send(
                     PacketType::RoleListResponse,
+                    PacketFlags::empty(),
+                    response.encode(),
+                )
+                .await?;
+            }
+            Err(e) => self.send_error(&e.to_string()).await?,
+        }
+        Ok(())
+    }
+
+    /// Send the full account list — the reply to `AccountListRequest` and to
+    /// every successful account mutation, so the Accounts window re-renders
+    /// from one message shape.
+    async fn reply_account_list(&mut self) -> Result<(), ConnectionError> {
+        match self.ctx.auth.list_accounts().await {
+            Ok(rows) => {
+                let response = AccountListResponse {
+                    accounts: rows
+                        .into_iter()
+                        .map(|(username, base_class, granted, revoked)| AccountSummary {
+                            username,
+                            base_class,
+                            granted,
+                            revoked,
+                        })
+                        .collect(),
+                };
+                self.send(
+                    PacketType::AccountListResponse,
                     PacketFlags::empty(),
                     response.encode(),
                 )

@@ -74,3 +74,38 @@ pub async fn set_overrides(
     }
     Ok(())
 }
+
+/// Set base class and privilege overrides in one shot (the Accounts editor).
+pub async fn update(
+    pool: &SqlitePool,
+    username: &str,
+    base_class: i64,
+    granted: i64,
+    revoked: i64,
+) -> Result<(), StorageError> {
+    let result = sqlx::query(
+        "UPDATE accounts SET base_class = ?, granted = ?, revoked = ? WHERE username = ?",
+    )
+    .bind(base_class)
+    .bind(granted)
+    .bind(revoked)
+    .bind(username)
+    .execute(pool)
+    .await?;
+    if result.rows_affected() == 0 {
+        return Err(StorageError::NotFound);
+    }
+    Ok(())
+}
+
+/// Every account (username, class, overrides), for the Accounts window. No
+/// password material is returned.
+pub async fn all(pool: &SqlitePool) -> Result<Vec<AccountRow>, StorageError> {
+    let rows = sqlx::query_as::<_, AccountRow>(
+        "SELECT id, username, password_phc, base_class, granted, revoked
+         FROM accounts ORDER BY base_class DESC, username",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}

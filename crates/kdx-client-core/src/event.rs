@@ -56,6 +56,27 @@ impl From<kdx_protocol::messages::RoleInfo> for RoleInfo {
     }
 }
 
+/// One account as shown in the Accounts window (Administration). Mirrors
+/// `kdx_protocol::messages::AccountSummary`; no password material.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct AccountSummary {
+    pub username: String,
+    pub base_class: u8,
+    pub granted: u32,
+    pub revoked: u32,
+}
+
+impl From<kdx_protocol::messages::AccountSummary> for AccountSummary {
+    fn from(a: kdx_protocol::messages::AccountSummary) -> Self {
+        Self {
+            username: a.username,
+            base_class: a.base_class,
+            granted: a.granted,
+            revoked: a.revoked,
+        }
+    }
+}
+
 /// Events pushed from the connection actor to the application. The serde
 /// representation (`{ "type": "chat", ... }`) is the exact contract the
 /// webview consumes, so its shape is covered by a test.

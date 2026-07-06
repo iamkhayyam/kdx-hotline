@@ -21,12 +21,13 @@ const PRIVILEGES = [
   { bit: 1 << 19, name: "SERVER_ADMIN", label: "Server: config/shutdown" },
 ];
 
-export function buildRoles() {
+export function buildRoles(openAccounts) {
   const body = document.createElement("div");
   body.className = "roles-win";
   body.innerHTML = `
     <div class="ab-toolbar">
       <input class="ab-filter" id="rl-filter" placeholder="filter…" spellcheck="false" />
+      <button class="mini" id="rl-accounts">Accounts…</button>
       <button class="mini" id="rl-new">New Role</button>
       <button class="mini" id="rl-refresh">Refresh</button>
     </div>
@@ -161,6 +162,7 @@ export function buildRoles() {
   $("#rl-new").addEventListener("click", () => openEditor(null));
   $("#rl-cancel").addEventListener("click", closeEditor);
   $("#rl-refresh").addEventListener("click", refresh);
+  if (openAccounts) $("#rl-accounts").addEventListener("click", openAccounts);
   filter.addEventListener("input", render);
 
   editor.addEventListener("submit", async (e) => {

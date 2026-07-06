@@ -393,6 +393,15 @@ td.fmeta { color: var(--grey-dim); font-size: 11px; }
 .mini.danger { color: var(--alert); border-color: var(--alert); }
 .mini.danger:hover { background: rgba(122, 10, 10, 0.28); }
 
+/* Accounts editor — tri-state privilege overrides */
+.ac-overrides { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 4px 12px; padding: 8px 14px 0; max-height: 200px; overflow-y: auto; }
+.ac-override { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 11px; color: var(--ink); }
+.ac-override span { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.ac-override select {
+  background: #060404; border: 1px solid var(--chrome-dim); color: var(--green);
+  font-family: var(--mono); font-size: 11px; padding: 2px 4px; flex: 0 0 auto;
+}
+
 .deskfoot {
   display: flex; gap: 16px; align-items: center; padding: 5px 14px;
   background: #0d0606; border-top: 1px solid var(--chrome-dim); font-size: 10px;

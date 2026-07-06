@@ -52,6 +52,10 @@ pub enum PacketType {
     RoleUnassign = 0x56,
     AccountRolesRequest = 0x57,
     AccountRolesResponse = 0x58,
+    AccountCreate = 0x59,
+    AccountUpdate = 0x5A,
+    AccountListRequest = 0x5B,
+    AccountListResponse = 0x5C,
 
     // System (0xF0-0xFF)
     Error = 0xF0,
@@ -60,7 +64,7 @@ pub enum PacketType {
 }
 
 impl PacketType {
-    pub const ALL: [PacketType; 39] = [
+    pub const ALL: [PacketType; 43] = [
         PacketType::HandshakeInit,
         PacketType::HandshakeResp,
         PacketType::Ping,
@@ -97,6 +101,10 @@ impl PacketType {
         PacketType::RoleUnassign,
         PacketType::AccountRolesRequest,
         PacketType::AccountRolesResponse,
+        PacketType::AccountCreate,
+        PacketType::AccountUpdate,
+        PacketType::AccountListRequest,
+        PacketType::AccountListResponse,
         PacketType::Error,
         PacketType::Warning,
         PacketType::Info,
@@ -145,6 +153,10 @@ impl TryFrom<u8> for PacketType {
             0x56 => RoleUnassign,
             0x57 => AccountRolesRequest,
             0x58 => AccountRolesResponse,
+            0x59 => AccountCreate,
+            0x5A => AccountUpdate,
+            0x5B => AccountListRequest,
+            0x5C => AccountListResponse,
             0xF0 => Error,
             0xF1 => Warning,
             0xF2 => Info,

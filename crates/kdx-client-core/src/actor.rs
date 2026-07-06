@@ -13,9 +13,9 @@ use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use kdx_crypto::KdfParams;
 use kdx_protocol::messages::{
-    AccountRolesRequest, AccountRolesResponse, AdminDisconnect, AuthChallenge, AuthRequest,
-    AuthResponse, AuthResult, ChatEvent, ChatJoin, ChatLeave, ChatSend, ChatTopic, ChatUserList,
-    FileListRequest,
+    AccountCreate, AccountListRequest, AccountListResponse, AccountRolesRequest,
+    AccountRolesResponse, AccountUpdate, AdminDisconnect, AuthChallenge, AuthRequest, AuthResponse,
+    AuthResult, ChatEvent, ChatJoin, ChatLeave, ChatSend, ChatTopic, ChatUserList, FileListRequest,
     FileListResponse, PresenceChange, PresenceListRequest, PresenceListResponse, PrivateMessage,
     PrivateSend, RoleAssign, RoleCreate, RoleDelete, RoleListRequest, RoleListResponse,
     RoleUnassign, RoleUpdate, TransferAccept, TransferData, TransferEnd, TransferRequest,
@@ -34,7 +34,7 @@ use tracing::{debug, warn};
 use uuid::Uuid;
 
 use crate::error::ClientError;
-use crate::event::{Direction, Event, PresenceUser, RoleInfo};
+use crate::event::{AccountSummary, Direction, Event, PresenceUser, RoleInfo};
 use crate::handle::{Command, Session};
 use crate::transfer::{chunk_len, total_chunks, ChunkBitmap, Sidecar, DEFAULT_CHUNK_SIZE};
 
@@ -94,6 +94,7 @@ pub(crate) struct Actor<S> {
     user_info_waiters: VecDeque<oneshot::Sender<Result<PresenceUser, ClientError>>>,
     role_waiters: VecDeque<oneshot::Sender<Result<Vec<RoleInfo>, ClientError>>>,
     account_roles_waiters: VecDeque<oneshot::Sender<Result<Vec<String>, ClientError>>>,
+    account_waiters: VecDeque<oneshot::Sender<Result<Vec<AccountSummary>, ClientError>>>,
     transfer: Option<Transfer>,
 }
 
@@ -115,6 +116,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
             user_info_waiters: VecDeque::new(),
             role_waiters: VecDeque::new(),
             account_roles_waiters: VecDeque::new(),
+            account_waiters: VecDeque::new(),
             transfer: None,
         }
     }
@@ -180,6 +182,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
             let _ = waiter.send(Err(ClientError::Disconnected));
         }
         for waiter in self.account_roles_waiters.drain(..) {
+            let _ = waiter.send(Err(ClientError::Disconnected));
+        }
+        for waiter in self.account_waiters.drain(..) {
             let _ = waiter.send(Err(ClientError::Disconnected));
         }
         if let Some(reply) = self.transfer.take().and_then(transfer_reply) {
@@ -410,6 +415,59 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
                 let r = self.send(PacketType::AdminDisconnect, msg.encode()).await;
                 let _ = reply.send(r.map_err(Into::into));
             }
+            Command::ListAccounts { reply } => {
+                match self
+                    .send(PacketType::AccountListRequest, AccountListRequest.encode())
+                    .await
+                {
+                    Ok(()) => self.account_waiters.push_back(reply),
+                    Err(e) => {
+                        let _ = reply.send(Err(e.into()));
+                    }
+                }
+            }
+            Command::CreateAccount {
+                username,
+                password,
+                base_class,
+                granted,
+                revoked,
+                reply,
+            } => {
+                let msg = AccountCreate {
+                    username,
+                    password,
+                    base_class,
+                    granted,
+                    revoked,
+                };
+                match self.send(PacketType::AccountCreate, msg.encode()).await {
+                    Ok(()) => self.account_waiters.push_back(reply),
+                    Err(e) => {
+                        let _ = reply.send(Err(e.into()));
+                    }
+                }
+            }
+            Command::UpdateAccount {
+                username,
+                base_class,
+                granted,
+                revoked,
+                reply,
+            } => {
+                let msg = AccountUpdate {
+                    username,
+                    base_class,
+                    granted,
+                    revoked,
+                };
+                match self.send(PacketType::AccountUpdate, msg.encode()).await {
+                    Ok(()) => self.account_waiters.push_back(reply),
+                    Err(e) => {
+                        let _ = reply.send(Err(e.into()));
+                    }
+                }
+            }
             Command::Disconnect => unreachable!("handled in run loop"),
         }
         Ok(())
@@ -577,6 +635,16 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
                         .role_ids
                         .into_iter()
                         .map(|id| Uuid::from_bytes(id).to_string())
+                        .collect()));
+                }
+            }
+            PacketType::AccountListResponse => {
+                let response = AccountListResponse::decode(&frame.payload)?;
+                if let Some(waiter) = self.account_waiters.pop_front() {
+                    let _ = waiter.send(Ok(response
+                        .accounts
+                        .into_iter()
+                        .map(Into::into)
                         .collect()));
                 }
             }
@@ -812,6 +880,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
             let _ = waiter.send(Err(ClientError::Server(text.clone())));
         }
         if let Some(waiter) = self.account_roles_waiters.pop_front() {
+            let _ = waiter.send(Err(ClientError::Server(text.clone())));
+        }
+        // Account mutations fail on privilege / duplicate-name / not-found.
+        if let Some(waiter) = self.account_waiters.pop_front() {
             let _ = waiter.send(Err(ClientError::Server(text.clone())));
         }
         self.emit(Event::ServerError { text }).await;

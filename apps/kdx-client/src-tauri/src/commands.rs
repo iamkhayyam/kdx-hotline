@@ -5,7 +5,8 @@
 use std::path::PathBuf;
 
 use kdx_client_core::{
-    connect as core_connect, trust_server, ClientConfig, ClientError, Event, PresenceUser, RoleInfo,
+    connect as core_connect, trust_server, AccountSummary, ClientConfig, ClientError, Event,
+    PresenceUser, RoleInfo,
 };
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -279,6 +280,41 @@ pub async fn disconnect_user(
 ) -> CmdResult<()> {
     with_client(&state, |c| async move {
         c.disconnect_user(&username, &reason, ban_secs).await
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn list_accounts(state: State<'_, AppState>) -> CmdResult<Vec<AccountSummary>> {
+    with_client(&state, |c| async move { c.list_accounts().await }).await
+}
+
+#[tauri::command]
+pub async fn create_account(
+    state: State<'_, AppState>,
+    username: String,
+    password: String,
+    base_class: u8,
+    granted: u32,
+    revoked: u32,
+) -> CmdResult<Vec<AccountSummary>> {
+    with_client(&state, |c| async move {
+        c.create_account(&username, &password, base_class, granted, revoked)
+            .await
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn update_account(
+    state: State<'_, AppState>,
+    username: String,
+    base_class: u8,
+    granted: u32,
+    revoked: u32,
+) -> CmdResult<Vec<AccountSummary>> {
+    with_client(&state, |c| async move {
+        c.update_account(&username, base_class, granted, revoked).await
     })
     .await
 }

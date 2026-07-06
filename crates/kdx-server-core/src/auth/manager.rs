@@ -20,6 +20,8 @@ pub enum AuthError {
     /// have been correct; login is refused regardless.
     #[error("account banned")]
     Banned { until: i64, reason: String },
+    #[error("an account with that name already exists")]
+    AccountExists,
     #[error("storage error: {0}")]
     Storage(#[from] kdx_storage::StorageError),
     #[error("crypto error: {0}")]
@@ -169,6 +171,58 @@ impl AuthManager {
             return Ok(None);
         };
         Ok(BaseClass::try_from(row.base_class as u8).ok())
+    }
+
+    /// Provision a new account. `password` is the initial plaintext (arriving
+    /// only over TLS); it is Argon2id-hashed here and never stored in the
+    /// clear. `granted`/`revoked` are applied as privilege overrides.
+    pub async fn create_account(
+        &self,
+        username: &str,
+        password: &str,
+        base_class: i64,
+        granted: i64,
+        revoked: i64,
+    ) -> Result<(), AuthError> {
+        if accounts::by_username(&self.pool, username).await?.is_some() {
+            return Err(AuthError::AccountExists);
+        }
+        let phc = kdx_crypto::hash_password(password)?;
+        accounts::create(&self.pool, username, &phc, base_class).await?;
+        if granted != 0 || revoked != 0 {
+            accounts::set_overrides(&self.pool, username, granted, revoked).await?;
+        }
+        Ok(())
+    }
+
+    /// Change an existing account's class and privilege overrides (not its
+    /// password).
+    pub async fn update_account(
+        &self,
+        username: &str,
+        base_class: i64,
+        granted: i64,
+        revoked: i64,
+    ) -> Result<(), AuthError> {
+        accounts::update(&self.pool, username, base_class, granted, revoked).await?;
+        Ok(())
+    }
+
+    /// Every account, for the Accounts window: `(username, base_class,
+    /// granted, revoked)`. No password material is returned.
+    pub async fn list_accounts(&self) -> Result<Vec<(String, u8, u32, u32)>, AuthError> {
+        let rows = accounts::all(&self.pool).await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                (
+                    r.username,
+                    r.base_class as u8,
+                    r.granted as u32,
+                    r.revoked as u32,
+                )
+            })
+            .collect())
     }
 
     /// Record (or replace) an expiring ban on an account. `until` is a

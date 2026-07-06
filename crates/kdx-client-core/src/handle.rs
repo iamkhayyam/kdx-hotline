@@ -5,7 +5,7 @@ use tokio::sync::{mpsc, oneshot};
 use kdx_protocol::messages::FileListResponse;
 
 use crate::error::ClientError;
-use crate::event::{PresenceUser, RoleInfo};
+use crate::event::{AccountSummary, PresenceUser, RoleInfo};
 
 /// A logged-in session's identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -109,6 +109,24 @@ pub(crate) enum Command {
         reason: String,
         ban_secs: u32,
         reply: oneshot::Sender<Result<(), ClientError>>,
+    },
+    ListAccounts {
+        reply: oneshot::Sender<Result<Vec<AccountSummary>, ClientError>>,
+    },
+    CreateAccount {
+        username: String,
+        password: String,
+        base_class: u8,
+        granted: u32,
+        revoked: u32,
+        reply: oneshot::Sender<Result<Vec<AccountSummary>, ClientError>>,
+    },
+    UpdateAccount {
+        username: String,
+        base_class: u8,
+        granted: u32,
+        revoked: u32,
+        reply: oneshot::Sender<Result<Vec<AccountSummary>, ClientError>>,
     },
     Disconnect,
 }
@@ -340,6 +358,53 @@ impl ClientHandle {
             username: username.to_owned(),
             reason: reason.to_owned(),
             ban_secs,
+            reply,
+        })
+        .await
+    }
+
+    /// List every account (the Accounts window). Requires `USER_ADMIN`;
+    /// otherwise resolves to `ClientError::Server`.
+    pub async fn list_accounts(&self) -> Result<Vec<AccountSummary>, ClientError> {
+        self.send(|reply| Command::ListAccounts { reply }).await
+    }
+
+    /// Provision a new account. The `password` is its initial password (sent
+    /// only over TLS and hashed server-side). Requires `USER_ADMIN`. Resolves
+    /// with the server's full, updated account list.
+    pub async fn create_account(
+        &self,
+        username: &str,
+        password: &str,
+        base_class: u8,
+        granted: u32,
+        revoked: u32,
+    ) -> Result<Vec<AccountSummary>, ClientError> {
+        self.send(|reply| Command::CreateAccount {
+            username: username.to_owned(),
+            password: password.to_owned(),
+            base_class,
+            granted,
+            revoked,
+            reply,
+        })
+        .await
+    }
+
+    /// Change an account's class and privilege overrides (not its password).
+    /// Requires `USER_ADMIN`.
+    pub async fn update_account(
+        &self,
+        username: &str,
+        base_class: u8,
+        granted: u32,
+        revoked: u32,
+    ) -> Result<Vec<AccountSummary>, ClientError> {
+        self.send(|reply| Command::UpdateAccount {
+            username: username.to_owned(),
+            base_class,
+            granted,
+            revoked,
             reply,
         })
         .await
