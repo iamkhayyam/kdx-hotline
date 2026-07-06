@@ -89,6 +89,10 @@ pub enum PacketType {
     ChatInvite = 0x77,
     ChatInvited = 0x78,
 
+    // Server History (0x79-0x7A)
+    HistoryListRequest = 0x79,
+    HistoryListResponse = 0x7A,
+
     // System (0xF0-0xFF)
     Error = 0xF0,
     Warning = 0xF1,
@@ -96,7 +100,7 @@ pub enum PacketType {
 }
 
 impl PacketType {
-    pub const ALL: [PacketType; 66] = [
+    pub const ALL: [PacketType; 68] = [
         PacketType::HandshakeInit,
         PacketType::HandshakeResp,
         PacketType::Ping,
@@ -160,6 +164,8 @@ impl PacketType {
         PacketType::AdminShutdown,
         PacketType::ChatInvite,
         PacketType::ChatInvited,
+        PacketType::HistoryListRequest,
+        PacketType::HistoryListResponse,
         PacketType::Error,
         PacketType::Warning,
         PacketType::Info,
@@ -235,6 +241,8 @@ impl TryFrom<u8> for PacketType {
             0x76 => AdminShutdown,
             0x77 => ChatInvite,
             0x78 => ChatInvited,
+            0x79 => HistoryListRequest,
+            0x7A => HistoryListResponse,
             0xF0 => Error,
             0xF1 => Warning,
             0xF2 => Info,

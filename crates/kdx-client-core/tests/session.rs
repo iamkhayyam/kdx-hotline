@@ -1049,3 +1049,52 @@ async fn plain_user_cannot_disconnect_others() {
 
     ts.stop();
 }
+
+#[tokio::test]
+async fn admin_views_history_after_actions_newest_first() {
+    let ts = TestServer::start().await;
+    ts.seed_account("sysop", "pw", 3).await; // Admin: has SERVER_ADMIN + USER_ADMIN
+    ts.seed_account("plain", "pw", 1).await;
+
+    let (sysop, mut es, _d1) = ts.connect_client().await;
+    next_event(&mut es).await;
+    sysop.login("sysop", "pw").await.unwrap();
+
+    // A plain login (recorded), then two admin-worthy actions.
+    let (plain, mut ep, _d2) = ts.connect_client().await;
+    next_event(&mut ep).await;
+    plain.login("plain", "pw").await.unwrap();
+
+    sysop.create_account("newbie", "letmein", 1, 0, 0).await.unwrap();
+    sysop
+        .update_server_settings("The Underground", "", "", 0)
+        .await
+        .unwrap();
+
+    let entries = sysop.list_history(10).await.unwrap();
+    assert!(entries.len() >= 3, "expected at least login + 2 admin actions");
+    // Newest first: the most recent action (settings update) leads.
+    assert_eq!(entries[0].action, "server_settings_updated");
+    assert!(entries.iter().any(|e| e.action == "account_created" && e.detail == "newbie"));
+    assert!(entries.iter().any(|e| e.action == "login" && e.actor == "plain"));
+    // Strictly non-increasing timestamps (newest first).
+    for pair in entries.windows(2) {
+        assert!(pair[0].timestamp >= pair[1].timestamp);
+    }
+
+    ts.stop();
+}
+
+#[tokio::test]
+async fn plain_user_cannot_view_history() {
+    let ts = TestServer::start().await;
+    ts.seed_account("plain", "pw", 1).await; // no SERVER_ADMIN
+
+    let (client, mut events, _dd) = ts.connect_client().await;
+    next_event(&mut events).await;
+    client.login("plain", "pw").await.unwrap();
+
+    assert!(matches!(client.list_history(10).await, Err(ClientError::Server(_))));
+
+    ts.stop();
+}

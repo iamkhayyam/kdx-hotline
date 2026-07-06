@@ -38,6 +38,7 @@ pub fn run() {
             commands::update_server_settings,
             commands::broadcast,
             commands::shutdown_server,
+            commands::list_history,
             commands::get_user_info,
             commands::send_private,
             commands::invite_to_chat,

@@ -5,7 +5,7 @@
 
 import { invoke } from "../bridge.js";
 
-export function buildServerAdmin() {
+export function buildServerAdmin(openHistory) {
   const body = document.createElement("div");
   body.className = "srv-win";
   body.innerHTML = `
@@ -22,6 +22,7 @@ export function buildServerAdmin() {
         <div class="ab-actions">
           <button type="submit" class="btn">Save</button>
           <button type="button" class="mini" id="srv-refresh">Refresh</button>
+          <button type="button" class="mini" id="srv-history">History…</button>
         </div>
         <div class="rl-assign-result" id="srv-settings-result"></div>
       </form>
@@ -95,6 +96,7 @@ export function buildServerAdmin() {
     }
   });
   $("#srv-refresh").addEventListener("click", refresh);
+  if (openHistory) $("#srv-history").addEventListener("click", openHistory);
 
   $("#srv-broadcast-form").addEventListener("submit", async (e) => {
     e.preventDefault();

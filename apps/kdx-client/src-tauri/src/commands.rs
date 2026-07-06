@@ -6,8 +6,8 @@ use std::path::PathBuf;
 
 use kdx_client_core::{
     connect as core_connect, trust_server, AccountSummary, ClientConfig, ClientError, Event,
-    FileSearchEntry, NewsPost, NewsgroupInfo, PresenceUser, RoleInfo, ServerSettings,
-    TrackerServer,
+    FileSearchEntry, HistoryEntry, NewsPost, NewsgroupInfo, PresenceUser, RoleInfo,
+    ServerSettings, TrackerServer,
 };
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -259,6 +259,11 @@ pub async fn broadcast(state: State<'_, AppState>, text: String) -> CmdResult<()
 #[tauri::command]
 pub async fn shutdown_server(state: State<'_, AppState>, message: String) -> CmdResult<()> {
     with_client(&state, |c| async move { c.shutdown_server(&message).await }).await
+}
+
+#[tauri::command]
+pub async fn list_history(state: State<'_, AppState>, limit: u32) -> CmdResult<Vec<HistoryEntry>> {
+    with_client(&state, |c| async move { c.list_history(limit).await }).await
 }
 
 #[tauri::command]

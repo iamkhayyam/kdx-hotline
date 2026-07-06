@@ -178,6 +178,28 @@ impl From<kdx_protocol::messages::FileSearchEntry> for FileSearchEntry {
     }
 }
 
+/// One audit-log entry (the Server History window). Mirrors
+/// `kdx_protocol::messages::HistoryEntry`. `actor` is empty when the event had
+/// no acting user (none currently do, but the wire format allows it).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct HistoryEntry {
+    pub timestamp: u64,
+    pub actor: String,
+    pub action: String,
+    pub detail: String,
+}
+
+impl From<kdx_protocol::messages::HistoryEntry> for HistoryEntry {
+    fn from(e: kdx_protocol::messages::HistoryEntry) -> Self {
+        Self {
+            timestamp: e.timestamp,
+            actor: e.actor,
+            action: e.action,
+            detail: e.detail,
+        }
+    }
+}
+
 /// Current server settings (the Server Settings window). Mirrors
 /// `kdx_protocol::messages::ServerSettingsResponse`. `port`,
 /// `max_upload_bytes_per_sec`, and `max_download_bytes_per_sec` are

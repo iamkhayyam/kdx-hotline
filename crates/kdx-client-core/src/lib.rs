@@ -30,8 +30,8 @@ use tokio_util::codec::Framed;
 pub use config::{ClientConfig, TrustPolicy};
 pub use error::ClientError;
 pub use event::{
-    AccountSummary, Direction, Event, FileSearchEntry, NewsPost, NewsgroupInfo, PresenceUser,
-    RoleInfo, ServerSettings, TrackerServer,
+    AccountSummary, Direction, Event, FileSearchEntry, HistoryEntry, NewsPost, NewsgroupInfo,
+    PresenceUser, RoleInfo, ServerSettings, TrackerServer,
 };
 pub use handle::{ClientHandle, Session};
 // Re-exported so consumers (the Tauri app) can name the file-listing shape

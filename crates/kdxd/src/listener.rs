@@ -5,6 +5,7 @@ use std::time::Duration;
 use kdx_server_core::auth::{AuthManager, RoleManager};
 use kdx_server_core::chat::RoomManager;
 use kdx_server_core::files::FileTree;
+use kdx_server_core::history::HistoryLog;
 use kdx_server_core::news::NewsManager;
 use kdx_server_core::settings::ServerSettings;
 use kdx_server_core::tracker::{ServerEntry, Tracker, DEFAULT_TTL};
@@ -78,6 +79,7 @@ pub async fn serve(config: Config) -> Result<Server, ServeError> {
     let ctx = Arc::new(ServerCtx {
         roles: RoleManager::new(pool.clone()),
         news: NewsManager::new(pool.clone()),
+        history: HistoryLog::new(pool.clone()),
         auth: AuthManager::new(pool, Duration::from_secs(config.session_ttl_secs)),
         rooms: RoomManager::new(),
         tree,

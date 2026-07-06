@@ -19,8 +19,8 @@ pub use account::{
     AccountCreate, AccountListRequest, AccountListResponse, AccountSummary, AccountUpdate,
 };
 pub use admin::{
-    AdminBroadcast, AdminDisconnect, AdminShutdown, ServerSettingsRequest, ServerSettingsResponse,
-    ServerSettingsUpdate,
+    AdminBroadcast, AdminDisconnect, AdminShutdown, HistoryEntry, HistoryListRequest,
+    HistoryListResponse, ServerSettingsRequest, ServerSettingsResponse, ServerSettingsUpdate,
 };
 pub use auth::{AuthChallenge, AuthRequest, AuthResponse, AuthResult};
 pub use chat::{

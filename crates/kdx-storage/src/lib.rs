@@ -6,6 +6,7 @@ pub mod accounts;
 pub mod bans;
 pub mod db;
 pub mod file_tree;
+pub mod history;
 pub mod news;
 pub mod roles;
 pub mod transfer_state;

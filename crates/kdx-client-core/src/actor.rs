@@ -18,7 +18,8 @@ use kdx_protocol::messages::{
     AdminBroadcast, AdminShutdown, AuthResult, ChatEvent, ChatInvite, ChatInvited, ChatJoin,
     ChatLeave, ChatSend, ChatTopic, ChatUserList, FileCatalogGenerated, FileCreateFolder,
     FileDelete, FileGenerateCatalog,
-    FileListRequest, FileMove, FileSearchRequest, FileSearchResponse, NewsPostCreate,
+    FileListRequest, FileMove, FileSearchRequest, FileSearchResponse, HistoryListRequest,
+    HistoryListResponse, NewsPostCreate,
     NewsPostDelete, NewsThreadListRequest, NewsThreadListResponse, NewsgroupCreate,
     NewsgroupListRequest, NewsgroupListResponse, ServerSettingsRequest, ServerSettingsResponse,
     ServerSettingsUpdate, TrackerListRequest, TrackerListResponse,
@@ -41,8 +42,8 @@ use uuid::Uuid;
 
 use crate::error::ClientError;
 use crate::event::{
-    AccountSummary, Direction, Event, FileSearchEntry, NewsPost, NewsgroupInfo, PresenceUser,
-    RoleInfo, ServerSettings, TrackerServer,
+    AccountSummary, Direction, Event, FileSearchEntry, HistoryEntry, NewsPost, NewsgroupInfo,
+    PresenceUser, RoleInfo, ServerSettings, TrackerServer,
 };
 use crate::handle::{Command, Session};
 use crate::transfer::{chunk_len, total_chunks, ChunkBitmap, Sidecar, DEFAULT_CHUNK_SIZE};
@@ -110,6 +111,7 @@ pub(crate) struct Actor<S> {
     account_waiters: VecDeque<oneshot::Sender<Result<Vec<AccountSummary>, ClientError>>>,
     newsgroup_waiters: VecDeque<oneshot::Sender<Result<Vec<NewsgroupInfo>, ClientError>>>,
     thread_waiters: VecDeque<oneshot::Sender<Result<Vec<NewsPost>, ClientError>>>,
+    history_waiters: VecDeque<oneshot::Sender<Result<Vec<HistoryEntry>, ClientError>>>,
     transfer: Option<Transfer>,
 }
 
@@ -138,6 +140,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
             account_waiters: VecDeque::new(),
             newsgroup_waiters: VecDeque::new(),
             thread_waiters: VecDeque::new(),
+            history_waiters: VecDeque::new(),
             transfer: None,
         }
     }
@@ -224,6 +227,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
             let _ = waiter.send(Err(ClientError::Disconnected));
         }
         for waiter in self.thread_waiters.drain(..) {
+            let _ = waiter.send(Err(ClientError::Disconnected));
+        }
+        for waiter in self.history_waiters.drain(..) {
             let _ = waiter.send(Err(ClientError::Disconnected));
         }
         if let Some(reply) = self.transfer.take().and_then(transfer_reply) {
@@ -416,6 +422,17 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
                     .send(PacketType::AdminShutdown, AdminShutdown { message }.encode())
                     .await;
                 let _ = reply.send(r.map_err(Into::into));
+            }
+            Command::ListHistory { limit, reply } => {
+                match self
+                    .send(PacketType::HistoryListRequest, HistoryListRequest { limit }.encode())
+                    .await
+                {
+                    Ok(()) => self.history_waiters.push_back(reply),
+                    Err(e) => {
+                        let _ = reply.send(Err(e.into()));
+                    }
+                }
             }
             Command::GetUserInfo { username, reply } => {
                 match self
@@ -904,6 +921,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
                     let _ = waiter.send(Ok(response.into()));
                 }
             }
+            PacketType::HistoryListResponse => {
+                let response = HistoryListResponse::decode(&frame.payload)?;
+                if let Some(waiter) = self.history_waiters.pop_front() {
+                    let _ = waiter.send(Ok(response.entries.into_iter().map(Into::into).collect()));
+                }
+            }
             PacketType::RoleListResponse => {
                 let response = RoleListResponse::decode(&frame.payload)?;
                 if let Some(waiter) = self.role_waiters.pop_front() {
@@ -1210,6 +1233,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
         }
         // Server settings requests/updates fail on missing SERVER_ADMIN.
         if let Some(waiter) = self.settings_waiters.pop_front() {
+            let _ = waiter.send(Err(ClientError::Server(text.clone())));
+        }
+        // Server History requests fail on missing SERVER_ADMIN.
+        if let Some(waiter) = self.history_waiters.pop_front() {
             let _ = waiter.send(Err(ClientError::Server(text.clone())));
         }
         self.emit(Event::ServerError { text }).await;

@@ -193,6 +193,83 @@ impl AdminShutdown {
     }
 }
 
+/// Client → server: fetch the most recent server-history entries. Requires
+/// `SERVER_ADMIN`. `limit` is capped server-side (see the dispatch handler).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HistoryListRequest {
+    pub limit: u32,
+}
+
+/// One audit-log entry. `actor` empty means no single user was responsible
+/// (there's no wire-level `Option`, matching the convention used elsewhere).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistoryEntry {
+    pub timestamp: u64,
+    pub actor: String,
+    pub action: String,
+    pub detail: String,
+}
+
+/// Server → client: reply to `HistoryListRequest`, newest first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistoryListResponse {
+    pub entries: Vec<HistoryEntry>,
+}
+
+impl HistoryListRequest {
+    pub fn encode(&self) -> Bytes {
+        let mut buf = BytesMut::new();
+        buf.put_u32(self.limit);
+        buf.freeze()
+    }
+    pub fn decode(mut payload: &[u8]) -> Result<Self, ProtocolError> {
+        if payload.remaining() < 4 {
+            return Err(ProtocolError::MalformedPayload("HistoryListRequest"));
+        }
+        let limit = payload.get_u32();
+        expect_end(payload, "HistoryListRequest")?;
+        Ok(Self { limit })
+    }
+}
+
+impl HistoryListResponse {
+    pub fn encode(&self) -> Bytes {
+        let mut buf = BytesMut::new();
+        buf.put_u32(self.entries.len() as u32);
+        for e in &self.entries {
+            buf.put_u64(e.timestamp);
+            put_str(&mut buf, &e.actor);
+            put_str(&mut buf, &e.action);
+            put_str(&mut buf, &e.detail);
+        }
+        buf.freeze()
+    }
+    pub fn decode(mut payload: &[u8]) -> Result<Self, ProtocolError> {
+        if payload.remaining() < 4 {
+            return Err(ProtocolError::MalformedPayload("HistoryListResponse"));
+        }
+        let count = payload.get_u32() as usize;
+        let mut entries = Vec::with_capacity(count.min(4096));
+        for _ in 0..count {
+            if payload.remaining() < 8 {
+                return Err(ProtocolError::MalformedPayload("HistoryListResponse"));
+            }
+            let timestamp = payload.get_u64();
+            let actor = get_str(&mut payload, "HistoryListResponse")?;
+            let action = get_str(&mut payload, "HistoryListResponse")?;
+            let detail = get_str(&mut payload, "HistoryListResponse")?;
+            entries.push(HistoryEntry {
+                timestamp,
+                actor,
+                action,
+                detail,
+            });
+        }
+        expect_end(payload, "HistoryListResponse")?;
+        Ok(Self { entries })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -263,5 +340,35 @@ mod tests {
         // Length prefix declares 5 bytes but only 1 follows.
         assert!(AdminBroadcast::decode(&[0, 5, 65]).is_err());
         assert!(AdminShutdown::decode(&[0, 5, 65]).is_err());
+    }
+
+    #[test]
+    fn history_round_trip() {
+        let req = HistoryListRequest { limit: 50 };
+        assert_eq!(HistoryListRequest::decode(&req.encode()).unwrap(), req);
+
+        let resp = HistoryListResponse {
+            entries: vec![
+                HistoryEntry {
+                    timestamp: 1_751_600_000,
+                    actor: "sysop".into(),
+                    action: "kicked".into(),
+                    detail: "target=lamer".into(),
+                },
+                HistoryEntry {
+                    timestamp: 1_751_600_100,
+                    actor: String::new(),
+                    action: "server_started".into(),
+                    detail: "".into(),
+                },
+            ],
+        };
+        assert_eq!(HistoryListResponse::decode(&resp.encode()).unwrap(), resp);
+
+        let empty = HistoryListResponse { entries: vec![] };
+        assert_eq!(HistoryListResponse::decode(&empty.encode()).unwrap(), empty);
+
+        assert!(HistoryListRequest::decode(&[0]).is_err());
+        assert!(HistoryListResponse::decode(&[0, 0]).is_err());
     }
 }

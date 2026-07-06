@@ -6,7 +6,7 @@ use kdx_protocol::messages::FileListResponse;
 
 use crate::error::ClientError;
 use crate::event::{
-    AccountSummary, FileSearchEntry, NewsPost, NewsgroupInfo, PresenceUser, RoleInfo,
+    AccountSummary, FileSearchEntry, HistoryEntry, NewsPost, NewsgroupInfo, PresenceUser, RoleInfo,
     ServerSettings, TrackerServer,
 };
 
@@ -97,6 +97,10 @@ pub(crate) enum Command {
     ShutdownServer {
         message: String,
         reply: oneshot::Sender<Result<(), ClientError>>,
+    },
+    ListHistory {
+        limit: u32,
+        reply: oneshot::Sender<Result<Vec<HistoryEntry>, ClientError>>,
     },
     GetUserInfo {
         username: String,
@@ -412,6 +416,14 @@ impl ClientHandle {
             reply,
         })
         .await
+    }
+
+    /// Fetch the most recent audit-log entries (the Server History window),
+    /// newest first. Requires `SERVER_ADMIN`; otherwise resolves to
+    /// `ClientError::Server`.
+    pub async fn list_history(&self, limit: u32) -> Result<Vec<HistoryEntry>, ClientError> {
+        self.send(|reply| Command::ListHistory { limit, reply })
+            .await
     }
 
     /// Fetch one user's detail (login/idle time, address) for the User Info

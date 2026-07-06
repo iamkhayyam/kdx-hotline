@@ -19,7 +19,8 @@ use kdx_protocol::messages::{
     ChatJoin, ChatLeave, ChatSend, ChatTopic, FileCatalogGenerated, FileCreateFolder, FileDelete,
     FileEntry,
     FileGenerateCatalog, FileListRequest, FileListResponse, FileMove, FileSearchEntry,
-    FileSearchRequest, FileSearchResponse, HandshakeInit, HandshakeResp, NewsPost as WireNewsPost,
+    FileSearchRequest, FileSearchResponse, HandshakeInit, HandshakeResp, HistoryEntry as WireHistoryEntry,
+    HistoryListRequest, HistoryListResponse, NewsPost as WireNewsPost,
     NewsPostCreate, NewsPostDelete, NewsThreadListRequest, NewsThreadListResponse, NewsgroupCreate,
     NewsgroupInfo, NewsgroupListRequest, NewsgroupListResponse, PresenceListRequest,
     PresenceListResponse, PrivateMessage, PrivateSend, RoleAssign, RoleCreate, RoleDelete, RoleInfo,
@@ -43,6 +44,7 @@ use crate::auth::{AuthManager, BaseClass, Privileges, Role, RoleManager, Session
 use crate::chat::{Member, Outbound, RoomCommand, RoomManager};
 use crate::files::{FileTree, NodeKind};
 use crate::news::{NewsManager, Post as NewsPostDomain};
+use crate::history::HistoryLog;
 use crate::presence::{unix_now, Presence};
 use crate::settings::ServerSettings;
 use crate::tracker::Tracker;
@@ -69,6 +71,10 @@ pub const OUTBOUND_QUEUE: usize = 128;
 /// Cap on search results returned in one `FileSearchResponse`.
 const FILE_SEARCH_LIMIT: usize = 200;
 
+/// Cap on entries returned in one `HistoryListResponse`, regardless of the
+/// `limit` a client requests.
+const HISTORY_LIST_LIMIT: u32 = 500;
+
 /// Shared server-wide services handed to every connection.
 pub struct ServerCtx {
     pub auth: AuthManager,
@@ -80,6 +86,7 @@ pub struct ServerCtx {
     pub presence: Presence,
     pub tracker: Tracker,
     pub settings: ServerSettings,
+    pub history: HistoryLog,
     /// The bound listen port — immutable, informational only (shown in the
     /// Server Settings window; not itself part of `ServerSettings`, which
     /// covers just the live-editable fields).
@@ -243,6 +250,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                             self.send(PacketType::AuthResult, PacketFlags::empty(), result.encode())
                                 .await?;
                             debug!(user = %session.username, "authenticated");
+                            self.record_history(Some(session.username.clone()), "login", String::new());
                             self.session = Some(session);
                             let greeting = self.ctx.settings.greeting().await;
                             if !greeting.is_empty() {
@@ -265,6 +273,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                             };
                             self.send(PacketType::AuthResult, PacketFlags::empty(), result.encode())
                                 .await?;
+                            self.record_history(
+                                Some(request.username.clone()),
+                                "login_failed",
+                                String::new(),
+                            );
                             if failures >= MAX_AUTH_ATTEMPTS {
                                 return Err(ConnectionError::TooManyAuthAttempts);
                             }
@@ -286,6 +299,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                             };
                             self.send(PacketType::AuthResult, PacketFlags::empty(), result.encode())
                                 .await?;
+                            self.record_history(
+                                Some(request.username.clone()),
+                                "login_banned",
+                                reason.clone(),
+                            );
                         }
                         Err(e) => return Err(e.into()),
                     }
@@ -886,6 +904,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                         self.send_error("missing USER_ADMIN privilege").await?;
                         continue;
                     }
+                    let admin_name = session.username.clone();
                     let color = (!create.color.is_empty()).then_some(create.color.as_str());
                     let result = self
                         .ctx
@@ -898,7 +917,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                         )
                         .await;
                     match result {
-                        Ok(_) => self.reply_role_list().await?,
+                        Ok(_) => {
+                            let _ = self
+                                .ctx
+                                .history
+                                .record(unix_now(), Some(&admin_name), "role_created", &create.name)
+                                .await;
+                            self.reply_role_list().await?
+                        }
                         Err(e) => self.send_error(&e.to_string()).await?,
                     }
                 }
@@ -909,6 +935,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                         self.send_error("missing USER_ADMIN privilege").await?;
                         continue;
                     }
+                    let admin_name = session.username.clone();
                     let color = (!update.color.is_empty()).then_some(update.color.as_str());
                     let result = self
                         .ctx
@@ -922,7 +949,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                         )
                         .await;
                     match result {
-                        Ok(()) => self.reply_role_list().await?,
+                        Ok(()) => {
+                            let _ = self
+                                .ctx
+                                .history
+                                .record(unix_now(), Some(&admin_name), "role_updated", &update.name)
+                                .await;
+                            self.reply_role_list().await?
+                        }
                         Err(e) => self.send_error(&e.to_string()).await?,
                     }
                 }
@@ -933,8 +967,17 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                         self.send_error("missing USER_ADMIN privilege").await?;
                         continue;
                     }
-                    match self.ctx.roles.delete(Uuid::from_bytes(delete.id)).await {
-                        Ok(()) => self.reply_role_list().await?,
+                    let admin_name = session.username.clone();
+                    let role_id = Uuid::from_bytes(delete.id);
+                    match self.ctx.roles.delete(role_id).await {
+                        Ok(()) => {
+                            let _ = self
+                                .ctx
+                                .history
+                                .record(unix_now(), Some(&admin_name), "role_deleted", &role_id.to_string())
+                                .await;
+                            self.reply_role_list().await?
+                        }
                         Err(e) => self.send_error(&e.to_string()).await?,
                     }
                 }
@@ -945,6 +988,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                         self.send_error("missing USER_ADMIN privilege").await?;
                         continue;
                     }
+                    let admin_name = session.username.clone();
                     match self.ctx.auth.account_id(&assign.username).await? {
                         Some(account_id) => {
                             match self
@@ -953,7 +997,19 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                                 .assign(&account_id, Uuid::from_bytes(assign.role_id))
                                 .await
                             {
-                                Ok(()) => self.reply_role_list().await?,
+                                Ok(()) => {
+                                    let _ = self
+                                        .ctx
+                                        .history
+                                        .record(
+                                            unix_now(),
+                                            Some(&admin_name),
+                                            "role_assigned",
+                                            &format!("target={}", assign.username),
+                                        )
+                                        .await;
+                                    self.reply_role_list().await?
+                                }
                                 Err(e) => self.send_error(&e.to_string()).await?,
                             }
                         }
@@ -967,6 +1023,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                         self.send_error("missing USER_ADMIN privilege").await?;
                         continue;
                     }
+                    let admin_name = session.username.clone();
                     match self.ctx.auth.account_id(&unassign.username).await? {
                         Some(account_id) => {
                             match self
@@ -975,7 +1032,19 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                                 .unassign(&account_id, Uuid::from_bytes(unassign.role_id))
                                 .await
                             {
-                                Ok(()) => self.reply_role_list().await?,
+                                Ok(()) => {
+                                    let _ = self
+                                        .ctx
+                                        .history
+                                        .record(
+                                            unix_now(),
+                                            Some(&admin_name),
+                                            "role_unassigned",
+                                            &format!("target={}", unassign.username),
+                                        )
+                                        .await;
+                                    self.reply_role_list().await?
+                                }
                                 Err(e) => self.send_error(&e.to_string()).await?,
                             }
                         }
@@ -1019,9 +1088,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                 }
                 PacketType::AccountCreate => {
                     let create = AccountCreate::decode(&frame.payload)?;
-                    let (admin_class, privs) = {
+                    let (admin_name, admin_class, privs) = {
                         let s = self.session.as_ref().expect("authed");
-                        (s.class as u8, s.privileges)
+                        (s.username.clone(), s.class as u8, s.privileges)
                     };
                     if !privs.contains(Privileges::USER_ADMIN) {
                         self.send_error("missing USER_ADMIN privilege").await?;
@@ -1049,15 +1118,22 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                         )
                         .await
                     {
-                        Ok(()) => self.reply_account_list().await?,
+                        Ok(()) => {
+                            let _ = self
+                                .ctx
+                                .history
+                                .record(unix_now(), Some(&admin_name), "account_created", &create.username)
+                                .await;
+                            self.reply_account_list().await?
+                        }
                         Err(e) => self.send_error(&e.to_string()).await?,
                     }
                 }
                 PacketType::AccountUpdate => {
                     let update = AccountUpdate::decode(&frame.payload)?;
-                    let (admin_class, privs) = {
+                    let (admin_name, admin_class, privs) = {
                         let s = self.session.as_ref().expect("authed");
-                        (s.class as u8, s.privileges)
+                        (s.username.clone(), s.class as u8, s.privileges)
                     };
                     if !privs.contains(Privileges::USER_ADMIN) {
                         self.send_error("missing USER_ADMIN privilege").await?;
@@ -1079,7 +1155,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                         )
                         .await
                     {
-                        Ok(()) => self.reply_account_list().await?,
+                        Ok(()) => {
+                            let _ = self
+                                .ctx
+                                .history
+                                .record(unix_now(), Some(&admin_name), "account_updated", &update.username)
+                                .await;
+                            self.reply_account_list().await?
+                        }
                         Err(e) => self.send_error(&e.to_string()).await?,
                     }
                 }
@@ -1118,36 +1201,80 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                     }
                     self.reply_server_settings().await?;
                 }
-                PacketType::ServerSettingsUpdate => {
-                    let update = ServerSettingsUpdate::decode(&frame.payload)?;
+                PacketType::HistoryListRequest => {
+                    let req = HistoryListRequest::decode(&frame.payload)?;
                     let privs = self.session.as_ref().expect("authed").privileges;
                     if !privs.contains(Privileges::SERVER_ADMIN) {
                         self.send_error("missing SERVER_ADMIN privilege").await?;
                         continue;
                     }
+                    let limit = req.limit.clamp(1, HISTORY_LIST_LIMIT);
+                    match self.ctx.history.recent(limit).await {
+                        Ok(entries) => {
+                            let response = HistoryListResponse {
+                                entries: entries
+                                    .into_iter()
+                                    .map(|e| WireHistoryEntry {
+                                        timestamp: e.timestamp,
+                                        actor: e.actor.unwrap_or_default(),
+                                        action: e.action,
+                                        detail: e.detail,
+                                    })
+                                    .collect(),
+                            };
+                            self.send(
+                                PacketType::HistoryListResponse,
+                                PacketFlags::empty(),
+                                response.encode(),
+                            )
+                            .await?;
+                        }
+                        Err(e) => self.send_error(&e.to_string()).await?,
+                    }
+                }
+                PacketType::ServerSettingsUpdate => {
+                    let update = ServerSettingsUpdate::decode(&frame.payload)?;
+                    let session = self.session.as_ref().expect("authed");
+                    if !session.privileges.contains(Privileges::SERVER_ADMIN) {
+                        self.send_error("missing SERVER_ADMIN privilege").await?;
+                        continue;
+                    }
+                    let admin_name = session.username.clone();
                     if update.name.trim().is_empty() {
                         self.send_error("server name is required").await?;
                         continue;
                     }
+                    let new_name = update.name.clone();
                     self.ctx
                         .settings
                         .update(update.name, update.description, update.greeting, update.max_users)
+                        .await;
+                    let _ = self
+                        .ctx
+                        .history
+                        .record(unix_now(), Some(&admin_name), "server_settings_updated", &new_name)
                         .await;
                     self.reply_server_settings().await?;
                 }
                 PacketType::AdminBroadcast => {
                     let broadcast = AdminBroadcast::decode(&frame.payload)?;
-                    let privs = self.session.as_ref().expect("authed").privileges;
-                    if !privs.contains(Privileges::SERVER_ADMIN) {
+                    let session = self.session.as_ref().expect("authed");
+                    if !session.privileges.contains(Privileges::SERVER_ADMIN) {
                         self.send_error("missing SERVER_ADMIN privilege").await?;
                         continue;
                     }
+                    let admin_name = session.username.clone();
                     let outbound = Outbound {
                         packet_type: PacketType::Info,
                         flags: PacketFlags::SYSTEM_MESSAGE,
                         payload: Bytes::copy_from_slice(broadcast.text.as_bytes()),
                     };
                     let reached = self.ctx.presence.broadcast_all(outbound).await;
+                    let _ = self
+                        .ctx
+                        .history
+                        .record(unix_now(), Some(&admin_name), "broadcast", &broadcast.text)
+                        .await;
                     self.send(
                         PacketType::Info,
                         PacketFlags::SYSTEM_MESSAGE,
@@ -1157,11 +1284,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                 }
                 PacketType::AdminShutdown => {
                     let shutdown = AdminShutdown::decode(&frame.payload)?;
-                    let privs = self.session.as_ref().expect("authed").privileges;
-                    if !privs.contains(Privileges::SERVER_ADMIN) {
+                    let session = self.session.as_ref().expect("authed");
+                    if !session.privileges.contains(Privileges::SERVER_ADMIN) {
                         self.send_error("missing SERVER_ADMIN privilege").await?;
                         continue;
                     }
+                    let admin_name = session.username.clone();
                     let message = if shutdown.message.trim().is_empty() {
                         "the server is shutting down".to_string()
                     } else {
@@ -1172,6 +1300,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                         flags: PacketFlags::SYSTEM_MESSAGE,
                         payload: Bytes::copy_from_slice(message.as_bytes()),
                     };
+                    let _ = self
+                        .ctx
+                        .history
+                        .record(unix_now(), Some(&admin_name), "shutdown", &message)
+                        .await;
                     self.ctx.presence.broadcast_all(notice).await;
                     self.ctx.presence.disconnect_all(&message).await;
                     // Stop the accept loop; already-open connections (this one
@@ -1185,11 +1318,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                 }
                 PacketType::NewsgroupCreate => {
                     let create = NewsgroupCreate::decode(&frame.payload)?;
-                    let privs = self.session.as_ref().expect("authed").privileges;
-                    if !privs.contains(Privileges::USER_ADMIN) {
+                    let session = self.session.as_ref().expect("authed");
+                    if !session.privileges.contains(Privileges::USER_ADMIN) {
                         self.send_error("missing USER_ADMIN privilege").await?;
                         continue;
                     }
+                    let admin_name = session.username.clone();
                     if create.name.trim().is_empty() {
                         self.send_error("newsgroup name is required").await?;
                         continue;
@@ -1205,7 +1339,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                         )
                         .await
                     {
-                        Ok(_) => self.reply_newsgroup_list().await?,
+                        Ok(_) => {
+                            let _ = self
+                                .ctx
+                                .history
+                                .record(unix_now(), Some(&admin_name), "newsgroup_created", &create.name)
+                                .await;
+                            self.reply_newsgroup_list().await?
+                        }
                         Err(e) => self.send_error(&e.to_string()).await?,
                     }
                 }
@@ -1356,6 +1497,20 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                         } else {
                             format!("disconnected {} — {} session(s)", req.username, reached)
                         };
+                        let action = if req.ban_secs > 0 { "banned" } else { "kicked" };
+                        let detail = if req.ban_secs > 0 {
+                            format!(
+                                "target={}, ban_secs={}, reason={}",
+                                req.username, req.ban_secs, reason
+                            )
+                        } else {
+                            format!("target={}, reason={}", req.username, reason)
+                        };
+                        let _ = self
+                            .ctx
+                            .history
+                            .record(unix_now(), Some(&admin_name), action, &detail)
+                            .await;
                         self.send(
                             PacketType::Info,
                             PacketFlags::SYSTEM_MESSAGE,
@@ -1387,6 +1542,22 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
             self.ctx.auth.end_session(session.id);
         }
         result
+    }
+
+    /// Fire-and-forget an audit-log entry on a detached task, used only for
+    /// the login paths in `authenticate()`. Awaiting `history.record` inline
+    /// there — even though it's best-effort and its own errors are ignored —
+    /// still delayed `dispatch_loop`'s `presence.join()` on the success path,
+    /// just long enough to lose a race against another connection's
+    /// immediately-following broadcast. Other call sites (role/account/
+    /// settings mutations etc.) await `history.record` inline on purpose:
+    /// their reply is the thing a test or client might act on next, and the
+    /// write should be durable before that reply lands.
+    fn record_history(&self, actor: Option<String>, action: &'static str, detail: String) {
+        let ctx = self.ctx.clone();
+        tokio::spawn(async move {
+            let _ = ctx.history.record(unix_now(), actor.as_deref(), action, &detail).await;
+        });
     }
 
     async fn send_error(&mut self, message: &str) -> Result<(), ProtocolError> {
@@ -1702,6 +1873,7 @@ mod tests {
         let ctx = Arc::new(ServerCtx {
             roles: RoleManager::new(pool.clone()),
             news: NewsManager::new(pool.clone()),
+            history: crate::history::HistoryLog::new(pool.clone()),
             auth: AuthManager::new(pool, Duration::from_secs(60)),
             rooms: RoomManager::new(),
             tree,
@@ -1960,6 +2132,7 @@ mod tests {
         let ctx = Arc::new(ServerCtx {
             roles: RoleManager::new(pool.clone()),
             news: NewsManager::new(pool.clone()),
+            history: crate::history::HistoryLog::new(pool.clone()),
             auth: AuthManager::new(pool, Duration::from_secs(60)),
             rooms: RoomManager::new(),
             tree,
