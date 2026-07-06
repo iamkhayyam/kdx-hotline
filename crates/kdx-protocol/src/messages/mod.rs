@@ -12,6 +12,7 @@ mod news;
 mod presence;
 mod private;
 mod roles;
+mod tracker;
 mod wire;
 
 pub use account::{
@@ -42,3 +43,4 @@ pub use roles::{
     AccountRolesRequest, AccountRolesResponse, RoleAssign, RoleCreate, RoleDelete, RoleInfo,
     RoleListRequest, RoleListResponse, RoleUnassign, RoleUpdate,
 };
+pub use tracker::{TrackerListRequest, TrackerListResponse, TrackerServer};

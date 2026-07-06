@@ -18,6 +18,7 @@ use kdx_protocol::messages::{
     AuthResult, ChatEvent, ChatJoin, ChatLeave, ChatSend, ChatTopic, ChatUserList, FileCreateFolder,
     FileDelete, FileListRequest, NewsPostCreate, NewsPostDelete, NewsThreadListRequest,
     NewsThreadListResponse, NewsgroupCreate, NewsgroupListRequest, NewsgroupListResponse,
+    TrackerListRequest, TrackerListResponse,
     FileListResponse, PresenceChange, PresenceListRequest, PresenceListResponse, PrivateMessage,
     PrivateSend, RoleAssign, RoleCreate, RoleDelete, RoleListRequest, RoleListResponse,
     RoleUnassign, RoleUpdate, TransferAccept, TransferData, TransferEnd, TransferRequest,
@@ -38,6 +39,7 @@ use uuid::Uuid;
 use crate::error::ClientError;
 use crate::event::{
     AccountSummary, Direction, Event, NewsPost, NewsgroupInfo, PresenceUser, RoleInfo,
+    TrackerServer,
 };
 use crate::handle::{Command, Session};
 use crate::transfer::{chunk_len, total_chunks, ChunkBitmap, Sidecar, DEFAULT_CHUNK_SIZE};
@@ -95,6 +97,7 @@ pub(crate) struct Actor<S> {
     login: Option<PendingLogin>,
     list_waiters: VecDeque<oneshot::Sender<Result<FileListResponse, ClientError>>>,
     user_list_waiters: VecDeque<oneshot::Sender<Result<Vec<PresenceUser>, ClientError>>>,
+    server_list_waiters: VecDeque<oneshot::Sender<Result<Vec<TrackerServer>, ClientError>>>,
     user_info_waiters: VecDeque<oneshot::Sender<Result<PresenceUser, ClientError>>>,
     role_waiters: VecDeque<oneshot::Sender<Result<Vec<RoleInfo>, ClientError>>>,
     account_roles_waiters: VecDeque<oneshot::Sender<Result<Vec<String>, ClientError>>>,
@@ -119,6 +122,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
             login: None,
             list_waiters: VecDeque::new(),
             user_list_waiters: VecDeque::new(),
+            server_list_waiters: VecDeque::new(),
             user_info_waiters: VecDeque::new(),
             role_waiters: VecDeque::new(),
             account_roles_waiters: VecDeque::new(),
@@ -181,6 +185,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
             let _ = waiter.send(Err(ClientError::Disconnected));
         }
         for waiter in self.user_list_waiters.drain(..) {
+            let _ = waiter.send(Err(ClientError::Disconnected));
+        }
+        for waiter in self.server_list_waiters.drain(..) {
             let _ = waiter.send(Err(ClientError::Disconnected));
         }
         for waiter in self.user_info_waiters.drain(..) {
@@ -298,6 +305,17 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
                     .await
                 {
                     Ok(()) => self.user_list_waiters.push_back(reply),
+                    Err(e) => {
+                        let _ = reply.send(Err(e.into()));
+                    }
+                }
+            }
+            Command::ListServers { filter, reply } => {
+                match self
+                    .send(PacketType::TrackerListRequest, TrackerListRequest { filter }.encode())
+                    .await
+                {
+                    Ok(()) => self.server_list_waiters.push_back(reply),
                     Err(e) => {
                         let _ = reply.send(Err(e.into()));
                     }
@@ -760,6 +778,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
                 let response = UserInfoResponse::decode(&frame.payload)?;
                 if let Some(waiter) = self.user_info_waiters.pop_front() {
                     let _ = waiter.send(Ok(response.entry.into()));
+                }
+            }
+            PacketType::TrackerListResponse => {
+                let response = TrackerListResponse::decode(&frame.payload)?;
+                if let Some(waiter) = self.server_list_waiters.pop_front() {
+                    let _ = waiter.send(Ok(response.servers.into_iter().map(Into::into).collect()));
                 }
             }
             PacketType::RoleListResponse => {

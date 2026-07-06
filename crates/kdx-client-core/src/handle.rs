@@ -5,7 +5,9 @@ use tokio::sync::{mpsc, oneshot};
 use kdx_protocol::messages::FileListResponse;
 
 use crate::error::ClientError;
-use crate::event::{AccountSummary, NewsPost, NewsgroupInfo, PresenceUser, RoleInfo};
+use crate::event::{
+    AccountSummary, NewsPost, NewsgroupInfo, PresenceUser, RoleInfo, TrackerServer,
+};
 
 /// A logged-in session's identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,6 +62,10 @@ pub(crate) enum Command {
     },
     ListUsers {
         reply: oneshot::Sender<Result<Vec<PresenceUser>, ClientError>>,
+    },
+    ListServers {
+        filter: String,
+        reply: oneshot::Sender<Result<Vec<TrackerServer>, ClientError>>,
     },
     GetUserInfo {
         username: String,
@@ -277,6 +283,16 @@ impl ClientHandle {
     /// User List, distinct from a chat room's member list).
     pub async fn list_users(&self) -> Result<Vec<PresenceUser>, ClientError> {
         self.send(|reply| Command::ListUsers { reply }).await
+    }
+
+    /// Fetch the tracker directory of live servers (the Tracker window),
+    /// optionally filtered by a case-insensitive name substring (empty = all).
+    pub async fn list_servers(&self, filter: &str) -> Result<Vec<TrackerServer>, ClientError> {
+        self.send(|reply| Command::ListServers {
+            filter: filter.to_owned(),
+            reply,
+        })
+        .await
     }
 
     /// Fetch one user's detail (login/idle time, address) for the User Info

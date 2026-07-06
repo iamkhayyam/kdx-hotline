@@ -6,6 +6,7 @@ use kdx_server_core::auth::{AuthManager, RoleManager};
 use kdx_server_core::chat::RoomManager;
 use kdx_server_core::files::FileTree;
 use kdx_server_core::news::NewsManager;
+use kdx_server_core::tracker::{ServerEntry, Tracker, DEFAULT_TTL};
 use kdx_server_core::transfer::{TransferConfig, TransferManager};
 use kdx_server_core::{Connection, Presence, ServerCtx};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -77,11 +78,16 @@ pub async fn serve(config: Config) -> Result<Server, ServeError> {
         tree,
         transfers,
         presence: Presence::spawn(),
+        tracker: Tracker::spawn(DEFAULT_TTL),
     });
 
     let listener = TcpListener::bind(config.bind).await?;
     let local_addr = listener.local_addr()?;
     info!(%local_addr, "kdxd listening");
+
+    // Register this server in its own tracker directory and keep the entry
+    // fresh (and its live user count current) with a periodic heartbeat.
+    spawn_self_registration(&ctx, &config, local_addr);
 
     let accept_ctx = ctx.clone();
     let handle = tokio::spawn(async move {
@@ -117,6 +123,36 @@ pub async fn serve(config: Config) -> Result<Server, ServeError> {
         ctx,
         handle,
     })
+}
+
+/// Register this server in its own in-process tracker and keep the entry fresh
+/// with a heartbeat every 30s (well within the 90s TTL), refreshing the live
+/// user count each tick. The first tick fires immediately, so the directory
+/// lists this server as soon as it starts.
+fn spawn_self_registration(ctx: &Arc<ServerCtx>, config: &Config, local_addr: SocketAddr) {
+    let host = if local_addr.ip().is_unspecified() {
+        "127.0.0.1".to_string()
+    } else {
+        local_addr.ip().to_string()
+    };
+    let base = ServerEntry {
+        name: config.server_name.clone(),
+        host,
+        port: local_addr.port(),
+        users: 0,
+        max_users: config.max_users,
+        description: config.server_description.clone(),
+    };
+    let ctx = ctx.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(30));
+        loop {
+            tick.tick().await;
+            let mut entry = base.clone();
+            entry.users = ctx.presence.list().await.len() as u32;
+            ctx.tracker.heartbeat(entry).await;
+        }
+    });
 }
 
 fn build_tls_config(

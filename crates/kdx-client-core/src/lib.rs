@@ -31,6 +31,7 @@ pub use config::{ClientConfig, TrustPolicy};
 pub use error::ClientError;
 pub use event::{
     AccountSummary, Direction, Event, NewsPost, NewsgroupInfo, PresenceUser, RoleInfo,
+    TrackerServer,
 };
 pub use handle::{ClientHandle, Session};
 // Re-exported so consumers (the Tauri app) can name the file-listing shape

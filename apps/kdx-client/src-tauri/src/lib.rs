@@ -30,6 +30,7 @@ pub fn run() {
             commands::create_folder,
             commands::delete_path,
             commands::list_users,
+            commands::list_servers,
             commands::get_user_info,
             commands::send_private,
             commands::upload,

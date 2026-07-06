@@ -21,9 +21,9 @@ use kdx_protocol::messages::{
     NewsPostCreate, NewsPostDelete, NewsThreadListRequest, NewsThreadListResponse, NewsgroupCreate,
     NewsgroupInfo, NewsgroupListRequest, NewsgroupListResponse, PresenceListRequest,
     PresenceListResponse, PrivateMessage, PrivateSend, RoleAssign, RoleCreate, RoleDelete, RoleInfo,
-    RoleListRequest, RoleListResponse, RoleUnassign, RoleUpdate, TransferAccept, TransferData,
-    TransferEnd, TransferRequest, UserInfoRequest, UserInfoResponse, TRANSFER_HASH_MISMATCH,
-    TRANSFER_VERIFIED,
+    RoleListRequest, RoleListResponse, RoleUnassign, RoleUpdate, TrackerListRequest,
+    TrackerListResponse, TrackerServer, TransferAccept, TransferData, TransferEnd, TransferRequest,
+    UserInfoRequest, UserInfoResponse, TRANSFER_HASH_MISMATCH, TRANSFER_VERIFIED,
 };
 use kdx_protocol::{
     KdxCodec, KdxFrame, PacketFlags, PacketHeader, PacketType, ProtocolError, Reassembler,
@@ -41,6 +41,7 @@ use crate::chat::{Member, Outbound, RoomCommand, RoomManager};
 use crate::files::{FileTree, NodeKind};
 use crate::news::{NewsManager, Post as NewsPostDomain};
 use crate::presence::{unix_now, Presence};
+use crate::tracker::Tracker;
 use crate::transfer::{resume_id_from_wire, ActiveUpload, TransferError, TransferManager};
 
 /// How long the client has to send `HandshakeInit` after connecting.
@@ -70,6 +71,7 @@ pub struct ServerCtx {
     pub tree: FileTree,
     pub transfers: TransferManager,
     pub presence: Presence,
+    pub tracker: Tracker,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -933,6 +935,32 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                         Err(e) => self.send_error(&e.to_string()).await?,
                     }
                 }
+                PacketType::TrackerListRequest => {
+                    let req = TrackerListRequest::decode(&frame.payload)?;
+                    let filter = (!req.filter.trim().is_empty()).then_some(req.filter.as_str());
+                    let servers = self
+                        .ctx
+                        .tracker
+                        .query(filter)
+                        .await
+                        .into_iter()
+                        .map(|e| TrackerServer {
+                            name: e.name,
+                            host: e.host,
+                            port: e.port,
+                            users: e.users,
+                            max_users: e.max_users,
+                            description: e.description,
+                        })
+                        .collect();
+                    let response = TrackerListResponse { servers };
+                    self.send(
+                        PacketType::TrackerListResponse,
+                        PacketFlags::empty(),
+                        response.encode(),
+                    )
+                    .await?;
+                }
                 PacketType::NewsgroupListRequest => {
                     NewsgroupListRequest::decode(&frame.payload)?;
                     self.reply_newsgroup_list().await?;
@@ -1443,6 +1471,7 @@ mod tests {
             tree,
             transfers,
             presence: crate::presence::Presence::spawn(),
+            tracker: crate::tracker::Tracker::spawn(crate::tracker::DEFAULT_TTL),
         });
         (ctx, dir)
     }
@@ -1693,6 +1722,7 @@ mod tests {
             tree,
             transfers,
             presence: crate::presence::Presence::spawn(),
+            tracker: crate::tracker::Tracker::spawn(crate::tracker::DEFAULT_TTL),
         });
         (ctx, dir)
     }

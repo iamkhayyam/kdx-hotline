@@ -175,6 +175,18 @@ body::before {
 .msg-scroll { flex: 1; overflow-y: auto; padding: 8px 10px; }
 .chat-line.pm-mine .nick { color: var(--amber); }
 
+/* Trackers (server directory) */
+.trk-win { flex: 1; display: flex; flex-direction: column; min-height: 0; }
+.trk-row { padding: 6px 10px; border-bottom: 1px solid #1a0d0d; }
+.trk-row:hover { background: rgba(122,10,10,.12); }
+.trk-main { display: flex; align-items: baseline; gap: 8px; }
+.trk-name { flex: 1; color: var(--amber); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.trk-pop { color: var(--grey-dim); font-size: 11px; font-family: var(--mono); }
+.trk-pop.full { color: var(--alert); }
+.trk-sub { color: var(--ink); font-size: 11px; margin: 2px 0; }
+.trk-addr { display: flex; align-items: center; gap: 8px; color: var(--grey-dim); font-size: 10px; font-family: var(--mono); }
+.trk-addr .mini { margin-left: auto; }
+
 /* User List */
 .userlist-win { flex: 1; display: flex; flex-direction: column; min-height: 0; }
 .ul-row {

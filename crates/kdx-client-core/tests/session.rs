@@ -502,6 +502,32 @@ async fn news_post_read_threaded_and_class_gated() {
 }
 
 #[tokio::test]
+async fn tracker_lists_the_self_registered_server() {
+    let ts = TestServer::start().await;
+    ts.seed_account("phraq", "pw", 1).await;
+
+    let (client, mut events, _dd) = ts.connect_client().await;
+    next_event(&mut events).await;
+    client.login("phraq", "pw").await.unwrap();
+
+    // The server self-registers in its own tracker at startup; the directory
+    // lists it (default name "KDX Server", advertised on the bound port).
+    let servers = client.list_servers("").await.unwrap();
+    let me = servers
+        .iter()
+        .find(|s| s.port == ts.port())
+        .expect("self-registered server present");
+    assert_eq!(me.name, "KDX Server");
+    assert_eq!(me.max_users, 256);
+
+    // The name filter is honored.
+    assert_eq!(client.list_servers("KDX").await.unwrap().len(), 1);
+    assert!(client.list_servers("no-such-server").await.unwrap().is_empty());
+
+    ts.stop();
+}
+
+#[tokio::test]
 async fn admin_creates_and_deletes_folders() {
     let ts = TestServer::start().await;
     ts.seed_account("sysop", "pw", 3).await; // Admin: has FILE_MANAGE_TREE

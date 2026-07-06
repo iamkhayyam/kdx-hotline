@@ -132,6 +132,31 @@ impl From<kdx_protocol::messages::NewsPost> for NewsPost {
     }
 }
 
+/// One server in the tracker directory (the Tracker window). Mirrors
+/// `kdx_protocol::messages::TrackerServer`.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct TrackerServer {
+    pub name: String,
+    pub host: String,
+    pub port: u16,
+    pub users: u32,
+    pub max_users: u32,
+    pub description: String,
+}
+
+impl From<kdx_protocol::messages::TrackerServer> for TrackerServer {
+    fn from(s: kdx_protocol::messages::TrackerServer) -> Self {
+        Self {
+            name: s.name,
+            host: s.host,
+            port: s.port,
+            users: s.users,
+            max_users: s.max_users,
+            description: s.description,
+        }
+    }
+}
+
 /// Events pushed from the connection actor to the application. The serde
 /// representation (`{ "type": "chat", ... }`) is the exact contract the
 /// webview consumes, so its shape is covered by a test.

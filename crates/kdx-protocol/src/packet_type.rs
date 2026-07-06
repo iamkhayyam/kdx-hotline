@@ -68,6 +68,10 @@ pub enum PacketType {
     NewsPostDelete = 0x65,
     NewsgroupCreate = 0x66,
 
+    // Tracker directory (0x70-0x71)
+    TrackerListRequest = 0x70,
+    TrackerListResponse = 0x71,
+
     // System (0xF0-0xFF)
     Error = 0xF0,
     Warning = 0xF1,
@@ -75,7 +79,7 @@ pub enum PacketType {
 }
 
 impl PacketType {
-    pub const ALL: [PacketType; 52] = [
+    pub const ALL: [PacketType; 54] = [
         PacketType::HandshakeInit,
         PacketType::HandshakeResp,
         PacketType::Ping,
@@ -125,6 +129,8 @@ impl PacketType {
         PacketType::NewsPostCreate,
         PacketType::NewsPostDelete,
         PacketType::NewsgroupCreate,
+        PacketType::TrackerListRequest,
+        PacketType::TrackerListResponse,
         PacketType::Error,
         PacketType::Warning,
         PacketType::Info,
@@ -186,6 +192,8 @@ impl TryFrom<u8> for PacketType {
             0x64 => NewsPostCreate,
             0x65 => NewsPostDelete,
             0x66 => NewsgroupCreate,
+            0x70 => TrackerListRequest,
+            0x71 => TrackerListResponse,
             0xF0 => Error,
             0xF1 => Warning,
             0xF2 => Info,

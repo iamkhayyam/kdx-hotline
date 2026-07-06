@@ -17,6 +17,7 @@ const FEATURES = [
   { id: "disconnect", label: "Disconnect", action: "disconnect", requires: "connected" },
   { id: "connect", label: "Connect…", win: "connect" },
   { id: "addressbook", label: "Address Book", win: "addressbook" },
+  { id: "trackers", label: "Trackers", win: "trackers", requires: "connected" },
   { id: "transfers", label: "File Transfers", win: "transfers" },
   { id: "messages", label: "Messages", win: "messages", led: true, requires: "connected" },
   { sep: true },

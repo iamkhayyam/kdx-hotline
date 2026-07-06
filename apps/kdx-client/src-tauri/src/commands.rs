@@ -6,7 +6,7 @@ use std::path::PathBuf;
 
 use kdx_client_core::{
     connect as core_connect, trust_server, AccountSummary, ClientConfig, ClientError, Event,
-    NewsPost, NewsgroupInfo, PresenceUser, RoleInfo,
+    NewsPost, NewsgroupInfo, PresenceUser, RoleInfo, TrackerServer,
 };
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -197,6 +197,14 @@ fn file_list_dto(r: kdx_client_core::FileListResponse) -> FileListDto {
 #[tauri::command]
 pub async fn list_users(state: State<'_, AppState>) -> CmdResult<Vec<PresenceUser>> {
     with_client(&state, |c| async move { c.list_users().await }).await
+}
+
+#[tauri::command]
+pub async fn list_servers(
+    state: State<'_, AppState>,
+    filter: String,
+) -> CmdResult<Vec<TrackerServer>> {
+    with_client(&state, |c| async move { c.list_servers(&filter).await }).await
 }
 
 #[tauri::command]

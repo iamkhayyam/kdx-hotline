@@ -30,6 +30,23 @@ pub struct Config {
     /// Per-transfer download throttle in bytes/sec. 0 = unlimited.
     #[serde(default)]
     pub max_download_bytes_per_sec: u64,
+    /// Display name this server advertises to the tracker directory.
+    #[serde(default = "default_server_name")]
+    pub server_name: String,
+    /// One-line description shown in the tracker directory.
+    #[serde(default)]
+    pub server_description: String,
+    /// Advertised capacity (for the tracker directory's "users/max" figure).
+    #[serde(default = "default_max_users")]
+    pub max_users: u32,
+}
+
+fn default_server_name() -> String {
+    "KDX Server".to_string()
+}
+
+fn default_max_users() -> u32 {
+    256
 }
 
 fn default_files_root() -> PathBuf {
@@ -65,6 +82,9 @@ impl Default for Config {
             files_root: default_files_root(),
             max_upload_bytes_per_sec: 0,
             max_download_bytes_per_sec: 0,
+            server_name: default_server_name(),
+            server_description: String::new(),
+            max_users: default_max_users(),
         }
     }
 }

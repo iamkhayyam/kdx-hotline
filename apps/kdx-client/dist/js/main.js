@@ -15,6 +15,7 @@ import { buildMessages } from "./windows/messages.js";
 import { buildRoles } from "./windows/roles.js";
 import { buildAccounts } from "./windows/accounts.js";
 import { buildNews } from "./windows/news.js";
+import { buildTrackers } from "./windows/trackers.js";
 
 const desktop = document.getElementById("desktop");
 
@@ -50,6 +51,11 @@ function openMessagesWith(username) {
 }
 const accounts = buildAccounts();
 const news = buildNews(() => getState().session && getState().session.username);
+// Trackers: picking a server pre-fills the Connect window with its address.
+const trackers = buildTrackers((host, port) => {
+  connectApi.fill({ host, port: String(port) });
+  open("connect");
+});
 const roles = buildRoles(() => open("accounts"));
 const userList = buildUserList(
   (username) => {
@@ -154,6 +160,13 @@ register({
   rect: { x: 240, y: 60, w: 640, h: 460 },
   build: () => ({ body: news.body }),
   onOpen: () => news.refresh(),
+});
+register({
+  id: "trackers",
+  title: "Trackers",
+  rect: { x: 300, y: 120, w: 420, h: 360 },
+  build: () => ({ body: trackers.body }),
+  onOpen: () => trackers.refresh(),
 });
 
 // The Button Bar — the always-present launcher, itself a floating window on
