@@ -6,7 +6,7 @@ use std::path::PathBuf;
 
 use kdx_client_core::{
     connect as core_connect, trust_server, AccountSummary, ClientConfig, ClientError, Event,
-    NewsPost, NewsgroupInfo, PresenceUser, RoleInfo, TrackerServer,
+    FileSearchEntry, NewsPost, NewsgroupInfo, PresenceUser, RoleInfo, TrackerServer,
 };
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -177,6 +177,19 @@ pub async fn delete_path(state: State<'_, AppState>, path: String) -> CmdResult<
     with_client(&state, |c| async move { c.delete_path(&path).await })
         .await
         .map(file_list_dto)
+}
+
+#[tauri::command]
+pub async fn generate_catalog(state: State<'_, AppState>) -> CmdResult<u32> {
+    with_client(&state, |c| async move { c.generate_catalog().await }).await
+}
+
+#[tauri::command]
+pub async fn search_files(
+    state: State<'_, AppState>,
+    query: String,
+) -> CmdResult<Vec<FileSearchEntry>> {
+    with_client(&state, |c| async move { c.search_files(&query).await }).await
 }
 
 fn file_list_dto(r: kdx_client_core::FileListResponse) -> FileListDto {

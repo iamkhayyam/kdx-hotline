@@ -375,6 +375,16 @@ body::before {
 .f-info .f-info-path { color: var(--grey-dim); }
 .f-info .mini { margin-left: auto; }
 .f-info .err { color: var(--alert); }
+
+/* Files: catalog search bar */
+.f-searchbar { display: flex; align-items: center; gap: 6px; padding: 6px 10px; border-bottom: 1px solid var(--chrome-dim); background: var(--panel-deep); }
+.f-searchbar input {
+  flex: 1; background: #060404; border: 1px solid var(--chrome-dim); color: var(--green);
+  font-family: var(--mono); font-size: 12px; padding: 3px 6px;
+}
+.f-searchbar input:focus { outline: none; border-color: var(--alert); }
+.f-search-status { padding: 0 10px; font-size: 10px; color: var(--grey-dim); min-height: 1.4em; }
+.f-search-status:not(:empty) { padding-top: 3px; }
 .pathbar .mini { border: 1px solid var(--chrome); color: #f0b8b8; padding: 2px 8px; font-size: 10px; letter-spacing: .1em; cursor: pointer; background: #240707; text-transform: uppercase; }
 .pathbar .mini:hover { border-color: var(--alert); color: #fff; }
 table.files, table.tracker { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }

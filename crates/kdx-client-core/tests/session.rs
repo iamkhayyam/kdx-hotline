@@ -502,6 +502,70 @@ async fn news_post_read_threaded_and_class_gated() {
 }
 
 #[tokio::test]
+async fn admin_generates_catalog_and_search_is_class_filtered() {
+    let ts = TestServer::start().await;
+    ts.seed_account("sysop", "pw", 3).await; // Admin
+    ts.seed_account("guest", "pw", 0).await; // Guest
+
+    let (sysop, mut es, _d1) = ts.connect_client().await;
+    next_event(&mut es).await;
+    sysop.login("sysop", "pw").await.unwrap();
+
+    sysop.create_folder("/", "pub", 0, 0, 1).await.unwrap();
+    let listing = sysop.list_files("/pub").await.unwrap();
+    let _ = listing; // just to exercise the freshly-created folder
+    sysop.create_folder("/", "staff", 0, 3, 3).await.unwrap(); // admin-only
+
+    // Before generating a catalog, search is refused.
+    assert!(matches!(
+        sysop.search_files("").await,
+        Err(ClientError::Server(_))
+    ));
+
+    let count = sysop.generate_catalog().await.unwrap();
+    assert!(count >= 2);
+
+    // The admin sees both folders.
+    let admin_hits = sysop.search_files("").await.unwrap();
+    let names: Vec<_> = admin_hits.iter().map(|e| e.name.as_str()).collect();
+    assert!(names.contains(&"pub"));
+    assert!(names.contains(&"staff"));
+
+    // A guest's search is class-filtered to just the public folder.
+    let (guest, mut eg, _d2) = ts.connect_client().await;
+    next_event(&mut eg).await;
+    guest.login("guest", "pw").await.unwrap();
+    let guest_hits = guest.search_files("").await.unwrap();
+    let guest_names: Vec<_> = guest_hits.iter().map(|e| e.name.as_str()).collect();
+    assert!(guest_names.contains(&"pub"));
+    assert!(!guest_names.contains(&"staff"));
+
+    // A name filter narrows further.
+    let filtered = sysop.search_files("staff").await.unwrap();
+    assert_eq!(filtered.len(), 1);
+    assert_eq!(filtered[0].name, "staff");
+
+    ts.stop();
+}
+
+#[tokio::test]
+async fn plain_user_cannot_generate_catalog() {
+    let ts = TestServer::start().await;
+    ts.seed_account("plain", "pw", 1).await; // no FILE_MANAGE_TREE
+
+    let (client, mut events, _dd) = ts.connect_client().await;
+    next_event(&mut events).await;
+    client.login("plain", "pw").await.unwrap();
+
+    assert!(matches!(
+        client.generate_catalog().await,
+        Err(ClientError::Server(_))
+    ));
+
+    ts.stop();
+}
+
+#[tokio::test]
 async fn tracker_lists_the_self_registered_server() {
     let ts = TestServer::start().await;
     ts.seed_account("phraq", "pw", 1).await;

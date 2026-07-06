@@ -65,6 +65,21 @@ pub struct Entry {
     pub size: u64,
 }
 
+/// One indexed node, as produced by [`FileTree::generate_catalog`] and
+/// returned by [`FileTree::search`]. `min_read_class` mirrors the same gate
+/// [`FileTree::list`] / [`FileTree::open_for_read`] apply to this entry (a
+/// folder's own class for a folder, its parent's for a file) — the catalog is
+/// shared across all classes, so visibility is filtered at search time rather
+/// than baked into which entries get indexed.
+#[derive(Debug, Clone)]
+pub struct CatalogEntry {
+    pub path: String,
+    pub name: String,
+    pub kind: NodeKind,
+    pub size: u64,
+    pub min_read_class: BaseClass,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum TreeError {
     #[error("path not found")]
@@ -81,6 +96,8 @@ pub enum TreeError {
     Storage(#[from] kdx_storage::StorageError),
     #[error("corrupt node kind {0}")]
     CorruptKind(i64),
+    #[error("no catalog has been generated yet")]
+    CatalogNotGenerated,
 }
 
 struct TreeState {
@@ -92,6 +109,10 @@ struct TreeState {
 pub struct FileTree {
     pool: SqlitePool,
     state: RwLock<TreeState>,
+    /// Snapshot built by `generate_catalog`; `None` until the first call.
+    /// Deliberately not auto-built or auto-refreshed — it's an explicit,
+    /// admin-triggered index, not a live search of the tree.
+    catalog: RwLock<Option<Vec<CatalogEntry>>>,
 }
 
 fn class_from_i64(v: i64) -> BaseClass {
@@ -128,6 +149,7 @@ impl FileTree {
         Ok(Self {
             pool,
             state: RwLock::new(TreeState { nodes, children }),
+            catalog: RwLock::new(None),
         })
     }
 
@@ -296,6 +318,44 @@ impl FileTree {
         Ok(kind)
     }
 
+    /// (Re)build the search catalog: a flat snapshot of every entry currently
+    /// in the tree, excluding drop-box subtrees (their contents can never be
+    /// listed by anyone — same structural rule `list()` enforces). Returns the
+    /// number of entries indexed.
+    pub async fn generate_catalog(&self) -> usize {
+        let entries = {
+            let state = self.state.read().await;
+            let mut entries = Vec::new();
+            let root = &state.nodes[ROOT_ID];
+            collect_catalog(&state, root, "", &mut entries);
+            entries
+        };
+        let count = entries.len();
+        *self.catalog.write().await = Some(entries);
+        count
+    }
+
+    /// Search the last-generated catalog for `query` (case-insensitive
+    /// substring of the entry's name), filtered to what `class` may actually
+    /// see. Errors if `generate_catalog` has never been called.
+    pub async fn search(
+        &self,
+        query: &str,
+        class: BaseClass,
+        limit: usize,
+    ) -> Result<Vec<CatalogEntry>, TreeError> {
+        let catalog = self.catalog.read().await;
+        let entries = catalog.as_ref().ok_or(TreeError::CatalogNotGenerated)?;
+        let needle = query.to_lowercase();
+        Ok(entries
+            .iter()
+            .filter(|e| needle.is_empty() || e.name.to_lowercase().contains(&needle))
+            .filter(|e| class >= e.min_read_class)
+            .take(limit)
+            .cloned()
+            .collect())
+    }
+
     async fn insert_in_memory(&self, node: Node) {
         let mut state = self.state.write().await;
         if let Some(parent) = &node.parent_id {
@@ -329,6 +389,48 @@ fn collect_subtree(
         }
     }
     ordered.push(id.to_owned());
+}
+
+/// Recursively flatten `node`'s subtree into `out`, building full `/`-joined
+/// paths as it goes. Does not recurse into (or index the contents of) a
+/// DropBox — only the drop box entry itself is indexed, matching the fact
+/// that its contents are structurally unlistable to everyone.
+fn collect_catalog(state: &TreeState, node: &Node, parent_path: &str, out: &mut Vec<CatalogEntry>) {
+    let path = if node.id == ROOT_ID {
+        String::from("/")
+    } else {
+        format!("{}/{}", parent_path.trim_end_matches('/'), node.name)
+    };
+    if node.id != ROOT_ID {
+        let min_read_class = if node.kind.is_folder() {
+            node.min_class_read
+        } else {
+            // A file's visibility follows its containing folder's read gate
+            // (mirrors open_for_read), not any class of its own.
+            state
+                .nodes
+                .get(node.parent_id.as_deref().unwrap_or(""))
+                .map(|p| p.min_class_read)
+                .unwrap_or(node.min_class_read)
+        };
+        out.push(CatalogEntry {
+            path: path.clone(),
+            name: node.name.clone(),
+            kind: node.kind,
+            size: node.size,
+            min_read_class,
+        });
+    }
+    if node.kind == NodeKind::DropBox {
+        return; // structurally unlistable — don't index what's inside
+    }
+    if let Some(children) = state.children.get(&node.id) {
+        for child_id in children {
+            if let Some(child) = state.nodes.get(child_id) {
+                collect_catalog(state, child, &path, out);
+            }
+        }
+    }
 }
 
 impl TreeState {
@@ -462,5 +564,74 @@ mod tests {
             tree.prepare_upload("/", "dup.bin", BaseClass::Admin).await,
             Err(TreeError::Exists)
         ));
+    }
+
+    #[tokio::test]
+    async fn search_requires_a_generated_catalog() {
+        let (tree, _dir) = tree().await;
+        assert!(matches!(
+            tree.search("x", BaseClass::Admin, 50).await,
+            Err(TreeError::CatalogNotGenerated)
+        ));
+    }
+
+    #[tokio::test]
+    async fn catalog_indexes_the_tree_and_search_filters_by_name_and_class() {
+        let (tree, _dir) = tree().await;
+        tree.create_folder("/", "pub", NodeKind::Directory, BaseClass::Guest, BaseClass::User)
+            .await
+            .unwrap();
+        let pub_dir = tree.resolve("/pub").await.unwrap();
+        tree.add_file(&pub_dir.id, "readme.txt", 10, &[0u8; 32], "/tmp/a")
+            .await
+            .unwrap();
+        tree.create_folder(
+            "/",
+            "staff",
+            NodeKind::Directory,
+            BaseClass::Admin, // only admins may even see this folder
+            BaseClass::Admin,
+        )
+        .await
+        .unwrap();
+        let staff_dir = tree.resolve("/staff").await.unwrap();
+        tree.add_file(&staff_dir.id, "payroll.csv", 20, &[0u8; 32], "/tmp/b")
+            .await
+            .unwrap();
+
+        let count = tree.generate_catalog().await;
+        assert_eq!(count, 4); // pub, pub/readme.txt, staff, staff/payroll.csv
+
+        // A guest sees the public entries but not the admin-only folder or
+        // its file, even though both are in the catalog.
+        let guest_hits = tree.search("", BaseClass::Guest, 50).await.unwrap();
+        let names: Vec<_> = guest_hits.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"pub"));
+        assert!(names.contains(&"readme.txt"));
+        assert!(!names.contains(&"staff"));
+        assert!(!names.contains(&"payroll.csv"));
+
+        // An admin sees everything; a name filter narrows it further.
+        let admin_hits = tree.search("read", BaseClass::Admin, 50).await.unwrap();
+        assert_eq!(admin_hits.len(), 1);
+        assert_eq!(admin_hits[0].path, "/pub/readme.txt");
+    }
+
+    #[tokio::test]
+    async fn catalog_excludes_dropbox_contents() {
+        let (tree, _dir) = tree().await;
+        tree.create_folder("/", "drop", NodeKind::DropBox, BaseClass::Guest, BaseClass::User)
+            .await
+            .unwrap();
+        let drop = tree.resolve("/drop").await.unwrap();
+        tree.add_file(&drop.id, "secret.zip", 5, &[0u8; 32], "/tmp/c")
+            .await
+            .unwrap();
+
+        tree.generate_catalog().await;
+        let hits = tree.search("", BaseClass::Admin, 50).await.unwrap();
+        let names: Vec<_> = hits.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"drop")); // the box itself is indexed
+        assert!(!names.contains(&"secret.zip")); // its contents are not
     }
 }

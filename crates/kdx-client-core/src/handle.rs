@@ -6,7 +6,8 @@ use kdx_protocol::messages::FileListResponse;
 
 use crate::error::ClientError;
 use crate::event::{
-    AccountSummary, NewsPost, NewsgroupInfo, PresenceUser, RoleInfo, TrackerServer,
+    AccountSummary, FileSearchEntry, NewsPost, NewsgroupInfo, PresenceUser, RoleInfo,
+    TrackerServer,
 };
 
 /// A logged-in session's identity.
@@ -59,6 +60,13 @@ pub(crate) enum Command {
     DeletePath {
         path: String,
         reply: oneshot::Sender<Result<FileListResponse, ClientError>>,
+    },
+    GenerateCatalog {
+        reply: oneshot::Sender<Result<u32, ClientError>>,
+    },
+    SearchFiles {
+        query: String,
+        reply: oneshot::Sender<Result<Vec<FileSearchEntry>, ClientError>>,
     },
     ListUsers {
         reply: oneshot::Sender<Result<Vec<PresenceUser>, ClientError>>,
@@ -274,6 +282,24 @@ impl ClientHandle {
     pub async fn delete_path(&self, path: &str) -> Result<FileListResponse, ClientError> {
         self.send(|reply| Command::DeletePath {
             path: path.to_owned(),
+            reply,
+        })
+        .await
+    }
+
+    /// (Re)build the server's search catalog. Requires FILE_MANAGE_TREE.
+    /// Resolves with the number of entries indexed. The catalog does not
+    /// auto-refresh — call again after tree changes to keep search current.
+    pub async fn generate_catalog(&self) -> Result<u32, ClientError> {
+        self.send(|reply| Command::GenerateCatalog { reply }).await
+    }
+
+    /// Search the last-generated catalog. Empty `query` matches everything
+    /// visible to the caller's class. Errors if no catalog has been
+    /// generated yet.
+    pub async fn search_files(&self, query: &str) -> Result<Vec<FileSearchEntry>, ClientError> {
+        self.send(|reply| Command::SearchFiles {
+            query: query.to_owned(),
             reply,
         })
         .await

@@ -157,6 +157,27 @@ impl From<kdx_protocol::messages::TrackerServer> for TrackerServer {
     }
 }
 
+/// One catalog search hit (the Files → Search results). Mirrors
+/// `kdx_protocol::messages::FileSearchEntry`.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct FileSearchEntry {
+    pub path: String,
+    pub name: String,
+    pub kind: u8,
+    pub size: u64,
+}
+
+impl From<kdx_protocol::messages::FileSearchEntry> for FileSearchEntry {
+    fn from(e: kdx_protocol::messages::FileSearchEntry) -> Self {
+        Self {
+            path: e.path,
+            name: e.name,
+            kind: e.kind,
+            size: e.size,
+        }
+    }
+}
+
 /// Events pushed from the connection actor to the application. The serde
 /// representation (`{ "type": "chat", ... }`) is the exact contract the
 /// webview consumes, so its shape is covered by a test.

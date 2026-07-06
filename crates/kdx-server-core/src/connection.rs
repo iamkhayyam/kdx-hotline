@@ -16,8 +16,9 @@ use kdx_protocol::messages::{
     AccountCreate, AccountListRequest, AccountListResponse, AccountRolesRequest,
     AccountRolesResponse, AccountSummary, AccountUpdate, AdminDisconnect, AuthChallenge,
     AuthRequest, AuthResponse, AuthResult, ChatJoin, ChatLeave, ChatSend, ChatTopic,
-    FileCreateFolder, FileDelete, FileEntry, FileListRequest, FileListResponse, HandshakeInit,
-    HandshakeResp, NewsPost as WireNewsPost,
+    FileCatalogGenerated, FileCreateFolder, FileDelete, FileEntry, FileGenerateCatalog,
+    FileListRequest, FileListResponse, FileSearchEntry, FileSearchRequest, FileSearchResponse,
+    HandshakeInit, HandshakeResp, NewsPost as WireNewsPost,
     NewsPostCreate, NewsPostDelete, NewsThreadListRequest, NewsThreadListResponse, NewsgroupCreate,
     NewsgroupInfo, NewsgroupListRequest, NewsgroupListResponse, PresenceListRequest,
     PresenceListResponse, PrivateMessage, PrivateSend, RoleAssign, RoleCreate, RoleDelete, RoleInfo,
@@ -61,6 +62,9 @@ pub const MAX_AUTH_ATTEMPTS: u8 = 3;
 /// Depth of a connection's outbound event queue. Room broadcasts to a full
 /// queue are dropped for that member rather than stalling the room.
 pub const OUTBOUND_QUEUE: usize = 128;
+
+/// Cap on search results returned in one `FileSearchResponse`.
+const FILE_SEARCH_LIMIT: usize = 200;
 
 /// Shared server-wide services handed to every connection.
 pub struct ServerCtx {
@@ -570,6 +574,54 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                             // Re-list the deleted node's parent directory.
                             let parent = parent_path(&req.path);
                             self.reply_file_list(&parent, class).await?;
+                        }
+                        Err(e) => self.send_error(&e.to_string()).await?,
+                    }
+                }
+                PacketType::FileGenerateCatalog => {
+                    FileGenerateCatalog::decode(&frame.payload)?;
+                    let privs = self.session.as_ref().expect("authed").privileges;
+                    if !privs.contains(Privileges::FILE_MANAGE_TREE) {
+                        self.send_error("missing FILE_MANAGE_TREE privilege").await?;
+                        continue;
+                    }
+                    let count = self.ctx.tree.generate_catalog().await as u32;
+                    self.send(
+                        PacketType::FileCatalogGenerated,
+                        PacketFlags::empty(),
+                        FileCatalogGenerated { count }.encode(),
+                    )
+                    .await?;
+                }
+                PacketType::FileSearchRequest => {
+                    let req = FileSearchRequest::decode(&frame.payload)?;
+                    let (class, privs) = {
+                        let s = self.session.as_ref().expect("authed");
+                        (s.class, s.privileges)
+                    };
+                    if !privs.contains(Privileges::FILE_LIST) {
+                        self.send_error("missing FILE_LIST privilege").await?;
+                        continue;
+                    }
+                    match self.ctx.tree.search(&req.query, class, FILE_SEARCH_LIMIT).await {
+                        Ok(hits) => {
+                            let response = FileSearchResponse {
+                                entries: hits
+                                    .into_iter()
+                                    .map(|e| FileSearchEntry {
+                                        path: e.path,
+                                        name: e.name,
+                                        kind: e.kind.as_u8(),
+                                        size: e.size,
+                                    })
+                                    .collect(),
+                            };
+                            self.send(
+                                PacketType::FileSearchResponse,
+                                PacketFlags::empty(),
+                                response.encode(),
+                            )
+                            .await?;
                         }
                         Err(e) => self.send_error(&e.to_string()).await?,
                     }

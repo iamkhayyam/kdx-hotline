@@ -18,9 +18,17 @@ export function buildFiles() {
       <input class="ab-filter" id="f-filter" placeholder="filter…" spellcheck="false" />
       <button class="mini" id="f-up">Up</button>
       <button class="mini" id="f-newfolder">New Folder</button>
+      <button class="mini" id="f-search-toggle">Search</button>
       <button class="mini" id="f-refresh">Refresh</button>
       <button class="mini" id="f-upload">Upload</button>
     </div>
+    <form class="f-searchbar hidden" id="f-searchbar">
+      <input id="f-search-query" placeholder="search the catalog…" spellcheck="false" autocomplete="off" />
+      <button type="submit" class="mini">Search</button>
+      <button type="button" class="mini" id="f-gen-catalog">Generate Catalog</button>
+      <button type="button" class="mini" id="f-search-close">×</button>
+    </form>
+    <div class="f-search-status" id="f-search-status"></div>
     <form class="f-mkform hidden" id="f-mkform">
       <div class="f-mkrow">
         <input id="f-mk-name" placeholder="folder name" spellcheck="false" autocomplete="off" />
@@ -46,10 +54,17 @@ export function buildFiles() {
   const filter = body.querySelector("#f-filter");
   const mkform = body.querySelector("#f-mkform");
   const infoEl = body.querySelector("#f-info");
+  const searchbar = body.querySelector("#f-searchbar");
+  const searchStatus = body.querySelector("#f-search-status");
   let cwd = "/";
   let entries = [];
+  let searchHits = null; // non-null while showing search results instead of a folder listing
 
   async function refresh() {
+    // Navigating/refreshing a folder always leaves search-results mode.
+    searchHits = null;
+    searchbar.classList.add("hidden");
+    searchStatus.textContent = "";
     pathEl.textContent = cwd;
     listEl.innerHTML = '<div class="empty">loading…</div>';
     try {
@@ -62,6 +77,11 @@ export function buildFiles() {
   }
 
   function render() {
+    if (searchHits) renderSearchResults();
+    else renderBrowse();
+  }
+
+  function renderBrowse() {
     const needle = filter.value.trim().toLowerCase();
     const shown = entries.filter((e) => !needle || e.name.toLowerCase().includes(needle));
     if (!shown.length) {
@@ -98,6 +118,49 @@ export function buildFiles() {
     listEl.appendChild(table);
   }
 
+  // Catalog search results carry a full path (they can span any folder), so
+  // clicking one jumps the browser there instead of joining onto `cwd`.
+  function renderSearchResults() {
+    if (!searchHits.length) {
+      listEl.innerHTML = '<div class="empty">no matches in the catalog</div>';
+      return;
+    }
+    const table = document.createElement("table");
+    table.className = "files";
+    table.innerHTML =
+      "<thead><tr><th>Name</th><th>Path</th><th style='text-align:right'>Size</th></tr></thead>";
+    const tb = document.createElement("tbody");
+    for (const e of searchHits) {
+      const tr = document.createElement("tr");
+      if (e.kind === KIND_DROPBOX) tr.className = "dropbox";
+      tr.innerHTML =
+        `<td class="fname"><span class="kind">${KINDS[e.kind] || "[?]"}</span>${escapeHtml(e.name)}</td>` +
+        `<td class="fmeta">${escapeHtml(e.path)}</td>` +
+        `<td class="fsize">${e.kind === KIND_FILE ? fmtSize(e.size) : "—"}</td>`;
+      tr.addEventListener("click", () => onSearchHit(e));
+      tb.appendChild(tr);
+    }
+    table.appendChild(tb);
+    listEl.innerHTML = "";
+    listEl.appendChild(table);
+  }
+
+  function onSearchHit(e) {
+    if (e.kind === KIND_FILE) {
+      downloadEntryAt(e.path, e.name);
+      return;
+    }
+    exitSearch();
+    cwd = e.path;
+    refresh();
+  }
+
+  function exitSearch() {
+    searchHits = null;
+    searchStatus.textContent = "";
+    searchbar.classList.add("hidden");
+  }
+
   async function onEntry(e) {
     if (e.kind === KIND_DIR || e.kind === KIND_DROPBOX || e.kind === 3) {
       cwd = joinPath(cwd, e.name);
@@ -109,9 +172,13 @@ export function buildFiles() {
   }
 
   async function downloadEntry(e) {
-    const dest = await pickSave(e.name);
+    await downloadEntryAt(joinPath(cwd, e.name), e.name);
+  }
+
+  async function downloadEntryAt(remotePath, name) {
+    const dest = await pickSave(name);
     if (!dest) return;
-    invoke("download", { remotePath: joinPath(cwd, e.name), local: dest }).catch(() => {});
+    invoke("download", { remotePath, local: dest }).catch(() => {});
   }
 
   function showInfo(e) {
@@ -155,8 +222,47 @@ export function buildFiles() {
     invoke("upload", { local: path, remoteDir: cwd }).catch(() => {});
   };
 
+  // Search — a catalog-wide lookup, distinct from the type-to-filter box
+  // (which only narrows the current folder's listing).
+  body.querySelector("#f-search-toggle").onclick = () => {
+    mkform.classList.add("hidden");
+    searchbar.classList.remove("hidden");
+    const q = body.querySelector("#f-search-query");
+    q.value = "";
+    searchStatus.textContent = "";
+    q.focus();
+  };
+  body.querySelector("#f-search-close").onclick = () => {
+    exitSearch();
+    render();
+  };
+  body.querySelector("#f-gen-catalog").onclick = async () => {
+    searchStatus.textContent = "generating catalog…";
+    try {
+      const count = await invoke("generate_catalog");
+      searchStatus.textContent = `catalog ready — ${count} entries indexed`;
+    } catch (err) {
+      searchStatus.textContent = escapeHtml(err.message || String(err));
+    }
+  };
+  searchbar.addEventListener("submit", async (ev) => {
+    ev.preventDefault();
+    const query = body.querySelector("#f-search-query").value.trim();
+    searchStatus.textContent = "searching…";
+    try {
+      searchHits = await invoke("search_files", { query });
+      searchStatus.textContent = `${searchHits.length} match${searchHits.length === 1 ? "" : "es"}`;
+      render();
+    } catch (err) {
+      searchHits = [];
+      searchStatus.textContent = escapeHtml(err.message || String(err));
+      render();
+    }
+  });
+
   // New Folder dialog.
   body.querySelector("#f-newfolder").onclick = () => {
+    searchbar.classList.add("hidden");
     mkform.classList.remove("hidden");
     body.querySelector("#f-mk-name").value = "";
     body.querySelector("#f-mk-result").textContent = "";

@@ -15,8 +15,9 @@ use kdx_crypto::KdfParams;
 use kdx_protocol::messages::{
     AccountCreate, AccountListRequest, AccountListResponse, AccountRolesRequest,
     AccountRolesResponse, AccountUpdate, AdminDisconnect, AuthChallenge, AuthRequest, AuthResponse,
-    AuthResult, ChatEvent, ChatJoin, ChatLeave, ChatSend, ChatTopic, ChatUserList, FileCreateFolder,
-    FileDelete, FileListRequest, NewsPostCreate, NewsPostDelete, NewsThreadListRequest,
+    AuthResult, ChatEvent, ChatJoin, ChatLeave, ChatSend, ChatTopic, ChatUserList,
+    FileCatalogGenerated, FileCreateFolder, FileDelete, FileGenerateCatalog, FileListRequest,
+    FileSearchRequest, FileSearchResponse, NewsPostCreate, NewsPostDelete, NewsThreadListRequest,
     NewsThreadListResponse, NewsgroupCreate, NewsgroupListRequest, NewsgroupListResponse,
     TrackerListRequest, TrackerListResponse,
     FileListResponse, PresenceChange, PresenceListRequest, PresenceListResponse, PrivateMessage,
@@ -38,8 +39,8 @@ use uuid::Uuid;
 
 use crate::error::ClientError;
 use crate::event::{
-    AccountSummary, Direction, Event, NewsPost, NewsgroupInfo, PresenceUser, RoleInfo,
-    TrackerServer,
+    AccountSummary, Direction, Event, FileSearchEntry, NewsPost, NewsgroupInfo, PresenceUser,
+    RoleInfo, TrackerServer,
 };
 use crate::handle::{Command, Session};
 use crate::transfer::{chunk_len, total_chunks, ChunkBitmap, Sidecar, DEFAULT_CHUNK_SIZE};
@@ -98,6 +99,8 @@ pub(crate) struct Actor<S> {
     list_waiters: VecDeque<oneshot::Sender<Result<FileListResponse, ClientError>>>,
     user_list_waiters: VecDeque<oneshot::Sender<Result<Vec<PresenceUser>, ClientError>>>,
     server_list_waiters: VecDeque<oneshot::Sender<Result<Vec<TrackerServer>, ClientError>>>,
+    catalog_waiters: VecDeque<oneshot::Sender<Result<u32, ClientError>>>,
+    search_waiters: VecDeque<oneshot::Sender<Result<Vec<FileSearchEntry>, ClientError>>>,
     user_info_waiters: VecDeque<oneshot::Sender<Result<PresenceUser, ClientError>>>,
     role_waiters: VecDeque<oneshot::Sender<Result<Vec<RoleInfo>, ClientError>>>,
     account_roles_waiters: VecDeque<oneshot::Sender<Result<Vec<String>, ClientError>>>,
@@ -123,6 +126,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
             list_waiters: VecDeque::new(),
             user_list_waiters: VecDeque::new(),
             server_list_waiters: VecDeque::new(),
+            catalog_waiters: VecDeque::new(),
+            search_waiters: VecDeque::new(),
             user_info_waiters: VecDeque::new(),
             role_waiters: VecDeque::new(),
             account_roles_waiters: VecDeque::new(),
@@ -188,6 +193,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
             let _ = waiter.send(Err(ClientError::Disconnected));
         }
         for waiter in self.server_list_waiters.drain(..) {
+            let _ = waiter.send(Err(ClientError::Disconnected));
+        }
+        for waiter in self.catalog_waiters.drain(..) {
+            let _ = waiter.send(Err(ClientError::Disconnected));
+        }
+        for waiter in self.search_waiters.drain(..) {
             let _ = waiter.send(Err(ClientError::Disconnected));
         }
         for waiter in self.user_info_waiters.drain(..) {
@@ -294,6 +305,28 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
             Command::DeletePath { path, reply } => {
                 match self.send(PacketType::FileDelete, FileDelete { path }.encode()).await {
                     Ok(()) => self.list_waiters.push_back(reply),
+                    Err(e) => {
+                        let _ = reply.send(Err(e.into()));
+                    }
+                }
+            }
+            Command::GenerateCatalog { reply } => {
+                match self
+                    .send(PacketType::FileGenerateCatalog, FileGenerateCatalog.encode())
+                    .await
+                {
+                    Ok(()) => self.catalog_waiters.push_back(reply),
+                    Err(e) => {
+                        let _ = reply.send(Err(e.into()));
+                    }
+                }
+            }
+            Command::SearchFiles { query, reply } => {
+                match self
+                    .send(PacketType::FileSearchRequest, FileSearchRequest { query }.encode())
+                    .await
+                {
+                    Ok(()) => self.search_waiters.push_back(reply),
                     Err(e) => {
                         let _ = reply.send(Err(e.into()));
                     }
@@ -768,6 +801,18 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
                     let _ = waiter.send(Ok(response));
                 }
             }
+            PacketType::FileCatalogGenerated => {
+                let response = FileCatalogGenerated::decode(&frame.payload)?;
+                if let Some(waiter) = self.catalog_waiters.pop_front() {
+                    let _ = waiter.send(Ok(response.count));
+                }
+            }
+            PacketType::FileSearchResponse => {
+                let response = FileSearchResponse::decode(&frame.payload)?;
+                if let Some(waiter) = self.search_waiters.pop_front() {
+                    let _ = waiter.send(Ok(response.entries.into_iter().map(Into::into).collect()));
+                }
+            }
             PacketType::PresenceListResponse => {
                 let response = PresenceListResponse::decode(&frame.payload)?;
                 if let Some(waiter) = self.user_list_waiters.pop_front() {
@@ -1049,6 +1094,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
         // A file listing/mutation can fail (missing privilege, name exists,
         // not found) — fail the pending waiter instead of hanging it.
         if let Some(waiter) = self.list_waiters.pop_front() {
+            let _ = waiter.send(Err(ClientError::Server(text.clone())));
+        }
+        // A catalog generation or search can fail the same way (missing
+        // privilege, or search before any catalog exists).
+        if let Some(waiter) = self.catalog_waiters.pop_front() {
+            let _ = waiter.send(Err(ClientError::Server(text.clone())));
+        }
+        if let Some(waiter) = self.search_waiters.pop_front() {
             let _ = waiter.send(Err(ClientError::Server(text.clone())));
         }
         // Likewise a pending User Info lookup (e.g. the user isn't online).

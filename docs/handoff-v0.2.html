@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>KDX — GUI & Feature Handoff</title>
+<title>KDX — GUI & Feature Handoff (v0.2)</title>
 <style>html,body{margin:0;background:#060404}</style>
 </head>
 <body>
@@ -173,7 +173,7 @@
 
   <nav class="toc">
     <div class="logo">KDX</div>
-    <div class="sub">GUI &amp; Feature Handoff</div>
+    <div class="sub">GUI &amp; Feature Handoff · v0.2</div>
     <div class="grp">Orientation</div>
     <a href="#overview">Overview</a>
     <a href="#map">System map</a>
@@ -183,6 +183,12 @@
     <a href="#chat">Chat window</a>
     <a href="#files">Files window</a>
     <a href="#transfers">Transfers window</a>
+    <a href="#people">User List &amp; Info</a>
+    <a href="#messages">Messages window</a>
+    <a href="#news">Public News window</a>
+    <a href="#admin-win">Administration window</a>
+    <a href="#accounts-win">Accounts window</a>
+    <a href="#extras">Address Book, Trackers, Settings</a>
     <div class="grp">The bridge</div>
     <a href="#commands">Command reference</a>
     <a href="#events">Event stream</a>
@@ -190,8 +196,11 @@
     <a href="#protocol">Protocol &amp; framing</a>
     <a href="#auth">Auth &amp; trust</a>
     <a href="#rooms">Chat &amp; classes</a>
+    <a href="#roles">Roles &amp; overrides</a>
     <a href="#tree">Files &amp; ACLs</a>
     <a href="#xfer">Transfers &amp; resume</a>
+    <a href="#pm">Private messaging</a>
+    <a href="#newsdeep">News &amp; threading</a>
     <div class="grp">Operating it</div>
     <a href="#run">Running it</a>
     <a href="#verify">Verification</a>
@@ -201,22 +210,27 @@
   <main>
 
     <section id="overview">
-      <div class="eyebrow">Handoff · v0.1</div>
+      <div class="eyebrow">Handoff · v0.2</div>
       <h1>KDX Client &amp; Server</h1>
-      <p class="lead">A from-scratch Rust rebuild of KDX — an early-2000s Hotline-style chat and file-sharing system. A custom binary protocol over TLS 1.3, a challenge-response login where the password never leaves the machine, chat rooms, a virtual file tree with drop boxes, and resumable chunked transfers both directions. The client is a Tauri desktop app in the classic black / blood-red / phosphor-green aesthetic.</p>
+      <p class="lead">A from-scratch Rust rebuild of KDX — an early-2000s Hotline-style chat and file-sharing system. A custom binary protocol over TLS 1.3, a challenge-response login where the password never leaves the machine, chat rooms with presence and private messages, threaded public news, a virtual file tree with drop boxes, in-app account and role administration, and resumable chunked transfers both directions. The client is a Tauri desktop app in the classic black / blood-red / phosphor-green aesthetic.</p>
 
       <div class="stats">
         <div class="cell"><div class="k">Crates</div><div class="v">6 <small>+ 1 app</small></div></div>
-        <div class="cell"><div class="k">Tests</div><div class="v">107 <small>green</small></div></div>
-        <div class="cell"><div class="k">Commands</div><div class="v">11</div></div>
-        <div class="cell"><div class="k">Events</div><div class="v">11</div></div>
-        <div class="cell"><div class="k">Windows</div><div class="v">4</div></div>
+        <div class="cell"><div class="k">Tests</div><div class="v">162 <small>green</small></div></div>
+        <div class="cell"><div class="k">Commands</div><div class="v">33</div></div>
+        <div class="cell"><div class="k">Events</div><div class="v">13</div></div>
+        <div class="cell"><div class="k">Windows</div><div class="v">14</div></div>
       </div>
 
       <p>This document is the reference for <strong>what the interface does</strong> and <strong>how each feature works underneath</strong>. Read the interface sections to operate the app; read "Under the hood" to understand or extend the machinery each window drives.</p>
 
       <div class="note">
-        <span class="lbl">Two halves, one protocol</span>
+        <span class="lbl">v0.1 → v0.2, in one line</span>
+        The 4-window "concept" client (Connect / Chat / Files / Transfers) is now a 14-window desktop: server-wide presence and User List, private Messages, threaded Public News, an Administration window (custom roles + disconnect/ban), an in-app Accounts editor, an Address Book, and a Trackers directory. <a class="inline" href="handoff.html">The original v0.1 doc</a> is kept as-is for comparison.
+      </div>
+
+      <div class="note green">
+        <span class="lbl" style="color:var(--green)">Two halves, one protocol</span>
         The client links the <em>same</em> <code>kdx-protocol</code> and <code>kdx-crypto</code> crates the server uses, so the wire format has a single implementation shared by both sides — no drift between what the server speaks and what the client expects.
       </div>
     </section>
@@ -244,8 +258,8 @@
           <tbody>
             <tr><td><code>kdx-protocol</code></td><td>Wire format: 20-byte framed packets, codec, fragmentation, typed messages. Shared by client and server.</td></tr>
             <tr><td><code>kdx-crypto</code></td><td>Argon2id password hashing + challenge-response helpers.</td></tr>
-            <tr><td><code>kdx-server-core</code></td><td>Connection state machine, auth, chat rooms, file tree, transfers, tracker.</td></tr>
-            <tr><td><code>kdx-storage</code></td><td>sqlx / SQLite persistence (accounts, file tree, resume state).</td></tr>
+            <tr><td><code>kdx-server-core</code></td><td>Connection state machine, auth, chat rooms + presence, private messages, roles/privilege overrides, public news, file tree, transfers, tracker.</td></tr>
+            <tr><td><code>kdx-storage</code></td><td>sqlx / SQLite persistence (accounts, roles, news, file tree, resume state).</td></tr>
             <tr><td><code>kdx-client-core</code></td><td>Async client library, zero UI deps. TOFU trust, transfer engines, event stream.</td></tr>
             <tr><td><code>kdxd</code></td><td>The server daemon binary (+ <code>useradd</code> subcommand).</td></tr>
             <tr><td><code>apps/kdx-client</code></td><td>Tauri v2 desktop app: a thin Rust shell + the webview frontend.</td></tr>
@@ -257,23 +271,26 @@
     <section id="desktop">
       <div class="eyebrow">The interface</div>
       <h2>The desktop</h2>
-      <p>The client is a single OS window hosting a <strong>desktop metaphor</strong>: four draggable, focusable panels rendered in the webview, not separate OS windows. A menu bar across the top focuses (and un-hides) each panel; a footer shows connection state. Click a title bar to drag; click anywhere in a panel to bring it forward.</p>
+      <p>The client is a single OS window hosting a <strong>desktop metaphor</strong>: a thin top menubar (brand + connection chip) over an open desktop, plus a vertical <strong>Button Bar</strong> — itself a floating, draggable window sized to its content — that launches all 14 feature windows. Windows are lazily built on first open, are resizable and rememeber their geometry, can be minimized to a bottom-left dock, and support a per-window "Keep on Top" toggle. F1 opens a window switcher; Ctrl/Cmd+W closes the focused window.</p>
 
       <div class="grid2">
         <div class="card">
-          <h3>Menu bar</h3>
+          <h3>Button Bar</h3>
           <ul class="clean">
-            <li><strong>File / Chat / Transfers</strong> — focus that window.</li>
-            <li><strong>Status chip</strong> (right) — <span class="pill grey">offline</span> <span class="pill amber">connecting</span> <span class="pill green">online</span>, showing <code>kdx://host:port</code> once connected.</li>
+            <li><strong>Server header</strong> — shows <code>host:port</code> or "Not connected"; click opens Connect.</li>
+            <li><strong>Feature buttons</strong> — News, Public Chat, Files, User List, Administration, Disconnect / Connect, Address Book, File Transfers, Messages (unread LED), Settings, About, Exit.</li>
+            <li><strong>Footer counters</strong> — users online · rooms · active transfers.</li>
+            <li>Buttons auto-enable once connected; admin-only windows still open for everyone but the actions inside them are gated server-side.</li>
           </ul>
         </div>
         <div class="card">
-          <h3>The four windows</h3>
+          <h3>The 14 windows</h3>
           <ul class="clean">
-            <li><strong>Connect</strong> — server address, login, TOFU trust prompt.</li>
-            <li><strong>Chat</strong> — the lobby: messages, users, topic.</li>
-            <li><strong>Files</strong> — browse, upload, download.</li>
-            <li><strong>Transfers</strong> — live per-chunk progress.</li>
+            <li><strong>Connect · Chat · Files · Transfers</strong> — the original core loop.</li>
+            <li><strong>User List · User Info · Messages</strong> — presence and private messaging.</li>
+            <li><strong>Public News</strong> — newsgroups and threaded posts.</li>
+            <li><strong>Administration · Accounts</strong> — roles, privilege overrides, disconnect/ban, in-app account creation.</li>
+            <li><strong>Address Book · Trackers · Settings · About</strong> — client-only conveniences.</li>
           </ul>
         </div>
       </div>
@@ -343,20 +360,31 @@
       </ul>
 
       <h3>Input commands</h3>
+      <p>Both <code>/</code> and <code>\</code> are accepted as the command prefix. New in v0.2: <code>/away</code>, <code>/back</code>, <code>/afk</code>, <code>/clear</code>, <code>/help</code> — plus right-click on any member for <strong>Send Message</strong> or <strong>Get Info</strong>, which opens the Messages or User Info window.</p>
       <div class="tbl-wrap"><table>
         <thead><tr><th>You type</th><th>Effect</th><th>Command</th></tr></thead>
         <tbody>
           <tr><td class="mono">hello there</td><td>Send a normal message to the room.</td><td><code>send_chat(flags 0)</code></td></tr>
           <tr><td class="mono">/me waves</td><td>Action message.</td><td><code>send_chat(flags 1)</code></td></tr>
-          <tr><td class="mono">/topic digital freedom</td><td>Set the room topic (needs privilege).</td><td><code>set_topic</code></td></tr>
+          <tr><td class="mono">/topic digital freedom</td><td>Set the room topic (needs CHAT_SET_TOPIC).</td><td><code>set_topic</code></td></tr>
+          <tr><td class="mono">/away brb lunch</td><td>Action: "is away (brb lunch)".</td><td><code>send_chat(flags 1)</code></td></tr>
+          <tr><td class="mono">/back</td><td>Action: "is back".</td><td><code>send_chat(flags 1)</code></td></tr>
+          <tr><td class="mono">/afk</td><td>Action: "is afk".</td><td><code>send_chat(flags 1)</code></td></tr>
+          <tr><td class="mono">/clear</td><td>Clear the local transcript — client-side only, doesn't sync to other clients.</td><td class="mono">—</td></tr>
+          <tr><td class="mono">/help</td><td>Show the slash-command list inline.</td><td class="mono">—</td></tr>
         </tbody>
       </table></div>
+      <p class="mono" style="font-size:12.5px;color:var(--grey-dim)">/name and /desc are recognized but stubbed — see <a class="inline" href="#gaps">Gaps &amp; next steps</a>.</p>
     </section>
 
     <section id="files">
       <div class="eyebrow">The interface</div>
       <h2>Files window</h2>
-      <p>A path bar with <strong>Up / Refresh / Upload</strong> controls over a directory listing. Each row shows a kind tag and — for files — a size. Clicking a folder navigates in; clicking a file opens a native save dialog and downloads it. Uploading opens a native file picker and sends into the current directory.</p>
+      <p>A path bar with <strong>Up / New Folder / Refresh / Upload</strong> controls over a filterable directory listing. Each row shows a kind tag and — for files — a size. Clicking a folder navigates in; clicking a file opens a native save dialog and downloads it. Uploading opens a native file picker and sends into the current directory. Right-click a row for <strong>Download / Delete / Copy name / Get Info</strong> (Delete needs <code>FILE_DELETE</code>).</p>
+      <div class="note amber">
+        <span class="lbl">New Folder dialog</span>
+        Creating a node lets you set its <strong>kind</strong> (folder, drop box, or upload folder) and its <strong>minimum read / write class</strong> right there — the ACL is set at creation time, not edited after the fact. Requires <code>FILE_MANAGE_TREE</code>.
+      </div>
 
       <div class="grid2">
         <div class="wire">
@@ -397,10 +425,70 @@
       <p>The bitmap is driven directly by the <code>transfer_progress</code> event's <code>bitmap</code> field, so what you see is the actual resume state — the same bytes persisted for resuming an interrupted transfer.</p>
     </section>
 
+    <section id="people">
+      <div class="eyebrow">The interface</div>
+      <h2>User List &amp; User Info</h2>
+      <p><strong>User List</strong> is server-wide, not room-scoped — every logged-in session, anywhere on the server, with a class-colored bar per row, idle time, and a filter box. Click a row to open <strong>User Info</strong> (class, login time, idle duration, IP address); right-click for <strong>Send Message</strong>, <strong>Get Info</strong>, or <strong>Disconnect</strong> (needs <code>USER_KICK</code>).</p>
+      <p>Presence is pushed live: the <code>presence</code> event fires on every login/logout server-wide, so the list updates incrementally without a manual refresh.</p>
+    </section>
+
+    <section id="messages">
+      <div class="eyebrow">The interface</div>
+      <h2>Messages window</h2>
+      <p>Classic two-pane private messaging: a conversation list on the left (unread ones highlighted red), the selected thread and an input line on the right. Sending echoes the message back into your own conversation so the sent line appears immediately. An incoming private message while the window is closed or on another conversation opens/updates it and lights the Button Bar's Messages LED.</p>
+    </section>
+
+    <section id="news">
+      <div class="eyebrow">The interface</div>
+      <h2>Public News window</h2>
+      <p>A three-pane newsreader: newsgroups on the left, the selected group's posts (threaded by reply depth) in the center, the selected post's full text on the right. <strong>New Message</strong> starts a thread, <strong>Reply</strong> nests under the open post; the author (or an admin) can delete a post, which removes it from the list for everyone.</p>
+      <div class="note amber">
+        <span class="lbl">Per-group access</span>
+        Each newsgroup carries its own <strong>minimum read class</strong> and <strong>minimum post class</strong> — a group can be readable by guests but postable only by power users, for instance. Creating a newsgroup needs <code>USER_ADMIN</code>.
+      </div>
+    </section>
+
+    <section id="admin-win">
+      <div class="eyebrow">The interface</div>
+      <h2>Administration window</h2>
+      <p>Three panels behind one Discord-shaped model: <strong>custom roles</strong> (name, sort rank, color swatch, a checkbox grid of privileges), a <strong>role-assignment</strong> panel (assign/unassign a role to a username, or look up a user's current roles), and a <strong>Disconnect</strong> panel (username, optional reason, and a ban duration — none, 5m, 1h, 1 day, 1 week, 1 year). Every action here needs <code>USER_ADMIN</code> (roles) or <code>USER_KICK</code>/<code>USER_BAN</code> (disconnect).</p>
+    </section>
+
+    <section id="accounts-win">
+      <div class="eyebrow">The interface</div>
+      <h2>Accounts window</h2>
+      <p>Closes the old "accounts only via CLI" gap. Lists every account with its base class and a summary of privilege overrides; <strong>Create</strong> takes a username, password, and base class; <strong>Edit</strong> changes the class and lets you flip each privilege to <span class="pill grey">inherit</span> / <span class="pill green">grant</span> / <span class="pill red">revoke</span> independent of role assignment. Password is only set at creation — there's no in-app reset yet. Needs <code>USER_ADMIN</code>.</p>
+    </section>
+
+    <section id="extras">
+      <div class="eyebrow">The interface</div>
+      <h2>Address Book, Trackers, Settings &amp; About</h2>
+      <div class="grid2">
+        <div class="card">
+          <h3>Address Book</h3>
+          <p>Client-only bookmarks: name, host:port, login, saved password, comments, connect count, and last-connected date. Click a row to pre-fill and auto-submit Connect; right-click for Connect / Edit / Remove.</p>
+        </div>
+        <div class="card">
+          <h3>Trackers</h3>
+          <p>Queries the connected server's tracker for other live KDX servers it knows about (name, population, address, description) with a type-to-filter box; picking one pre-fills Connect with its address.</p>
+        </div>
+        <div class="card">
+          <h3>Settings</h3>
+          <p>Theme picker (Blood Red, TRON, Amber, Matrix — live preview), a timestamps toggle, and identity fields (display name, description) that are saved locally but not yet sent to the server — see <a class="inline" href="#gaps">Gaps</a>.</p>
+        </div>
+        <div class="card">
+          <h3>About</h3>
+          <p>Static branding, version, and credits. Read-only.</p>
+        </div>
+      </div>
+    </section>
+
     <section id="commands">
       <div class="eyebrow">The bridge</div>
       <h2>Command reference</h2>
-      <p>The webview calls these via <code>__TAURI__.core.invoke</code>. Each is a thin async forward into <code>kdx-client-core</code>; none holds business logic. Errors return a tagged object — <code>kind: "untrusted_certificate"</code> (with host, port, fingerprint, previous) drives the TOFU prompt, everything else is <code>kind: "message"</code>.</p>
+      <p>The webview calls these via <code>__TAURI__.core.invoke</code>. Each is a thin async forward into <code>kdx-client-core</code>; none holds business logic. Errors return a tagged object — <code>kind: "untrusted_certificate"</code> (with host, port, fingerprint, previous) drives the TOFU prompt, everything else is <code>kind: "message"</code>. 33 commands total, up from 11 in v0.1.</p>
+
+      <h3>Session &amp; chat</h3>
       <div class="tbl-wrap"><table>
         <thead><tr><th>Command</th><th>Arguments</th><th>Returns</th><th>Effect</th></tr></thead>
         <tbody>
@@ -411,10 +499,59 @@
           <tr><td><span class="cmd">leave_room</span></td><td class="mono">room</td><td class="mono">—</td><td>Leave a room.</td></tr>
           <tr><td><span class="cmd">send_chat</span></td><td class="mono">room, flags, text</td><td class="mono">—</td><td>Send a message; <code>flags</code> bit 0 = action (/me).</td></tr>
           <tr><td><span class="cmd">set_topic</span></td><td class="mono">room, topic</td><td class="mono">—</td><td>Set a room topic (needs CHAT_SET_TOPIC).</td></tr>
-          <tr><td><span class="cmd">list_files</span></td><td class="mono">path</td><td class="mono">{path, entries[]}</td><td>List a directory; entries carry name, kind, size.</td></tr>
+          <tr><td><span class="cmd">send_private</span></td><td class="mono">to, text</td><td class="mono">—</td><td>Send a direct message; echoed back to the sender's own sessions.</td></tr>
+          <tr><td><span class="cmd">disconnect</span></td><td class="mono">—</td><td class="mono">—</td><td>Close the connection.</td></tr>
+        </tbody>
+      </table></div>
+
+      <h3>Presence &amp; tracker</h3>
+      <div class="tbl-wrap"><table>
+        <thead><tr><th>Command</th><th>Arguments</th><th>Returns</th><th>Effect</th></tr></thead>
+        <tbody>
+          <tr><td><span class="cmd">list_users</span></td><td class="mono">—</td><td class="mono">PresenceUser[]</td><td>Server-wide roster: username, class, idle time, address.</td></tr>
+          <tr><td><span class="cmd">get_user_info</span></td><td class="mono">username</td><td class="mono">PresenceUser</td><td>One user's presence snapshot.</td></tr>
+          <tr><td><span class="cmd">list_servers</span></td><td class="mono">filter</td><td class="mono">TrackerServer[]</td><td>Query the tracker for other live servers matching a substring.</td></tr>
+        </tbody>
+      </table></div>
+
+      <h3>Files &amp; transfers</h3>
+      <div class="tbl-wrap"><table>
+        <thead><tr><th>Command</th><th>Arguments</th><th>Returns</th><th>Effect</th></tr></thead>
+        <tbody>
+          <tr><td><span class="cmd">list_files</span></td><td class="mono">path</td><td class="mono">{path, entries[]}</td><td>List a directory (recursive tree); entries carry name, kind, size.</td></tr>
+          <tr><td><span class="cmd">create_folder</span></td><td class="mono">path, name, kind, min_read_class, min_write_class</td><td class="mono">FileListDto</td><td>Create a folder / drop box / upload folder with its ACL (needs FILE_MANAGE_TREE).</td></tr>
+          <tr><td><span class="cmd">delete_path</span></td><td class="mono">path</td><td class="mono">FileListDto</td><td>Delete a file or folder (needs FILE_DELETE).</td></tr>
           <tr><td><span class="cmd">upload</span></td><td class="mono">local, remote_dir</td><td class="mono">—</td><td>Upload a local file; resolves when verified. Progress via events.</td></tr>
           <tr><td><span class="cmd">download</span></td><td class="mono">remote_path, local</td><td class="mono">—</td><td>Download to a local path, resuming from a sidecar if present.</td></tr>
-          <tr><td><span class="cmd">disconnect</span></td><td class="mono">—</td><td class="mono">—</td><td>Close the connection.</td></tr>
+        </tbody>
+      </table></div>
+
+      <h3>Roles &amp; accounts <span class="pill amber">USER_ADMIN</span></h3>
+      <div class="tbl-wrap"><table>
+        <thead><tr><th>Command</th><th>Arguments</th><th>Returns</th><th>Effect</th></tr></thead>
+        <tbody>
+          <tr><td><span class="cmd">list_roles</span></td><td class="mono">—</td><td class="mono">RoleInfo[]</td><td>Fetch all custom roles.</td></tr>
+          <tr><td><span class="cmd">create_role</span></td><td class="mono">name, privileges, rank, color</td><td class="mono">RoleInfo[]</td><td>Define a new role; returns the updated list.</td></tr>
+          <tr><td><span class="cmd">update_role</span></td><td class="mono">id, name, privileges, rank, color</td><td class="mono">RoleInfo[]</td><td>Modify an existing role.</td></tr>
+          <tr><td><span class="cmd">delete_role</span></td><td class="mono">id</td><td class="mono">RoleInfo[]</td><td>Remove a role.</td></tr>
+          <tr><td><span class="cmd">assign_role</span> / <span class="cmd">unassign_role</span></td><td class="mono">username, role_id</td><td class="mono">RoleInfo[]</td><td>Grant or revoke a role on an account.</td></tr>
+          <tr><td><span class="cmd">account_roles</span></td><td class="mono">username</td><td class="mono">String[]</td><td>List role IDs assigned to an account.</td></tr>
+          <tr><td><span class="cmd">disconnect_user</span></td><td class="mono">username, reason, ban_secs</td><td class="mono">—</td><td>Kick and optionally ban (needs USER_KICK / USER_BAN).</td></tr>
+          <tr><td><span class="cmd">list_accounts</span></td><td class="mono">—</td><td class="mono">AccountSummary[]</td><td>All accounts with class and privilege overrides.</td></tr>
+          <tr><td><span class="cmd">create_account</span></td><td class="mono">username, password, base_class, granted, revoked</td><td class="mono">AccountSummary[]</td><td>Create a new account in-app.</td></tr>
+          <tr><td><span class="cmd">update_account</span></td><td class="mono">username, base_class, granted, revoked</td><td class="mono">AccountSummary[]</td><td>Edit an account's class and privilege overrides.</td></tr>
+        </tbody>
+      </table></div>
+
+      <h3>Public news</h3>
+      <div class="tbl-wrap"><table>
+        <thead><tr><th>Command</th><th>Arguments</th><th>Returns</th><th>Effect</th></tr></thead>
+        <tbody>
+          <tr><td><span class="cmd">list_newsgroups</span></td><td class="mono">—</td><td class="mono">NewsgroupInfo[]</td><td>All newsgroups with read/post class thresholds.</td></tr>
+          <tr><td><span class="cmd">create_newsgroup</span></td><td class="mono">name, description, min_read_class, min_post_class</td><td class="mono">NewsgroupInfo[]</td><td>Create a newsgroup (needs USER_ADMIN).</td></tr>
+          <tr><td><span class="cmd">list_thread</span></td><td class="mono">newsgroup_id</td><td class="mono">NewsPost[]</td><td>Fetch all posts in a group (flat; UI threads by parent_id).</td></tr>
+          <tr><td><span class="cmd">create_post</span></td><td class="mono">newsgroup_id, parent_id, subject, body</td><td class="mono">NewsPost[]</td><td>Post a root (empty parent_id) or a reply.</td></tr>
+          <tr><td><span class="cmd">delete_post</span></td><td class="mono">post_id</td><td class="mono">NewsPost[]</td><td>Delete a post (author, or USER_ADMIN for others).</td></tr>
         </tbody>
       </table></div>
     </section>
@@ -431,6 +568,8 @@
           <tr><td><span class="ev">chat</span></td><td class="mono">room, sender, timestamp, flags, text</td><td>Render a chat line (normal / action / system by flags).</td></tr>
           <tr><td><span class="ev">user_list</span></td><td class="mono">room, users[]</td><td>Repaint the user list; update the member-count tag.</td></tr>
           <tr><td><span class="ev">topic</span></td><td class="mono">room, topic</td><td>Update the topic bar.</td></tr>
+          <tr><td><span class="ev">presence</span></td><td class="mono">user, online</td><td>Server-wide login/logout; patches the User List incrementally.</td></tr>
+          <tr><td><span class="ev">private_message</span></td><td class="mono">from, to, timestamp, text</td><td>Opens/updates the Messages window; marks unread if it isn't the active conversation.</td></tr>
           <tr><td><span class="ev">transfer_progress</span></td><td class="mono">id, direction, done, total, bitmap</td><td>Update / create the transfer card and its chunk-bitmap grid.</td></tr>
           <tr><td><span class="ev">transfer_complete</span></td><td class="mono">id, direction, status, message</td><td>Mark the card done (status 0 = verified); refresh Files.</td></tr>
           <tr><td><span class="ev">server_warning</span></td><td class="mono">text</td><td>Amber chat line (e.g. flood control).</td></tr>
@@ -458,6 +597,22 @@ checksum    <span class="g">2</span>  <span class="c">CRC32C-folded — framing 
         <li><strong>Fragmentation</strong> — payloads over a 16 KB frame cap (a file chunk, say) split across frames flagged <code>FRAGMENTED</code> / <code>MORE_FRAGMENTS</code> and reassemble on the far side, guarded by a size cap and timeout.</li>
         <li><strong>Integrity</strong> comes from TLS and per-chunk SHA-256 — the header checksum only catches framing corruption.</li>
       </ul>
+      <h3>packet_type ranges (v0.2)</h3>
+      <p>The original four ranges (handshake / auth / file / chat) are unchanged; presence, private messages, roles/accounts, and news each claimed a new range as they were wired in:</p>
+      <div class="tbl-wrap"><table>
+        <thead><tr><th>Range</th><th>Group</th><th>Since</th></tr></thead>
+        <tbody>
+          <tr><td class="mono">0x00–0x0F</td><td>Connection — handshake, ping/pong, disconnect</td><td class="mono">v0.1</td></tr>
+          <tr><td class="mono">0x10–0x1F</td><td>Authentication — challenge/response</td><td class="mono">v0.1</td></tr>
+          <tr><td class="mono">0x20–0x2F</td><td>Files — list, transfer start/data/end, create/delete</td><td class="mono">v0.1</td></tr>
+          <tr><td class="mono">0x30–0x34</td><td>Chat — message, join/leave, user list, topic</td><td class="mono">v0.1</td></tr>
+          <tr><td class="mono">0x35–0x39</td><td>Presence — list/change, user info</td><td class="mono">P1</td></tr>
+          <tr><td class="mono">0x40–0x42</td><td>Private messages &amp; admin disconnect</td><td class="mono">P1 / P3</td></tr>
+          <tr><td class="mono">0x50–0x5C</td><td>Roles &amp; accounts — CRUD, assign/unassign, list</td><td class="mono">P3</td></tr>
+          <tr><td class="mono">0x60–0x66</td><td>Public news — newsgroups, threads, posts</td><td class="mono">P4</td></tr>
+          <tr><td class="mono">0xF0–0xF2</td><td>System — error, warning, info</td><td class="mono">v0.1</td></tr>
+        </tbody>
+      </table></div>
     </section>
 
     <section id="auth">
@@ -474,16 +629,41 @@ checksum    <span class="g">2</span>  <span class="c">CRC32C-folded — framing 
       <h2>Chat &amp; user classes</h2>
       <p>Each chat room is its own <strong>actor task</strong> owning its membership, topic, and per-member flood gate — broadcasting a message is N channel sends with no shared lock on the hot path. A token-bucket flood gate (burst 5, refill 1/s) throttles a spammer with a <code>server_warning</code>. Clients cannot forge system-flagged messages.</p>
       <h3>Classes &amp; privileges</h3>
-      <p>Four base classes with strictly-increasing privilege sets; per-account overrides can grant beyond or revoke from the class.</p>
+      <p>Four base classes with strictly-increasing privilege sets; custom roles and per-account overrides can grant beyond or revoke from the class (see <a class="inline" href="#roles">Roles &amp; overrides</a>).</p>
       <div class="tbl-wrap"><table>
         <thead><tr><th>Class</th><th>Gains (on top of the one below)</th></tr></thead>
         <tbody>
           <tr><td><span class="pill grey">guest</span></td><td class="mono">CHAT_SEND, FILE_LIST</td></tr>
           <tr><td><span class="pill green">user</span></td><td class="mono">CHAT_PRIVATE, FILE_DOWNLOAD, FILE_UPLOAD</td></tr>
           <tr><td><span class="pill amber">power</span></td><td class="mono">CHAT_CREATE_ROOM, CHAT_SET_TOPIC, FILE_DELETE, FILE_MANAGE_TREE</td></tr>
-          <tr><td><span class="pill red">admin</span></td><td class="mono">everything (USER_KICK/BAN/ADMIN, SERVER_ADMIN)</td></tr>
+          <tr><td><span class="pill red">admin</span></td><td class="mono">everything (USER_KICK, USER_BAN, USER_ADMIN, SERVER_ADMIN)</td></tr>
         </tbody>
       </table></div>
+      <p>The underlying bitflags, from <code>kdx-server-core/src/auth/classes.rs</code>:</p>
+      <pre><span class="g">CHAT_SEND</span>        = 1 &lt;&lt; 0
+<span class="g">CHAT_PRIVATE</span>     = 1 &lt;&lt; 1
+<span class="g">CHAT_CREATE_ROOM</span> = 1 &lt;&lt; 2
+<span class="g">CHAT_SET_TOPIC</span>   = 1 &lt;&lt; 3
+<span class="g">FILE_LIST</span>        = 1 &lt;&lt; 4
+<span class="g">FILE_DOWNLOAD</span>    = 1 &lt;&lt; 5
+<span class="g">FILE_UPLOAD</span>      = 1 &lt;&lt; 6
+<span class="g">FILE_DELETE</span>      = 1 &lt;&lt; 7
+<span class="g">FILE_MANAGE_TREE</span> = 1 &lt;&lt; 8   <span class="c">// create/remove folders, dropboxes</span>
+<span class="a">USER_KICK</span>        = 1 &lt;&lt; 16
+<span class="a">USER_BAN</span>         = 1 &lt;&lt; 17
+<span class="a">USER_ADMIN</span>       = 1 &lt;&lt; 18  <span class="c">// create/edit accounts, manage roles</span>
+<span class="a">SERVER_ADMIN</span>     = 1 &lt;&lt; 19  <span class="c">// config, shutdown</span></pre>
+    </section>
+
+    <section id="roles">
+      <div class="eyebrow">Under the hood</div>
+      <h2>Roles &amp; overrides</h2>
+      <p>On top of the four base classes, P3 added a Discord-shaped custom-role layer: a SysOp defines named roles (with a sort rank and a color) as arbitrary privilege bundles, and assigns any number of them to an account. Independently, each account can carry <strong>per-privilege grant/revoke bits</strong> that apply on top of everything else.</p>
+      <div class="note">
+        <span class="lbl">Resolution order</span>
+        <code>effective_privileges(base, roles, granted, revoked)</code> computes: <strong>base class</strong> privileges, unioned with every assigned <strong>role's</strong> privileges, unioned with per-account <strong>grants</strong> — then the per-account <strong>revokes</strong> are subtracted last. Revokes always win, so an admin can silence one specific privilege on one specific account regardless of class or role.
+      </div>
+      <p>This is exactly what the <a class="inline" href="#admin-win">Administration</a> and <a class="inline" href="#accounts-win">Accounts</a> windows edit: roles are the reusable bundle, account overrides are the one-off exception.</p>
     </section>
 
     <section id="tree">
@@ -513,6 +693,20 @@ checksum    <span class="g">2</span>  <span class="c">CRC32C-folded — framing 
       <p>The chunk grid in the Transfers window is a direct view of this bitmap — the visualization and the resume mechanism are the same bytes.</p>
     </section>
 
+    <section id="pm">
+      <div class="eyebrow">Under the hood</div>
+      <h2>Private messaging</h2>
+      <p>Closes the v0.1 gap where <code>CHAT_PRIVATE</code> existed but wasn't wired end to end. <code>send_private(to, text)</code> sends a <code>PrivateSend</code> (0x40) packet; the server delivers a <code>PrivateMessage</code> (0x41) to every one of the recipient's sessions <em>and</em> echoes it back to every one of the sender's own sessions, so a user logged in twice sees the same conversation on both.</p>
+      <p>There's no persistence yet — a message not received live (recipient offline) is simply not delivered; there's no mailbox or history replay.</p>
+    </section>
+
+    <section id="newsdeep">
+      <div class="eyebrow">Under the hood</div>
+      <h2>News &amp; threading</h2>
+      <p>Newsgroups and posts persist in SQLite (<code>kdx-storage/src/news.rs</code>), with domain logic in <code>kdx-server-core/src/news.rs</code>. A post is a root (empty <code>parent_id</code>) or a reply nested under any existing post in the same group; the server returns the whole group as a flat list and the client threads it by walking <code>parent_id</code> and indenting by depth.</p>
+      <p>Access is per-group, not per-post: <code>min_read_class</code> gates <code>list_thread</code>, <code>min_post_class</code> gates <code>create_post</code>. Deleting a post is restricted to its author or an admin (<code>USER_ADMIN</code>) — there's no edit, only delete-and-repost.</p>
+    </section>
+
     <section id="run">
       <div class="eyebrow">Operating it</div>
       <h2>Running it</h2>
@@ -534,11 +728,14 @@ cargo run -p kdxd</pre>
     <section id="verify">
       <div class="eyebrow">Operating it</div>
       <h2>Verification</h2>
-      <p>The whole stack runs green under <code>cargo test --workspace</code> — 107 tests, no external services. The client library is tested headlessly against a real in-process <code>kdxd</code> (real TLS over <code>127.0.0.1</code>), and the server's own tests are an independent second implementation of the wire flows.</p>
+      <p>The whole stack runs green under <code>cargo test --workspace</code> — 162 tests (up from 107), no external services. The client library is tested headlessly against a real in-process <code>kdxd</code> (real TLS over <code>127.0.0.1</code>), and the server's own tests are an independent second implementation of the wire flows.</p>
       <ul class="clean">
         <li><strong>Protocol</strong> — codec round-trips, checksum corruption, fragment reassembly.</li>
         <li><strong>Crypto</strong> — Argon2 verify, challenge round-trip, replay rejection.</li>
         <li><strong>End-to-end</strong> — login, chat both directions, uploads/downloads with kill-and-resume in both directions, DropBox refusal, throttle pacing.</li>
+        <li><strong>Presence &amp; messaging</strong> — server-wide login/logout fan-out, private message delivery + sender echo.</li>
+        <li><strong>Roles &amp; accounts</strong> — effective-privilege resolution (base ∪ roles ∪ grants − revokes), CRUD round-trips.</li>
+        <li><strong>News</strong> — newsgroup creation, threaded post/reply, per-class read/post gating, delete authorization.</li>
         <li><strong>Cross-process smoke</strong> — <code>cargo run -p kdx-client-core --example smoke</code> drives a separately-running <code>kdxd</code>: TOFU-pin → login → join → chat → list, over a real socket.</li>
       </ul>
     </section>
@@ -546,20 +743,27 @@ cargo run -p kdxd</pre>
     <section id="gaps">
       <div class="eyebrow">Operating it</div>
       <h2>Gaps &amp; next steps</h2>
+
+      <div class="note green">
+        <span class="lbl" style="color:var(--green)">Closed since v0.1</span>
+        <strong>Tracker window</strong> (Trackers, wired to <code>list_servers</code>) · <strong>Account admin</strong> (Accounts window, in-app create/edit) · <strong>Private messaging</strong> (Messages window, fully wired) · <strong>Custom roles</strong> (Administration window — didn't exist as a concept in v0.1) · <strong>Public news</strong> (didn't exist in v0.1).
+      </div>
+
       <div class="grid2">
         <div class="note amber">
-          <span class="lbl">Tracker window</span>
-          The tracker (a directory of KDX servers) exists in <code>kdx-server-core</code> as an in-process registry but has <strong>no client-facing wire protocol</strong> yet — so there is no Tracker window. Exposing it is its own protocol milestone (new packet types + client method), on the model of the download work.
+          <span class="lbl">Identity fields don't sync</span>
+          Settings lets you set a display name and description, but they're saved to <code>localStorage</code> only — never sent to the server or reflected in presence. The <code>/name</code> and <code>/desc</code> slash commands are recognized but stubbed with a "not supported yet" message. Needs a protocol field + server-side storage.
         </div>
         <div class="note amber">
-          <span class="lbl">Account admin</span>
-          Accounts are created only via the <code>kdxd useradd</code> CLI. No in-app admin UI for creating / editing accounts or setting privilege overrides.
+          <span class="lbl">Single room</span>
+          The client still fixes on <code>#lobby</code>; <code>join_room</code> / <code>leave_room</code> and the room-scoped protocol exist, but there's no room list or switcher UI. A room picker is a UI-only addition on top of already-wired plumbing.
         </div>
       </div>
       <ul class="clean">
-        <li><strong>Private messaging</strong> — the <code>CHAT_PRIVATE</code> privilege exists but direct messages aren't wired end to end yet.</li>
-        <li><strong>Multi-room UI</strong> — the client fixes on <code>#lobby</code>; the protocol supports many rooms, so a room switcher is a UI-only addition.</li>
         <li><strong>Postgres</strong> — persistence is SQLite; a Postgres swap is confined to <code>kdx-storage</code>.</li>
+        <li><strong>No PM history</strong> — private messages aren't persisted; a message to an offline user is simply not delivered, there's no mailbox or replay.</li>
+        <li><strong>No password reset UI</strong> — Accounts sets a password only at creation; changing an existing account's password still needs direct DB access.</li>
+        <li><strong>File manager</strong> — no drag-drop and no batch upload/download; the resumable-chunk plumbing exists but the UI never surfaces a partial-download resume prompt.</li>
         <li><strong>GUI manual smoke</strong> — the desktop window itself is verified by hand (<code>cargo run -p kdx-client</code>); every layer it wraps is covered by automated tests.</li>
       </ul>
     </section>
@@ -568,7 +772,7 @@ cargo run -p kdxd</pre>
 </div>
 
 <footer class="doc">
-  KDX · GUI &amp; Feature Handoff · 6 crates + 1 app · 107 tests · TLS 1.3 · Argon2id · TOFU pinning · chunk-bitmap resume
+  KDX · GUI &amp; Feature Handoff v0.2 · 6 crates + 1 app · 162 tests · 33 commands · 14 windows · TLS 1.3 · Argon2id · TOFU pinning · chunk-bitmap resume · roles &amp; overrides · public news
 </footer>
 </div>
 

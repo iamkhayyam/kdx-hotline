@@ -59,6 +59,40 @@ pub struct FileDelete {
     pub path: String,
 }
 
+/// Client → server: (re)build the server's search catalog — a snapshot index
+/// of the whole tree. Requires `FILE_MANAGE_TREE`; the catalog does not
+/// auto-refresh, so search results reflect the tree as of the last call.
+/// Empty payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileGenerateCatalog;
+
+/// Server → client: reply to `FileGenerateCatalog` with the entry count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileCatalogGenerated {
+    pub count: u32,
+}
+
+/// Client → server: search the catalog. Empty `query` matches everything (a
+/// full listing of what the caller may see). Requires `FILE_LIST`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileSearchRequest {
+    pub query: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileSearchEntry {
+    pub path: String,
+    pub name: String,
+    pub kind: u8,
+    pub size: u64,
+}
+
+/// Server → client: matches, already filtered to the caller's read class.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileSearchResponse {
+    pub entries: Vec<FileSearchEntry>,
+}
+
 /// Client → server (in a FileTransferStart packet): request a transfer.
 ///
 /// `direction` selects upload or download. For an **upload**, `size`/`sha256`
@@ -203,6 +237,78 @@ impl FileDelete {
         let path = get_str(&mut payload, "FileDelete")?;
         expect_end(payload, "FileDelete")?;
         Ok(Self { path })
+    }
+}
+
+impl FileGenerateCatalog {
+    pub fn encode(&self) -> Bytes {
+        Bytes::new()
+    }
+    pub fn decode(payload: &[u8]) -> Result<Self, ProtocolError> {
+        expect_end(payload, "FileGenerateCatalog")?;
+        Ok(Self)
+    }
+}
+
+impl FileCatalogGenerated {
+    pub fn encode(&self) -> Bytes {
+        let mut buf = BytesMut::new();
+        buf.put_u32(self.count);
+        buf.freeze()
+    }
+    pub fn decode(mut payload: &[u8]) -> Result<Self, ProtocolError> {
+        if payload.remaining() < 4 {
+            return Err(ProtocolError::MalformedPayload("FileCatalogGenerated"));
+        }
+        let count = payload.get_u32();
+        expect_end(payload, "FileCatalogGenerated")?;
+        Ok(Self { count })
+    }
+}
+
+impl FileSearchRequest {
+    pub fn encode(&self) -> Bytes {
+        let mut buf = BytesMut::new();
+        put_str(&mut buf, &self.query);
+        buf.freeze()
+    }
+    pub fn decode(mut payload: &[u8]) -> Result<Self, ProtocolError> {
+        let query = get_str(&mut payload, "FileSearchRequest")?;
+        expect_end(payload, "FileSearchRequest")?;
+        Ok(Self { query })
+    }
+}
+
+impl FileSearchResponse {
+    pub fn encode(&self) -> Bytes {
+        let mut buf = BytesMut::new();
+        buf.put_u32(self.entries.len() as u32);
+        for e in &self.entries {
+            put_str(&mut buf, &e.path);
+            put_str(&mut buf, &e.name);
+            buf.put_u8(e.kind);
+            buf.put_u64(e.size);
+        }
+        buf.freeze()
+    }
+    pub fn decode(mut payload: &[u8]) -> Result<Self, ProtocolError> {
+        if payload.remaining() < 4 {
+            return Err(ProtocolError::MalformedPayload("FileSearchResponse"));
+        }
+        let count = payload.get_u32() as usize;
+        let mut entries = Vec::with_capacity(count.min(4096));
+        for _ in 0..count {
+            let path = get_str(&mut payload, "FileSearchResponse")?;
+            let name = get_str(&mut payload, "FileSearchResponse")?;
+            if payload.remaining() < 9 {
+                return Err(ProtocolError::MalformedPayload("FileSearchResponse"));
+            }
+            let kind = payload.get_u8();
+            let size = payload.get_u64();
+            entries.push(FileSearchEntry { path, name, kind, size });
+        }
+        expect_end(payload, "FileSearchResponse")?;
+        Ok(Self { entries })
     }
 }
 
@@ -454,5 +560,36 @@ mod tests {
 
         assert!(FileCreateFolder::decode(&[0, 1, 65]).is_err());
         assert!(FileDelete::decode(&[]).is_err());
+    }
+
+    #[test]
+    fn catalog_and_search_round_trip() {
+        assert!(FileGenerateCatalog::decode(&FileGenerateCatalog.encode()).is_ok());
+        let generated = FileCatalogGenerated { count: 42 };
+        assert_eq!(FileCatalogGenerated::decode(&generated.encode()).unwrap(), generated);
+
+        let req = FileSearchRequest { query: "readme".into() };
+        assert_eq!(FileSearchRequest::decode(&req.encode()).unwrap(), req);
+
+        let resp = FileSearchResponse {
+            entries: vec![
+                FileSearchEntry {
+                    path: "/pub/readme.txt".into(),
+                    name: "readme.txt".into(),
+                    kind: KIND_FILE,
+                    size: 10,
+                },
+                FileSearchEntry {
+                    path: "/pub".into(),
+                    name: "pub".into(),
+                    kind: KIND_DIR,
+                    size: 0,
+                },
+            ],
+        };
+        assert_eq!(FileSearchResponse::decode(&resp.encode()).unwrap(), resp);
+
+        assert!(FileCatalogGenerated::decode(&[0, 0]).is_err());
+        assert!(FileSearchResponse::decode(&[0, 0]).is_err());
     }
 }
