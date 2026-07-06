@@ -33,6 +33,13 @@ pub fn run() {
             commands::upload,
             commands::download,
             commands::disconnect,
+            commands::list_roles,
+            commands::create_role,
+            commands::update_role,
+            commands::delete_role,
+            commands::assign_role,
+            commands::unassign_role,
+            commands::account_roles,
         ])
         .run(tauri::generate_context!())
         .expect("error while running KDX");

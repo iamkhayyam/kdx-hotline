@@ -12,6 +12,7 @@ import { buildAbout } from "./windows/about.js";
 import { buildUserList } from "./windows/userlist.js";
 import { buildUserInfo } from "./windows/userinfo.js";
 import { buildMessages } from "./windows/messages.js";
+import { buildRoles } from "./windows/roles.js";
 
 const desktop = document.getElementById("desktop");
 
@@ -37,6 +38,7 @@ function openMessagesWith(username) {
   open("messages");
   messages.openWith(username);
 }
+const roles = buildRoles();
 const userList = buildUserList(
   (username) => {
     open("userinfo");
@@ -115,6 +117,13 @@ register({
   title: "Messages",
   rect: { x: 340, y: 120, w: 500, h: 340 },
   build: () => ({ body: messages.body }),
+});
+register({
+  id: "admin",
+  title: "Administration",
+  rect: { x: 380, y: 90, w: 520, h: 460 },
+  build: () => ({ body: roles.body }),
+  onOpen: () => roles.refresh(),
 });
 
 // The Button Bar — the always-present launcher, itself a floating window on

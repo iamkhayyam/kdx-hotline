@@ -12,7 +12,7 @@ const FEATURES = [
   { id: "chat", label: "Public Chat", win: "chat", requires: "connected" },
   { id: "files", label: "Files", win: "files", requires: "connected" },
   { id: "userlist", label: "User List", win: "userlist", requires: "connected" },
-  { id: "admin", label: "Administration", win: "admin", requires: "admin" },
+  { id: "admin", label: "Administration", win: "admin", requires: "connected" },
   { sep: true },
   { id: "disconnect", label: "Disconnect", action: "disconnect", requires: "connected" },
   { id: "connect", label: "Connect…", win: "connect" },

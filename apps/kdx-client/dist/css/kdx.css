@@ -373,6 +373,20 @@ td.fmeta { color: var(--grey-dim); font-size: 11px; }
 .xfer.done .name::before { content: "✓ "; color: var(--green); }
 .empty { padding: 16px; color: var(--grey-dim); font-size: 11px; text-align: center; }
 
+.roles-win { flex: 1; display: flex; flex-direction: column; min-height: 0; }
+.rl-swatch { display: inline-block; width: 10px; height: 10px; border: 1px solid var(--chrome-dim); vertical-align: middle; }
+.rl-privs { display: grid; grid-template-columns: 1fr 1fr; gap: 4px 12px; padding: 8px 14px 0; max-height: 160px; overflow-y: auto; }
+.rl-priv { display: flex; align-items: center; gap: 6px; font-size: 11px; color: var(--ink); }
+.rl-priv input { accent-color: var(--alert); }
+.rl-assign { border-top: 1px solid var(--chrome-dim); padding: 8px 14px; background: var(--panel-deep); flex: 0 0 auto; }
+.rl-assign-row { display: flex; gap: 6px; align-items: center; }
+.rl-assign-row input, .rl-assign-row select {
+  background: #060404; border: 1px solid var(--chrome-dim); color: var(--green);
+  font-family: var(--mono); font-size: 12px; padding: 3px 6px;
+}
+.rl-assign-row input { flex: 1; }
+.rl-assign-result { margin-top: 6px; font-size: 11px; color: var(--grey-dim); min-height: 1.4em; }
+
 .deskfoot {
   display: flex; gap: 16px; align-items: center; padding: 5px 14px;
   background: #0d0606; border-top: 1px solid var(--chrome-dim); font-size: 10px;

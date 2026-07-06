@@ -5,7 +5,7 @@
 use std::path::PathBuf;
 
 use kdx_client_core::{
-    connect as core_connect, trust_server, ClientConfig, ClientError, Event, PresenceUser,
+    connect as core_connect, trust_server, ClientConfig, ClientError, Event, PresenceUser, RoleInfo,
 };
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -206,4 +206,66 @@ pub async fn disconnect(state: State<'_, AppState>) -> CmdResult<()> {
         client.disconnect().await;
     }
     Ok(())
+}
+
+#[tauri::command]
+pub async fn list_roles(state: State<'_, AppState>) -> CmdResult<Vec<RoleInfo>> {
+    with_client(&state, |c| async move { c.list_roles().await }).await
+}
+
+#[tauri::command]
+pub async fn create_role(
+    state: State<'_, AppState>,
+    name: String,
+    privileges: u32,
+    rank: i32,
+    color: String,
+) -> CmdResult<Vec<RoleInfo>> {
+    with_client(&state, |c| async move {
+        c.create_role(&name, privileges, rank, &color).await
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn update_role(
+    state: State<'_, AppState>,
+    id: String,
+    name: String,
+    privileges: u32,
+    rank: i32,
+    color: String,
+) -> CmdResult<Vec<RoleInfo>> {
+    with_client(&state, |c| async move {
+        c.update_role(&id, &name, privileges, rank, &color).await
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn delete_role(state: State<'_, AppState>, id: String) -> CmdResult<Vec<RoleInfo>> {
+    with_client(&state, |c| async move { c.delete_role(&id).await }).await
+}
+
+#[tauri::command]
+pub async fn assign_role(
+    state: State<'_, AppState>,
+    username: String,
+    role_id: String,
+) -> CmdResult<Vec<RoleInfo>> {
+    with_client(&state, |c| async move { c.assign_role(&username, &role_id).await }).await
+}
+
+#[tauri::command]
+pub async fn unassign_role(
+    state: State<'_, AppState>,
+    username: String,
+    role_id: String,
+) -> CmdResult<Vec<RoleInfo>> {
+    with_client(&state, |c| async move { c.unassign_role(&username, &role_id).await }).await
+}
+
+#[tauri::command]
+pub async fn account_roles(state: State<'_, AppState>, username: String) -> CmdResult<Vec<String>> {
+    with_client(&state, |c| async move { c.account_roles(&username).await }).await
 }
