@@ -6,12 +6,14 @@ use kdx_server_core::auth::{AuthManager, RoleManager};
 use kdx_server_core::chat::RoomManager;
 use kdx_server_core::files::FileTree;
 use kdx_server_core::news::NewsManager;
+use kdx_server_core::settings::ServerSettings;
 use kdx_server_core::tracker::{ServerEntry, Tracker, DEFAULT_TTL};
 use kdx_server_core::transfer::{TransferConfig, TransferManager};
 use kdx_server_core::{Connection, Presence, ServerCtx};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::ServerConfig as TlsServerConfig;
 use tokio::net::TcpListener;
+use tokio::sync::Notify;
 use tokio_rustls::TlsAcceptor;
 use tracing::{error, info, warn};
 
@@ -70,6 +72,9 @@ pub async fn serve(config: Config) -> Result<Server, ServeError> {
     )
     .await
     .map_err(|e| ServeError::Init(e.to_string()))?;
+    let listener = TcpListener::bind(config.bind).await?;
+    let local_addr = listener.local_addr()?;
+
     let ctx = Arc::new(ServerCtx {
         roles: RoleManager::new(pool.clone()),
         news: NewsManager::new(pool.clone()),
@@ -79,42 +84,59 @@ pub async fn serve(config: Config) -> Result<Server, ServeError> {
         transfers,
         presence: Presence::spawn(),
         tracker: Tracker::spawn(DEFAULT_TTL),
+        settings: ServerSettings::new(
+            config.server_name.clone(),
+            config.server_description.clone(),
+            config.max_users,
+        ),
+        bind_port: local_addr.port(),
+        shutdown: Arc::new(Notify::new()),
     });
-
-    let listener = TcpListener::bind(config.bind).await?;
-    let local_addr = listener.local_addr()?;
     info!(%local_addr, "kdxd listening");
 
     // Register this server in its own tracker directory and keep the entry
-    // fresh (and its live user count current) with a periodic heartbeat.
-    spawn_self_registration(&ctx, &config, local_addr);
+    // fresh (and its live user count / settings current) with a periodic
+    // heartbeat.
+    spawn_self_registration(&ctx, local_addr);
 
     let accept_ctx = ctx.clone();
     let handle = tokio::spawn(async move {
         loop {
-            let (tcp, peer) = match listener.accept().await {
-                Ok(pair) => pair,
-                Err(e) => {
-                    error!(error = %e, "accept failed");
-                    continue;
+            tokio::select! {
+                biased;
+                // AdminShutdown notifies this to stop taking new connections.
+                // Already-open connections close on their own as the
+                // presence-wide Disconnect it also sent gets processed.
+                _ = accept_ctx.shutdown.notified() => {
+                    info!("shutdown requested; accept loop stopping");
+                    break;
                 }
-            };
-            let acceptor = acceptor.clone();
-            let conn_ctx = accept_ctx.clone();
-            tokio::spawn(async move {
-                let tls = match acceptor.accept(tcp).await {
-                    Ok(tls) => tls,
-                    Err(e) => {
-                        warn!(%peer, error = %e, "tls handshake failed");
-                        return;
-                    }
-                };
-                if let Err(e) =
-                    Connection::new_with_peer(tls, conn_ctx, peer.to_string()).run().await
-                {
-                    warn!(%peer, error = %e, "connection ended with error");
+                accepted = listener.accept() => {
+                    let (tcp, peer) = match accepted {
+                        Ok(pair) => pair,
+                        Err(e) => {
+                            error!(error = %e, "accept failed");
+                            continue;
+                        }
+                    };
+                    let acceptor = acceptor.clone();
+                    let conn_ctx = accept_ctx.clone();
+                    tokio::spawn(async move {
+                        let tls = match acceptor.accept(tcp).await {
+                            Ok(tls) => tls,
+                            Err(e) => {
+                                warn!(%peer, error = %e, "tls handshake failed");
+                                return;
+                            }
+                        };
+                        if let Err(e) =
+                            Connection::new_with_peer(tls, conn_ctx, peer.to_string()).run().await
+                        {
+                            warn!(%peer, error = %e, "connection ended with error");
+                        }
+                    });
                 }
-            });
+            }
         }
     });
 
@@ -126,30 +148,31 @@ pub async fn serve(config: Config) -> Result<Server, ServeError> {
 }
 
 /// Register this server in its own in-process tracker and keep the entry fresh
-/// with a heartbeat every 30s (well within the 90s TTL), refreshing the live
-/// user count each tick. The first tick fires immediately, so the directory
-/// lists this server as soon as it starts.
-fn spawn_self_registration(ctx: &Arc<ServerCtx>, config: &Config, local_addr: SocketAddr) {
+/// with a heartbeat every 30s (well within the 90s TTL), reading `settings`
+/// and the live user count fresh each tick — so an admin's `ServerSettingsUpdate`
+/// (name/description/max_users) shows up in the tracker directory within one
+/// heartbeat, without restarting anything.
+fn spawn_self_registration(ctx: &Arc<ServerCtx>, local_addr: SocketAddr) {
     let host = if local_addr.ip().is_unspecified() {
         "127.0.0.1".to_string()
     } else {
         local_addr.ip().to_string()
     };
-    let base = ServerEntry {
-        name: config.server_name.clone(),
-        host,
-        port: local_addr.port(),
-        users: 0,
-        max_users: config.max_users,
-        description: config.server_description.clone(),
-    };
+    let port = local_addr.port();
     let ctx = ctx.clone();
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(30));
         loop {
             tick.tick().await;
-            let mut entry = base.clone();
-            entry.users = ctx.presence.list().await.len() as u32;
+            let snap = ctx.settings.snapshot().await;
+            let entry = ServerEntry {
+                name: snap.name,
+                host: host.clone(),
+                port,
+                users: ctx.presence.list().await.len() as u32,
+                max_users: snap.max_users,
+                description: snap.description,
+            };
             ctx.tracker.heartbeat(entry).await;
         }
     });

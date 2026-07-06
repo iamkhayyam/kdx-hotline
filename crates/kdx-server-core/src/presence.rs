@@ -60,6 +60,19 @@ pub enum PresenceCommand {
         reason: String,
         reply: oneshot::Sender<usize>,
     },
+    /// Push an outbound frame to literally every connected session, regardless
+    /// of username. Replies with the number of sessions it reached.
+    BroadcastAll {
+        outbound: Outbound,
+        reply: oneshot::Sender<usize>,
+    },
+    /// Forcibly disconnect every connected session (including the caller's
+    /// own, if it's among them) — the presence side of a server shutdown.
+    /// Replies with the number of sessions signalled.
+    DisconnectAll {
+        reason: String,
+        reply: oneshot::Sender<usize>,
+    },
 }
 
 struct Entry {
@@ -198,6 +211,39 @@ impl Presence {
         }
         rx.await.unwrap_or(0)
     }
+
+    /// Push `outbound` to literally every connected session. Returns the
+    /// number of sessions reached.
+    pub async fn broadcast_all(&self, outbound: Outbound) -> usize {
+        let (reply, rx) = oneshot::channel();
+        if self
+            .tx
+            .send(PresenceCommand::BroadcastAll { outbound, reply })
+            .await
+            .is_err()
+        {
+            return 0;
+        }
+        rx.await.unwrap_or(0)
+    }
+
+    /// Forcibly disconnect every connected session, delivering `reason`.
+    /// Returns the number of sessions signalled.
+    pub async fn disconnect_all(&self, reason: &str) -> usize {
+        let (reply, rx) = oneshot::channel();
+        if self
+            .tx
+            .send(PresenceCommand::DisconnectAll {
+                reason: reason.to_owned(),
+                reply,
+            })
+            .await
+            .is_err()
+        {
+            return 0;
+        }
+        rx.await.unwrap_or(0)
+    }
 }
 
 async fn handle(entries: &mut HashMap<Uuid, Entry>, command: PresenceCommand) {
@@ -288,6 +334,30 @@ async fn handle(entries: &mut HashMap<Uuid, Entry>, command: PresenceCommand) {
             let payload = Bytes::copy_from_slice(reason.as_bytes());
             let mut reached = 0;
             for entry in entries.values().filter(|e| e.username == username) {
+                let signal = Outbound {
+                    packet_type: PacketType::Disconnect,
+                    flags: PacketFlags::empty(),
+                    payload: payload.clone(),
+                };
+                if entry.tx.try_send(signal).is_ok() {
+                    reached += 1;
+                }
+            }
+            let _ = reply.send(reached);
+        }
+        PresenceCommand::BroadcastAll { outbound, reply } => {
+            let mut reached = 0;
+            for entry in entries.values() {
+                if entry.tx.try_send(outbound.clone()).is_ok() {
+                    reached += 1;
+                }
+            }
+            let _ = reply.send(reached);
+        }
+        PresenceCommand::DisconnectAll { reason, reply } => {
+            let payload = Bytes::copy_from_slice(reason.as_bytes());
+            let mut reached = 0;
+            for entry in entries.values() {
                 let signal = Outbound {
                     packet_type: PacketType::Disconnect,
                     flags: PacketFlags::empty(),
@@ -433,5 +503,44 @@ mod tests {
         presence.touch(id).await;
         let after = presence.get("alice").await.unwrap();
         assert!(after.idle_secs < before.idle_secs);
+    }
+
+    #[tokio::test]
+    async fn broadcast_all_reaches_every_session() {
+        let presence = Presence::spawn();
+        let (tx_a, mut rx_a) = member_channel();
+        presence.join(Uuid::new_v4(), "alice".into(), 1, "a".into(), tx_a).await;
+        let (tx_b, mut rx_b) = member_channel();
+        presence.join(Uuid::new_v4(), "bob".into(), 1, "b".into(), tx_b).await;
+        // Drain each one's join-broadcast-of-the-other before asserting.
+        rx_a.recv().await.unwrap();
+
+        let outbound = Outbound {
+            packet_type: PacketType::Info,
+            flags: PacketFlags::empty(),
+            payload: Bytes::from_static(b"server message"),
+        };
+        let reached = presence.broadcast_all(outbound).await;
+        assert_eq!(reached, 2);
+        assert_eq!(rx_a.recv().await.unwrap().payload, Bytes::from_static(b"server message"));
+        assert_eq!(rx_b.recv().await.unwrap().payload, Bytes::from_static(b"server message"));
+    }
+
+    #[tokio::test]
+    async fn disconnect_all_signals_every_session_including_caller() {
+        let presence = Presence::spawn();
+        let (tx_a, mut rx_a) = member_channel();
+        presence.join(Uuid::new_v4(), "alice".into(), 1, "a".into(), tx_a).await;
+        let (tx_b, mut rx_b) = member_channel();
+        presence.join(Uuid::new_v4(), "bob".into(), 1, "b".into(), tx_b).await;
+        rx_a.recv().await.unwrap(); // the join broadcast
+
+        let reached = presence.disconnect_all("server is shutting down").await;
+        assert_eq!(reached, 2);
+        let a = rx_a.recv().await.unwrap();
+        assert_eq!(a.packet_type, PacketType::Disconnect);
+        assert_eq!(a.payload, Bytes::from_static(b"server is shutting down"));
+        let b = rx_b.recv().await.unwrap();
+        assert_eq!(b.packet_type, PacketType::Disconnect);
     }
 }

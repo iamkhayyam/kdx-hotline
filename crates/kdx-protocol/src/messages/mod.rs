@@ -18,7 +18,10 @@ mod wire;
 pub use account::{
     AccountCreate, AccountListRequest, AccountListResponse, AccountSummary, AccountUpdate,
 };
-pub use admin::AdminDisconnect;
+pub use admin::{
+    AdminBroadcast, AdminDisconnect, AdminShutdown, ServerSettingsRequest, ServerSettingsResponse,
+    ServerSettingsUpdate,
+};
 pub use auth::{AuthChallenge, AuthRequest, AuthResponse, AuthResult};
 pub use chat::{
     ChatEvent, ChatJoin, ChatLeave, ChatSend, ChatTopic, ChatUserList, CHAT_ACTION, CHAT_SYSTEM,

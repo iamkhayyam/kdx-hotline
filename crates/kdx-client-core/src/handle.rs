@@ -7,7 +7,7 @@ use kdx_protocol::messages::FileListResponse;
 use crate::error::ClientError;
 use crate::event::{
     AccountSummary, FileSearchEntry, NewsPost, NewsgroupInfo, PresenceUser, RoleInfo,
-    TrackerServer,
+    ServerSettings, TrackerServer,
 };
 
 /// A logged-in session's identity.
@@ -79,6 +79,24 @@ pub(crate) enum Command {
     ListServers {
         filter: String,
         reply: oneshot::Sender<Result<Vec<TrackerServer>, ClientError>>,
+    },
+    GetServerSettings {
+        reply: oneshot::Sender<Result<ServerSettings, ClientError>>,
+    },
+    UpdateServerSettings {
+        name: String,
+        description: String,
+        greeting: String,
+        max_users: u32,
+        reply: oneshot::Sender<Result<ServerSettings, ClientError>>,
+    },
+    Broadcast {
+        text: String,
+        reply: oneshot::Sender<Result<(), ClientError>>,
+    },
+    ShutdownServer {
+        message: String,
+        reply: oneshot::Sender<Result<(), ClientError>>,
     },
     GetUserInfo {
         username: String,
@@ -338,6 +356,55 @@ impl ClientHandle {
     pub async fn list_servers(&self, filter: &str) -> Result<Vec<TrackerServer>, ClientError> {
         self.send(|reply| Command::ListServers {
             filter: filter.to_owned(),
+            reply,
+        })
+        .await
+    }
+
+    /// Fetch the live server settings (the Server Settings window). Requires
+    /// `SERVER_ADMIN`.
+    pub async fn get_server_settings(&self) -> Result<ServerSettings, ClientError> {
+        self.send(|reply| Command::GetServerSettings { reply }).await
+    }
+
+    /// Replace the live-editable server settings (name/description/greeting/
+    /// max_users) wholesale. Requires `SERVER_ADMIN`. Resolves with the
+    /// updated settings.
+    pub async fn update_server_settings(
+        &self,
+        name: &str,
+        description: &str,
+        greeting: &str,
+        max_users: u32,
+    ) -> Result<ServerSettings, ClientError> {
+        self.send(|reply| Command::UpdateServerSettings {
+            name: name.to_owned(),
+            description: description.to_owned(),
+            greeting: greeting.to_owned(),
+            max_users,
+            reply,
+        })
+        .await
+    }
+
+    /// Send `text` to every currently-connected session, regardless of chat
+    /// room membership. Requires `SERVER_ADMIN`. Resolves once the request is
+    /// written; the server's ack (or refusal) arrives as `Event::ServerInfo`
+    /// (or `Event::ServerError`).
+    pub async fn broadcast(&self, text: &str) -> Result<(), ClientError> {
+        self.send(|reply| Command::Broadcast {
+            text: text.to_owned(),
+            reply,
+        })
+        .await
+    }
+
+    /// Gracefully shut down the server: broadcast `message`, disconnect every
+    /// session (including this one), and stop accepting new connections.
+    /// Requires `SERVER_ADMIN`. "Exit" only — never touches the host OS.
+    pub async fn shutdown_server(&self, message: &str) -> Result<(), ClientError> {
+        self.send(|reply| Command::ShutdownServer {
+            message: message.to_owned(),
             reply,
         })
         .await

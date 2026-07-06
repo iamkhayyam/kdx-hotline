@@ -7,7 +7,7 @@ mod common;
 use std::time::Duration;
 
 use common::TestServer;
-use kdx_client_core::{ClientError, Event};
+use kdx_client_core::{connect, ClientConfig, ClientError, Event};
 use kdx_protocol::messages::CHAT_ACTION;
 use tokio::sync::mpsc::Receiver;
 
@@ -642,6 +642,192 @@ async fn tracker_lists_the_self_registered_server() {
     assert_eq!(client.list_servers("KDX").await.unwrap().len(), 1);
     assert!(client.list_servers("no-such-server").await.unwrap().is_empty());
 
+    ts.stop();
+}
+
+#[tokio::test]
+async fn admin_views_and_updates_server_settings_and_greeting_shows_on_login() {
+    let ts = TestServer::start().await;
+    ts.seed_account("sysop", "pw", 3).await; // Admin: has SERVER_ADMIN
+    ts.seed_account("later", "pw", 1).await;
+
+    let (sysop, mut es, _d1) = ts.connect_client().await;
+    next_event(&mut es).await;
+    sysop.login("sysop", "pw").await.unwrap();
+
+    let current = sysop.get_server_settings().await.unwrap();
+    assert_eq!(current.name, "KDX Server");
+    assert_eq!(current.greeting, "");
+    assert_eq!(current.port, ts.port());
+
+    let updated = sysop
+        .update_server_settings("The Underground", "warez & wares", "welcome back", 42)
+        .await
+        .unwrap();
+    assert_eq!(updated.name, "The Underground");
+    assert_eq!(updated.description, "warez & wares");
+    assert_eq!(updated.greeting, "welcome back");
+    assert_eq!(updated.max_users, 42);
+
+    // A fresh read agrees (it's live server state, not an echo).
+    assert_eq!(sysop.get_server_settings().await.unwrap().name, "The Underground");
+
+    // A newly-logging-in user sees the greeting right after AuthResult.
+    let (later, mut el, _d2) = ts.connect_client().await;
+    next_event(&mut el).await;
+    later.login("later", "pw").await.unwrap();
+    let mut saw_greeting = false;
+    for _ in 0..5 {
+        if let Event::ServerInfo { text } = next_event(&mut el).await {
+            assert_eq!(text, "welcome back");
+            saw_greeting = true;
+            break;
+        }
+    }
+    assert!(saw_greeting, "new login should see the greeting");
+
+    ts.stop();
+}
+
+#[tokio::test]
+async fn plain_user_cannot_view_or_update_server_settings() {
+    let ts = TestServer::start().await;
+    ts.seed_account("plain", "pw", 1).await; // no SERVER_ADMIN
+
+    let (client, mut events, _dd) = ts.connect_client().await;
+    next_event(&mut events).await;
+    client.login("plain", "pw").await.unwrap();
+
+    assert!(matches!(client.get_server_settings().await, Err(ClientError::Server(_))));
+    assert!(matches!(
+        client.update_server_settings("hax", "", "", 1).await,
+        Err(ClientError::Server(_))
+    ));
+
+    ts.stop();
+}
+
+#[tokio::test]
+async fn admin_broadcast_reaches_every_connected_session() {
+    let ts = TestServer::start().await;
+    ts.seed_account("sysop", "pw", 3).await;
+    ts.seed_account("bystander", "pw", 1).await;
+
+    let (sysop, mut es, _d1) = ts.connect_client().await;
+    next_event(&mut es).await;
+    sysop.login("sysop", "pw").await.unwrap();
+
+    let (bystander, mut eb, _d2) = ts.connect_client().await;
+    next_event(&mut eb).await;
+    bystander.login("bystander", "pw").await.unwrap();
+
+    sysop.broadcast("server restarting in 5 minutes").await.unwrap();
+
+    // The bystander receives it even though they're in no chat room with
+    // the admin and it's not a private message.
+    let mut got = false;
+    for _ in 0..10 {
+        if let Event::ServerInfo { text } = next_event(&mut eb).await {
+            assert_eq!(text, "server restarting in 5 minutes");
+            got = true;
+            break;
+        }
+    }
+    assert!(got, "bystander should receive the broadcast");
+
+    // The admin gets an ack naming how many sessions were reached.
+    let mut saw_ack = false;
+    for _ in 0..10 {
+        if let Event::ServerInfo { text } = next_event(&mut es).await {
+            if text.contains("session") {
+                saw_ack = true;
+                break;
+            }
+        }
+    }
+    assert!(saw_ack, "admin should get a reached-count ack");
+
+    ts.stop();
+}
+
+#[tokio::test]
+async fn plain_user_cannot_broadcast_or_shutdown() {
+    let ts = TestServer::start().await;
+    ts.seed_account("plain", "pw", 1).await;
+
+    let (client, mut events, _dd) = ts.connect_client().await;
+    next_event(&mut events).await;
+    client.login("plain", "pw").await.unwrap();
+
+    client.broadcast("nope").await.unwrap(); // the send itself succeeds...
+    let mut refused = false;
+    for _ in 0..10 {
+        if let Event::ServerError { text } = next_event(&mut events).await {
+            assert!(text.contains("SERVER_ADMIN"));
+            refused = true;
+            break;
+        }
+    }
+    assert!(refused, "broadcast should be refused server-side");
+
+    client.shutdown_server("nope").await.unwrap();
+    let mut shutdown_refused = false;
+    for _ in 0..10 {
+        if let Event::ServerError { text } = next_event(&mut events).await {
+            assert!(text.contains("SERVER_ADMIN"));
+            shutdown_refused = true;
+            break;
+        }
+    }
+    assert!(shutdown_refused, "shutdown should be refused server-side");
+
+    ts.stop();
+}
+
+#[tokio::test]
+async fn admin_shutdown_disconnects_everyone_and_stops_the_listener() {
+    let ts = TestServer::start().await;
+    ts.seed_account("sysop", "pw", 3).await;
+    ts.seed_account("bystander", "pw", 1).await;
+    let port = ts.port();
+
+    let (sysop, mut es, _d1) = ts.connect_client().await;
+    next_event(&mut es).await;
+    sysop.login("sysop", "pw").await.unwrap();
+
+    let (bystander, mut eb, _d2) = ts.connect_client().await;
+    next_event(&mut eb).await;
+    bystander.login("bystander", "pw").await.unwrap();
+
+    sysop.shutdown_server("goodnight").await.unwrap();
+
+    // Both the admin and the bystander see the notice, then get disconnected.
+    for rx in [&mut es, &mut eb] {
+        let mut saw_notice = false;
+        let mut saw_disconnect = false;
+        for _ in 0..10 {
+            match next_event(rx).await {
+                Event::ServerInfo { text } if text == "goodnight" => saw_notice = true,
+                Event::Disconnected { .. } => {
+                    saw_disconnect = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_notice, "should see the shutdown notice");
+        assert!(saw_disconnect, "should be disconnected");
+    }
+
+    // The accept loop stops taking new connections. A little slack for the
+    // listener task to actually observe the shutdown notify and break.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let data_dir = tempfile::tempdir().unwrap();
+    let cfg = ClientConfig::new("127.0.0.1", port, data_dir.path());
+    assert!(connect(cfg).await.is_err(), "listener should have stopped accepting");
+
+    // Not calling ts.stop(): the server already shut itself down; aborting a
+    // finished task is a harmless no-op.
     ts.stop();
 }
 

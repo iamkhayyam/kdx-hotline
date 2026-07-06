@@ -178,6 +178,35 @@ impl From<kdx_protocol::messages::FileSearchEntry> for FileSearchEntry {
     }
 }
 
+/// Current server settings (the Server Settings window). Mirrors
+/// `kdx_protocol::messages::ServerSettingsResponse`. `port`,
+/// `max_upload_bytes_per_sec`, and `max_download_bytes_per_sec` are
+/// informational — set at process start, not remotely editable.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ServerSettings {
+    pub name: String,
+    pub description: String,
+    pub greeting: String,
+    pub max_users: u32,
+    pub port: u16,
+    pub max_upload_bytes_per_sec: u64,
+    pub max_download_bytes_per_sec: u64,
+}
+
+impl From<kdx_protocol::messages::ServerSettingsResponse> for ServerSettings {
+    fn from(s: kdx_protocol::messages::ServerSettingsResponse) -> Self {
+        Self {
+            name: s.name,
+            description: s.description,
+            greeting: s.greeting,
+            max_users: s.max_users,
+            port: s.port,
+            max_upload_bytes_per_sec: s.max_upload_bytes_per_sec,
+            max_download_bytes_per_sec: s.max_download_bytes_per_sec,
+        }
+    }
+}
+
 /// Events pushed from the connection actor to the application. The serde
 /// representation (`{ "type": "chat", ... }`) is the exact contract the
 /// webview consumes, so its shape is covered by a test.

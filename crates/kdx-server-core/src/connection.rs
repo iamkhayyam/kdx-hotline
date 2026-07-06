@@ -14,24 +14,25 @@ use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use kdx_protocol::messages::{
     AccountCreate, AccountListRequest, AccountListResponse, AccountRolesRequest,
-    AccountRolesResponse, AccountSummary, AccountUpdate, AdminDisconnect, AuthChallenge,
-    AuthRequest, AuthResponse, AuthResult, ChatJoin, ChatLeave, ChatSend, ChatTopic,
-    FileCatalogGenerated, FileCreateFolder, FileDelete, FileEntry, FileGenerateCatalog,
-    FileListRequest, FileListResponse, FileMove, FileSearchEntry, FileSearchRequest,
-    FileSearchResponse, HandshakeInit, HandshakeResp, NewsPost as WireNewsPost,
+    AccountRolesResponse, AccountSummary, AccountUpdate, AdminBroadcast, AdminDisconnect,
+    AdminShutdown, AuthChallenge, AuthRequest, AuthResponse, AuthResult, ChatJoin, ChatLeave,
+    ChatSend, ChatTopic, FileCatalogGenerated, FileCreateFolder, FileDelete, FileEntry,
+    FileGenerateCatalog, FileListRequest, FileListResponse, FileMove, FileSearchEntry,
+    FileSearchRequest, FileSearchResponse, HandshakeInit, HandshakeResp, NewsPost as WireNewsPost,
     NewsPostCreate, NewsPostDelete, NewsThreadListRequest, NewsThreadListResponse, NewsgroupCreate,
     NewsgroupInfo, NewsgroupListRequest, NewsgroupListResponse, PresenceListRequest,
     PresenceListResponse, PrivateMessage, PrivateSend, RoleAssign, RoleCreate, RoleDelete, RoleInfo,
-    RoleListRequest, RoleListResponse, RoleUnassign, RoleUpdate, TrackerListRequest,
-    TrackerListResponse, TrackerServer, TransferAccept, TransferData, TransferEnd, TransferRequest,
-    UserInfoRequest, UserInfoResponse, TRANSFER_HASH_MISMATCH, TRANSFER_VERIFIED,
+    RoleListRequest, RoleListResponse, RoleUnassign, RoleUpdate, ServerSettingsRequest,
+    ServerSettingsResponse, ServerSettingsUpdate, TrackerListRequest, TrackerListResponse,
+    TrackerServer, TransferAccept, TransferData, TransferEnd, TransferRequest, UserInfoRequest,
+    UserInfoResponse, TRANSFER_HASH_MISMATCH, TRANSFER_VERIFIED,
 };
 use kdx_protocol::{
     KdxCodec, KdxFrame, PacketFlags, PacketHeader, PacketType, ProtocolError, Reassembler,
     PROTOCOL_VERSION,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Notify};
 use tokio::time::timeout;
 use tokio_util::codec::Framed;
 use tracing::{debug, warn};
@@ -42,6 +43,7 @@ use crate::chat::{Member, Outbound, RoomCommand, RoomManager};
 use crate::files::{FileTree, NodeKind};
 use crate::news::{NewsManager, Post as NewsPostDomain};
 use crate::presence::{unix_now, Presence};
+use crate::settings::ServerSettings;
 use crate::tracker::Tracker;
 use crate::transfer::{resume_id_from_wire, ActiveUpload, TransferError, TransferManager};
 
@@ -76,6 +78,15 @@ pub struct ServerCtx {
     pub transfers: TransferManager,
     pub presence: Presence,
     pub tracker: Tracker,
+    pub settings: ServerSettings,
+    /// The bound listen port — immutable, informational only (shown in the
+    /// Server Settings window; not itself part of `ServerSettings`, which
+    /// covers just the live-editable fields).
+    pub bind_port: u16,
+    /// Notified by `AdminShutdown` to make the accept loop stop taking new
+    /// connections and let the server task wind down. Not touched anywhere
+    /// else in the request path.
+    pub shutdown: Arc<Notify>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -232,6 +243,15 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                                 .await?;
                             debug!(user = %session.username, "authenticated");
                             self.session = Some(session);
+                            let greeting = self.ctx.settings.greeting().await;
+                            if !greeting.is_empty() {
+                                self.send(
+                                    PacketType::Info,
+                                    PacketFlags::SYSTEM_MESSAGE,
+                                    Bytes::copy_from_slice(greeting.as_bytes()),
+                                )
+                                .await?;
+                            }
                             return Ok(true);
                         }
                         Err(crate::auth::AuthError::InvalidCredentials) => {
@@ -1028,6 +1048,76 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                     )
                     .await?;
                 }
+                PacketType::ServerSettingsRequest => {
+                    ServerSettingsRequest::decode(&frame.payload)?;
+                    let privs = self.session.as_ref().expect("authed").privileges;
+                    if !privs.contains(Privileges::SERVER_ADMIN) {
+                        self.send_error("missing SERVER_ADMIN privilege").await?;
+                        continue;
+                    }
+                    self.reply_server_settings().await?;
+                }
+                PacketType::ServerSettingsUpdate => {
+                    let update = ServerSettingsUpdate::decode(&frame.payload)?;
+                    let privs = self.session.as_ref().expect("authed").privileges;
+                    if !privs.contains(Privileges::SERVER_ADMIN) {
+                        self.send_error("missing SERVER_ADMIN privilege").await?;
+                        continue;
+                    }
+                    if update.name.trim().is_empty() {
+                        self.send_error("server name is required").await?;
+                        continue;
+                    }
+                    self.ctx
+                        .settings
+                        .update(update.name, update.description, update.greeting, update.max_users)
+                        .await;
+                    self.reply_server_settings().await?;
+                }
+                PacketType::AdminBroadcast => {
+                    let broadcast = AdminBroadcast::decode(&frame.payload)?;
+                    let privs = self.session.as_ref().expect("authed").privileges;
+                    if !privs.contains(Privileges::SERVER_ADMIN) {
+                        self.send_error("missing SERVER_ADMIN privilege").await?;
+                        continue;
+                    }
+                    let outbound = Outbound {
+                        packet_type: PacketType::Info,
+                        flags: PacketFlags::SYSTEM_MESSAGE,
+                        payload: Bytes::copy_from_slice(broadcast.text.as_bytes()),
+                    };
+                    let reached = self.ctx.presence.broadcast_all(outbound).await;
+                    self.send(
+                        PacketType::Info,
+                        PacketFlags::SYSTEM_MESSAGE,
+                        Bytes::copy_from_slice(format!("broadcast sent to {reached} session(s)").as_bytes()),
+                    )
+                    .await?;
+                }
+                PacketType::AdminShutdown => {
+                    let shutdown = AdminShutdown::decode(&frame.payload)?;
+                    let privs = self.session.as_ref().expect("authed").privileges;
+                    if !privs.contains(Privileges::SERVER_ADMIN) {
+                        self.send_error("missing SERVER_ADMIN privilege").await?;
+                        continue;
+                    }
+                    let message = if shutdown.message.trim().is_empty() {
+                        "the server is shutting down".to_string()
+                    } else {
+                        shutdown.message
+                    };
+                    let notice = Outbound {
+                        packet_type: PacketType::Info,
+                        flags: PacketFlags::SYSTEM_MESSAGE,
+                        payload: Bytes::copy_from_slice(message.as_bytes()),
+                    };
+                    self.ctx.presence.broadcast_all(notice).await;
+                    self.ctx.presence.disconnect_all(&message).await;
+                    // Stop the accept loop; already-open connections (this one
+                    // included) close individually as their queued Disconnect
+                    // event above is processed on the next select iteration.
+                    self.ctx.shutdown.notify_waiters();
+                }
                 PacketType::NewsgroupListRequest => {
                     NewsgroupListRequest::decode(&frame.payload)?;
                     self.reply_newsgroup_list().await?;
@@ -1329,6 +1419,28 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
         Ok(())
     }
 
+    /// Send the current server settings — the reply to `ServerSettingsRequest`
+    /// and to a successful `ServerSettingsUpdate`.
+    async fn reply_server_settings(&mut self) -> Result<(), ConnectionError> {
+        let snap = self.ctx.settings.snapshot().await;
+        let response = ServerSettingsResponse {
+            name: snap.name,
+            description: snap.description,
+            greeting: snap.greeting,
+            max_users: snap.max_users,
+            port: self.ctx.bind_port,
+            max_upload_bytes_per_sec: self.ctx.transfers.upload_rate(),
+            max_download_bytes_per_sec: self.ctx.transfers.download_rate(),
+        };
+        self.send(
+            PacketType::ServerSettingsResponse,
+            PacketFlags::empty(),
+            response.encode(),
+        )
+        .await?;
+        Ok(())
+    }
+
     /// Send the newsgroups the caller may read (filtered by their class) — the
     /// reply to `NewsgroupListRequest` and to a successful create.
     async fn reply_newsgroup_list(&mut self) -> Result<(), ConnectionError> {
@@ -1539,6 +1651,13 @@ mod tests {
             transfers,
             presence: crate::presence::Presence::spawn(),
             tracker: crate::tracker::Tracker::spawn(crate::tracker::DEFAULT_TTL),
+            settings: crate::settings::ServerSettings::new(
+                "Test Server".into(),
+                String::new(),
+                256,
+            ),
+            bind_port: 0,
+            shutdown: Arc::new(Notify::new()),
         });
         (ctx, dir)
     }
@@ -1790,6 +1909,13 @@ mod tests {
             transfers,
             presence: crate::presence::Presence::spawn(),
             tracker: crate::tracker::Tracker::spawn(crate::tracker::DEFAULT_TTL),
+            settings: crate::settings::ServerSettings::new(
+                "Test Server".into(),
+                String::new(),
+                256,
+            ),
+            bind_port: 0,
+            shutdown: Arc::new(Notify::new()),
         });
         (ctx, dir)
     }

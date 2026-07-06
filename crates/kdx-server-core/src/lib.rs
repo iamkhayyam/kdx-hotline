@@ -9,6 +9,7 @@ pub mod connection;
 pub mod files;
 pub mod news;
 pub mod presence;
+pub mod settings;
 pub mod tracker;
 pub mod transfer;
 

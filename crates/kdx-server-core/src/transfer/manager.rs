@@ -118,6 +118,11 @@ impl TransferManager {
         self.config.max_download_bytes_per_sec
     }
 
+    /// Configured upload throttle in bytes/sec (0 = unlimited).
+    pub(crate) fn upload_rate(&self) -> u64 {
+        self.config.max_upload_bytes_per_sec
+    }
+
     /// Begin (or resume) an upload into `path`/`name` for `session`.
     #[allow(clippy::too_many_arguments)] // mirrors the TransferRequest wire fields
     pub async fn begin_upload(

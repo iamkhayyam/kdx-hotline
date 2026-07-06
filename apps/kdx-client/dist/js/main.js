@@ -16,6 +16,7 @@ import { buildRoles } from "./windows/roles.js";
 import { buildAccounts } from "./windows/accounts.js";
 import { buildNews } from "./windows/news.js";
 import { buildTrackers } from "./windows/trackers.js";
+import { buildServerAdmin } from "./windows/serveradmin.js";
 
 const desktop = document.getElementById("desktop");
 
@@ -56,7 +57,11 @@ const trackers = buildTrackers((host, port) => {
   connectApi.fill({ host, port: String(port) });
   open("connect");
 });
-const roles = buildRoles(() => open("accounts"));
+const serverAdmin = buildServerAdmin();
+const roles = buildRoles(
+  () => open("accounts"),
+  () => open("server")
+);
 const userList = buildUserList(
   (username) => {
     open("userinfo");
@@ -153,6 +158,13 @@ register({
   rect: { x: 420, y: 70, w: 560, h: 480 },
   build: () => ({ body: accounts.body }),
   onOpen: () => accounts.refresh(),
+});
+register({
+  id: "server",
+  title: "Server",
+  rect: { x: 440, y: 90, w: 460, h: 460 },
+  build: () => ({ body: serverAdmin.body }),
+  onOpen: () => serverAdmin.refresh(),
 });
 register({
   id: "news",

@@ -38,10 +38,22 @@ async fn run(config_path: Option<PathBuf>) -> Result<(), Box<dyn std::error::Err
 
     let server = serve(config).await?;
     info!(addr = %server.local_addr, "kdxd running; ctrl-c to stop");
+    let abort_handle = server.handle.abort_handle();
 
-    tokio::signal::ctrl_c().await?;
-    info!("shutting down");
-    server.handle.abort();
+    tokio::select! {
+        result = tokio::signal::ctrl_c() => {
+            result?;
+            info!("shutting down");
+            abort_handle.abort();
+        }
+        _ = server.handle => {
+            // The accept loop stopped on its own — an admin's AdminShutdown.
+            // Give already-open connections a moment to flush their queued
+            // Disconnect frame and close before the process actually exits.
+            info!("server shut down remotely; exiting");
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        }
+    }
     Ok(())
 }
 

@@ -77,6 +77,13 @@ pub enum PacketType {
     TrackerListRequest = 0x70,
     TrackerListResponse = 0x71,
 
+    // Remote server management (0x72-0x76)
+    ServerSettingsRequest = 0x72,
+    ServerSettingsResponse = 0x73,
+    ServerSettingsUpdate = 0x74,
+    AdminBroadcast = 0x75,
+    AdminShutdown = 0x76,
+
     // System (0xF0-0xFF)
     Error = 0xF0,
     Warning = 0xF1,
@@ -84,7 +91,7 @@ pub enum PacketType {
 }
 
 impl PacketType {
-    pub const ALL: [PacketType; 59] = [
+    pub const ALL: [PacketType; 64] = [
         PacketType::HandshakeInit,
         PacketType::HandshakeResp,
         PacketType::Ping,
@@ -141,6 +148,11 @@ impl PacketType {
         PacketType::NewsgroupCreate,
         PacketType::TrackerListRequest,
         PacketType::TrackerListResponse,
+        PacketType::ServerSettingsRequest,
+        PacketType::ServerSettingsResponse,
+        PacketType::ServerSettingsUpdate,
+        PacketType::AdminBroadcast,
+        PacketType::AdminShutdown,
         PacketType::Error,
         PacketType::Warning,
         PacketType::Info,
@@ -209,6 +221,11 @@ impl TryFrom<u8> for PacketType {
             0x66 => NewsgroupCreate,
             0x70 => TrackerListRequest,
             0x71 => TrackerListResponse,
+            0x72 => ServerSettingsRequest,
+            0x73 => ServerSettingsResponse,
+            0x74 => ServerSettingsUpdate,
+            0x75 => AdminBroadcast,
+            0x76 => AdminShutdown,
             0xF0 => Error,
             0xF1 => Warning,
             0xF2 => Info,

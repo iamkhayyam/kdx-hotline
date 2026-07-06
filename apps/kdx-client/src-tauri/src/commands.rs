@@ -6,7 +6,8 @@ use std::path::PathBuf;
 
 use kdx_client_core::{
     connect as core_connect, trust_server, AccountSummary, ClientConfig, ClientError, Event,
-    FileSearchEntry, NewsPost, NewsgroupInfo, PresenceUser, RoleInfo, TrackerServer,
+    FileSearchEntry, NewsPost, NewsgroupInfo, PresenceUser, RoleInfo, ServerSettings,
+    TrackerServer,
 };
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -229,6 +230,35 @@ pub async fn list_servers(
     filter: String,
 ) -> CmdResult<Vec<TrackerServer>> {
     with_client(&state, |c| async move { c.list_servers(&filter).await }).await
+}
+
+#[tauri::command]
+pub async fn get_server_settings(state: State<'_, AppState>) -> CmdResult<ServerSettings> {
+    with_client(&state, |c| async move { c.get_server_settings().await }).await
+}
+
+#[tauri::command]
+pub async fn update_server_settings(
+    state: State<'_, AppState>,
+    name: String,
+    description: String,
+    greeting: String,
+    max_users: u32,
+) -> CmdResult<ServerSettings> {
+    with_client(&state, |c| async move {
+        c.update_server_settings(&name, &description, &greeting, max_users).await
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn broadcast(state: State<'_, AppState>, text: String) -> CmdResult<()> {
+    with_client(&state, |c| async move { c.broadcast(&text).await }).await
+}
+
+#[tauri::command]
+pub async fn shutdown_server(state: State<'_, AppState>, message: String) -> CmdResult<()> {
+    with_client(&state, |c| async move { c.shutdown_server(&message).await }).await
 }
 
 #[tauri::command]
