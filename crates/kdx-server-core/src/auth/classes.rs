@@ -70,11 +70,13 @@ impl TryFrom<u8> for BaseClass {
     }
 }
 
-/// Combine a base class with per-account override bits.
-pub fn effective_privileges(base: BaseClass, granted: u32, revoked: u32) -> Privileges {
+/// Combine a base class, the union of assigned custom roles, and per-account
+/// override bits. Revokes win over both the class and any role — an admin
+/// silencing a specific account should never be undone by a role grant.
+pub fn effective_privileges(base: BaseClass, roles: Privileges, granted: u32, revoked: u32) -> Privileges {
     let granted = Privileges::from_bits_truncate(granted);
     let revoked = Privileges::from_bits_truncate(revoked);
-    (base.privileges() | granted) - revoked
+    (base.privileges() | roles | granted) - revoked
 }
 
 #[cfg(test)]
@@ -96,6 +98,7 @@ mod tests {
     fn grants_extend_class() {
         let effective = effective_privileges(
             BaseClass::User,
+            Privileges::empty(),
             Privileges::CHAT_SET_TOPIC.bits(),
             0,
         );
@@ -107,6 +110,7 @@ mod tests {
     fn revokes_restrict_class() {
         let effective = effective_privileges(
             BaseClass::PowerUser,
+            Privileges::empty(),
             0,
             Privileges::FILE_UPLOAD.bits(),
         );
@@ -117,7 +121,30 @@ mod tests {
     #[test]
     fn revoke_beats_grant() {
         let bits = Privileges::FILE_DELETE.bits();
-        let effective = effective_privileges(BaseClass::User, bits, bits);
+        let effective = effective_privileges(BaseClass::User, Privileges::empty(), bits, bits);
         assert!(!effective.contains(Privileges::FILE_DELETE));
+    }
+
+    #[test]
+    fn role_grants_beyond_class() {
+        let effective = effective_privileges(
+            BaseClass::Guest,
+            Privileges::USER_KICK,
+            0,
+            0,
+        );
+        assert!(effective.contains(Privileges::USER_KICK));
+        assert!(effective.contains(Privileges::CHAT_SEND)); // still has the class set
+    }
+
+    #[test]
+    fn revoke_beats_role() {
+        let effective = effective_privileges(
+            BaseClass::Guest,
+            Privileges::USER_KICK,
+            0,
+            Privileges::USER_KICK.bits(),
+        );
+        assert!(!effective.contains(Privileges::USER_KICK));
     }
 }

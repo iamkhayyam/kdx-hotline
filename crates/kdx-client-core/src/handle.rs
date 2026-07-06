@@ -5,6 +5,7 @@ use tokio::sync::{mpsc, oneshot};
 use kdx_protocol::messages::FileListResponse;
 
 use crate::error::ClientError;
+use crate::event::PresenceUser;
 
 /// A logged-in session's identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,6 +45,13 @@ pub(crate) enum Command {
     ListFiles {
         path: String,
         reply: oneshot::Sender<Result<FileListResponse, ClientError>>,
+    },
+    ListUsers {
+        reply: oneshot::Sender<Result<Vec<PresenceUser>, ClientError>>,
+    },
+    GetUserInfo {
+        username: String,
+        reply: oneshot::Sender<Result<PresenceUser, ClientError>>,
     },
     Upload {
         local: PathBuf,
@@ -126,6 +134,22 @@ impl ClientHandle {
     pub async fn list_files(&self, path: &str) -> Result<FileListResponse, ClientError> {
         self.send(|reply| Command::ListFiles {
             path: path.to_owned(),
+            reply,
+        })
+        .await
+    }
+
+    /// Fetch the server-wide roster of currently online users (the global
+    /// User List, distinct from a chat room's member list).
+    pub async fn list_users(&self) -> Result<Vec<PresenceUser>, ClientError> {
+        self.send(|reply| Command::ListUsers { reply }).await
+    }
+
+    /// Fetch one user's detail (login/idle time, address) for the User Info
+    /// window. Errors if the user isn't currently online.
+    pub async fn get_user_info(&self, username: &str) -> Result<PresenceUser, ClientError> {
+        self.send(|reply| Command::GetUserInfo {
+            username: username.to_owned(),
             reply,
         })
         .await

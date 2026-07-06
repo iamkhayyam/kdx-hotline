@@ -7,7 +7,9 @@ pub mod auth;
 pub mod chat;
 pub mod connection;
 pub mod files;
+pub mod presence;
 pub mod tracker;
 pub mod transfer;
 
 pub use connection::{Connection, ConnectionError, ServerCtx};
+pub use presence::Presence;

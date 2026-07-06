@@ -160,6 +160,30 @@ body::before {
 .set-actions { display: flex; align-items: center; gap: 12px; }
 .set-status { color: var(--green); font-family: var(--mono); font-size: 11px; }
 
+/* User List */
+.userlist-win { flex: 1; display: flex; flex-direction: column; min-height: 0; }
+.ul-row {
+  display: flex; align-items: center; gap: 8px; padding: 5px 10px;
+  border-bottom: 1px solid #1a0d0d; cursor: pointer; font-family: var(--mono); font-size: 12px;
+}
+.ul-row:hover { background: rgba(122,10,10,.14); }
+.classbar { width: 4px; align-self: stretch; flex: 0 0 auto; background: var(--grey-dim); }
+.classbar[data-class="0"] { background: #4a4a4a; }   /* guest */
+.classbar[data-class="1"] { background: #3d8cf5; }   /* user */
+.classbar[data-class="2"] { background: var(--amber); } /* power user */
+.classbar[data-class="3"] { background: var(--alert); } /* admin */
+.ul-name { color: var(--green); font-weight: 700; flex: 0 0 auto; }
+.ul-meta { color: var(--grey-dim); font-size: 11px; margin-left: auto; white-space: nowrap; }
+
+/* User Info */
+.userinfo { padding: 16px 18px; flex: 1; }
+.ui-empty { color: var(--grey-dim); font-size: 12px; text-align: center; padding: 30px 10px; }
+.ui-name { font-family: var(--mono); font-weight: 700; color: var(--green); font-size: 16px; margin-bottom: 10px; }
+.ui-row { display: flex; justify-content: space-between; font-size: 12px; padding: 4px 0; border-bottom: 1px solid #1a0d0d; }
+.ui-row span:first-child { color: var(--grey-dim); font-family: var(--mono); font-size: 10px; letter-spacing: .1em; text-transform: uppercase; }
+.ui-row span:last-child { color: var(--ink, #cbb6b6); font-family: var(--mono); font-size: 12px; }
+.ui-detail .btn { margin-top: 14px; }
+
 /* About */
 .about { padding: 18px 20px; text-align: center; }
 .about-logo { font-family: var(--mono); font-weight: 700; letter-spacing: .3em; font-size: 32px; color: var(--alert); }

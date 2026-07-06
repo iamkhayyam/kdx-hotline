@@ -104,7 +104,7 @@ impl AuthManager {
     }
 
     /// Verify the client's response and mint a session.
-    pub fn complete(&self, pending: PendingAuth, response: &[u8; 32]) -> Result<Session, AuthError> {
+    pub async fn complete(&self, pending: PendingAuth, response: &[u8; 32]) -> Result<Session, AuthError> {
         let Some(account) = pending.account else {
             return Err(AuthError::InvalidCredentials);
         };
@@ -115,12 +115,21 @@ impl AuthManager {
 
         let class = BaseClass::try_from(account.base_class as u8)
             .map_err(|_| AuthError::InvalidCredentials)?;
+        let roles = kdx_storage::roles::for_account(&self.pool, &account.id).await?;
+        let role_privileges = roles
+            .iter()
+            .fold(Privileges::empty(), |acc, r| acc | Privileges::from_bits_truncate(r.privileges as u32));
         let session = Session {
             id: Uuid::new_v4(),
             account_id: account.id,
             username: account.username,
             class,
-            privileges: effective_privileges(class, account.granted as u32, account.revoked as u32),
+            privileges: effective_privileges(
+                class,
+                role_privileges,
+                account.granted as u32,
+                account.revoked as u32,
+            ),
             expires_at: Instant::now() + self.session_ttl,
         };
         self.sessions.insert(session.id, session.clone());
@@ -180,7 +189,7 @@ mod tests {
         let mgr = AuthManager::new(pool, Duration::from_secs(60));
 
         let (data, pending) = mgr.begin("phraq").await.unwrap();
-        let session = mgr.complete(pending, &answer(&data, "s3cret")).unwrap();
+        let session = mgr.complete(pending, &answer(&data, "s3cret")).await.unwrap();
 
         assert_eq!(session.class, BaseClass::PowerUser);
         assert!(session.privileges.contains(Privileges::CHAT_CREATE_ROOM));
@@ -194,7 +203,7 @@ mod tests {
         let mgr = AuthManager::new(pool, Duration::from_secs(60));
 
         let (data, pending) = mgr.begin("phraq").await.unwrap();
-        let result = mgr.complete(pending, &answer(&data, "wrong"));
+        let result = mgr.complete(pending, &answer(&data, "wrong")).await;
         assert!(matches!(result, Err(AuthError::InvalidCredentials)));
     }
 
@@ -205,7 +214,7 @@ mod tests {
 
         let (data, pending) = mgr.begin("nobody").await.unwrap();
         assert_eq!(data.salt.len(), 16);
-        let result = mgr.complete(pending, &answer(&data, "anything"));
+        let result = mgr.complete(pending, &answer(&data, "anything")).await;
         assert!(matches!(result, Err(AuthError::InvalidCredentials)));
     }
 
@@ -224,7 +233,7 @@ mod tests {
         let mgr = AuthManager::new(pool, Duration::from_secs(60));
 
         let (data, pending) = mgr.begin("phraq").await.unwrap();
-        let session = mgr.complete(pending, &answer(&data, "s3cret")).unwrap();
+        let session = mgr.complete(pending, &answer(&data, "s3cret")).await.unwrap();
 
         assert!(session.privileges.contains(Privileges::CHAT_SET_TOPIC)); // granted beyond class
         assert!(!session.privileges.contains(Privileges::FILE_UPLOAD)); // revoked from class
@@ -237,7 +246,7 @@ mod tests {
         let mgr = AuthManager::new(pool, Duration::from_secs(30));
 
         let (data, pending) = mgr.begin("phraq").await.unwrap();
-        let session = mgr.complete(pending, &answer(&data, "s3cret")).unwrap();
+        let session = mgr.complete(pending, &answer(&data, "s3cret")).await.unwrap();
         assert!(mgr.validate(session.id).is_some());
 
         // Pause the clock only now — sqlx's pool timeouts misbehave under a

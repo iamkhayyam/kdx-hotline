@@ -29,6 +29,13 @@ pub enum PacketType {
     ChatUserList = 0x33,
     ChatTopicSet = 0x34,
 
+    // Presence (0x35-0x39)
+    PresenceListRequest = 0x35,
+    PresenceListResponse = 0x36,
+    PresenceChange = 0x37,
+    UserInfoRequest = 0x38,
+    UserInfoResponse = 0x39,
+
     // System (0xF0-0xFF)
     Error = 0xF0,
     Warning = 0xF1,
@@ -36,7 +43,7 @@ pub enum PacketType {
 }
 
 impl PacketType {
-    pub const ALL: [PacketType; 22] = [
+    pub const ALL: [PacketType; 27] = [
         PacketType::HandshakeInit,
         PacketType::HandshakeResp,
         PacketType::Ping,
@@ -56,6 +63,11 @@ impl PacketType {
         PacketType::ChatLeave,
         PacketType::ChatUserList,
         PacketType::ChatTopicSet,
+        PacketType::PresenceListRequest,
+        PacketType::PresenceListResponse,
+        PacketType::PresenceChange,
+        PacketType::UserInfoRequest,
+        PacketType::UserInfoResponse,
         PacketType::Error,
         PacketType::Warning,
         PacketType::Info,
@@ -87,6 +99,11 @@ impl TryFrom<u8> for PacketType {
             0x32 => ChatLeave,
             0x33 => ChatUserList,
             0x34 => ChatTopicSet,
+            0x35 => PresenceListRequest,
+            0x36 => PresenceListResponse,
+            0x37 => PresenceChange,
+            0x38 => UserInfoRequest,
+            0x39 => UserInfoResponse,
             0xF0 => Error,
             0xF1 => Warning,
             0xF2 => Info,

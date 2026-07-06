@@ -29,7 +29,7 @@ use tokio_util::codec::Framed;
 
 pub use config::{ClientConfig, TrustPolicy};
 pub use error::ClientError;
-pub use event::{Direction, Event};
+pub use event::{Direction, Event, PresenceUser};
 pub use handle::{ClientHandle, Session};
 pub use tls::{spki_fingerprint, KnownHosts};
 

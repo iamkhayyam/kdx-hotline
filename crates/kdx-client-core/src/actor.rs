@@ -14,8 +14,9 @@ use futures_util::{SinkExt, StreamExt};
 use kdx_crypto::KdfParams;
 use kdx_protocol::messages::{
     AuthChallenge, AuthRequest, AuthResponse, AuthResult, ChatEvent, ChatJoin, ChatLeave, ChatSend,
-    ChatTopic, ChatUserList, FileListRequest, FileListResponse, TransferAccept, TransferData,
-    TransferEnd, TransferRequest, DIRECTION_DOWNLOAD, DIRECTION_UPLOAD, TRANSFER_VERIFIED,
+    ChatTopic, ChatUserList, FileListRequest, FileListResponse, PresenceChange, PresenceListRequest,
+    PresenceListResponse, TransferAccept, TransferData, TransferEnd, TransferRequest,
+    UserInfoRequest, UserInfoResponse, DIRECTION_DOWNLOAD, DIRECTION_UPLOAD, TRANSFER_VERIFIED,
 };
 use kdx_protocol::{
     KdxCodec, KdxFrame, PacketFlags, PacketHeader, PacketType, Reassembler, PROTOCOL_VERSION,
@@ -30,7 +31,7 @@ use tracing::{debug, warn};
 use uuid::Uuid;
 
 use crate::error::ClientError;
-use crate::event::{Direction, Event};
+use crate::event::{Direction, Event, PresenceUser};
 use crate::handle::{Command, Session};
 use crate::transfer::{chunk_len, total_chunks, ChunkBitmap, Sidecar, DEFAULT_CHUNK_SIZE};
 
@@ -86,6 +87,8 @@ pub(crate) struct Actor<S> {
     seq: u32,
     login: Option<PendingLogin>,
     list_waiters: VecDeque<oneshot::Sender<Result<FileListResponse, ClientError>>>,
+    user_list_waiters: VecDeque<oneshot::Sender<Result<Vec<PresenceUser>, ClientError>>>,
+    user_info_waiters: VecDeque<oneshot::Sender<Result<PresenceUser, ClientError>>>,
     transfer: Option<Transfer>,
 }
 
@@ -103,6 +106,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
             seq: 0,
             login: None,
             list_waiters: VecDeque::new(),
+            user_list_waiters: VecDeque::new(),
+            user_info_waiters: VecDeque::new(),
             transfer: None,
         }
     }
@@ -156,6 +161,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
             let _ = login.reply.send(Err(ClientError::Disconnected));
         }
         for waiter in self.list_waiters.drain(..) {
+            let _ = waiter.send(Err(ClientError::Disconnected));
+        }
+        for waiter in self.user_list_waiters.drain(..) {
+            let _ = waiter.send(Err(ClientError::Disconnected));
+        }
+        for waiter in self.user_info_waiters.drain(..) {
             let _ = waiter.send(Err(ClientError::Disconnected));
         }
         if let Some(reply) = self.transfer.take().and_then(transfer_reply) {
@@ -214,6 +225,28 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
                     .await
                 {
                     Ok(()) => self.list_waiters.push_back(reply),
+                    Err(e) => {
+                        let _ = reply.send(Err(e.into()));
+                    }
+                }
+            }
+            Command::ListUsers { reply } => {
+                match self
+                    .send(PacketType::PresenceListRequest, PresenceListRequest.encode())
+                    .await
+                {
+                    Ok(()) => self.user_list_waiters.push_back(reply),
+                    Err(e) => {
+                        let _ = reply.send(Err(e.into()));
+                    }
+                }
+            }
+            Command::GetUserInfo { username, reply } => {
+                match self
+                    .send(PacketType::UserInfoRequest, UserInfoRequest { username }.encode())
+                    .await
+                {
+                    Ok(()) => self.user_info_waiters.push_back(reply),
                     Err(e) => {
                         let _ = reply.send(Err(e.into()));
                     }
@@ -370,6 +403,26 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
                 if let Some(waiter) = self.list_waiters.pop_front() {
                     let _ = waiter.send(Ok(response));
                 }
+            }
+            PacketType::PresenceListResponse => {
+                let response = PresenceListResponse::decode(&frame.payload)?;
+                if let Some(waiter) = self.user_list_waiters.pop_front() {
+                    let _ = waiter.send(Ok(response.users.into_iter().map(Into::into).collect()));
+                }
+            }
+            PacketType::UserInfoResponse => {
+                let response = UserInfoResponse::decode(&frame.payload)?;
+                if let Some(waiter) = self.user_info_waiters.pop_front() {
+                    let _ = waiter.send(Ok(response.entry.into()));
+                }
+            }
+            PacketType::PresenceChange => {
+                let change = PresenceChange::decode(&frame.payload)?;
+                self.emit(Event::Presence {
+                    user: change.entry.into(),
+                    online: change.online,
+                })
+                .await;
             }
             PacketType::FileTransferStart => self.on_transfer_accept(&frame.payload).await?,
             PacketType::FileTransferData => self.on_transfer_data(&frame.payload).await?,
@@ -562,6 +615,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
         // If a transfer is mid-negotiation, an Error frame aborts it.
         if let Some(reply) = self.transfer.take().and_then(transfer_reply) {
             let _ = reply.send(Err(ClientError::Transfer(text.clone())));
+        }
+        // Likewise a pending User Info lookup (e.g. the user isn't online).
+        if let Some(waiter) = self.user_info_waiters.pop_front() {
+            let _ = waiter.send(Err(ClientError::Server(text.clone())));
         }
         self.emit(Event::ServerError { text }).await;
     }

@@ -117,7 +117,7 @@ export function buildButtonBar(mount, handlers) {
       btn.classList.toggle("active", !!f.win && isOpen(f.win));
     }
 
-    const users = state.users ? state.users.length : 0;
+    const users = state.presenceCount || 0;
     const xfer = state.transfers
       ? Object.values(state.transfers).filter((t) => t.status === undefined).length
       : 0;

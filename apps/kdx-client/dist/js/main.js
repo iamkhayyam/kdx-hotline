@@ -9,6 +9,8 @@ import { buildTransfers } from "./windows/transfers.js";
 import { buildAddressBook } from "./windows/addressbook.js";
 import { buildSettings, applySettings, loadSettings } from "./windows/settings.js";
 import { buildAbout } from "./windows/about.js";
+import { buildUserList } from "./windows/userlist.js";
+import { buildUserInfo } from "./windows/userinfo.js";
 
 const desktop = document.getElementById("desktop");
 
@@ -25,6 +27,11 @@ const connectApi = buildConnect(onLoggedIn);
 const addressbook = buildAddressBook(connectApi, () => open("connect"));
 const settings = buildSettings();
 const about = buildAbout();
+const userInfo = buildUserInfo();
+const userList = buildUserList((username) => {
+  open("userinfo");
+  userInfo.show(username);
+});
 
 // Default window positions clear the floating Button Bar (top-left).
 register({
@@ -75,6 +82,22 @@ register({
   resizable: false,
   build: () => ({ body: about.body }),
 });
+register({
+  id: "userlist",
+  title: "User List",
+  rect: { x: 630, y: 430, w: 300, h: 320 },
+  build: () => ({ body: userList.body }),
+  onOpen: () => {
+    userList.refresh().then(() => update({ presenceCount: userList.count }));
+  },
+});
+register({
+  id: "userinfo",
+  title: "User Info",
+  rect: { x: 940, y: 430, w: 280, h: 260 },
+  resizable: false,
+  build: () => ({ body: userInfo.body }),
+});
 
 // The Button Bar — the always-present launcher, itself a floating window on
 // the desktop.
@@ -82,7 +105,7 @@ const buttonBar = buildButtonBar(desktop, {
   onAction: (name) => {
     if (name === "disconnect") {
       invoke("disconnect").catch(() => {});
-      update({ connection: "offline", session: null });
+      update({ connection: "offline", session: null, presenceCount: 0 });
     } else if (name === "server") {
       toggle("connect");
     } else if (name === "exit") {
@@ -97,6 +120,9 @@ open("connect");
 function onLoggedIn() {
   open("chat");
   chat.focusEntry();
+  // Populate the global roster (and Button Bar count) even if the User List
+  // window is never opened.
+  userList.refresh().then(() => update({ presenceCount: userList.count }));
 }
 
 // Reflect connection + window state in the Button Bar (on store changes and
@@ -121,6 +147,10 @@ onKdxEvent((ev) => {
     case "topic":
       chat.onTopic(ev.topic);
       break;
+    case "presence":
+      userList.onPresence(ev.user, ev.online);
+      update({ presenceCount: userList.count });
+      break;
     case "transfer_progress":
       transfers.onProgress(ev);
       updateTransfer(ev.id, { done: ev.done, total: ev.total });
@@ -141,7 +171,7 @@ onKdxEvent((ev) => {
       chat.onChat({ sender: "", text: ev.text, timestamp: Date.now() / 1000, flags: 2 });
       break;
     case "disconnected":
-      update({ connection: "offline", session: null });
+      update({ connection: "offline", session: null, presenceCount: 0 });
       chat.onError("disconnected: " + ev.reason + " — reconnect from the Connect window");
       setChatTag(0);
       open("connect");

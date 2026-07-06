@@ -8,6 +8,29 @@ pub enum Direction {
     Download,
 }
 
+/// One user's presence snapshot, as shown in the global User List / User Info
+/// windows. Mirrors `kdx_protocol::messages::PresenceEntry`.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct PresenceUser {
+    pub username: String,
+    pub class: u8,
+    pub login_at: u64,
+    pub idle_secs: u32,
+    pub address: String,
+}
+
+impl From<kdx_protocol::messages::PresenceEntry> for PresenceUser {
+    fn from(e: kdx_protocol::messages::PresenceEntry) -> Self {
+        Self {
+            username: e.username,
+            class: e.class,
+            login_at: e.login_at,
+            idle_secs: e.idle_secs,
+            address: e.address,
+        }
+    }
+}
+
 /// Events pushed from the connection actor to the application. The serde
 /// representation (`{ "type": "chat", ... }`) is the exact contract the
 /// webview consumes, so its shape is covered by a test.
@@ -30,6 +53,9 @@ pub enum Event {
     UserList { room: String, users: Vec<String> },
     /// A room's topic was set or announced.
     Topic { room: String, topic: String },
+    /// A user came online or went offline (global roster, not room-scoped).
+    /// Never sent for your own connection's join.
+    Presence { user: PresenceUser, online: bool },
     /// Progress on an active transfer. `bitmap` is the LSB-first set of
     /// completed chunks, for the chunk-grid visualization.
     TransferProgress {
@@ -90,6 +116,25 @@ mod tests {
         assert_eq!(json["direction"], "download");
         assert_eq!(json["done"], 3);
         assert_eq!(json["bitmap"][0], 7);
+    }
+
+    #[test]
+    fn presence_event_json_shape() {
+        let ev = Event::Presence {
+            user: PresenceUser {
+                username: "phraq".into(),
+                class: 2,
+                login_at: 1_751_600_000,
+                idle_secs: 5,
+                address: "127.0.0.1:1234".into(),
+            },
+            online: true,
+        };
+        let json = serde_json::to_value(&ev).unwrap();
+        assert_eq!(json["type"], "presence");
+        assert_eq!(json["online"], true);
+        assert_eq!(json["user"]["username"], "phraq");
+        assert_eq!(json["user"]["class"], 2);
     }
 
     #[test]

@@ -6,7 +6,7 @@ use kdx_server_core::auth::AuthManager;
 use kdx_server_core::chat::RoomManager;
 use kdx_server_core::files::FileTree;
 use kdx_server_core::transfer::{TransferConfig, TransferManager};
-use kdx_server_core::{Connection, ServerCtx};
+use kdx_server_core::{Connection, Presence, ServerCtx};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::ServerConfig as TlsServerConfig;
 use tokio::net::TcpListener;
@@ -73,6 +73,7 @@ pub async fn serve(config: Config) -> Result<Server, ServeError> {
         rooms: RoomManager::new(),
         tree,
         transfers,
+        presence: Presence::spawn(),
     });
 
     let listener = TcpListener::bind(config.bind).await?;
@@ -99,7 +100,9 @@ pub async fn serve(config: Config) -> Result<Server, ServeError> {
                         return;
                     }
                 };
-                if let Err(e) = Connection::new(tls, conn_ctx).run().await {
+                if let Err(e) =
+                    Connection::new_with_peer(tls, conn_ctx, peer.to_string()).run().await
+                {
                     warn!(%peer, error = %e, "connection ended with error");
                 }
             });

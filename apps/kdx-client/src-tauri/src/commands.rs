@@ -4,7 +4,9 @@
 
 use std::path::PathBuf;
 
-use kdx_client_core::{connect as core_connect, trust_server, ClientConfig, ClientError, Event};
+use kdx_client_core::{
+    connect as core_connect, trust_server, ClientConfig, ClientError, Event, PresenceUser,
+};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
 
@@ -161,6 +163,16 @@ pub async fn list_files(state: State<'_, AppState>, path: String) -> CmdResult<F
                 })
                 .collect(),
         })
+}
+
+#[tauri::command]
+pub async fn list_users(state: State<'_, AppState>) -> CmdResult<Vec<PresenceUser>> {
+    with_client(&state, |c| async move { c.list_users().await }).await
+}
+
+#[tauri::command]
+pub async fn get_user_info(state: State<'_, AppState>, username: String) -> CmdResult<PresenceUser> {
+    with_client(&state, |c| async move { c.get_user_info(&username).await }).await
 }
 
 #[tauri::command]

@@ -10,3 +10,6 @@ apps/kdx-client/src-tauri/gen/
 # Original KDX archives — distilled into docs/original-kdx-reference.md (binaries, not source)
 Haxial-KDX-main.zip
 _github/
+
+# Local dev playground (accounts, db, served files)
+.dev/

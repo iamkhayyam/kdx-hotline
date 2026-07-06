@@ -6,7 +6,8 @@ const state = {
   server: null, // { host, port }
   session: null, // { class }
   room: "lobby",
-  users: [],
+  users: [], // current room's roster (chat window's user-list pane)
+  presenceCount: 0, // server-wide online count (Button Bar footer)
   topic: "",
   files: { path: "/", entries: [] },
   transfers: {}, // id -> { direction, done, total, bitmap, name, status }

@@ -6,6 +6,7 @@ mod auth;
 mod chat;
 mod file;
 mod handshake;
+mod presence;
 mod wire;
 
 pub use auth::{AuthChallenge, AuthRequest, AuthResponse, AuthResult};
@@ -18,3 +19,7 @@ pub use file::{
     KIND_UPLOAD, TRANSFER_ABORTED, TRANSFER_HASH_MISMATCH, TRANSFER_VERIFIED,
 };
 pub use handshake::{HandshakeInit, HandshakeResp};
+pub use presence::{
+    PresenceChange, PresenceEntry, PresenceListRequest, PresenceListResponse, UserInfoRequest,
+    UserInfoResponse,
+};

@@ -15,7 +15,8 @@ use futures_util::{SinkExt, StreamExt};
 use kdx_protocol::messages::{
     AuthChallenge, AuthRequest, AuthResponse, AuthResult, ChatJoin, ChatLeave, ChatSend,
     ChatTopic, FileEntry, FileListRequest, FileListResponse, HandshakeInit, HandshakeResp,
-    TransferAccept, TransferData, TransferEnd, TransferRequest, TRANSFER_HASH_MISMATCH,
+    PresenceListRequest, PresenceListResponse, TransferAccept, TransferData, TransferEnd,
+    TransferRequest, UserInfoRequest, UserInfoResponse, TRANSFER_HASH_MISMATCH,
     TRANSFER_VERIFIED,
 };
 use kdx_protocol::{
@@ -31,6 +32,7 @@ use tracing::{debug, warn};
 use crate::auth::{AuthManager, Privileges, Session};
 use crate::chat::{Member, Outbound, RoomCommand, RoomManager};
 use crate::files::FileTree;
+use crate::presence::Presence;
 use crate::transfer::{resume_id_from_wire, ActiveUpload, TransferError, TransferManager};
 
 /// How long the client has to send `HandshakeInit` after connecting.
@@ -57,6 +59,7 @@ pub struct ServerCtx {
     pub rooms: RoomManager,
     pub tree: FileTree,
     pub transfers: TransferManager,
+    pub presence: Presence,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -92,16 +95,28 @@ pub struct Connection<S> {
     session: Option<Session>,
     /// Monotonic sequence counter for server-sent frames.
     next_sequence: u32,
+    /// Best-effort "host:port" for this connection's peer, used for presence
+    /// and User Info. `"unknown"` for streams that don't have a real
+    /// network peer (e.g. tests over `tokio::io::duplex`).
+    peer_addr: String,
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
     pub fn new(stream: S, ctx: Arc<ServerCtx>) -> Self {
+        Self::new_with_peer(stream, ctx, "unknown".to_string())
+    }
+
+    /// Like [`Connection::new`], but records the peer's network address for
+    /// presence/User Info. `kdxd`'s real listener uses this; tests generally
+    /// don't need to.
+    pub fn new_with_peer(stream: S, ctx: Arc<ServerCtx>, peer_addr: String) -> Self {
         Self {
             framed: Framed::new(stream, KdxCodec::default()),
             ctx,
             reassembler: Reassembler::default(),
             session: None,
             next_sequence: 0,
+            peer_addr,
         }
     }
 
@@ -189,7 +204,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                     }
                     let response = AuthResponse::decode(&response_frame.payload)?;
 
-                    match self.ctx.auth.complete(pending, &response.response) {
+                    match self.ctx.auth.complete(pending, &response.response).await {
                         Ok(session) => {
                             let result = AuthResult {
                                 success: true,
@@ -238,6 +253,23 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
         // One upload at a time per connection; the chunk stream is inherently
         // serialized on the socket anyway.
         let mut upload: Option<ActiveUpload> = None;
+
+        // Join the server-wide presence roster for the User List / User Info
+        // windows; every authenticated connection is visible here regardless
+        // of which chat rooms it's in.
+        {
+            let session = self.session.as_ref().expect("authed in dispatch");
+            self.ctx
+                .presence
+                .join(
+                    session.id,
+                    session.username.clone(),
+                    session.class as u8,
+                    self.peer_addr.clone(),
+                    outbound_tx.clone(),
+                )
+                .await;
+        }
 
         enum Next {
             Event(Outbound),
@@ -290,12 +322,40 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
 
             match frame.header.packet_type {
                 PacketType::Ping => {
+                    let session_id = self.session.as_ref().expect("authed").id;
+                    self.ctx.presence.touch(session_id).await;
                     self.send(PacketType::Pong, PacketFlags::empty(), frame.payload)
                         .await?;
                 }
                 PacketType::Disconnect => {
                     debug!("client disconnected cleanly");
                     break Ok(());
+                }
+                PacketType::PresenceListRequest => {
+                    PresenceListRequest::decode(&frame.payload)?;
+                    let users = self.ctx.presence.list().await;
+                    let response = PresenceListResponse { users };
+                    self.send(
+                        PacketType::PresenceListResponse,
+                        PacketFlags::empty(),
+                        response.encode(),
+                    )
+                    .await?;
+                }
+                PacketType::UserInfoRequest => {
+                    let request = UserInfoRequest::decode(&frame.payload)?;
+                    match self.ctx.presence.get(&request.username).await {
+                        Some(entry) => {
+                            let response = UserInfoResponse { entry };
+                            self.send(
+                                PacketType::UserInfoResponse,
+                                PacketFlags::empty(),
+                                response.encode(),
+                            )
+                            .await?;
+                        }
+                        None => self.send_error("user is not online").await?,
+                    }
                 }
                 PacketType::ChatJoin => {
                     let join = ChatJoin::decode(&frame.payload)?;
@@ -327,6 +387,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                         self.send_error("missing CHAT_SEND privilege").await?;
                         continue;
                     }
+                    self.ctx.presence.touch(session.id).await;
                     match joined.get(&send.room) {
                         Some(handle) => {
                             let _ = handle
@@ -542,7 +603,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
             }
         };
 
-        // Cleanup regardless of how the loop ended: leave rooms, end session.
+        // Cleanup regardless of how the loop ended: leave rooms, presence,
+        // and end the session.
         if let Some(session) = &self.session {
             for (room, handle) in joined {
                 let _ = handle
@@ -552,6 +614,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                     .await;
                 debug!(room, "left on disconnect");
             }
+            self.ctx.presence.leave(session.id).await;
             self.ctx.auth.end_session(session.id);
         }
         result
@@ -683,6 +746,7 @@ mod tests {
             rooms: RoomManager::new(),
             tree,
             transfers,
+            presence: crate::presence::Presence::spawn(),
         });
         (ctx, dir)
     }
@@ -786,6 +850,9 @@ mod tests {
         let session_id = uuid::Uuid::from_bytes(result.session_id);
         let session = ctx.auth.validate(session_id).unwrap();
         assert!(session.privileges.contains(Privileges::CHAT_CREATE_ROOM));
+
+        // Entering dispatch joins the presence roster; joins broadcast only
+        // to *other* connections, so this sole client receives nothing.
 
         // Post-auth Ping still works (Active state reached).
         client

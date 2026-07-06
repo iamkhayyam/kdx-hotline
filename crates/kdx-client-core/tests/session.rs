@@ -145,6 +145,63 @@ async fn flood_surfaces_as_warning() {
 }
 
 #[tokio::test]
+async fn global_roster_tracks_presence_live() {
+    let ts = TestServer::start().await;
+    ts.seed_account("alice", "pw", 1).await;
+    ts.seed_account("bob", "pw", 2).await;
+
+    let (alice, mut ea, _d1) = ts.connect_client().await;
+    next_event(&mut ea).await; // Connected
+    alice.login("alice", "pw").await.unwrap();
+
+    // Alice alone on the roster.
+    let roster = alice.list_users().await.unwrap();
+    assert_eq!(roster.len(), 1);
+    assert_eq!(roster[0].username, "alice");
+
+    // Bob logs in: alice gets a live online push, roster grows.
+    let (bob, mut eb, _d2) = ts.connect_client().await;
+    next_event(&mut eb).await;
+    bob.login("bob", "pw").await.unwrap();
+
+    let mut saw_bob_online = false;
+    for _ in 0..10 {
+        if let Event::Presence { user, online } = next_event(&mut ea).await {
+            assert!(online);
+            assert_eq!(user.username, "bob");
+            assert_eq!(user.class, 2);
+            saw_bob_online = true;
+            break;
+        }
+    }
+    assert!(saw_bob_online);
+    assert_eq!(alice.list_users().await.unwrap().len(), 2);
+
+    // Get Info on bob shows his detail.
+    let info = alice.get_user_info("bob").await.unwrap();
+    assert_eq!(info.class, 2);
+    assert!(!info.address.is_empty());
+    // Unknown user errors.
+    assert!(alice.get_user_info("nobody").await.is_err());
+
+    // Bob leaves: alice gets an offline push and the roster shrinks.
+    bob.disconnect().await;
+    let mut saw_bob_offline = false;
+    for _ in 0..10 {
+        if let Event::Presence { user, online } = next_event(&mut ea).await {
+            if user.username == "bob" && !online {
+                saw_bob_offline = true;
+                break;
+            }
+        }
+    }
+    assert!(saw_bob_offline);
+    assert_eq!(alice.list_users().await.unwrap().len(), 1);
+
+    ts.stop();
+}
+
+#[tokio::test]
 async fn disconnect_yields_disconnected_event() {
     let ts = TestServer::start().await;
     ts.seed_account("phraq", "pw", 1).await;
