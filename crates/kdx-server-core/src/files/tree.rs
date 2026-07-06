@@ -251,6 +251,51 @@ impl FileTree {
         Ok(node)
     }
 
+    /// Delete a node (recursively, for folders), enforcing write access on the
+    /// containing folder. The root cannot be deleted. Backing files on disk are
+    /// removed for file nodes. Returns the deleted node's kind.
+    pub async fn delete(&self, path: &str, class: BaseClass) -> Result<NodeKind, TreeError> {
+        // Gather the subtree (post-order: children before parents) and the
+        // parent's write ACL under a read lock, then mutate.
+        let (kind, ordered_ids, storage_paths, parent_id) = {
+            let state = self.state.read().await;
+            let node = state.resolve(path)?;
+            if node.id == ROOT_ID {
+                return Err(TreeError::NotAFolder); // root isn't a deletable entry
+            }
+            // Require write access to the node itself — you may not delete a
+            // folder (or its subtree) you couldn't write to.
+            acl::check_write(node.kind, node.min_class_write, class)?;
+
+            let mut ordered = Vec::new();
+            let mut storage_paths = Vec::new();
+            collect_subtree(&state, &node.id, &mut ordered, &mut storage_paths);
+            (node.kind, ordered, storage_paths, node.parent_id.clone())
+        };
+
+        // Remove backing files first (best-effort), then rows (post-order so a
+        // partial failure never orphans a child under enforced FKs).
+        for sp in &storage_paths {
+            let _ = tokio::fs::remove_file(sp).await;
+        }
+        for id in &ordered_ids {
+            file_tree::delete(&self.pool, id).await?;
+        }
+
+        // Drop from the in-memory tree.
+        let mut state = self.state.write().await;
+        for id in &ordered_ids {
+            state.nodes.remove(id);
+            state.children.remove(id);
+        }
+        if let Some(pid) = &parent_id {
+            if let Some(siblings) = state.children.get_mut(pid) {
+                siblings.retain(|id| !ordered_ids.contains(id));
+            }
+        }
+        Ok(kind)
+    }
+
     async fn insert_in_memory(&self, node: Node) {
         let mut state = self.state.write().await;
         if let Some(parent) = &node.parent_id {
@@ -262,6 +307,28 @@ impl FileTree {
         }
         state.nodes.insert(node.id.clone(), node);
     }
+}
+
+/// Post-order walk of a subtree: pushes every descendant id (deepest first,
+/// then the node itself) and collects the storage paths of any file nodes so
+/// their bytes can be removed from disk.
+fn collect_subtree(
+    state: &TreeState,
+    id: &str,
+    ordered: &mut Vec<String>,
+    storage_paths: &mut Vec<String>,
+) {
+    if let Some(children) = state.children.get(id) {
+        for child in children.clone() {
+            collect_subtree(state, &child, ordered, storage_paths);
+        }
+    }
+    if let Some(node) = state.nodes.get(id) {
+        if let Some(sp) = &node.storage_path {
+            storage_paths.push(sp.clone());
+        }
+    }
+    ordered.push(id.to_owned());
 }
 
 impl TreeState {
@@ -345,6 +412,43 @@ mod tests {
             .prepare_upload("/staff", "x.bin", BaseClass::Admin)
             .await
             .is_ok());
+    }
+
+    #[tokio::test]
+    async fn delete_removes_folder_and_children() {
+        let (tree, _dir) = tree().await;
+        tree.create_folder("/", "pub", NodeKind::Directory, BaseClass::Guest, BaseClass::User)
+            .await
+            .unwrap();
+        tree.create_folder("/pub", "docs", NodeKind::Directory, BaseClass::Guest, BaseClass::User)
+            .await
+            .unwrap();
+        let parent = tree.resolve("/pub/docs").await.unwrap();
+        tree.add_file(&parent.id, "a.txt", 1, &[0u8; 32], "/tmp/none")
+            .await
+            .unwrap();
+
+        // A user may delete under /pub (write class User).
+        tree.delete("/pub", BaseClass::User).await.unwrap();
+        assert!(matches!(tree.resolve("/pub").await, Err(TreeError::NotFound)));
+        assert!(matches!(
+            tree.resolve("/pub/docs").await,
+            Err(TreeError::NotFound)
+        ));
+        assert!(tree.list("/", BaseClass::Guest).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn delete_enforces_parent_write_class_and_guards_root() {
+        let (tree, _dir) = tree().await;
+        // /staff is writable only by admin.
+        tree.create_folder("/", "staff", NodeKind::Directory, BaseClass::Guest, BaseClass::Admin)
+            .await
+            .unwrap();
+        assert!(tree.delete("/staff", BaseClass::PowerUser).await.is_err());
+        assert!(tree.delete("/staff", BaseClass::Admin).await.is_ok());
+        // Root is not a deletable entry.
+        assert!(tree.delete("/", BaseClass::Admin).await.is_err());
     }
 
     #[tokio::test]

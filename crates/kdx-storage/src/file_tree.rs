@@ -100,3 +100,17 @@ pub async fn create_file(
         storage_path: Some(storage_path.to_owned()),
     })
 }
+
+/// Delete a single node by id. The caller deletes children first — the
+/// `parent_id` self-reference has no `ON DELETE CASCADE`, so with foreign keys
+/// enforced a non-empty folder would otherwise fail.
+pub async fn delete(pool: &SqlitePool, id: &str) -> Result<(), StorageError> {
+    let result = sqlx::query("DELETE FROM file_nodes WHERE id = ?")
+        .bind(id)
+        .execute(pool)
+        .await?;
+    if result.rows_affected() == 0 {
+        return Err(StorageError::NotFound);
+    }
+    Ok(())
+}

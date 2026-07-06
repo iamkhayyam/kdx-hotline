@@ -347,8 +347,22 @@ body::before {
 
 /* files */
 .pathbar { display: flex; align-items: center; gap: 8px; padding: 5px 10px; border-bottom: 1px solid var(--chrome-dim); background: var(--panel-deep); font-size: 11px; }
-.pathbar .path { color: var(--green); }
+.pathbar .path { color: var(--green); flex: 0 0 auto; max-width: 40%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .pathbar .spacer { margin-left: auto; }
+
+/* Files: New Folder dialog + Get Info banner */
+.f-mkform { display: flex; flex-direction: column; gap: 6px; padding: 8px 10px; border-bottom: 1px solid var(--chrome-dim); background: var(--panel-deep); }
+.f-mkrow { display: flex; align-items: center; gap: 6px; }
+.f-mkrow input, .f-mkrow select { background: #060404; border: 1px solid var(--chrome-dim); color: var(--green); font-family: var(--mono); font-size: 12px; padding: 3px 6px; }
+.f-mkrow > input { flex: 1; }
+.f-mkrow input:focus, .f-mkrow select:focus { outline: none; border-color: var(--alert); }
+.f-mklbl { display: flex; align-items: center; gap: 4px; font-size: 11px; color: var(--ink); }
+.f-mk-result { font-size: 11px; color: var(--alert); min-height: 1.2em; }
+.f-info { padding: 5px 10px; border-bottom: 1px solid var(--chrome-dim); background: #0d0606; font-size: 11px; color: var(--ink); display: flex; align-items: center; gap: 6px; }
+.f-info b { color: var(--amber); }
+.f-info .f-info-path { color: var(--grey-dim); }
+.f-info .mini { margin-left: auto; }
+.f-info .err { color: var(--alert); }
 .pathbar .mini { border: 1px solid var(--chrome); color: #f0b8b8; padding: 2px 8px; font-size: 10px; letter-spacing: .1em; cursor: pointer; background: #240707; text-transform: uppercase; }
 .pathbar .mini:hover { border-color: var(--alert); color: #fff; }
 table.files, table.tracker { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }

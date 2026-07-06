@@ -152,18 +152,46 @@ pub async fn set_topic(state: State<'_, AppState>, room: String, topic: String) 
 pub async fn list_files(state: State<'_, AppState>, path: String) -> CmdResult<FileListDto> {
     with_client(&state, |c| async move { c.list_files(&path).await })
         .await
-        .map(|r| FileListDto {
-            path: r.path,
-            entries: r
-                .entries
-                .into_iter()
-                .map(|e| FileEntryDto {
-                    name: e.name,
-                    kind: e.kind,
-                    size: e.size,
-                })
-                .collect(),
-        })
+        .map(file_list_dto)
+}
+
+#[tauri::command]
+pub async fn create_folder(
+    state: State<'_, AppState>,
+    path: String,
+    name: String,
+    kind: u8,
+    min_read_class: u8,
+    min_write_class: u8,
+) -> CmdResult<FileListDto> {
+    with_client(&state, |c| async move {
+        c.create_folder(&path, &name, kind, min_read_class, min_write_class)
+            .await
+    })
+    .await
+    .map(file_list_dto)
+}
+
+#[tauri::command]
+pub async fn delete_path(state: State<'_, AppState>, path: String) -> CmdResult<FileListDto> {
+    with_client(&state, |c| async move { c.delete_path(&path).await })
+        .await
+        .map(file_list_dto)
+}
+
+fn file_list_dto(r: kdx_client_core::FileListResponse) -> FileListDto {
+    FileListDto {
+        path: r.path,
+        entries: r
+            .entries
+            .into_iter()
+            .map(|e| FileEntryDto {
+                name: e.name,
+                kind: e.kind,
+                size: e.size,
+            })
+            .collect(),
+    }
 }
 
 #[tauri::command]

@@ -38,6 +38,27 @@ pub struct FileListResponse {
     pub entries: Vec<FileEntry>,
 }
 
+/// Client → server: create a folder-like node (`kind` is `KIND_DIR`,
+/// `KIND_DROPBOX`, or `KIND_UPLOAD`). `min_read_class` / `min_write_class` are
+/// base-class thresholds. Requires write access to `path`. The server replies
+/// with a `FileListResponse` for `path`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileCreateFolder {
+    pub path: String,
+    pub name: String,
+    pub kind: u8,
+    pub min_read_class: u8,
+    pub min_write_class: u8,
+}
+
+/// Client → server: delete a node (recursively, for folders). Requires write
+/// access to the node. The server replies with a `FileListResponse` for the
+/// deleted node's parent directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileDelete {
+    pub path: String,
+}
+
 /// Client → server (in a FileTransferStart packet): request a transfer.
 ///
 /// `direction` selects upload or download. For an **upload**, `size`/`sha256`
@@ -137,6 +158,51 @@ impl FileListResponse {
         }
         expect_end(payload, "FileListResponse")?;
         Ok(Self { path, entries })
+    }
+}
+
+impl FileCreateFolder {
+    pub fn encode(&self) -> Bytes {
+        let mut buf = BytesMut::new();
+        put_str(&mut buf, &self.path);
+        put_str(&mut buf, &self.name);
+        buf.put_u8(self.kind);
+        buf.put_u8(self.min_read_class);
+        buf.put_u8(self.min_write_class);
+        buf.freeze()
+    }
+
+    pub fn decode(mut payload: &[u8]) -> Result<Self, ProtocolError> {
+        let path = get_str(&mut payload, "FileCreateFolder")?;
+        let name = get_str(&mut payload, "FileCreateFolder")?;
+        if payload.remaining() < 3 {
+            return Err(ProtocolError::MalformedPayload("FileCreateFolder"));
+        }
+        let kind = payload.get_u8();
+        let min_read_class = payload.get_u8();
+        let min_write_class = payload.get_u8();
+        expect_end(payload, "FileCreateFolder")?;
+        Ok(Self {
+            path,
+            name,
+            kind,
+            min_read_class,
+            min_write_class,
+        })
+    }
+}
+
+impl FileDelete {
+    pub fn encode(&self) -> Bytes {
+        let mut buf = BytesMut::new();
+        put_str(&mut buf, &self.path);
+        buf.freeze()
+    }
+
+    pub fn decode(mut payload: &[u8]) -> Result<Self, ProtocolError> {
+        let path = get_str(&mut payload, "FileDelete")?;
+        expect_end(payload, "FileDelete")?;
+        Ok(Self { path })
     }
 }
 
@@ -370,5 +436,23 @@ mod tests {
         assert!(FileListRequest::decode(&[9]).is_err());
         assert!(TransferRequest::decode(&[0, 0]).is_err());
         assert!(TransferData::decode(&[0u8; 20]).is_err());
+    }
+
+    #[test]
+    fn create_folder_and_delete_round_trip() {
+        let mk = FileCreateFolder {
+            path: "/pub".into(),
+            name: "docs".into(),
+            kind: KIND_DROPBOX,
+            min_read_class: 0,
+            min_write_class: 1,
+        };
+        assert_eq!(FileCreateFolder::decode(&mk.encode()).unwrap(), mk);
+
+        let del = FileDelete { path: "/pub/docs".into() };
+        assert_eq!(FileDelete::decode(&del.encode()).unwrap(), del);
+
+        assert!(FileCreateFolder::decode(&[0, 1, 65]).is_err());
+        assert!(FileDelete::decode(&[]).is_err());
     }
 }

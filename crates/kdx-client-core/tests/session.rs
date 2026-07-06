@@ -502,6 +502,52 @@ async fn news_post_read_threaded_and_class_gated() {
 }
 
 #[tokio::test]
+async fn admin_creates_and_deletes_folders() {
+    let ts = TestServer::start().await;
+    ts.seed_account("sysop", "pw", 3).await; // Admin: has FILE_MANAGE_TREE
+
+    let (sysop, mut es, _d1) = ts.connect_client().await;
+    next_event(&mut es).await;
+    sysop.login("sysop", "pw").await.unwrap();
+
+    // Create a normal folder and an upload folder at the root.
+    let listing = sysop.create_folder("/", "pub", 0, 0, 1).await.unwrap();
+    assert!(listing.entries.iter().any(|e| e.name == "pub"));
+    sysop.create_folder("/", "incoming", 3, 0, 0).await.unwrap();
+
+    // Nest a subfolder, then delete the whole /pub subtree.
+    sysop.create_folder("/pub", "docs", 0, 0, 1).await.unwrap();
+    let after = sysop.delete_path("/pub").await.unwrap();
+    assert!(!after.entries.iter().any(|e| e.name == "pub"));
+    assert!(after.entries.iter().any(|e| e.name == "incoming"));
+    // /pub/docs went with it.
+    assert!(sysop.list_files("/pub").await.is_err());
+
+    ts.stop();
+}
+
+#[tokio::test]
+async fn plain_user_cannot_manage_the_tree() {
+    let ts = TestServer::start().await;
+    ts.seed_account("plain", "pw", 1).await; // no FILE_MANAGE_TREE
+
+    let (client, mut events, _dd) = ts.connect_client().await;
+    next_event(&mut events).await;
+    client.login("plain", "pw").await.unwrap();
+
+    assert!(matches!(
+        client.create_folder("/", "mine", 0, 0, 0).await,
+        Err(ClientError::Server(_))
+    ));
+    assert!(matches!(
+        client.delete_path("/anything").await,
+        Err(ClientError::Server(_))
+    ));
+
+    ts.stop();
+}
+
+#[tokio::test]
 async fn plain_user_cannot_create_newsgroup() {
     let ts = TestServer::start().await;
     ts.seed_account("plain", "pw", 1).await;

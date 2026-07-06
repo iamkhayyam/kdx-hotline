@@ -15,8 +15,9 @@ use futures_util::{SinkExt, StreamExt};
 use kdx_protocol::messages::{
     AccountCreate, AccountListRequest, AccountListResponse, AccountRolesRequest,
     AccountRolesResponse, AccountSummary, AccountUpdate, AdminDisconnect, AuthChallenge,
-    AuthRequest, AuthResponse, AuthResult, ChatJoin, ChatLeave, ChatSend, ChatTopic, FileEntry,
-    FileListRequest, FileListResponse, HandshakeInit, HandshakeResp, NewsPost as WireNewsPost,
+    AuthRequest, AuthResponse, AuthResult, ChatJoin, ChatLeave, ChatSend, ChatTopic,
+    FileCreateFolder, FileDelete, FileEntry, FileListRequest, FileListResponse, HandshakeInit,
+    HandshakeResp, NewsPost as WireNewsPost,
     NewsPostCreate, NewsPostDelete, NewsThreadListRequest, NewsThreadListResponse, NewsgroupCreate,
     NewsgroupInfo, NewsgroupListRequest, NewsgroupListResponse, PresenceListRequest,
     PresenceListResponse, PrivateMessage, PrivateSend, RoleAssign, RoleCreate, RoleDelete, RoleInfo,
@@ -35,9 +36,9 @@ use tokio_util::codec::Framed;
 use tracing::{debug, warn};
 use uuid::Uuid;
 
-use crate::auth::{AuthManager, Privileges, Role, RoleManager, Session};
+use crate::auth::{AuthManager, BaseClass, Privileges, Role, RoleManager, Session};
 use crate::chat::{Member, Outbound, RoomCommand, RoomManager};
-use crate::files::FileTree;
+use crate::files::{FileTree, NodeKind};
 use crate::news::{NewsManager, Post as NewsPostDomain};
 use crate::presence::{unix_now, Presence};
 use crate::transfer::{resume_id_from_wire, ActiveUpload, TransferError, TransferManager};
@@ -517,6 +518,56 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                                 response.encode(),
                             )
                             .await?;
+                        }
+                        Err(e) => self.send_error(&e.to_string()).await?,
+                    }
+                }
+                PacketType::FileCreateFolder => {
+                    let req = FileCreateFolder::decode(&frame.payload)?;
+                    let (class, privs) = {
+                        let s = self.session.as_ref().expect("authed");
+                        (s.class, s.privileges)
+                    };
+                    if !privs.contains(Privileges::FILE_MANAGE_TREE) {
+                        self.send_error("missing FILE_MANAGE_TREE privilege").await?;
+                        continue;
+                    }
+                    let kind = match req.kind {
+                        kdx_protocol::messages::KIND_DIR => NodeKind::Directory,
+                        kdx_protocol::messages::KIND_DROPBOX => NodeKind::DropBox,
+                        kdx_protocol::messages::KIND_UPLOAD => NodeKind::UploadFolder,
+                        _ => {
+                            self.send_error("not a folder kind").await?;
+                            continue;
+                        }
+                    };
+                    let read = class_from_u8(req.min_read_class);
+                    let write = class_from_u8(req.min_write_class);
+                    match self
+                        .ctx
+                        .tree
+                        .create_folder(&req.path, &req.name, kind, read, write)
+                        .await
+                    {
+                        Ok(_) => self.reply_file_list(&req.path, class).await?,
+                        Err(e) => self.send_error(&e.to_string()).await?,
+                    }
+                }
+                PacketType::FileDelete => {
+                    let req = FileDelete::decode(&frame.payload)?;
+                    let (class, privs) = {
+                        let s = self.session.as_ref().expect("authed");
+                        (s.class, s.privileges)
+                    };
+                    if !privs.contains(Privileges::FILE_MANAGE_TREE) {
+                        self.send_error("missing FILE_MANAGE_TREE privilege").await?;
+                        continue;
+                    }
+                    match self.ctx.tree.delete(&req.path, class).await {
+                        Ok(_) => {
+                            // Re-list the deleted node's parent directory.
+                            let parent = parent_path(&req.path);
+                            self.reply_file_list(&parent, class).await?;
                         }
                         Err(e) => self.send_error(&e.to_string()).await?,
                     }
@@ -1155,6 +1206,34 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
         Ok(())
     }
 
+    /// List `path` for `class` and send it as a `FileListResponse` — the reply
+    /// to a successful folder create/delete so the Files window re-renders.
+    async fn reply_file_list(&mut self, path: &str, class: BaseClass) -> Result<(), ConnectionError> {
+        match self.ctx.tree.list(path, class).await {
+            Ok(entries) => {
+                let response = FileListResponse {
+                    path: path.to_owned(),
+                    entries: entries
+                        .into_iter()
+                        .map(|e| FileEntry {
+                            name: e.name,
+                            kind: e.kind.as_u8(),
+                            size: e.size,
+                        })
+                        .collect(),
+                };
+                self.send(
+                    PacketType::FileListResponse,
+                    PacketFlags::empty(),
+                    response.encode(),
+                )
+                .await?;
+            }
+            Err(e) => self.send_error(&e.to_string()).await?,
+        }
+        Ok(())
+    }
+
     /// Send the newsgroups the caller may read (filtered by their class) — the
     /// reply to `NewsgroupListRequest` and to a successful create.
     async fn reply_newsgroup_list(&mut self) -> Result<(), ConnectionError> {
@@ -1292,6 +1371,20 @@ async fn timeout_at<F: std::future::Future>(
 /// payload byte (see `TransferRequest::encode`).
 fn is_download(payload: &[u8]) -> bool {
     payload.first() == Some(&kdx_protocol::messages::DIRECTION_DOWNLOAD)
+}
+
+/// Clamp a wire class byte (0..=3) to a `BaseClass`.
+fn class_from_u8(v: u8) -> BaseClass {
+    BaseClass::try_from(v.min(3)).expect("clamped to a valid class")
+}
+
+/// The parent directory of a `/`-separated path (`/a/b/c` → `/a/b`, `/x` → `/`).
+fn parent_path(path: &str) -> String {
+    let trimmed = path.trim_end_matches('/');
+    match trimmed.rsplit_once('/') {
+        Some((parent, _)) if !parent.is_empty() => parent.to_string(),
+        _ => "/".to_string(),
+    }
 }
 
 fn news_post_to_wire(p: NewsPostDomain) -> WireNewsPost {

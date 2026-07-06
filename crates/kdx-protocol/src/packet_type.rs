@@ -21,6 +21,8 @@ pub enum PacketType {
     FileTransferStart = 0x22,
     FileTransferData = 0x23,
     FileTransferEnd = 0x24,
+    FileCreateFolder = 0x25,
+    FileDelete = 0x26,
 
     // Chat (0x30-0x3F)
     ChatMessage = 0x30,
@@ -73,7 +75,7 @@ pub enum PacketType {
 }
 
 impl PacketType {
-    pub const ALL: [PacketType; 50] = [
+    pub const ALL: [PacketType; 52] = [
         PacketType::HandshakeInit,
         PacketType::HandshakeResp,
         PacketType::Ping,
@@ -88,6 +90,8 @@ impl PacketType {
         PacketType::FileTransferStart,
         PacketType::FileTransferData,
         PacketType::FileTransferEnd,
+        PacketType::FileCreateFolder,
+        PacketType::FileDelete,
         PacketType::ChatMessage,
         PacketType::ChatJoin,
         PacketType::ChatLeave,
@@ -147,6 +151,8 @@ impl TryFrom<u8> for PacketType {
             0x22 => FileTransferStart,
             0x23 => FileTransferData,
             0x24 => FileTransferEnd,
+            0x25 => FileCreateFolder,
+            0x26 => FileDelete,
             0x30 => ChatMessage,
             0x31 => ChatJoin,
             0x32 => ChatLeave,

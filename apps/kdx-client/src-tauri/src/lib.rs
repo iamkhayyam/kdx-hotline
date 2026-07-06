@@ -27,6 +27,8 @@ pub fn run() {
             commands::send_chat,
             commands::set_topic,
             commands::list_files,
+            commands::create_folder,
+            commands::delete_path,
             commands::list_users,
             commands::get_user_info,
             commands::send_private,

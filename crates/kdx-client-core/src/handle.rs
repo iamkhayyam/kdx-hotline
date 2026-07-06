@@ -46,6 +46,18 @@ pub(crate) enum Command {
         path: String,
         reply: oneshot::Sender<Result<FileListResponse, ClientError>>,
     },
+    CreateFolder {
+        path: String,
+        name: String,
+        kind: u8,
+        min_read_class: u8,
+        min_write_class: u8,
+        reply: oneshot::Sender<Result<FileListResponse, ClientError>>,
+    },
+    DeletePath {
+        path: String,
+        reply: oneshot::Sender<Result<FileListResponse, ClientError>>,
+    },
     ListUsers {
         reply: oneshot::Sender<Result<Vec<PresenceUser>, ClientError>>,
     },
@@ -223,6 +235,38 @@ impl ClientHandle {
 
     pub async fn list_files(&self, path: &str) -> Result<FileListResponse, ClientError> {
         self.send(|reply| Command::ListFiles {
+            path: path.to_owned(),
+            reply,
+        })
+        .await
+    }
+
+    /// Create a folder-like node (`kind`: 0 directory, 2 drop box, 3 upload
+    /// folder) under `path` with class thresholds. Requires FILE_MANAGE_TREE.
+    /// Resolves with the updated listing of `path`.
+    pub async fn create_folder(
+        &self,
+        path: &str,
+        name: &str,
+        kind: u8,
+        min_read_class: u8,
+        min_write_class: u8,
+    ) -> Result<FileListResponse, ClientError> {
+        self.send(|reply| Command::CreateFolder {
+            path: path.to_owned(),
+            name: name.to_owned(),
+            kind,
+            min_read_class,
+            min_write_class,
+            reply,
+        })
+        .await
+    }
+
+    /// Delete a node (recursively, for folders). Requires FILE_MANAGE_TREE.
+    /// Resolves with the updated listing of the deleted node's parent.
+    pub async fn delete_path(&self, path: &str) -> Result<FileListResponse, ClientError> {
+        self.send(|reply| Command::DeletePath {
             path: path.to_owned(),
             reply,
         })

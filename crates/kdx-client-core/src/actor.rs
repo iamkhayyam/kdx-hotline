@@ -15,9 +15,9 @@ use kdx_crypto::KdfParams;
 use kdx_protocol::messages::{
     AccountCreate, AccountListRequest, AccountListResponse, AccountRolesRequest,
     AccountRolesResponse, AccountUpdate, AdminDisconnect, AuthChallenge, AuthRequest, AuthResponse,
-    AuthResult, ChatEvent, ChatJoin, ChatLeave, ChatSend, ChatTopic, ChatUserList, FileListRequest,
-    NewsPostCreate, NewsPostDelete, NewsThreadListRequest, NewsThreadListResponse, NewsgroupCreate,
-    NewsgroupListRequest, NewsgroupListResponse,
+    AuthResult, ChatEvent, ChatJoin, ChatLeave, ChatSend, ChatTopic, ChatUserList, FileCreateFolder,
+    FileDelete, FileListRequest, NewsPostCreate, NewsPostDelete, NewsThreadListRequest,
+    NewsThreadListResponse, NewsgroupCreate, NewsgroupListRequest, NewsgroupListResponse,
     FileListResponse, PresenceChange, PresenceListRequest, PresenceListResponse, PrivateMessage,
     PrivateSend, RoleAssign, RoleCreate, RoleDelete, RoleListRequest, RoleListResponse,
     RoleUnassign, RoleUpdate, TransferAccept, TransferData, TransferEnd, TransferRequest,
@@ -256,6 +256,36 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
                     .send(PacketType::FileListRequest, FileListRequest { path }.encode())
                     .await
                 {
+                    Ok(()) => self.list_waiters.push_back(reply),
+                    Err(e) => {
+                        let _ = reply.send(Err(e.into()));
+                    }
+                }
+            }
+            Command::CreateFolder {
+                path,
+                name,
+                kind,
+                min_read_class,
+                min_write_class,
+                reply,
+            } => {
+                let msg = FileCreateFolder {
+                    path,
+                    name,
+                    kind,
+                    min_read_class,
+                    min_write_class,
+                };
+                match self.send(PacketType::FileCreateFolder, msg.encode()).await {
+                    Ok(()) => self.list_waiters.push_back(reply),
+                    Err(e) => {
+                        let _ = reply.send(Err(e.into()));
+                    }
+                }
+            }
+            Command::DeletePath { path, reply } => {
+                match self.send(PacketType::FileDelete, FileDelete { path }.encode()).await {
                     Ok(()) => self.list_waiters.push_back(reply),
                     Err(e) => {
                         let _ = reply.send(Err(e.into()));
@@ -991,6 +1021,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
         // If a transfer is mid-negotiation, an Error frame aborts it.
         if let Some(reply) = self.transfer.take().and_then(transfer_reply) {
             let _ = reply.send(Err(ClientError::Transfer(text.clone())));
+        }
+        // A file listing/mutation can fail (missing privilege, name exists,
+        // not found) — fail the pending waiter instead of hanging it.
+        if let Some(waiter) = self.list_waiters.pop_front() {
+            let _ = waiter.send(Err(ClientError::Server(text.clone())));
         }
         // Likewise a pending User Info lookup (e.g. the user isn't online).
         if let Some(waiter) = self.user_info_waiters.pop_front() {

@@ -33,6 +33,9 @@ pub use event::{
     AccountSummary, Direction, Event, NewsPost, NewsgroupInfo, PresenceUser, RoleInfo,
 };
 pub use handle::{ClientHandle, Session};
+// Re-exported so consumers (the Tauri app) can name the file-listing shape
+// returned by list_files / create_folder / delete_path.
+pub use kdx_protocol::messages::FileListResponse;
 pub use tls::{spki_fingerprint, KnownHosts};
 
 use actor::Actor;
