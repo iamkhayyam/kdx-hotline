@@ -23,7 +23,15 @@ applySettings(loadSettings()); // apply saved theme/prefs at startup
 // Build feature instances eagerly (cheap DOM); the window manager wraps each
 // in floating chrome lazily on first open. Events route to these instances
 // whether or not their window is currently open.
-const chat = buildChat();
+// Chat member verbs reuse the Messages + User Info windows (defined below;
+// these closures run only on user interaction, after those consts init).
+const chat = buildChat(
+  (username) => openMessagesWith(username),
+  (username) => {
+    open("userinfo");
+    userInfo.show(username);
+  }
+);
 const files = buildFiles();
 const transfers = buildTransfers();
 const connectApi = buildConnect(onLoggedIn);

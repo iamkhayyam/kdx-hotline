@@ -1,10 +1,20 @@
 import { invoke } from "../bridge.js";
 import { getState } from "../store.js";
+import { showMenu } from "../menu.js";
 
 const CHAT_ACTION = 1 << 0;
 const CHAT_SYSTEM = 1 << 1;
 
-export function buildChat() {
+// Slash-command help, shown by /help. Both `/` and `\` prefixes are accepted.
+const SLASH_HELP = [
+  "/me <action> — pose an action (also \\me)",
+  "/away [reason] · /back · /afk — announce your status",
+  "/topic <text> — set the room topic",
+  "/clear — clear this transcript",
+  "/help — this list",
+];
+
+export function buildChat(sendMessage, getInfo) {
   const body = document.createElement("div");
   body.style.flex = "1";
   body.style.display = "flex";
@@ -43,22 +53,59 @@ export function buildChat() {
 
   entry.addEventListener("keydown", async (e) => {
     if (e.key !== "Enter") return;
-    const text = entry.value;
-    if (!text.trim()) return;
+    const raw = entry.value;
+    if (!raw.trim()) return;
     entry.value = "";
-    const room = getState().room;
     try {
-      if (text.startsWith("/me ")) {
-        await invoke("send_chat", { room, flags: CHAT_ACTION, text: text.slice(4) });
-      } else if (text.startsWith("/topic ")) {
-        await invoke("set_topic", { room, topic: text.slice(7) });
-      } else {
-        await invoke("send_chat", { room, flags: 0, text });
-      }
+      await handleInput(raw);
     } catch (err) {
       line("err", "! " + (err.message || err));
     }
   });
+
+  // Parse and dispatch a line of input. A leading `/` or `\` marks a command;
+  // everything else is an ordinary chat message.
+  async function handleInput(raw) {
+    const room = getState().room;
+    if (!/^[/\\]/.test(raw)) {
+      await invoke("send_chat", { room, flags: 0, text: raw });
+      return;
+    }
+    const space = raw.indexOf(" ");
+    const cmd = (space === -1 ? raw.slice(1) : raw.slice(1, space)).toLowerCase();
+    const rest = space === -1 ? "" : raw.slice(space + 1);
+    switch (cmd) {
+      case "me":
+        if (rest.trim()) await invoke("send_chat", { room, flags: CHAT_ACTION, text: rest });
+        break;
+      case "away":
+        await invoke("send_chat", { room, flags: CHAT_ACTION, text: rest.trim() ? `is away (${rest.trim()})` : "is away" });
+        break;
+      case "back":
+        await invoke("send_chat", { room, flags: CHAT_ACTION, text: "is back" });
+        break;
+      case "afk":
+        await invoke("send_chat", { room, flags: CHAT_ACTION, text: rest.trim() ? `is afk (${rest.trim()})` : "is afk" });
+        break;
+      case "topic":
+        await invoke("set_topic", { room, topic: rest });
+        break;
+      case "clear":
+        scroll.innerHTML = "";
+        break;
+      case "help":
+        for (const h of SLASH_HELP) line("sys", `*** ${esc(h)}`);
+        break;
+      case "name":
+      case "n":
+      case "desc":
+      case "d":
+        line("sys", `*** changing your ${cmd.startsWith("d") ? "description" : "name"} isn't supported yet`);
+        break;
+      default:
+        line("err", `! unknown command: /${esc(cmd)} — try /help`);
+    }
+  }
 
   const api = {
     body,
@@ -74,10 +121,20 @@ export function buildChat() {
     },
     onUsers(users) {
       usersEl.innerHTML = "";
+      const me = getState().session && getState().session.username;
       for (const u of users) {
         const d = document.createElement("div");
         d.className = "u";
         d.textContent = u;
+        // Right-click (or second click) a member for the verb menu — the
+        // primary action surface, mirroring the global User List.
+        d.addEventListener("contextmenu", (e) => {
+          e.preventDefault();
+          const items = [];
+          if (sendMessage && u !== me) items.push({ label: "Send Message", fn: () => sendMessage(u) });
+          if (getInfo) items.push({ label: "Get Info", fn: () => getInfo(u) });
+          if (items.length) showMenu(e.clientX, e.clientY, items);
+        });
         usersEl.appendChild(d);
       }
     },
