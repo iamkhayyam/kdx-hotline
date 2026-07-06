@@ -16,6 +16,10 @@ use super::classes::{effective_privileges, BaseClass, Privileges};
 pub enum AuthError {
     #[error("invalid credentials")]
     InvalidCredentials,
+    /// The account is banned until `until` (unix seconds). The credentials may
+    /// have been correct; login is refused regardless.
+    #[error("account banned")]
+    Banned { until: i64, reason: String },
     #[error("storage error: {0}")]
     Storage(#[from] kdx_storage::StorageError),
     #[error("crypto error: {0}")]
@@ -113,6 +117,19 @@ impl AuthManager {
             return Err(AuthError::InvalidCredentials);
         }
 
+        // Credentials check out, but an active ban still refuses the login.
+        // Checked only after verification so ban status isn't observable to
+        // someone who can't authenticate as the account.
+        if let Some(ban) =
+            kdx_storage::bans::active(&self.pool, &account.id, crate::presence::unix_now() as i64)
+                .await?
+        {
+            return Err(AuthError::Banned {
+                until: ban.until,
+                reason: ban.reason,
+            });
+        }
+
         let class = BaseClass::try_from(account.base_class as u8)
             .map_err(|_| AuthError::InvalidCredentials)?;
         let roles = kdx_storage::roles::for_account(&self.pool, &account.id).await?;
@@ -143,6 +160,29 @@ impl AuthManager {
         Ok(accounts::by_username(&self.pool, username)
             .await?
             .map(|row| row.id))
+    }
+
+    /// Look up an account's base class (for admin rank checks against offline
+    /// targets). `None` if the account doesn't exist.
+    pub async fn account_class(&self, username: &str) -> Result<Option<BaseClass>, AuthError> {
+        let Some(row) = accounts::by_username(&self.pool, username).await? else {
+            return Ok(None);
+        };
+        Ok(BaseClass::try_from(row.base_class as u8).ok())
+    }
+
+    /// Record (or replace) an expiring ban on an account. `until` is a
+    /// unix-seconds expiry. Live sessions are dropped separately (via the
+    /// presence kick); this only governs future logins.
+    pub async fn set_ban(
+        &self,
+        account_id: &str,
+        until: i64,
+        reason: &str,
+        banned_by: &str,
+    ) -> Result<(), AuthError> {
+        kdx_storage::bans::set(&self.pool, account_id, until, reason, banned_by).await?;
+        Ok(())
     }
 
     /// Look up a live session, evicting it if expired. Callers treat `None`
@@ -245,6 +285,45 @@ mod tests {
 
         assert!(session.privileges.contains(Privileges::CHAT_SET_TOPIC)); // granted beyond class
         assert!(!session.privileges.contains(Privileges::FILE_UPLOAD)); // revoked from class
+    }
+
+    #[tokio::test]
+    async fn active_ban_refuses_login_despite_correct_password() {
+        let (pool, _dir) = test_pool().await;
+        seed(&pool, "lamer", "s3cret", 1).await;
+        let account_id = accounts::by_username(&pool, "lamer").await.unwrap().unwrap().id;
+        // Ban far into the future relative to the wall clock.
+        let until = crate::presence::unix_now() as i64 + 10_000;
+        kdx_storage::bans::set(&pool, &account_id, until, "spamming", "admin")
+            .await
+            .unwrap();
+        let mgr = AuthManager::new(pool, Duration::from_secs(60));
+
+        let (data, pending) = mgr.begin("lamer").await.unwrap();
+        let result = mgr.complete(pending, &answer(&data, "s3cret")).await;
+        match result {
+            Err(AuthError::Banned { reason, .. }) => assert_eq!(reason, "spamming"),
+            other => panic!("expected Banned, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn lapsed_ban_permits_login() {
+        let (pool, _dir) = test_pool().await;
+        seed(&pool, "reformed", "s3cret", 1).await;
+        let account_id = accounts::by_username(&pool, "reformed")
+            .await
+            .unwrap()
+            .unwrap()
+            .id;
+        // A ban that already expired (until in the past) must not block login.
+        kdx_storage::bans::set(&pool, &account_id, 1, "old news", "admin")
+            .await
+            .unwrap();
+        let mgr = AuthManager::new(pool, Duration::from_secs(60));
+
+        let (data, pending) = mgr.begin("reformed").await.unwrap();
+        assert!(mgr.complete(pending, &answer(&data, "s3cret")).await.is_ok());
     }
 
     #[tokio::test]

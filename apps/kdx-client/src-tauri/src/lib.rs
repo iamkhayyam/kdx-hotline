@@ -40,6 +40,7 @@ pub fn run() {
             commands::assign_role,
             commands::unassign_role,
             commands::account_roles,
+            commands::disconnect_user,
         ])
         .run(tauri::generate_context!())
         .expect("error while running KDX");

@@ -13,8 +13,9 @@ use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use kdx_crypto::KdfParams;
 use kdx_protocol::messages::{
-    AccountRolesRequest, AccountRolesResponse, AuthChallenge, AuthRequest, AuthResponse,
-    AuthResult, ChatEvent, ChatJoin, ChatLeave, ChatSend, ChatTopic, ChatUserList, FileListRequest,
+    AccountRolesRequest, AccountRolesResponse, AdminDisconnect, AuthChallenge, AuthRequest,
+    AuthResponse, AuthResult, ChatEvent, ChatJoin, ChatLeave, ChatSend, ChatTopic, ChatUserList,
+    FileListRequest,
     FileListResponse, PresenceChange, PresenceListRequest, PresenceListResponse, PrivateMessage,
     PrivateSend, RoleAssign, RoleCreate, RoleDelete, RoleListRequest, RoleListResponse,
     RoleUnassign, RoleUpdate, TransferAccept, TransferData, TransferEnd, TransferRequest,
@@ -395,6 +396,20 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
                     }
                 }
             }
+            Command::DisconnectUser {
+                username,
+                reason,
+                ban_secs,
+                reply,
+            } => {
+                let msg = AdminDisconnect {
+                    username,
+                    reason,
+                    ban_secs,
+                };
+                let r = self.send(PacketType::AdminDisconnect, msg.encode()).await;
+                let _ = reply.send(r.map_err(Into::into));
+            }
             Command::Disconnect => unreachable!("handled in run loop"),
         }
         Ok(())
@@ -598,6 +613,18 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
                     text: String::from_utf8_lossy(&frame.payload).into_owned(),
                 })
                 .await;
+            }
+            PacketType::Disconnect => {
+                // The server is closing us (admin disconnect / ban). Surface
+                // the reason as an error; the socket close that follows yields
+                // the terminal Disconnected event on its own.
+                let text = String::from_utf8_lossy(&frame.payload).into_owned();
+                let text = if text.is_empty() {
+                    "disconnected by the server".to_string()
+                } else {
+                    format!("disconnected by the server: {text}")
+                };
+                self.emit(Event::ServerError { text }).await;
             }
             PacketType::Pong => {}
             other => debug!(packet_type = ?other, "unhandled inbound packet"),

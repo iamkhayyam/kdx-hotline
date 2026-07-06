@@ -2,6 +2,7 @@
 //! opcode range. Each type provides `encode() -> Bytes` and
 //! `decode(&[u8]) -> Result<Self, ProtocolError>`.
 
+mod admin;
 mod auth;
 mod chat;
 mod file;
@@ -11,6 +12,7 @@ mod private;
 mod roles;
 mod wire;
 
+pub use admin::AdminDisconnect;
 pub use auth::{AuthChallenge, AuthRequest, AuthResponse, AuthResult};
 pub use chat::{
     ChatEvent, ChatJoin, ChatLeave, ChatSend, ChatTopic, ChatUserList, CHAT_ACTION, CHAT_SYSTEM,

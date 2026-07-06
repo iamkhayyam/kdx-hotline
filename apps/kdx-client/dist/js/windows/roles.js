@@ -45,6 +45,7 @@ export function buildRoles() {
       </div>
     </form>
     <div class="rl-assign">
+      <div class="rl-assign-head">Roles</div>
       <div class="rl-assign-row">
         <input id="rl-username" placeholder="username" spellcheck="false" />
         <select id="rl-role-select"></select>
@@ -53,6 +54,27 @@ export function buildRoles() {
         <button class="mini" id="rl-lookup-btn">Look Up</button>
       </div>
       <div class="rl-assign-result" id="rl-assign-result"></div>
+    </div>
+    <div class="rl-kick">
+      <div class="rl-assign-head">Disconnect User</div>
+      <div class="rl-assign-row">
+        <input id="rl-kick-user" placeholder="username" spellcheck="false" />
+        <input id="rl-kick-reason" class="rl-kick-reason" placeholder="reason (optional)" spellcheck="false" />
+      </div>
+      <div class="rl-assign-row">
+        <label class="rl-kick-ban">Ban
+          <select id="rl-kick-ban">
+            <option value="0">no ban (kick only)</option>
+            <option value="300">5 minutes</option>
+            <option value="3600">1 hour</option>
+            <option value="86400">1 day</option>
+            <option value="604800">1 week</option>
+            <option value="31536000">1 year</option>
+          </select>
+        </label>
+        <button class="mini danger" id="rl-kick-btn">Disconnect</button>
+      </div>
+      <div class="rl-assign-result" id="rl-kick-result"></div>
     </div>
   `;
 
@@ -198,7 +220,33 @@ export function buildRoles() {
     }
   });
 
-  return { body, refresh };
+  const kickResult = $("#rl-kick-result");
+  $("#rl-kick-btn").addEventListener("click", async () => {
+    const username = $("#rl-kick-user").value.trim();
+    if (!username) return;
+    const reason = $("#rl-kick-reason").value.trim();
+    const banSecs = parseInt($("#rl-kick-ban").value, 10) || 0;
+    // The server acks over the event channel (server_info / server_error);
+    // this just reflects that the request was sent.
+    try {
+      await invoke("disconnect_user", { username, reason, banSecs });
+      kickResult.textContent = banSecs
+        ? `requested disconnect + ban of ${username}`
+        : `requested disconnect of ${username}`;
+    } catch (err) {
+      kickResult.textContent = err.message || String(err);
+    }
+  });
+
+  /** Pre-fill the Disconnect panel from a User List context-menu verb. */
+  function openDisconnect(username) {
+    $("#rl-kick-user").value = username;
+    $("#rl-kick-reason").value = "";
+    kickResult.textContent = "";
+    $("#rl-kick-user").scrollIntoView({ block: "nearest" });
+  }
+
+  return { body, refresh, openDisconnect };
 }
 
 function countBits(n) {

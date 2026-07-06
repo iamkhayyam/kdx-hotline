@@ -6,7 +6,7 @@ import { showMenu } from "../menu.js";
 
 const CLASS_NAME = ["guest", "user", "power user", "admin"];
 
-export function buildUserList(openUserInfo, sendMessage) {
+export function buildUserList(openUserInfo, sendMessage, disconnectUser) {
   const body = document.createElement("div");
   body.className = "userlist-win";
   body.innerHTML = `
@@ -53,6 +53,7 @@ export function buildUserList(openUserInfo, sendMessage) {
         showMenu(e.clientX, e.clientY, [
           { label: "Send Message", fn: () => sendMessage(u.username) },
           { label: "Get Info", fn: () => openUserInfo(u.username) },
+          { label: "Disconnect…", fn: () => disconnectUser(u.username) },
         ]);
       });
       listEl.appendChild(row);

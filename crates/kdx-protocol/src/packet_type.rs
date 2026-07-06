@@ -39,6 +39,8 @@ pub enum PacketType {
     // Private messages (0x40-0x41)
     PrivateSend = 0x40,
     PrivateMessage = 0x41,
+    // Admin: forcibly disconnect / ban a user (0x42)
+    AdminDisconnect = 0x42,
 
     // Roles / account admin (0x50-0x58)
     RoleListRequest = 0x50,
@@ -58,7 +60,7 @@ pub enum PacketType {
 }
 
 impl PacketType {
-    pub const ALL: [PacketType; 38] = [
+    pub const ALL: [PacketType; 39] = [
         PacketType::HandshakeInit,
         PacketType::HandshakeResp,
         PacketType::Ping,
@@ -85,6 +87,7 @@ impl PacketType {
         PacketType::UserInfoResponse,
         PacketType::PrivateSend,
         PacketType::PrivateMessage,
+        PacketType::AdminDisconnect,
         PacketType::RoleListRequest,
         PacketType::RoleListResponse,
         PacketType::RoleCreate,
@@ -132,6 +135,7 @@ impl TryFrom<u8> for PacketType {
             0x39 => UserInfoResponse,
             0x40 => PrivateSend,
             0x41 => PrivateMessage,
+            0x42 => AdminDisconnect,
             0x50 => RoleListRequest,
             0x51 => RoleListResponse,
             0x52 => RoleCreate,

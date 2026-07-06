@@ -104,6 +104,12 @@ pub(crate) enum Command {
         username: String,
         reply: oneshot::Sender<Result<Vec<String>, ClientError>>,
     },
+    DisconnectUser {
+        username: String,
+        reason: String,
+        ban_secs: u32,
+        reply: oneshot::Sender<Result<(), ClientError>>,
+    },
     Disconnect,
 }
 
@@ -314,6 +320,26 @@ impl ClientHandle {
     pub async fn account_roles(&self, username: &str) -> Result<Vec<String>, ClientError> {
         self.send(|reply| Command::AccountRoles {
             username: username.to_owned(),
+            reply,
+        })
+        .await
+    }
+
+    /// Forcibly disconnect another user by username. Requires `USER_KICK`; a
+    /// non-zero `ban_secs` additionally requires `USER_BAN` and records an
+    /// expiring ban that refuses that account's logins until it lapses.
+    /// Resolves once the request frame is written; the server's acknowledgement
+    /// (or refusal) arrives as `Event::ServerInfo` / `Event::ServerError`.
+    pub async fn disconnect_user(
+        &self,
+        username: &str,
+        reason: &str,
+        ban_secs: u32,
+    ) -> Result<(), ClientError> {
+        self.send(|reply| Command::DisconnectUser {
+            username: username.to_owned(),
+            reason: reason.to_owned(),
+            ban_secs,
             reply,
         })
         .await

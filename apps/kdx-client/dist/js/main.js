@@ -44,7 +44,11 @@ const userList = buildUserList(
     open("userinfo");
     userInfo.show(username);
   },
-  openMessagesWith
+  openMessagesWith,
+  (username) => {
+    open("admin");
+    roles.openDisconnect(username);
+  }
 );
 
 // Default window positions clear the floating Button Bar (top-left).

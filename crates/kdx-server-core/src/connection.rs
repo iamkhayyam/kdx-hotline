@@ -13,8 +13,8 @@ use std::time::Duration;
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use kdx_protocol::messages::{
-    AccountRolesRequest, AccountRolesResponse, AuthChallenge, AuthRequest, AuthResponse,
-    AuthResult, ChatJoin, ChatLeave, ChatSend, ChatTopic, FileEntry, FileListRequest,
+    AccountRolesRequest, AccountRolesResponse, AdminDisconnect, AuthChallenge, AuthRequest,
+    AuthResponse, AuthResult, ChatJoin, ChatLeave, ChatSend, ChatTopic, FileEntry, FileListRequest,
     FileListResponse, HandshakeInit, HandshakeResp, PresenceListRequest, PresenceListResponse,
     PrivateMessage, PrivateSend, RoleAssign, RoleCreate, RoleDelete, RoleInfo, RoleListRequest,
     RoleListResponse, RoleUnassign, RoleUpdate, TransferAccept, TransferData, TransferEnd,
@@ -235,6 +235,24 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                                 return Err(ConnectionError::TooManyAuthAttempts);
                             }
                         }
+                        // Correct password but the account is banned: refuse
+                        // the login outright (no retry budget spent — retrying
+                        // won't help until the ban lapses).
+                        Err(crate::auth::AuthError::Banned { until, reason }) => {
+                            let message = if reason.is_empty() {
+                                format!("banned until {until}")
+                            } else {
+                                format!("banned until {until}: {reason}")
+                            };
+                            let result = AuthResult {
+                                success: false,
+                                session_id: [0u8; 16],
+                                class: 0,
+                                message,
+                            };
+                            self.send(PacketType::AuthResult, PacketFlags::empty(), result.encode())
+                                .await?;
+                        }
                         Err(e) => return Err(e.into()),
                     }
                 }
@@ -305,7 +323,15 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
 
             let frame_or_eof = match next {
                 Next::Event(event) => {
+                    // A `Disconnect` event is the presence actor kicking this
+                    // connection (admin disconnect / ban): send the reason,
+                    // then close so the normal cleanup path runs.
+                    let closing = event.packet_type == PacketType::Disconnect;
                     self.send(event.packet_type, event.flags, event.payload).await?;
+                    if closing {
+                        debug!("disconnected by server (admin action)");
+                        break Ok(());
+                    }
                     continue;
                 }
                 Next::ReassemblyTimedOut => {
@@ -773,6 +799,89 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                             Err(e) => self.send_error(&e.to_string()).await?,
                         },
                         None => self.send_error("no such account").await?,
+                    }
+                }
+                PacketType::AdminDisconnect => {
+                    let req = AdminDisconnect::decode(&frame.payload)?;
+                    // Pull what we need as owned values so we don't hold a
+                    // borrow of `self.session` across the `&mut self` sends.
+                    let (admin_name, admin_class, privs) = {
+                        let s = self.session.as_ref().expect("authed");
+                        (s.username.clone(), s.class as u8, s.privileges)
+                    };
+                    // Kicking always needs USER_KICK; a ban additionally needs
+                    // USER_BAN.
+                    if !privs.contains(Privileges::USER_KICK) {
+                        self.send_error("missing USER_KICK privilege").await?;
+                        continue;
+                    }
+                    if req.ban_secs > 0 && !privs.contains(Privileges::USER_BAN) {
+                        self.send_error("missing USER_BAN privilege").await?;
+                        continue;
+                    }
+                    if req.username == admin_name {
+                        self.send_error("cannot disconnect yourself").await?;
+                        continue;
+                    }
+                    // Rank guard: never act on a user who outranks you. Prefer
+                    // the live (effective) class; fall back to the stored
+                    // account class so an offline ban target is still checked.
+                    let target_class = match self.ctx.presence.get(&req.username).await {
+                        Some(entry) => Some(entry.class),
+                        None => self
+                            .ctx
+                            .auth
+                            .account_class(&req.username)
+                            .await?
+                            .map(|c| c as u8),
+                    };
+                    if target_class.is_some_and(|tc| tc > admin_class) {
+                        self.send_error("cannot disconnect a higher-class user").await?;
+                        continue;
+                    }
+                    // Record the ban before kicking, so a racing reconnect is
+                    // already refused by the login path.
+                    if req.ban_secs > 0 {
+                        match self.ctx.auth.account_id(&req.username).await? {
+                            Some(account_id) => {
+                                let until = unix_now() as i64 + req.ban_secs as i64;
+                                self.ctx
+                                    .auth
+                                    .set_ban(&account_id, until, &req.reason, &admin_name)
+                                    .await?;
+                            }
+                            None => {
+                                self.send_error("no such account").await?;
+                                continue;
+                            }
+                        }
+                    }
+                    let reason = if req.reason.is_empty() {
+                        "disconnected by an administrator".to_string()
+                    } else {
+                        req.reason.clone()
+                    };
+                    let reached = self.ctx.presence.disconnect(&req.username, &reason).await;
+                    if reached == 0 && req.ban_secs == 0 {
+                        // Pure kick with nobody online is a no-op worth
+                        // reporting; a ban of an offline account is fine.
+                        self.send_error(&format!("{} is not online", req.username))
+                            .await?;
+                    } else {
+                        let ack = if req.ban_secs > 0 {
+                            format!(
+                                "banned {} — {} session(s) dropped",
+                                req.username, reached
+                            )
+                        } else {
+                            format!("disconnected {} — {} session(s)", req.username, reached)
+                        };
+                        self.send(
+                            PacketType::Info,
+                            PacketFlags::SYSTEM_MESSAGE,
+                            Bytes::copy_from_slice(ack.as_bytes()),
+                        )
+                        .await?;
                     }
                 }
                 other => {

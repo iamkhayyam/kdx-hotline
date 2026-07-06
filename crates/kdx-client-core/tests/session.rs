@@ -331,3 +331,96 @@ async fn plain_user_role_mutation_is_rejected() {
 
     ts.stop();
 }
+
+#[tokio::test]
+async fn sysop_disconnects_and_bans_a_user() {
+    let ts = TestServer::start().await;
+    ts.seed_account("sysop", "pw", 3).await; // Admin: has USER_KICK + USER_BAN
+    ts.seed_account("lamer", "pw", 1).await;
+
+    let (sysop, mut es, _d1) = ts.connect_client().await;
+    next_event(&mut es).await;
+    sysop.login("sysop", "pw").await.unwrap();
+
+    let (lamer, mut el, _d2) = ts.connect_client().await;
+    next_event(&mut el).await;
+    lamer.login("lamer", "pw").await.unwrap();
+
+    // Admin disconnects lamer with a one-hour ban.
+    sysop
+        .disconnect_user("lamer", "flooding the boards", 3600)
+        .await
+        .unwrap();
+
+    // The kicked client sees the reason, then the terminal Disconnected.
+    let mut saw_reason = false;
+    let mut saw_disconnect = false;
+    for _ in 0..12 {
+        match next_event(&mut el).await {
+            Event::ServerError { text } if text.contains("flooding") => saw_reason = true,
+            Event::Disconnected { .. } => {
+                saw_disconnect = true;
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert!(saw_reason, "kicked user should see the disconnect reason");
+    assert!(saw_disconnect, "kicked user should be disconnected");
+
+    // The admin gets an informational acknowledgement.
+    let mut saw_ack = false;
+    for _ in 0..10 {
+        if let Event::ServerInfo { text } = next_event(&mut es).await {
+            assert!(text.contains("lamer"));
+            saw_ack = true;
+            break;
+        }
+    }
+    assert!(saw_ack, "admin should get a disconnect ack");
+
+    // A fresh login as the banned account is refused (correct password).
+    let (again, mut ea, _d3) = ts.connect_client().await;
+    next_event(&mut ea).await;
+    let err = again.login("lamer", "pw").await.unwrap_err();
+    match err {
+        ClientError::AuthFailed(msg) => assert!(msg.contains("banned"), "got: {msg}"),
+        other => panic!("expected AuthFailed(banned), got {other:?}"),
+    }
+
+    ts.stop();
+}
+
+#[tokio::test]
+async fn plain_user_cannot_disconnect_others() {
+    let ts = TestServer::start().await;
+    ts.seed_account("nobody", "pw", 1).await; // no USER_KICK
+    ts.seed_account("target", "pw", 1).await;
+
+    let (nobody, mut en, _d1) = ts.connect_client().await;
+    next_event(&mut en).await;
+    nobody.login("nobody", "pw").await.unwrap();
+
+    let (target, mut et, _d2) = ts.connect_client().await;
+    next_event(&mut et).await;
+    target.login("target", "pw").await.unwrap();
+
+    nobody.disconnect_user("target", "", 0).await.unwrap();
+
+    // The attempt is refused with a privilege error…
+    let mut saw_err = false;
+    for _ in 0..10 {
+        if let Event::ServerError { text } = next_event(&mut en).await {
+            assert!(text.contains("USER_KICK"));
+            saw_err = true;
+            break;
+        }
+    }
+    assert!(saw_err);
+
+    // …and the target stays connected: a ping still round-trips as usual by
+    // way of the still-live roster (list_users succeeds).
+    assert!(target.list_users().await.is_ok());
+
+    ts.stop();
+}

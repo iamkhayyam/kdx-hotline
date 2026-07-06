@@ -3,6 +3,7 @@
 //! live on the filesystem, never in the database.
 
 pub mod accounts;
+pub mod bans;
 pub mod db;
 pub mod file_tree;
 pub mod roles;

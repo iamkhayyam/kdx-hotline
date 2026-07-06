@@ -269,3 +269,16 @@ pub async fn unassign_role(
 pub async fn account_roles(state: State<'_, AppState>, username: String) -> CmdResult<Vec<String>> {
     with_client(&state, |c| async move { c.account_roles(&username).await }).await
 }
+
+#[tauri::command]
+pub async fn disconnect_user(
+    state: State<'_, AppState>,
+    username: String,
+    reason: String,
+    ban_secs: u32,
+) -> CmdResult<()> {
+    with_client(&state, |c| async move {
+        c.disconnect_user(&username, &reason, ban_secs).await
+    })
+    .await
+}

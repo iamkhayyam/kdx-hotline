@@ -7,6 +7,7 @@
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use bytes::Bytes;
 use kdx_protocol::messages::PresenceChange;
 use kdx_protocol::messages::PresenceEntry as WireEntry;
 use kdx_protocol::{PacketFlags, PacketType};
@@ -49,6 +50,14 @@ pub enum PresenceCommand {
     Deliver {
         username: String,
         outbound: Outbound,
+        reply: oneshot::Sender<usize>,
+    },
+    /// Forcibly disconnect every connection of `username`: push a `Disconnect`
+    /// frame carrying `reason`, which the target's dispatch loop sends and then
+    /// closes on. Replies with the number of sessions signalled.
+    Disconnect {
+        username: String,
+        reason: String,
         reply: oneshot::Sender<usize>,
     },
 }
@@ -168,6 +177,27 @@ impl Presence {
         }
         rx.await.unwrap_or(0)
     }
+
+    /// Forcibly disconnect every connection of `username`, delivering `reason`.
+    /// Returns the number of sessions signalled (0 = offline). The target's
+    /// dispatch loop closes after sending the `Disconnect` frame, which runs
+    /// the usual room-leave / presence-leave / session-end cleanup.
+    pub async fn disconnect(&self, username: &str, reason: &str) -> usize {
+        let (reply, rx) = oneshot::channel();
+        if self
+            .tx
+            .send(PresenceCommand::Disconnect {
+                username: username.to_owned(),
+                reason: reason.to_owned(),
+                reply,
+            })
+            .await
+            .is_err()
+        {
+            return 0;
+        }
+        rx.await.unwrap_or(0)
+    }
 }
 
 async fn handle(entries: &mut HashMap<Uuid, Entry>, command: PresenceCommand) {
@@ -245,6 +275,25 @@ async fn handle(entries: &mut HashMap<Uuid, Entry>, command: PresenceCommand) {
             let mut reached = 0;
             for entry in entries.values().filter(|e| e.username == username) {
                 if entry.tx.try_send(outbound.clone()).is_ok() {
+                    reached += 1;
+                }
+            }
+            let _ = reply.send(reached);
+        }
+        PresenceCommand::Disconnect {
+            username,
+            reason,
+            reply,
+        } => {
+            let payload = Bytes::copy_from_slice(reason.as_bytes());
+            let mut reached = 0;
+            for entry in entries.values().filter(|e| e.username == username) {
+                let signal = Outbound {
+                    packet_type: PacketType::Disconnect,
+                    flags: PacketFlags::empty(),
+                    payload: payload.clone(),
+                };
+                if entry.tx.try_send(signal).is_ok() {
                     reached += 1;
                 }
             }
