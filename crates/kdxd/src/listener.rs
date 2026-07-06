@@ -6,7 +6,9 @@ use kdx_server_core::auth::{AuthManager, RoleManager};
 use kdx_server_core::chat::RoomManager;
 use kdx_server_core::files::FileTree;
 use kdx_server_core::history::HistoryLog;
+use kdx_server_core::ip_rules::{IpRuleManager, Verdict};
 use kdx_server_core::news::NewsManager;
+use kdx_server_core::presence::unix_now;
 use kdx_server_core::settings::ServerSettings;
 use kdx_server_core::tracker::{ServerEntry, Tracker, DEFAULT_TTL};
 use kdx_server_core::transfer::{TransferConfig, TransferManager};
@@ -73,6 +75,9 @@ pub async fn serve(config: Config) -> Result<Server, ServeError> {
     )
     .await
     .map_err(|e| ServeError::Init(e.to_string()))?;
+    let ip_rules = IpRuleManager::load(pool.clone())
+        .await
+        .map_err(|e| ServeError::Init(e.to_string()))?;
     let listener = TcpListener::bind(config.bind).await?;
     let local_addr = listener.local_addr()?;
 
@@ -80,6 +85,7 @@ pub async fn serve(config: Config) -> Result<Server, ServeError> {
         roles: RoleManager::new(pool.clone()),
         news: NewsManager::new(pool.clone()),
         history: HistoryLog::new(pool.clone()),
+        ip_rules,
         auth: AuthManager::new(pool, Duration::from_secs(config.session_ttl_secs)),
         rooms: RoomManager::new(),
         tree,
@@ -121,6 +127,28 @@ pub async fn serve(config: Config) -> Result<Server, ServeError> {
                             continue;
                         }
                     };
+                    // Allow-Deny IP rules: match before TLS so a denied
+                    // peer burns zero handshake work. `match_ip` is a
+                    // scan of a small in-memory cache; the sockaddr's IP
+                    // is what the rules apply to, not the port.
+                    let verdict = accept_ctx.ip_rules.match_ip(peer.ip()).await;
+                    if let Verdict::Deny { note } = verdict {
+                        warn!(%peer, note = %note, "connection denied by IP rule");
+                        let _ = accept_ctx
+                            .history
+                            .record(
+                                unix_now(),
+                                None,
+                                "ip_denied",
+                                &format!("peer={}, note={}", peer.ip(), note),
+                            )
+                            .await;
+                        // Close the socket immediately (drop it) — we do
+                        // not want to send anything back, since even that
+                        // hint would help someone probe for the ban.
+                        drop(tcp);
+                        continue;
+                    }
                     let acceptor = acceptor.clone();
                     let conn_ctx = accept_ctx.clone();
                     tokio::spawn(async move {

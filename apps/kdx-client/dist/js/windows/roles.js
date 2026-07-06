@@ -21,7 +21,7 @@ const PRIVILEGES = [
   { bit: 1 << 19, name: "SERVER_ADMIN", label: "Server: config/shutdown" },
 ];
 
-export function buildRoles(openAccounts, openServer, openHistory) {
+export function buildRoles(openAccounts, openServer, openHistory, openIpRules) {
   const body = document.createElement("div");
   body.className = "roles-win";
   body.innerHTML = `
@@ -30,6 +30,7 @@ export function buildRoles(openAccounts, openServer, openHistory) {
       <button class="mini" id="rl-accounts">Accounts…</button>
       <button class="mini" id="rl-server">Server…</button>
       <button class="mini" id="rl-history">History…</button>
+      <button class="mini" id="rl-iprules">IP Rules…</button>
       <button class="mini" id="rl-new">New Role</button>
       <button class="mini" id="rl-refresh">Refresh</button>
     </div>
@@ -167,6 +168,7 @@ export function buildRoles(openAccounts, openServer, openHistory) {
   if (openAccounts) $("#rl-accounts").addEventListener("click", openAccounts);
   if (openServer) $("#rl-server").addEventListener("click", openServer);
   if (openHistory) $("#rl-history").addEventListener("click", openHistory);
+  if (openIpRules) $("#rl-iprules").addEventListener("click", openIpRules);
   filter.addEventListener("input", render);
 
   editor.addEventListener("submit", async (e) => {

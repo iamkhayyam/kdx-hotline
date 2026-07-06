@@ -6,7 +6,7 @@ use std::path::PathBuf;
 
 use kdx_client_core::{
     connect as core_connect, trust_server, AccountSummary, ClientConfig, ClientError, Event,
-    FileSearchEntry, HistoryEntry, NewsPost, NewsgroupInfo, PresenceUser, RoleInfo,
+    FileSearchEntry, HistoryEntry, IpRule, NewsPost, NewsgroupInfo, PresenceUser, RoleInfo,
     ServerSettings, TrackerServer,
 };
 use serde::Serialize;
@@ -264,6 +264,30 @@ pub async fn shutdown_server(state: State<'_, AppState>, message: String) -> Cmd
 #[tauri::command]
 pub async fn list_history(state: State<'_, AppState>, limit: u32) -> CmdResult<Vec<HistoryEntry>> {
     with_client(&state, |c| async move { c.list_history(limit).await }).await
+}
+
+#[tauri::command]
+pub async fn list_ip_rules(state: State<'_, AppState>) -> CmdResult<Vec<IpRule>> {
+    with_client(&state, |c| async move { c.list_ip_rules().await }).await
+}
+
+#[tauri::command]
+pub async fn create_ip_rule(
+    state: State<'_, AppState>,
+    position: i32,
+    action: String,
+    cidr: String,
+    note: String,
+) -> CmdResult<Vec<IpRule>> {
+    with_client(&state, |c| async move {
+        c.create_ip_rule(position, &action, &cidr, &note).await
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn delete_ip_rule(state: State<'_, AppState>, id: String) -> CmdResult<Vec<IpRule>> {
+    with_client(&state, |c| async move { c.delete_ip_rule(&id).await }).await
 }
 
 #[tauri::command]

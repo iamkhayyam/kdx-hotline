@@ -398,7 +398,7 @@ async fn broadcast_filtered(
     }
 }
 
-pub(crate) fn unix_now() -> u64 {
+pub fn unix_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("clock after 1970")

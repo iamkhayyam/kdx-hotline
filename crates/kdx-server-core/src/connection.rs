@@ -20,7 +20,8 @@ use kdx_protocol::messages::{
     FileEntry,
     FileGenerateCatalog, FileListRequest, FileListResponse, FileMove, FileSearchEntry,
     FileSearchRequest, FileSearchResponse, HandshakeInit, HandshakeResp, HistoryEntry as WireHistoryEntry,
-    HistoryListRequest, HistoryListResponse, NewsPost as WireNewsPost,
+    HistoryListRequest, HistoryListResponse, IpRuleCreate, IpRuleDelete,
+    IpRuleEntry as WireIpRule, IpRuleListRequest, IpRuleListResponse, NewsPost as WireNewsPost,
     NewsPostCreate, NewsPostDelete, NewsThreadListRequest, NewsThreadListResponse, NewsgroupCreate,
     NewsgroupInfo, NewsgroupListRequest, NewsgroupListResponse, PresenceListRequest,
     PresenceListResponse, PrivateMessage, PrivateSend, RoleAssign, RoleCreate, RoleDelete, RoleInfo,
@@ -87,6 +88,7 @@ pub struct ServerCtx {
     pub tracker: Tracker,
     pub settings: ServerSettings,
     pub history: HistoryLog,
+    pub ip_rules: crate::ip_rules::IpRuleManager,
     /// The bound listen port — immutable, informational only (shown in the
     /// Server Settings window; not itself part of `ServerSettings`, which
     /// covers just the live-editable fields).
@@ -1232,6 +1234,107 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                         Err(e) => self.send_error(&e.to_string()).await?,
                     }
                 }
+                PacketType::IpRuleListRequest => {
+                    IpRuleListRequest::decode(&frame.payload)?;
+                    let privs = self.session.as_ref().expect("authed").privileges;
+                    if !privs.contains(Privileges::SERVER_ADMIN) {
+                        self.send_error("missing SERVER_ADMIN privilege").await?;
+                        continue;
+                    }
+                    match self.ctx.ip_rules.list().await {
+                        Ok(rules) => {
+                            let response = IpRuleListResponse {
+                                rules: rules
+                                    .into_iter()
+                                    .map(|r| WireIpRule {
+                                        id: r.id,
+                                        position: r.position,
+                                        action: match r.action {
+                                            crate::ip_rules::Action::Allow => "allow".into(),
+                                            crate::ip_rules::Action::Deny => "deny".into(),
+                                        },
+                                        cidr: r.cidr,
+                                        note: r.note,
+                                        created_by: r.created_by,
+                                        created_at: r.created_at,
+                                    })
+                                    .collect(),
+                            };
+                            self.send(
+                                PacketType::IpRuleListResponse,
+                                PacketFlags::empty(),
+                                response.encode(),
+                            )
+                            .await?;
+                        }
+                        Err(e) => self.send_error(&e.to_string()).await?,
+                    }
+                }
+                PacketType::IpRuleCreate => {
+                    let create = IpRuleCreate::decode(&frame.payload)?;
+                    let session = self.session.as_ref().expect("authed");
+                    if !session.privileges.contains(Privileges::SERVER_ADMIN) {
+                        self.send_error("missing SERVER_ADMIN privilege").await?;
+                        continue;
+                    }
+                    let admin_name = session.username.clone();
+                    let action = match create.action.as_str() {
+                        "allow" => crate::ip_rules::Action::Allow,
+                        "deny" => crate::ip_rules::Action::Deny,
+                        other => {
+                            self.send_error(&format!("invalid action: {other}")).await?;
+                            continue;
+                        }
+                    };
+                    match self
+                        .ctx
+                        .ip_rules
+                        .create(
+                            create.position,
+                            action,
+                            &create.cidr,
+                            &create.note,
+                            &admin_name,
+                            unix_now(),
+                        )
+                        .await
+                    {
+                        Ok(_) => {
+                            let _ = self
+                                .ctx
+                                .history
+                                .record(
+                                    unix_now(),
+                                    Some(&admin_name),
+                                    "ip_rule_created",
+                                    &format!("{} {}", create.action, create.cidr),
+                                )
+                                .await;
+                            self.reply_ip_rule_list().await?
+                        }
+                        Err(e) => self.send_error(&e.to_string()).await?,
+                    }
+                }
+                PacketType::IpRuleDelete => {
+                    let del = IpRuleDelete::decode(&frame.payload)?;
+                    let session = self.session.as_ref().expect("authed");
+                    if !session.privileges.contains(Privileges::SERVER_ADMIN) {
+                        self.send_error("missing SERVER_ADMIN privilege").await?;
+                        continue;
+                    }
+                    let admin_name = session.username.clone();
+                    match self.ctx.ip_rules.delete(&del.id).await {
+                        Ok(()) => {
+                            let _ = self
+                                .ctx
+                                .history
+                                .record(unix_now(), Some(&admin_name), "ip_rule_deleted", &del.id)
+                                .await;
+                            self.reply_ip_rule_list().await?
+                        }
+                        Err(e) => self.send_error(&e.to_string()).await?,
+                    }
+                }
                 PacketType::ServerSettingsUpdate => {
                     let update = ServerSettingsUpdate::decode(&frame.payload)?;
                     let session = self.session.as_ref().expect("authed");
@@ -1669,6 +1772,40 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
         Ok(())
     }
 
+    /// Send the current IP rule set — the reply to a successful create or delete
+    /// so the admin's window can just re-render from one message shape.
+    async fn reply_ip_rule_list(&mut self) -> Result<(), ConnectionError> {
+        match self.ctx.ip_rules.list().await {
+            Ok(rules) => {
+                let response = IpRuleListResponse {
+                    rules: rules
+                        .into_iter()
+                        .map(|r| WireIpRule {
+                            id: r.id,
+                            position: r.position,
+                            action: match r.action {
+                                crate::ip_rules::Action::Allow => "allow".into(),
+                                crate::ip_rules::Action::Deny => "deny".into(),
+                            },
+                            cidr: r.cidr,
+                            note: r.note,
+                            created_by: r.created_by,
+                            created_at: r.created_at,
+                        })
+                        .collect(),
+                };
+                self.send(
+                    PacketType::IpRuleListResponse,
+                    PacketFlags::empty(),
+                    response.encode(),
+                )
+                .await?;
+            }
+            Err(e) => self.send_error(&e.to_string()).await?,
+        }
+        Ok(())
+    }
+
     /// Send the newsgroups the caller may read (filtered by their class) — the
     /// reply to `NewsgroupListRequest` and to a successful create.
     async fn reply_newsgroup_list(&mut self) -> Result<(), ConnectionError> {
@@ -1870,10 +2007,14 @@ mod tests {
         )
         .await
         .unwrap();
+        let ip_rules = crate::ip_rules::IpRuleManager::load(pool.clone())
+            .await
+            .expect("ip_rules load");
         let ctx = Arc::new(ServerCtx {
             roles: RoleManager::new(pool.clone()),
             news: NewsManager::new(pool.clone()),
             history: crate::history::HistoryLog::new(pool.clone()),
+            ip_rules,
             auth: AuthManager::new(pool, Duration::from_secs(60)),
             rooms: RoomManager::new(),
             tree,
@@ -2129,10 +2270,14 @@ mod tests {
         )
         .await
         .unwrap();
+        let ip_rules = crate::ip_rules::IpRuleManager::load(pool.clone())
+            .await
+            .expect("ip_rules load");
         let ctx = Arc::new(ServerCtx {
             roles: RoleManager::new(pool.clone()),
             news: NewsManager::new(pool.clone()),
             history: crate::history::HistoryLog::new(pool.clone()),
+            ip_rules,
             auth: AuthManager::new(pool, Duration::from_secs(60)),
             rooms: RoomManager::new(),
             tree,

@@ -1098,3 +1098,129 @@ async fn plain_user_cannot_view_history() {
 
     ts.stop();
 }
+
+#[tokio::test]
+async fn admin_creates_lists_and_deletes_ip_rules() {
+    let ts = TestServer::start().await;
+    ts.seed_account("sysop", "pw", 3).await;
+
+    let (sysop, mut es, _d) = ts.connect_client().await;
+    next_event(&mut es).await;
+    sysop.login("sysop", "pw").await.unwrap();
+
+    // Empty at start.
+    assert!(sysop.list_ip_rules().await.unwrap().is_empty());
+
+    // Create two rules — the allow-exception at a lower position so it sorts first.
+    let after_deny = sysop
+        .create_ip_rule(20, "deny", "1.2.3.0/24", "spammy /24")
+        .await
+        .unwrap();
+    assert_eq!(after_deny.len(), 1);
+    assert_eq!(after_deny[0].action, "deny");
+
+    let after_both = sysop
+        .create_ip_rule(10, "allow", "1.2.3.4/32", "our office")
+        .await
+        .unwrap();
+    assert_eq!(after_both.len(), 2);
+    // Priority order: allow (10) before deny (20).
+    assert_eq!(after_both[0].cidr, "1.2.3.4/32");
+    assert_eq!(after_both[0].action, "allow");
+    assert_eq!(after_both[1].cidr, "1.2.3.0/24");
+
+    // List agrees with the create reply.
+    let listed = sysop.list_ip_rules().await.unwrap();
+    assert_eq!(listed, after_both);
+
+    // Delete the allow-exception; the deny should be the only one left.
+    let after_del = sysop.delete_ip_rule(&after_both[0].id).await.unwrap();
+    assert_eq!(after_del.len(), 1);
+    assert_eq!(after_del[0].cidr, "1.2.3.0/24");
+
+    ts.stop();
+}
+
+#[tokio::test]
+async fn ip_rule_create_refuses_bogus_cidr() {
+    let ts = TestServer::start().await;
+    ts.seed_account("sysop", "pw", 3).await;
+
+    let (sysop, mut es, _d) = ts.connect_client().await;
+    next_event(&mut es).await;
+    sysop.login("sysop", "pw").await.unwrap();
+
+    // Bad CIDR is refused at the domain layer (before touching storage).
+    assert!(matches!(
+        sysop.create_ip_rule(10, "deny", "not-a-cidr", "").await,
+        Err(ClientError::Server(_))
+    ));
+    // Bad action likewise.
+    assert!(matches!(
+        sysop.create_ip_rule(10, "maybe", "1.2.3.0/24", "").await,
+        Err(ClientError::Server(_))
+    ));
+    // Nothing landed in storage.
+    assert!(sysop.list_ip_rules().await.unwrap().is_empty());
+
+    ts.stop();
+}
+
+#[tokio::test]
+async fn plain_user_cannot_manage_ip_rules() {
+    let ts = TestServer::start().await;
+    ts.seed_account("plain", "pw", 1).await; // no SERVER_ADMIN
+
+    let (client, mut events, _dd) = ts.connect_client().await;
+    next_event(&mut events).await;
+    client.login("plain", "pw").await.unwrap();
+
+    assert!(matches!(client.list_ip_rules().await, Err(ClientError::Server(_))));
+    assert!(matches!(
+        client.create_ip_rule(10, "deny", "1.2.3.0/24", "").await,
+        Err(ClientError::Server(_))
+    ));
+    assert!(matches!(
+        client.delete_ip_rule("nonexistent").await,
+        Err(ClientError::Server(_))
+    ));
+
+    ts.stop();
+}
+
+#[tokio::test]
+async fn deny_rule_refuses_new_connections_from_localhost() {
+    let ts = TestServer::start().await;
+    ts.seed_account("sysop", "pw", 3).await;
+
+    let (sysop, mut es, _d) = ts.connect_client().await;
+    next_event(&mut es).await;
+    sysop.login("sysop", "pw").await.unwrap();
+
+    // Deny all of localhost. The already-established `sysop` connection
+    // stays alive — the rule only gates NEW accept()s.
+    sysop
+        .create_ip_rule(10, "deny", "127.0.0.0/8", "test lockout")
+        .await
+        .unwrap();
+
+    // A fresh client is dropped at the accept loop, before TLS. The
+    // client-side manifestation is that the TLS handshake fails; the
+    // TestServer harness surfaces that as a raw connect error either
+    // from the trust-on-first-use probe or the pinning attempt below.
+    use kdx_client_core::{connect, ClientConfig};
+    let data_dir = tempfile::tempdir().unwrap();
+    let cfg = ClientConfig::new("127.0.0.1", ts.port(), data_dir.path());
+    // The server-side accept loop drops the socket; the client-side
+    // effect is a TLS/handshake failure — not `UntrustedCertificate`.
+    let result = connect(cfg).await;
+    assert!(
+        result.is_err(),
+        "denied peer must not complete a session, got {result:?}",
+    );
+
+    // Existing sysop connection is unaffected.
+    assert!(sysop.list_ip_rules().await.is_ok());
+
+    ts.stop();
+}

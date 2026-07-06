@@ -20,7 +20,8 @@ pub use account::{
 };
 pub use admin::{
     AdminBroadcast, AdminDisconnect, AdminShutdown, HistoryEntry, HistoryListRequest,
-    HistoryListResponse, ServerSettingsRequest, ServerSettingsResponse, ServerSettingsUpdate,
+    HistoryListResponse, IpRuleCreate, IpRuleDelete, IpRuleEntry, IpRuleListRequest,
+    IpRuleListResponse, ServerSettingsRequest, ServerSettingsResponse, ServerSettingsUpdate,
 };
 pub use auth::{AuthChallenge, AuthRequest, AuthResponse, AuthResult};
 pub use chat::{

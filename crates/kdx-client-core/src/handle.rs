@@ -6,8 +6,8 @@ use kdx_protocol::messages::FileListResponse;
 
 use crate::error::ClientError;
 use crate::event::{
-    AccountSummary, FileSearchEntry, HistoryEntry, NewsPost, NewsgroupInfo, PresenceUser, RoleInfo,
-    ServerSettings, TrackerServer,
+    AccountSummary, FileSearchEntry, HistoryEntry, IpRule, NewsPost, NewsgroupInfo, PresenceUser,
+    RoleInfo, ServerSettings, TrackerServer,
 };
 
 /// A logged-in session's identity.
@@ -101,6 +101,20 @@ pub(crate) enum Command {
     ListHistory {
         limit: u32,
         reply: oneshot::Sender<Result<Vec<HistoryEntry>, ClientError>>,
+    },
+    ListIpRules {
+        reply: oneshot::Sender<Result<Vec<IpRule>, ClientError>>,
+    },
+    CreateIpRule {
+        position: i32,
+        action: String,
+        cidr: String,
+        note: String,
+        reply: oneshot::Sender<Result<Vec<IpRule>, ClientError>>,
+    },
+    DeleteIpRule {
+        id: String,
+        reply: oneshot::Sender<Result<Vec<IpRule>, ClientError>>,
     },
     GetUserInfo {
         username: String,
@@ -424,6 +438,43 @@ impl ClientHandle {
     pub async fn list_history(&self, limit: u32) -> Result<Vec<HistoryEntry>, ClientError> {
         self.send(|reply| Command::ListHistory { limit, reply })
             .await
+    }
+
+    /// List Allow-Deny IP rules in priority order (lowest `position` first).
+    /// Requires `SERVER_ADMIN`.
+    pub async fn list_ip_rules(&self) -> Result<Vec<IpRule>, ClientError> {
+        self.send(|reply| Command::ListIpRules { reply }).await
+    }
+
+    /// Create a new IP rule. `action` must be "allow" or "deny"; `cidr` must
+    /// parse as an `ipnet::IpNet` (e.g. "1.2.3.4/32", "10.0.0.0/8",
+    /// "2001:db8::/32"). Resolves with the server's full, updated rule list.
+    /// Requires `SERVER_ADMIN`.
+    pub async fn create_ip_rule(
+        &self,
+        position: i32,
+        action: &str,
+        cidr: &str,
+        note: &str,
+    ) -> Result<Vec<IpRule>, ClientError> {
+        self.send(|reply| Command::CreateIpRule {
+            position,
+            action: action.to_owned(),
+            cidr: cidr.to_owned(),
+            note: note.to_owned(),
+            reply,
+        })
+        .await
+    }
+
+    /// Delete an IP rule by id. Resolves with the server's full, updated rule
+    /// list. Requires `SERVER_ADMIN`.
+    pub async fn delete_ip_rule(&self, id: &str) -> Result<Vec<IpRule>, ClientError> {
+        self.send(|reply| Command::DeleteIpRule {
+            id: id.to_owned(),
+            reply,
+        })
+        .await
     }
 
     /// Fetch one user's detail (login/idle time, address) for the User Info

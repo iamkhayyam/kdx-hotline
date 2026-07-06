@@ -93,6 +93,12 @@ pub enum PacketType {
     HistoryListRequest = 0x79,
     HistoryListResponse = 0x7A,
 
+    // Allow-Deny IP rules (0x7B-0x7E)
+    IpRuleListRequest = 0x7B,
+    IpRuleListResponse = 0x7C,
+    IpRuleCreate = 0x7D,
+    IpRuleDelete = 0x7E,
+
     // System (0xF0-0xFF)
     Error = 0xF0,
     Warning = 0xF1,
@@ -100,7 +106,7 @@ pub enum PacketType {
 }
 
 impl PacketType {
-    pub const ALL: [PacketType; 68] = [
+    pub const ALL: [PacketType; 72] = [
         PacketType::HandshakeInit,
         PacketType::HandshakeResp,
         PacketType::Ping,
@@ -166,6 +172,10 @@ impl PacketType {
         PacketType::ChatInvited,
         PacketType::HistoryListRequest,
         PacketType::HistoryListResponse,
+        PacketType::IpRuleListRequest,
+        PacketType::IpRuleListResponse,
+        PacketType::IpRuleCreate,
+        PacketType::IpRuleDelete,
         PacketType::Error,
         PacketType::Warning,
         PacketType::Info,
@@ -243,6 +253,10 @@ impl TryFrom<u8> for PacketType {
             0x78 => ChatInvited,
             0x79 => HistoryListRequest,
             0x7A => HistoryListResponse,
+            0x7B => IpRuleListRequest,
+            0x7C => IpRuleListResponse,
+            0x7D => IpRuleCreate,
+            0x7E => IpRuleDelete,
             0xF0 => Error,
             0xF1 => Warning,
             0xF2 => Info,

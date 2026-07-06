@@ -1957,6 +1957,7 @@ dependencies = [
  "bytes",
  "dashmap",
  "futures-util",
+ "ipnet",
  "kdx-crypto",
  "kdx-protocol",
  "kdx-storage",

@@ -19,7 +19,8 @@ use kdx_protocol::messages::{
     ChatLeave, ChatSend, ChatTopic, ChatUserList, FileCatalogGenerated, FileCreateFolder,
     FileDelete, FileGenerateCatalog,
     FileListRequest, FileMove, FileSearchRequest, FileSearchResponse, HistoryListRequest,
-    HistoryListResponse, NewsPostCreate,
+    HistoryListResponse, IpRuleCreate, IpRuleDelete, IpRuleListRequest, IpRuleListResponse,
+    NewsPostCreate,
     NewsPostDelete, NewsThreadListRequest, NewsThreadListResponse, NewsgroupCreate,
     NewsgroupListRequest, NewsgroupListResponse, ServerSettingsRequest, ServerSettingsResponse,
     ServerSettingsUpdate, TrackerListRequest, TrackerListResponse,
@@ -42,8 +43,8 @@ use uuid::Uuid;
 
 use crate::error::ClientError;
 use crate::event::{
-    AccountSummary, Direction, Event, FileSearchEntry, HistoryEntry, NewsPost, NewsgroupInfo,
-    PresenceUser, RoleInfo, ServerSettings, TrackerServer,
+    AccountSummary, Direction, Event, FileSearchEntry, HistoryEntry, IpRule, NewsPost,
+    NewsgroupInfo, PresenceUser, RoleInfo, ServerSettings, TrackerServer,
 };
 use crate::handle::{Command, Session};
 use crate::transfer::{chunk_len, total_chunks, ChunkBitmap, Sidecar, DEFAULT_CHUNK_SIZE};
@@ -112,6 +113,7 @@ pub(crate) struct Actor<S> {
     newsgroup_waiters: VecDeque<oneshot::Sender<Result<Vec<NewsgroupInfo>, ClientError>>>,
     thread_waiters: VecDeque<oneshot::Sender<Result<Vec<NewsPost>, ClientError>>>,
     history_waiters: VecDeque<oneshot::Sender<Result<Vec<HistoryEntry>, ClientError>>>,
+    ip_rule_waiters: VecDeque<oneshot::Sender<Result<Vec<IpRule>, ClientError>>>,
     transfer: Option<Transfer>,
 }
 
@@ -141,6 +143,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
             newsgroup_waiters: VecDeque::new(),
             thread_waiters: VecDeque::new(),
             history_waiters: VecDeque::new(),
+            ip_rule_waiters: VecDeque::new(),
             transfer: None,
         }
     }
@@ -230,6 +233,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
             let _ = waiter.send(Err(ClientError::Disconnected));
         }
         for waiter in self.history_waiters.drain(..) {
+            let _ = waiter.send(Err(ClientError::Disconnected));
+        }
+        for waiter in self.ip_rule_waiters.drain(..) {
             let _ = waiter.send(Err(ClientError::Disconnected));
         }
         if let Some(reply) = self.transfer.take().and_then(transfer_reply) {
@@ -429,6 +435,46 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
                     .await
                 {
                     Ok(()) => self.history_waiters.push_back(reply),
+                    Err(e) => {
+                        let _ = reply.send(Err(e.into()));
+                    }
+                }
+            }
+            Command::ListIpRules { reply } => {
+                match self
+                    .send(PacketType::IpRuleListRequest, IpRuleListRequest.encode())
+                    .await
+                {
+                    Ok(()) => self.ip_rule_waiters.push_back(reply),
+                    Err(e) => {
+                        let _ = reply.send(Err(e.into()));
+                    }
+                }
+            }
+            Command::CreateIpRule {
+                position,
+                action,
+                cidr,
+                note,
+                reply,
+            } => {
+                let msg = IpRuleCreate {
+                    position,
+                    action,
+                    cidr,
+                    note,
+                };
+                match self.send(PacketType::IpRuleCreate, msg.encode()).await {
+                    Ok(()) => self.ip_rule_waiters.push_back(reply),
+                    Err(e) => {
+                        let _ = reply.send(Err(e.into()));
+                    }
+                }
+            }
+            Command::DeleteIpRule { id, reply } => {
+                let msg = IpRuleDelete { id };
+                match self.send(PacketType::IpRuleDelete, msg.encode()).await {
+                    Ok(()) => self.ip_rule_waiters.push_back(reply),
                     Err(e) => {
                         let _ = reply.send(Err(e.into()));
                     }
@@ -927,6 +973,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
                     let _ = waiter.send(Ok(response.entries.into_iter().map(Into::into).collect()));
                 }
             }
+            PacketType::IpRuleListResponse => {
+                let response = IpRuleListResponse::decode(&frame.payload)?;
+                if let Some(waiter) = self.ip_rule_waiters.pop_front() {
+                    let _ = waiter.send(Ok(response.rules.into_iter().map(Into::into).collect()));
+                }
+            }
             PacketType::RoleListResponse => {
                 let response = RoleListResponse::decode(&frame.payload)?;
                 if let Some(waiter) = self.role_waiters.pop_front() {
@@ -1237,6 +1289,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
         }
         // Server History requests fail on missing SERVER_ADMIN.
         if let Some(waiter) = self.history_waiters.pop_front() {
+            let _ = waiter.send(Err(ClientError::Server(text.clone())));
+        }
+        // IP rule ops fail on missing SERVER_ADMIN or bad action/CIDR input.
+        if let Some(waiter) = self.ip_rule_waiters.pop_front() {
             let _ = waiter.send(Err(ClientError::Server(text.clone())));
         }
         self.emit(Event::ServerError { text }).await;

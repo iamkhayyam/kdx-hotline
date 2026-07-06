@@ -5,7 +5,7 @@
 
 import { invoke } from "../bridge.js";
 
-export function buildServerAdmin(openHistory) {
+export function buildServerAdmin(openHistory, openIpRules) {
   const body = document.createElement("div");
   body.className = "srv-win";
   body.innerHTML = `
@@ -23,6 +23,7 @@ export function buildServerAdmin(openHistory) {
           <button type="submit" class="btn">Save</button>
           <button type="button" class="mini" id="srv-refresh">Refresh</button>
           <button type="button" class="mini" id="srv-history">History…</button>
+          <button type="button" class="mini" id="srv-iprules">IP Rules…</button>
         </div>
         <div class="rl-assign-result" id="srv-settings-result"></div>
       </form>
@@ -97,6 +98,7 @@ export function buildServerAdmin(openHistory) {
   });
   $("#srv-refresh").addEventListener("click", refresh);
   if (openHistory) $("#srv-history").addEventListener("click", openHistory);
+  if (openIpRules) $("#srv-iprules").addEventListener("click", openIpRules);
 
   $("#srv-broadcast-form").addEventListener("submit", async (e) => {
     e.preventDefault();

@@ -18,6 +18,7 @@ import { buildNews } from "./windows/news.js";
 import { buildTrackers } from "./windows/trackers.js";
 import { buildServerAdmin } from "./windows/serveradmin.js";
 import { buildServerHistory } from "./windows/serverhistory.js";
+import { buildIpRules } from "./windows/iprules.js";
 
 const desktop = document.getElementById("desktop");
 
@@ -62,12 +63,14 @@ const trackers = buildTrackers((host, port) => {
   connectApi.fill({ host, port: String(port) });
   open("connect");
 });
-const serverAdmin = buildServerAdmin(() => open("history"));
+const serverAdmin = buildServerAdmin(() => open("history"), () => open("iprules"));
 const serverHistory = buildServerHistory();
+const ipRules = buildIpRules();
 const roles = buildRoles(
   () => open("accounts"),
   () => open("server"),
-  () => open("history")
+  () => open("history"),
+  () => open("iprules")
 );
 const userList = buildUserList(
   (username) => {
@@ -181,6 +184,13 @@ register({
   rect: { x: 300, y: 80, w: 640, h: 460 },
   build: () => ({ body: serverHistory.body }),
   onOpen: () => serverHistory.refresh(),
+});
+register({
+  id: "iprules",
+  title: "IP Rules",
+  rect: { x: 320, y: 100, w: 620, h: 440 },
+  build: () => ({ body: ipRules.body }),
+  onOpen: () => ipRules.refresh(),
 });
 register({
   id: "news",

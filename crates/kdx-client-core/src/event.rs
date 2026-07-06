@@ -200,6 +200,34 @@ impl From<kdx_protocol::messages::HistoryEntry> for HistoryEntry {
     }
 }
 
+/// One Allow-Deny IP rule (the IP Rules window). Mirrors
+/// `kdx_protocol::messages::IpRuleEntry`.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct IpRule {
+    pub id: String,
+    pub position: i32,
+    /// "allow" or "deny".
+    pub action: String,
+    pub cidr: String,
+    pub note: String,
+    pub created_by: String,
+    pub created_at: u64,
+}
+
+impl From<kdx_protocol::messages::IpRuleEntry> for IpRule {
+    fn from(r: kdx_protocol::messages::IpRuleEntry) -> Self {
+        Self {
+            id: r.id,
+            position: r.position,
+            action: r.action,
+            cidr: r.cidr,
+            note: r.note,
+            created_by: r.created_by,
+            created_at: r.created_at,
+        }
+    }
+}
+
 /// Current server settings (the Server Settings window). Mirrors
 /// `kdx_protocol::messages::ServerSettingsResponse`. `port`,
 /// `max_upload_bytes_per_sec`, and `max_download_bytes_per_sec` are

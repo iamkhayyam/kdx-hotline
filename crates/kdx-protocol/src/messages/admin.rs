@@ -270,6 +270,143 @@ impl HistoryListResponse {
     }
 }
 
+/// Client → server: list current Allow-Deny IP rules in priority order.
+/// Requires `SERVER_ADMIN`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IpRuleListRequest;
+
+/// One IP rule, as shown in the IP Rules window. `action` is "allow" or
+/// "deny" as a plain string (the enum lives server-side).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IpRuleEntry {
+    pub id: String,
+    pub position: i32,
+    pub action: String,
+    pub cidr: String,
+    pub note: String,
+    pub created_by: String,
+    pub created_at: u64,
+}
+
+/// Server → client: reply to `IpRuleListRequest`, priority order (lowest
+/// `position` first).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IpRuleListResponse {
+    pub rules: Vec<IpRuleEntry>,
+}
+
+/// Client → server: create a new allow/deny rule. `action` must be exactly
+/// "allow" or "deny"; `cidr` must parse as an `ipnet::IpNet`. Rejected with
+/// an `Error` if either is invalid, or if the caller lacks `SERVER_ADMIN`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IpRuleCreate {
+    pub position: i32,
+    pub action: String,
+    pub cidr: String,
+    pub note: String,
+}
+
+/// Client → server: delete a rule by id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IpRuleDelete {
+    pub id: String,
+}
+
+impl IpRuleListRequest {
+    pub fn encode(&self) -> Bytes {
+        Bytes::new()
+    }
+    pub fn decode(payload: &[u8]) -> Result<Self, ProtocolError> {
+        expect_end(payload, "IpRuleListRequest")?;
+        Ok(Self)
+    }
+}
+
+impl IpRuleListResponse {
+    pub fn encode(&self) -> Bytes {
+        let mut buf = BytesMut::new();
+        buf.put_u32(self.rules.len() as u32);
+        for r in &self.rules {
+            put_str(&mut buf, &r.id);
+            buf.put_i32(r.position);
+            put_str(&mut buf, &r.action);
+            put_str(&mut buf, &r.cidr);
+            put_str(&mut buf, &r.note);
+            put_str(&mut buf, &r.created_by);
+            buf.put_u64(r.created_at);
+        }
+        buf.freeze()
+    }
+    pub fn decode(mut payload: &[u8]) -> Result<Self, ProtocolError> {
+        if payload.remaining() < 4 {
+            return Err(ProtocolError::MalformedPayload("IpRuleListResponse"));
+        }
+        let count = payload.get_u32() as usize;
+        let mut rules = Vec::with_capacity(count.min(4096));
+        for _ in 0..count {
+            let id = get_str(&mut payload, "IpRuleListResponse")?;
+            if payload.remaining() < 4 {
+                return Err(ProtocolError::MalformedPayload("IpRuleListResponse"));
+            }
+            let position = payload.get_i32();
+            let action = get_str(&mut payload, "IpRuleListResponse")?;
+            let cidr = get_str(&mut payload, "IpRuleListResponse")?;
+            let note = get_str(&mut payload, "IpRuleListResponse")?;
+            let created_by = get_str(&mut payload, "IpRuleListResponse")?;
+            if payload.remaining() < 8 {
+                return Err(ProtocolError::MalformedPayload("IpRuleListResponse"));
+            }
+            let created_at = payload.get_u64();
+            rules.push(IpRuleEntry {
+                id,
+                position,
+                action,
+                cidr,
+                note,
+                created_by,
+                created_at,
+            });
+        }
+        expect_end(payload, "IpRuleListResponse")?;
+        Ok(Self { rules })
+    }
+}
+
+impl IpRuleCreate {
+    pub fn encode(&self) -> Bytes {
+        let mut buf = BytesMut::new();
+        buf.put_i32(self.position);
+        put_str(&mut buf, &self.action);
+        put_str(&mut buf, &self.cidr);
+        put_str(&mut buf, &self.note);
+        buf.freeze()
+    }
+    pub fn decode(mut payload: &[u8]) -> Result<Self, ProtocolError> {
+        if payload.remaining() < 4 {
+            return Err(ProtocolError::MalformedPayload("IpRuleCreate"));
+        }
+        let position = payload.get_i32();
+        let action = get_str(&mut payload, "IpRuleCreate")?;
+        let cidr = get_str(&mut payload, "IpRuleCreate")?;
+        let note = get_str(&mut payload, "IpRuleCreate")?;
+        expect_end(payload, "IpRuleCreate")?;
+        Ok(Self { position, action, cidr, note })
+    }
+}
+
+impl IpRuleDelete {
+    pub fn encode(&self) -> Bytes {
+        let mut buf = BytesMut::new();
+        put_str(&mut buf, &self.id);
+        buf.freeze()
+    }
+    pub fn decode(mut payload: &[u8]) -> Result<Self, ProtocolError> {
+        let id = get_str(&mut payload, "IpRuleDelete")?;
+        expect_end(payload, "IpRuleDelete")?;
+        Ok(Self { id })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -370,5 +507,52 @@ mod tests {
 
         assert!(HistoryListRequest::decode(&[0]).is_err());
         assert!(HistoryListResponse::decode(&[0, 0]).is_err());
+    }
+
+    #[test]
+    fn ip_rule_round_trip() {
+        assert!(IpRuleListRequest::decode(&IpRuleListRequest.encode()).is_ok());
+
+        let resp = IpRuleListResponse {
+            rules: vec![
+                IpRuleEntry {
+                    id: "aaaa".into(),
+                    position: 10,
+                    action: "deny".into(),
+                    cidr: "1.2.3.0/24".into(),
+                    note: "spammy /24".into(),
+                    created_by: "sysop".into(),
+                    created_at: 1_700_000_000,
+                },
+                IpRuleEntry {
+                    id: "bbbb".into(),
+                    position: 5,
+                    action: "allow".into(),
+                    cidr: "1.2.3.4/32".into(),
+                    note: "our office".into(),
+                    created_by: "sysop".into(),
+                    created_at: 1_700_000_100,
+                },
+            ],
+        };
+        assert_eq!(IpRuleListResponse::decode(&resp.encode()).unwrap(), resp);
+
+        let empty = IpRuleListResponse { rules: vec![] };
+        assert_eq!(IpRuleListResponse::decode(&empty.encode()).unwrap(), empty);
+
+        let create = IpRuleCreate {
+            position: 42,
+            action: "deny".into(),
+            cidr: "10.0.0.0/8".into(),
+            note: "".into(),
+        };
+        assert_eq!(IpRuleCreate::decode(&create.encode()).unwrap(), create);
+
+        let del = IpRuleDelete { id: "some-uuid".into() };
+        assert_eq!(IpRuleDelete::decode(&del.encode()).unwrap(), del);
+
+        // Truncation guards.
+        assert!(IpRuleCreate::decode(&[0, 0]).is_err());
+        assert!(IpRuleListResponse::decode(&[0, 0]).is_err());
     }
 }
