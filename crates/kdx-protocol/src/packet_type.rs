@@ -36,6 +36,21 @@ pub enum PacketType {
     UserInfoRequest = 0x38,
     UserInfoResponse = 0x39,
 
+    // Private messages (0x40-0x41)
+    PrivateSend = 0x40,
+    PrivateMessage = 0x41,
+
+    // Roles / account admin (0x50-0x58)
+    RoleListRequest = 0x50,
+    RoleListResponse = 0x51,
+    RoleCreate = 0x52,
+    RoleUpdate = 0x53,
+    RoleDelete = 0x54,
+    RoleAssign = 0x55,
+    RoleUnassign = 0x56,
+    AccountRolesRequest = 0x57,
+    AccountRolesResponse = 0x58,
+
     // System (0xF0-0xFF)
     Error = 0xF0,
     Warning = 0xF1,
@@ -43,7 +58,7 @@ pub enum PacketType {
 }
 
 impl PacketType {
-    pub const ALL: [PacketType; 27] = [
+    pub const ALL: [PacketType; 38] = [
         PacketType::HandshakeInit,
         PacketType::HandshakeResp,
         PacketType::Ping,
@@ -68,6 +83,17 @@ impl PacketType {
         PacketType::PresenceChange,
         PacketType::UserInfoRequest,
         PacketType::UserInfoResponse,
+        PacketType::PrivateSend,
+        PacketType::PrivateMessage,
+        PacketType::RoleListRequest,
+        PacketType::RoleListResponse,
+        PacketType::RoleCreate,
+        PacketType::RoleUpdate,
+        PacketType::RoleDelete,
+        PacketType::RoleAssign,
+        PacketType::RoleUnassign,
+        PacketType::AccountRolesRequest,
+        PacketType::AccountRolesResponse,
         PacketType::Error,
         PacketType::Warning,
         PacketType::Info,
@@ -104,6 +130,17 @@ impl TryFrom<u8> for PacketType {
             0x37 => PresenceChange,
             0x38 => UserInfoRequest,
             0x39 => UserInfoResponse,
+            0x40 => PrivateSend,
+            0x41 => PrivateMessage,
+            0x50 => RoleListRequest,
+            0x51 => RoleListResponse,
+            0x52 => RoleCreate,
+            0x53 => RoleUpdate,
+            0x54 => RoleDelete,
+            0x55 => RoleAssign,
+            0x56 => RoleUnassign,
+            0x57 => AccountRolesRequest,
+            0x58 => AccountRolesResponse,
             0xF0 => Error,
             0xF1 => Warning,
             0xF2 => Info,

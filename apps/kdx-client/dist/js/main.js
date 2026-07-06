@@ -11,6 +11,7 @@ import { buildSettings, applySettings, loadSettings } from "./windows/settings.j
 import { buildAbout } from "./windows/about.js";
 import { buildUserList } from "./windows/userlist.js";
 import { buildUserInfo } from "./windows/userinfo.js";
+import { buildMessages } from "./windows/messages.js";
 
 const desktop = document.getElementById("desktop");
 
@@ -28,10 +29,21 @@ const addressbook = buildAddressBook(connectApi, () => open("connect"));
 const settings = buildSettings();
 const about = buildAbout();
 const userInfo = buildUserInfo();
-const userList = buildUserList((username) => {
-  open("userinfo");
-  userInfo.show(username);
-});
+const messages = buildMessages(
+  () => getState().session && getState().session.username,
+  (unread) => buttonBar.setLed(unread > 0)
+);
+function openMessagesWith(username) {
+  open("messages");
+  messages.openWith(username);
+}
+const userList = buildUserList(
+  (username) => {
+    open("userinfo");
+    userInfo.show(username);
+  },
+  openMessagesWith
+);
 
 // Default window positions clear the floating Button Bar (top-left).
 register({
@@ -98,6 +110,12 @@ register({
   resizable: false,
   build: () => ({ body: userInfo.body }),
 });
+register({
+  id: "messages",
+  title: "Messages",
+  rect: { x: 340, y: 120, w: 500, h: 340 },
+  build: () => ({ body: messages.body }),
+});
 
 // The Button Bar — the always-present launcher, itself a floating window on
 // the desktop.
@@ -150,6 +168,10 @@ onKdxEvent((ev) => {
     case "presence":
       userList.onPresence(ev.user, ev.online);
       update({ presenceCount: userList.count });
+      break;
+    case "private_message":
+      messages.onMessage(ev);
+      if (!isOpen("messages")) open("messages");
       break;
     case "transfer_progress":
       transfers.onProgress(ev);

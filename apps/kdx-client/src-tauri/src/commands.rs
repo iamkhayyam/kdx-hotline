@@ -176,6 +176,11 @@ pub async fn get_user_info(state: State<'_, AppState>, username: String) -> CmdR
 }
 
 #[tauri::command]
+pub async fn send_private(state: State<'_, AppState>, to: String, text: String) -> CmdResult<()> {
+    with_client(&state, |c| async move { c.send_private(&to, &text).await }).await
+}
+
+#[tauri::command]
 pub async fn upload(state: State<'_, AppState>, local: String, remote_dir: String) -> CmdResult<()> {
     with_client(&state, |c| async move {
         c.upload(PathBuf::from(local), &remote_dir).await

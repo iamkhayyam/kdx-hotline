@@ -6,7 +6,7 @@ import { showMenu } from "../menu.js";
 
 const CLASS_NAME = ["guest", "user", "power user", "admin"];
 
-export function buildUserList(openUserInfo) {
+export function buildUserList(openUserInfo, sendMessage) {
   const body = document.createElement("div");
   body.className = "userlist-win";
   body.innerHTML = `
@@ -51,6 +51,7 @@ export function buildUserList(openUserInfo) {
       row.addEventListener("contextmenu", (e) => {
         e.preventDefault();
         showMenu(e.clientX, e.clientY, [
+          { label: "Send Message", fn: () => sendMessage(u.username) },
           { label: "Get Info", fn: () => openUserInfo(u.username) },
         ]);
       });

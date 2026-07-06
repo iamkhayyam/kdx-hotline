@@ -29,6 +29,7 @@ pub fn run() {
             commands::list_files,
             commands::list_users,
             commands::get_user_info,
+            commands::send_private,
             commands::upload,
             commands::download,
             commands::disconnect,

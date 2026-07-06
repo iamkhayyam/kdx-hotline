@@ -7,7 +7,7 @@ mod common;
 use std::time::Duration;
 
 use common::TestServer;
-use kdx_client_core::Event;
+use kdx_client_core::{ClientError, Event};
 use kdx_protocol::messages::CHAT_ACTION;
 use tokio::sync::mpsc::Receiver;
 
@@ -202,6 +202,63 @@ async fn global_roster_tracks_presence_live() {
 }
 
 #[tokio::test]
+async fn private_messages_route_between_users() {
+    let ts = TestServer::start().await;
+    ts.seed_account("alice", "pw", 1).await; // user class has CHAT_PRIVATE
+    ts.seed_account("bob", "pw", 1).await;
+
+    let (alice, mut ea, _d1) = ts.connect_client().await;
+    next_event(&mut ea).await;
+    alice.login("alice", "pw").await.unwrap();
+
+    let (bob, mut eb, _d2) = ts.connect_client().await;
+    next_event(&mut eb).await;
+    bob.login("bob", "pw").await.unwrap();
+
+    // Alice DMs bob.
+    alice.send_private("bob", "meet me in /incoming").await.unwrap();
+
+    // Bob receives it.
+    let mut got = None;
+    for _ in 0..10 {
+        if let Event::PrivateMessage { from, to, text, .. } = next_event(&mut eb).await {
+            got = Some((from, to, text));
+            break;
+        }
+    }
+    let (from, to, text) = got.expect("bob should receive the PM");
+    assert_eq!(from, "alice");
+    assert_eq!(to, "bob");
+    assert_eq!(text, "meet me in /incoming");
+
+    // Alice's own session gets an echo so her transcript shows the sent line.
+    let mut echo = None;
+    for _ in 0..10 {
+        if let Event::PrivateMessage { from, to, .. } = next_event(&mut ea).await {
+            echo = Some((from, to));
+            break;
+        }
+    }
+    let (efrom, eto) = echo.expect("alice should get her own sent echo");
+    assert_eq!(efrom, "alice");
+    assert_eq!(eto, "bob");
+
+    // DM to an offline user surfaces a server error.
+    alice.send_private("ghost", "anyone there?").await.unwrap();
+    let mut saw_err = false;
+    for _ in 0..10 {
+        if let Event::ServerError { text } = next_event(&mut ea).await {
+            assert!(text.contains("ghost") || text.contains("not online"));
+            saw_err = true;
+            break;
+        }
+    }
+    assert!(saw_err);
+
+    ts.stop();
+}
+
+#[tokio::test]
 async fn disconnect_yields_disconnected_event() {
     let ts = TestServer::start().await;
     ts.seed_account("phraq", "pw", 1).await;
@@ -222,6 +279,55 @@ async fn disconnect_yields_disconnected_event() {
         }
     }
     assert!(saw_disconnect);
+
+    ts.stop();
+}
+
+#[tokio::test]
+async fn sysop_defines_and_assigns_a_custom_role() {
+    let ts = TestServer::start().await;
+    ts.seed_account("sysop", "pw", 3).await; // Admin: has USER_ADMIN
+    ts.seed_account("mod", "pw", 1).await; // plain User, no custom role yet
+
+    let (client, mut events, _dd) = ts.connect_client().await;
+    next_event(&mut events).await;
+    client.login("sysop", "pw").await.unwrap();
+
+    let roles = client
+        .create_role("Moderator", 0, 10, "#e11b1b")
+        .await
+        .unwrap();
+    assert_eq!(roles.len(), 1);
+    assert_eq!(roles[0].name, "Moderator");
+    let role_id = roles[0].id.clone();
+
+    let roles = client.assign_role("mod", &role_id).await.unwrap();
+    assert_eq!(roles.len(), 1);
+
+    let assigned = client.account_roles("mod").await.unwrap();
+    assert_eq!(assigned, vec![role_id.clone()]);
+
+    let roles = client.unassign_role("mod", &role_id).await.unwrap();
+    assert_eq!(roles.len(), 1); // the role itself still exists
+    assert!(client.account_roles("mod").await.unwrap().is_empty());
+
+    let roles = client.delete_role(&role_id).await.unwrap();
+    assert!(roles.is_empty());
+
+    ts.stop();
+}
+
+#[tokio::test]
+async fn plain_user_role_mutation_is_rejected() {
+    let ts = TestServer::start().await;
+    ts.seed_account("plain", "pw", 1).await;
+
+    let (client, mut events, _dd) = ts.connect_client().await;
+    next_event(&mut events).await;
+    client.login("plain", "pw").await.unwrap();
+
+    let result = client.create_role("Sneaky", u32::MAX, 0, "").await;
+    assert!(matches!(result, Err(ClientError::Server(_))));
 
     ts.stop();
 }

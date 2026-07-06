@@ -44,6 +44,13 @@ pub enum PresenceCommand {
         username: String,
         reply: oneshot::Sender<Option<WireEntry>>,
     },
+    /// Push an outbound frame to every connection of `username`. Replies with
+    /// the number of sessions it reached (0 = the user is offline).
+    Deliver {
+        username: String,
+        outbound: Outbound,
+        reply: oneshot::Sender<usize>,
+    },
 }
 
 struct Entry {
@@ -142,6 +149,25 @@ impl Presence {
         }
         rx.await.ok().flatten()
     }
+
+    /// Push `outbound` to every connection of `username`. Returns the number
+    /// of sessions reached (0 = offline).
+    pub async fn deliver(&self, username: &str, outbound: Outbound) -> usize {
+        let (reply, rx) = oneshot::channel();
+        if self
+            .tx
+            .send(PresenceCommand::Deliver {
+                username: username.to_owned(),
+                outbound,
+                reply,
+            })
+            .await
+            .is_err()
+        {
+            return 0;
+        }
+        rx.await.unwrap_or(0)
+    }
 }
 
 async fn handle(entries: &mut HashMap<Uuid, Entry>, command: PresenceCommand) {
@@ -211,6 +237,19 @@ async fn handle(entries: &mut HashMap<Uuid, Entry>, command: PresenceCommand) {
                 .map(|e| e.to_wire(now));
             let _ = reply.send(found);
         }
+        PresenceCommand::Deliver {
+            username,
+            outbound,
+            reply,
+        } => {
+            let mut reached = 0;
+            for entry in entries.values().filter(|e| e.username == username) {
+                if entry.tx.try_send(outbound.clone()).is_ok() {
+                    reached += 1;
+                }
+            }
+            let _ = reply.send(reached);
+        }
     }
 }
 
@@ -240,7 +279,7 @@ async fn broadcast_filtered(
     }
 }
 
-fn unix_now() -> u64 {
+pub(crate) fn unix_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("clock after 1970")

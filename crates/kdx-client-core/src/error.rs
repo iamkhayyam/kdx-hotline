@@ -32,4 +32,6 @@ pub enum ClientError {
     Transfer(String),
     #[error("invalid server name: {0}")]
     InvalidServerName(String),
+    #[error("invalid input: {0}")]
+    InvalidInput(String),
 }

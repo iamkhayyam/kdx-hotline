@@ -13,9 +13,11 @@ use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use kdx_crypto::KdfParams;
 use kdx_protocol::messages::{
-    AuthChallenge, AuthRequest, AuthResponse, AuthResult, ChatEvent, ChatJoin, ChatLeave, ChatSend,
-    ChatTopic, ChatUserList, FileListRequest, FileListResponse, PresenceChange, PresenceListRequest,
-    PresenceListResponse, TransferAccept, TransferData, TransferEnd, TransferRequest,
+    AccountRolesRequest, AccountRolesResponse, AuthChallenge, AuthRequest, AuthResponse,
+    AuthResult, ChatEvent, ChatJoin, ChatLeave, ChatSend, ChatTopic, ChatUserList, FileListRequest,
+    FileListResponse, PresenceChange, PresenceListRequest, PresenceListResponse, PrivateMessage,
+    PrivateSend, RoleAssign, RoleCreate, RoleDelete, RoleListRequest, RoleListResponse,
+    RoleUnassign, RoleUpdate, TransferAccept, TransferData, TransferEnd, TransferRequest,
     UserInfoRequest, UserInfoResponse, DIRECTION_DOWNLOAD, DIRECTION_UPLOAD, TRANSFER_VERIFIED,
 };
 use kdx_protocol::{
@@ -31,7 +33,7 @@ use tracing::{debug, warn};
 use uuid::Uuid;
 
 use crate::error::ClientError;
-use crate::event::{Direction, Event, PresenceUser};
+use crate::event::{Direction, Event, PresenceUser, RoleInfo};
 use crate::handle::{Command, Session};
 use crate::transfer::{chunk_len, total_chunks, ChunkBitmap, Sidecar, DEFAULT_CHUNK_SIZE};
 
@@ -89,6 +91,8 @@ pub(crate) struct Actor<S> {
     list_waiters: VecDeque<oneshot::Sender<Result<FileListResponse, ClientError>>>,
     user_list_waiters: VecDeque<oneshot::Sender<Result<Vec<PresenceUser>, ClientError>>>,
     user_info_waiters: VecDeque<oneshot::Sender<Result<PresenceUser, ClientError>>>,
+    role_waiters: VecDeque<oneshot::Sender<Result<Vec<RoleInfo>, ClientError>>>,
+    account_roles_waiters: VecDeque<oneshot::Sender<Result<Vec<String>, ClientError>>>,
     transfer: Option<Transfer>,
 }
 
@@ -108,6 +112,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
             list_waiters: VecDeque::new(),
             user_list_waiters: VecDeque::new(),
             user_info_waiters: VecDeque::new(),
+            role_waiters: VecDeque::new(),
+            account_roles_waiters: VecDeque::new(),
             transfer: None,
         }
     }
@@ -167,6 +173,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
             let _ = waiter.send(Err(ClientError::Disconnected));
         }
         for waiter in self.user_info_waiters.drain(..) {
+            let _ = waiter.send(Err(ClientError::Disconnected));
+        }
+        for waiter in self.role_waiters.drain(..) {
+            let _ = waiter.send(Err(ClientError::Disconnected));
+        }
+        for waiter in self.account_roles_waiters.drain(..) {
             let _ = waiter.send(Err(ClientError::Disconnected));
         }
         if let Some(reply) = self.transfer.take().and_then(transfer_reply) {
@@ -252,6 +264,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
                     }
                 }
             }
+            Command::SendPrivate { to, text, reply } => {
+                let r = self
+                    .send(PacketType::PrivateSend, PrivateSend { to, text }.encode())
+                    .await;
+                let _ = reply.send(r.map_err(Into::into));
+            }
             Command::Upload {
                 local,
                 remote_dir,
@@ -262,6 +280,121 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
                 local,
                 reply,
             } => self.start_download(remote_path, local, reply).await?,
+            Command::ListRoles { reply } => {
+                match self
+                    .send(PacketType::RoleListRequest, RoleListRequest.encode())
+                    .await
+                {
+                    Ok(()) => self.role_waiters.push_back(reply),
+                    Err(e) => {
+                        let _ = reply.send(Err(e.into()));
+                    }
+                }
+            }
+            Command::CreateRole {
+                name,
+                privileges,
+                rank,
+                color,
+                reply,
+            } => {
+                let msg = RoleCreate {
+                    name,
+                    privileges,
+                    rank,
+                    color,
+                };
+                match self.send(PacketType::RoleCreate, msg.encode()).await {
+                    Ok(()) => self.role_waiters.push_back(reply),
+                    Err(e) => {
+                        let _ = reply.send(Err(e.into()));
+                    }
+                }
+            }
+            Command::UpdateRole {
+                id,
+                name,
+                privileges,
+                rank,
+                color,
+                reply,
+            } => {
+                let Some(id) = parse_role_id(&id) else {
+                    let _ = reply.send(Err(ClientError::InvalidInput("bad role id".into())));
+                    return Ok(());
+                };
+                let msg = RoleUpdate {
+                    id,
+                    name,
+                    privileges,
+                    rank,
+                    color,
+                };
+                match self.send(PacketType::RoleUpdate, msg.encode()).await {
+                    Ok(()) => self.role_waiters.push_back(reply),
+                    Err(e) => {
+                        let _ = reply.send(Err(e.into()));
+                    }
+                }
+            }
+            Command::DeleteRole { id, reply } => {
+                let Some(id) = parse_role_id(&id) else {
+                    let _ = reply.send(Err(ClientError::InvalidInput("bad role id".into())));
+                    return Ok(());
+                };
+                match self
+                    .send(PacketType::RoleDelete, RoleDelete { id }.encode())
+                    .await
+                {
+                    Ok(()) => self.role_waiters.push_back(reply),
+                    Err(e) => {
+                        let _ = reply.send(Err(e.into()));
+                    }
+                }
+            }
+            Command::AssignRole {
+                username,
+                role_id,
+                reply,
+            } => {
+                let Some(role_id) = parse_role_id(&role_id) else {
+                    let _ = reply.send(Err(ClientError::InvalidInput("bad role id".into())));
+                    return Ok(());
+                };
+                let msg = RoleAssign { username, role_id };
+                match self.send(PacketType::RoleAssign, msg.encode()).await {
+                    Ok(()) => self.role_waiters.push_back(reply),
+                    Err(e) => {
+                        let _ = reply.send(Err(e.into()));
+                    }
+                }
+            }
+            Command::UnassignRole {
+                username,
+                role_id,
+                reply,
+            } => {
+                let Some(role_id) = parse_role_id(&role_id) else {
+                    let _ = reply.send(Err(ClientError::InvalidInput("bad role id".into())));
+                    return Ok(());
+                };
+                let msg = RoleUnassign { username, role_id };
+                match self.send(PacketType::RoleUnassign, msg.encode()).await {
+                    Ok(()) => self.role_waiters.push_back(reply),
+                    Err(e) => {
+                        let _ = reply.send(Err(e.into()));
+                    }
+                }
+            }
+            Command::AccountRoles { username, reply } => {
+                let msg = AccountRolesRequest { username };
+                match self.send(PacketType::AccountRolesRequest, msg.encode()).await {
+                    Ok(()) => self.account_roles_waiters.push_back(reply),
+                    Err(e) => {
+                        let _ = reply.send(Err(e.into()));
+                    }
+                }
+            }
             Command::Disconnect => unreachable!("handled in run loop"),
         }
         Ok(())
@@ -416,11 +549,37 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
                     let _ = waiter.send(Ok(response.entry.into()));
                 }
             }
+            PacketType::RoleListResponse => {
+                let response = RoleListResponse::decode(&frame.payload)?;
+                if let Some(waiter) = self.role_waiters.pop_front() {
+                    let _ = waiter.send(Ok(response.roles.into_iter().map(Into::into).collect()));
+                }
+            }
+            PacketType::AccountRolesResponse => {
+                let response = AccountRolesResponse::decode(&frame.payload)?;
+                if let Some(waiter) = self.account_roles_waiters.pop_front() {
+                    let _ = waiter.send(Ok(response
+                        .role_ids
+                        .into_iter()
+                        .map(|id| Uuid::from_bytes(id).to_string())
+                        .collect()));
+                }
+            }
             PacketType::PresenceChange => {
                 let change = PresenceChange::decode(&frame.payload)?;
                 self.emit(Event::Presence {
                     user: change.entry.into(),
                     online: change.online,
+                })
+                .await;
+            }
+            PacketType::PrivateMessage => {
+                let msg = PrivateMessage::decode(&frame.payload)?;
+                self.emit(Event::PrivateMessage {
+                    from: msg.from,
+                    to: msg.to,
+                    timestamp: msg.timestamp,
+                    text: msg.text,
                 })
                 .await;
             }
@@ -620,6 +779,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
         if let Some(waiter) = self.user_info_waiters.pop_front() {
             let _ = waiter.send(Err(ClientError::Server(text.clone())));
         }
+        // Role mutations routinely fail on privilege/not-found errors — don't
+        // leave the caller hanging until disconnect.
+        if let Some(waiter) = self.role_waiters.pop_front() {
+            let _ = waiter.send(Err(ClientError::Server(text.clone())));
+        }
+        if let Some(waiter) = self.account_roles_waiters.pop_front() {
+            let _ = waiter.send(Err(ClientError::Server(text.clone())));
+        }
         self.emit(Event::ServerError { text }).await;
     }
 
@@ -752,4 +919,9 @@ fn with_part_suffix(local: &std::path::Path) -> PathBuf {
     let mut s = local.as_os_str().to_owned();
     s.push(".part");
     PathBuf::from(s)
+}
+
+/// Parse a `RoleInfo::id`-style UUID string back into wire bytes.
+fn parse_role_id(id: &str) -> Option<[u8; 16]> {
+    Uuid::parse_str(id).ok().map(|u| *u.as_bytes())
 }

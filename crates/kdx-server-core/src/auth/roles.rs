@@ -145,7 +145,7 @@ mod tests {
 
     #[tokio::test]
     async fn update_changes_privileges_and_rank() {
-        let pool = pool().await;
+        let (pool, _dir) = pool().await;
         let mgr = RoleManager::new(pool);
         let role = mgr.create("VIP", Privileges::CHAT_PRIVATE, 1, None).await.unwrap();
 
@@ -161,7 +161,7 @@ mod tests {
 
     #[tokio::test]
     async fn unassign_removes_role_from_account() {
-        let pool = pool().await;
+        let (pool, _dir) = pool().await;
         let account = kdx_storage::accounts::create(&pool, "acidburn", "phc", 1)
             .await
             .unwrap();

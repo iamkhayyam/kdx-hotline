@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use kdx_server_core::auth::AuthManager;
+use kdx_server_core::auth::{AuthManager, RoleManager};
 use kdx_server_core::chat::RoomManager;
 use kdx_server_core::files::FileTree;
 use kdx_server_core::transfer::{TransferConfig, TransferManager};
@@ -69,6 +69,7 @@ pub async fn serve(config: Config) -> Result<Server, ServeError> {
     .await
     .map_err(|e| ServeError::Init(e.to_string()))?;
     let ctx = Arc::new(ServerCtx {
+        roles: RoleManager::new(pool.clone()),
         auth: AuthManager::new(pool, Duration::from_secs(config.session_ttl_secs)),
         rooms: RoomManager::new(),
         tree,

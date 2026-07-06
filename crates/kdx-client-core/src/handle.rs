@@ -5,7 +5,7 @@ use tokio::sync::{mpsc, oneshot};
 use kdx_protocol::messages::FileListResponse;
 
 use crate::error::ClientError;
-use crate::event::PresenceUser;
+use crate::event::{PresenceUser, RoleInfo};
 
 /// A logged-in session's identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,6 +53,11 @@ pub(crate) enum Command {
         username: String,
         reply: oneshot::Sender<Result<PresenceUser, ClientError>>,
     },
+    SendPrivate {
+        to: String,
+        text: String,
+        reply: oneshot::Sender<Result<(), ClientError>>,
+    },
     Upload {
         local: PathBuf,
         remote_dir: String,
@@ -62,6 +67,42 @@ pub(crate) enum Command {
         remote_path: String,
         local: PathBuf,
         reply: oneshot::Sender<Result<(), ClientError>>,
+    },
+    ListRoles {
+        reply: oneshot::Sender<Result<Vec<RoleInfo>, ClientError>>,
+    },
+    CreateRole {
+        name: String,
+        privileges: u32,
+        rank: i32,
+        color: String,
+        reply: oneshot::Sender<Result<Vec<RoleInfo>, ClientError>>,
+    },
+    UpdateRole {
+        id: String,
+        name: String,
+        privileges: u32,
+        rank: i32,
+        color: String,
+        reply: oneshot::Sender<Result<Vec<RoleInfo>, ClientError>>,
+    },
+    DeleteRole {
+        id: String,
+        reply: oneshot::Sender<Result<Vec<RoleInfo>, ClientError>>,
+    },
+    AssignRole {
+        username: String,
+        role_id: String,
+        reply: oneshot::Sender<Result<Vec<RoleInfo>, ClientError>>,
+    },
+    UnassignRole {
+        username: String,
+        role_id: String,
+        reply: oneshot::Sender<Result<Vec<RoleInfo>, ClientError>>,
+    },
+    AccountRoles {
+        username: String,
+        reply: oneshot::Sender<Result<Vec<String>, ClientError>>,
     },
     Disconnect,
 }
@@ -155,6 +196,19 @@ impl ClientHandle {
         .await
     }
 
+    /// Send a private (direct) message to `to`. Resolves once the send frame
+    /// is written; delivery and the sender-echo arrive as
+    /// `Event::PrivateMessage`. Errors surface via `Event::ServerError` (e.g.
+    /// the recipient is offline).
+    pub async fn send_private(&self, to: &str, text: &str) -> Result<(), ClientError> {
+        self.send(|reply| Command::SendPrivate {
+            to: to.to_owned(),
+            text: text.to_owned(),
+            reply,
+        })
+        .await
+    }
+
     /// Upload a local file into `remote_dir`; the remote name is the local
     /// file's basename. Resolves when the transfer verifies (or fails);
     /// `Event::TransferProgress` is emitted throughout.
@@ -173,6 +227,93 @@ impl ClientHandle {
         self.send(|reply| Command::Download {
             remote_path: remote_path.to_owned(),
             local,
+            reply,
+        })
+        .await
+    }
+
+    /// Fetch every custom role defined on the server (the Roles window's
+    /// initial load and refresh).
+    pub async fn list_roles(&self) -> Result<Vec<RoleInfo>, ClientError> {
+        self.send(|reply| Command::ListRoles { reply }).await
+    }
+
+    /// Define a new role. Requires the SysOp's account to hold `USER_ADMIN`;
+    /// otherwise resolves to `ClientError::Server`. Resolves with the
+    /// server's full, updated role list.
+    pub async fn create_role(
+        &self,
+        name: &str,
+        privileges: u32,
+        rank: i32,
+        color: &str,
+    ) -> Result<Vec<RoleInfo>, ClientError> {
+        self.send(|reply| Command::CreateRole {
+            name: name.to_owned(),
+            privileges,
+            rank,
+            color: color.to_owned(),
+            reply,
+        })
+        .await
+    }
+
+    /// Rename/re-scope an existing role by id (a UUID string from
+    /// `RoleInfo::id`). Requires `USER_ADMIN`.
+    pub async fn update_role(
+        &self,
+        id: &str,
+        name: &str,
+        privileges: u32,
+        rank: i32,
+        color: &str,
+    ) -> Result<Vec<RoleInfo>, ClientError> {
+        self.send(|reply| Command::UpdateRole {
+            id: id.to_owned(),
+            name: name.to_owned(),
+            privileges,
+            rank,
+            color: color.to_owned(),
+            reply,
+        })
+        .await
+    }
+
+    /// Delete a role outright. Requires `USER_ADMIN`.
+    pub async fn delete_role(&self, id: &str) -> Result<Vec<RoleInfo>, ClientError> {
+        self.send(|reply| Command::DeleteRole {
+            id: id.to_owned(),
+            reply,
+        })
+        .await
+    }
+
+    /// Attach a role to an account by username. Requires `USER_ADMIN`.
+    /// Idempotent server-side.
+    pub async fn assign_role(&self, username: &str, role_id: &str) -> Result<Vec<RoleInfo>, ClientError> {
+        self.send(|reply| Command::AssignRole {
+            username: username.to_owned(),
+            role_id: role_id.to_owned(),
+            reply,
+        })
+        .await
+    }
+
+    /// Detach a role from an account by username. Requires `USER_ADMIN`.
+    pub async fn unassign_role(&self, username: &str, role_id: &str) -> Result<Vec<RoleInfo>, ClientError> {
+        self.send(|reply| Command::UnassignRole {
+            username: username.to_owned(),
+            role_id: role_id.to_owned(),
+            reply,
+        })
+        .await
+    }
+
+    /// Which roles does `username` currently hold? Requires `USER_ADMIN`.
+    /// Returns role ids (UUID strings, matching `RoleInfo::id`).
+    pub async fn account_roles(&self, username: &str) -> Result<Vec<String>, ClientError> {
+        self.send(|reply| Command::AccountRoles {
+            username: username.to_owned(),
             reply,
         })
         .await

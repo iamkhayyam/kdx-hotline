@@ -137,6 +137,14 @@ impl AuthManager {
         Ok(session)
     }
 
+    /// Resolve a username to its account id, for admin operations (e.g. role
+    /// assignment) that address accounts by username over the wire.
+    pub async fn account_id(&self, username: &str) -> Result<Option<String>, AuthError> {
+        Ok(accounts::by_username(&self.pool, username)
+            .await?
+            .map(|row| row.id))
+    }
+
     /// Look up a live session, evicting it if expired. Callers treat `None`
     /// as "reauthentication required".
     pub fn validate(&self, session_id: Uuid) -> Option<Session> {

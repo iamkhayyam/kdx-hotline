@@ -13,11 +13,12 @@ use std::time::Duration;
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use kdx_protocol::messages::{
-    AuthChallenge, AuthRequest, AuthResponse, AuthResult, ChatJoin, ChatLeave, ChatSend,
-    ChatTopic, FileEntry, FileListRequest, FileListResponse, HandshakeInit, HandshakeResp,
-    PresenceListRequest, PresenceListResponse, TransferAccept, TransferData, TransferEnd,
-    TransferRequest, UserInfoRequest, UserInfoResponse, TRANSFER_HASH_MISMATCH,
-    TRANSFER_VERIFIED,
+    AccountRolesRequest, AccountRolesResponse, AuthChallenge, AuthRequest, AuthResponse,
+    AuthResult, ChatJoin, ChatLeave, ChatSend, ChatTopic, FileEntry, FileListRequest,
+    FileListResponse, HandshakeInit, HandshakeResp, PresenceListRequest, PresenceListResponse,
+    PrivateMessage, PrivateSend, RoleAssign, RoleCreate, RoleDelete, RoleInfo, RoleListRequest,
+    RoleListResponse, RoleUnassign, RoleUpdate, TransferAccept, TransferData, TransferEnd,
+    TransferRequest, UserInfoRequest, UserInfoResponse, TRANSFER_HASH_MISMATCH, TRANSFER_VERIFIED,
 };
 use kdx_protocol::{
     KdxCodec, KdxFrame, PacketFlags, PacketHeader, PacketType, ProtocolError, Reassembler,
@@ -28,11 +29,12 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::time::timeout;
 use tokio_util::codec::Framed;
 use tracing::{debug, warn};
+use uuid::Uuid;
 
-use crate::auth::{AuthManager, Privileges, Session};
+use crate::auth::{AuthManager, Privileges, Role, RoleManager, Session};
 use crate::chat::{Member, Outbound, RoomCommand, RoomManager};
 use crate::files::FileTree;
-use crate::presence::Presence;
+use crate::presence::{unix_now, Presence};
 use crate::transfer::{resume_id_from_wire, ActiveUpload, TransferError, TransferManager};
 
 /// How long the client has to send `HandshakeInit` after connecting.
@@ -56,6 +58,7 @@ pub const OUTBOUND_QUEUE: usize = 128;
 /// Shared server-wide services handed to every connection.
 pub struct ServerCtx {
     pub auth: AuthManager,
+    pub roles: RoleManager,
     pub rooms: RoomManager,
     pub tree: FileTree,
     pub transfers: TransferManager,
@@ -357,6 +360,41 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                         None => self.send_error("user is not online").await?,
                     }
                 }
+                PacketType::PrivateSend => {
+                    let send = PrivateSend::decode(&frame.payload)?;
+                    let session = self.session.as_ref().expect("authed");
+                    if !session.privileges.contains(Privileges::CHAT_PRIVATE) {
+                        self.send_error("missing CHAT_PRIVATE privilege").await?;
+                        continue;
+                    }
+                    self.ctx.presence.touch(session.id).await;
+                    let msg = PrivateMessage {
+                        from: session.username.clone(),
+                        to: send.to.clone(),
+                        timestamp: unix_now(),
+                        text: send.text,
+                    };
+                    let outbound = Outbound {
+                        packet_type: PacketType::PrivateMessage,
+                        flags: PacketFlags::empty(),
+                        payload: msg.encode(),
+                    };
+                    // Deliver to the recipient's connection(s). Don't echo to
+                    // the sender if messaging themselves twice; instead always
+                    // echo once to the sender so their own sessions show the
+                    // sent line in the conversation.
+                    let reached = self.ctx.presence.deliver(&send.to, outbound.clone()).await;
+                    if reached == 0 {
+                        self.send_error(&format!("{} is not online", send.to)).await?;
+                    } else if send.to != session.username {
+                        // Echo to the sender's own sessions so the sent
+                        // message appears in their transcript.
+                        self.ctx
+                            .presence
+                            .deliver(&session.username, outbound)
+                            .await;
+                    }
+                }
                 PacketType::ChatJoin => {
                     let join = ChatJoin::decode(&frame.payload)?;
                     let session = self.session.as_ref().expect("authed in dispatch");
@@ -591,6 +629,152 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                         Err(e) => return Err(ConnectionError::Transfer(e)),
                     }
                 }
+                PacketType::RoleListRequest => {
+                    RoleListRequest::decode(&frame.payload)?;
+                    match self.ctx.roles.list().await {
+                        Ok(roles) => {
+                            let response = RoleListResponse {
+                                roles: roles.into_iter().map(role_to_wire).collect(),
+                            };
+                            self.send(
+                                PacketType::RoleListResponse,
+                                PacketFlags::empty(),
+                                response.encode(),
+                            )
+                            .await?;
+                        }
+                        Err(e) => self.send_error(&e.to_string()).await?,
+                    }
+                }
+                PacketType::RoleCreate => {
+                    let create = RoleCreate::decode(&frame.payload)?;
+                    let session = self.session.as_ref().expect("authed");
+                    if !session.privileges.contains(Privileges::USER_ADMIN) {
+                        self.send_error("missing USER_ADMIN privilege").await?;
+                        continue;
+                    }
+                    let color = (!create.color.is_empty()).then_some(create.color.as_str());
+                    let result = self
+                        .ctx
+                        .roles
+                        .create(
+                            &create.name,
+                            Privileges::from_bits_truncate(create.privileges),
+                            create.rank,
+                            color,
+                        )
+                        .await;
+                    match result {
+                        Ok(_) => self.reply_role_list().await?,
+                        Err(e) => self.send_error(&e.to_string()).await?,
+                    }
+                }
+                PacketType::RoleUpdate => {
+                    let update = RoleUpdate::decode(&frame.payload)?;
+                    let session = self.session.as_ref().expect("authed");
+                    if !session.privileges.contains(Privileges::USER_ADMIN) {
+                        self.send_error("missing USER_ADMIN privilege").await?;
+                        continue;
+                    }
+                    let color = (!update.color.is_empty()).then_some(update.color.as_str());
+                    let result = self
+                        .ctx
+                        .roles
+                        .update(
+                            Uuid::from_bytes(update.id),
+                            &update.name,
+                            Privileges::from_bits_truncate(update.privileges),
+                            update.rank,
+                            color,
+                        )
+                        .await;
+                    match result {
+                        Ok(()) => self.reply_role_list().await?,
+                        Err(e) => self.send_error(&e.to_string()).await?,
+                    }
+                }
+                PacketType::RoleDelete => {
+                    let delete = RoleDelete::decode(&frame.payload)?;
+                    let session = self.session.as_ref().expect("authed");
+                    if !session.privileges.contains(Privileges::USER_ADMIN) {
+                        self.send_error("missing USER_ADMIN privilege").await?;
+                        continue;
+                    }
+                    match self.ctx.roles.delete(Uuid::from_bytes(delete.id)).await {
+                        Ok(()) => self.reply_role_list().await?,
+                        Err(e) => self.send_error(&e.to_string()).await?,
+                    }
+                }
+                PacketType::RoleAssign => {
+                    let assign = RoleAssign::decode(&frame.payload)?;
+                    let session = self.session.as_ref().expect("authed");
+                    if !session.privileges.contains(Privileges::USER_ADMIN) {
+                        self.send_error("missing USER_ADMIN privilege").await?;
+                        continue;
+                    }
+                    match self.ctx.auth.account_id(&assign.username).await? {
+                        Some(account_id) => {
+                            match self
+                                .ctx
+                                .roles
+                                .assign(&account_id, Uuid::from_bytes(assign.role_id))
+                                .await
+                            {
+                                Ok(()) => self.reply_role_list().await?,
+                                Err(e) => self.send_error(&e.to_string()).await?,
+                            }
+                        }
+                        None => self.send_error("no such account").await?,
+                    }
+                }
+                PacketType::RoleUnassign => {
+                    let unassign = RoleUnassign::decode(&frame.payload)?;
+                    let session = self.session.as_ref().expect("authed");
+                    if !session.privileges.contains(Privileges::USER_ADMIN) {
+                        self.send_error("missing USER_ADMIN privilege").await?;
+                        continue;
+                    }
+                    match self.ctx.auth.account_id(&unassign.username).await? {
+                        Some(account_id) => {
+                            match self
+                                .ctx
+                                .roles
+                                .unassign(&account_id, Uuid::from_bytes(unassign.role_id))
+                                .await
+                            {
+                                Ok(()) => self.reply_role_list().await?,
+                                Err(e) => self.send_error(&e.to_string()).await?,
+                            }
+                        }
+                        None => self.send_error("no such account").await?,
+                    }
+                }
+                PacketType::AccountRolesRequest => {
+                    let request = AccountRolesRequest::decode(&frame.payload)?;
+                    let session = self.session.as_ref().expect("authed");
+                    if !session.privileges.contains(Privileges::USER_ADMIN) {
+                        self.send_error("missing USER_ADMIN privilege").await?;
+                        continue;
+                    }
+                    match self.ctx.auth.account_id(&request.username).await? {
+                        Some(account_id) => match self.ctx.roles.for_account(&account_id).await {
+                            Ok(roles) => {
+                                let response = AccountRolesResponse {
+                                    username: request.username,
+                                    role_ids: roles.into_iter().map(|r| *r.id.as_bytes()).collect(),
+                                };
+                                self.send(
+                                    PacketType::AccountRolesResponse,
+                                    PacketFlags::empty(),
+                                    response.encode(),
+                                )
+                                .await?;
+                            }
+                            Err(e) => self.send_error(&e.to_string()).await?,
+                        },
+                        None => self.send_error("no such account").await?,
+                    }
+                }
                 other => {
                     warn!(packet_type = ?other, "unhandled packet type");
                     self.send(
@@ -627,6 +811,27 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
             Bytes::copy_from_slice(message.as_bytes()),
         )
         .await
+    }
+
+    /// Send the full, current role list — the reply to a successful role
+    /// mutation as well as to `RoleListRequest` itself, so every client's
+    /// Roles window can just re-render from one message shape.
+    async fn reply_role_list(&mut self) -> Result<(), ConnectionError> {
+        match self.ctx.roles.list().await {
+            Ok(roles) => {
+                let response = RoleListResponse {
+                    roles: roles.into_iter().map(role_to_wire).collect(),
+                };
+                self.send(
+                    PacketType::RoleListResponse,
+                    PacketFlags::empty(),
+                    response.encode(),
+                )
+                .await?;
+            }
+            Err(e) => self.send_error(&e.to_string()).await?,
+        }
+        Ok(())
     }
 
     /// Stream every chunk the client still needs, then the terminal
@@ -716,6 +921,16 @@ fn is_download(payload: &[u8]) -> bool {
     payload.first() == Some(&kdx_protocol::messages::DIRECTION_DOWNLOAD)
 }
 
+fn role_to_wire(role: Role) -> RoleInfo {
+    RoleInfo {
+        id: *role.id.as_bytes(),
+        name: role.name,
+        privileges: role.privileges.bits(),
+        rank: role.rank,
+        color: role.color.unwrap_or_default(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -742,6 +957,7 @@ mod tests {
         .await
         .unwrap();
         let ctx = Arc::new(ServerCtx {
+            roles: RoleManager::new(pool.clone()),
             auth: AuthManager::new(pool, Duration::from_secs(60)),
             rooms: RoomManager::new(),
             tree,
@@ -966,5 +1182,176 @@ mod tests {
             conn.await.unwrap().unwrap_err(),
             ConnectionError::PeerClosed
         ));
+    }
+
+    /// Like `test_ctx`, but seeds a `sysop` admin account instead of a plain
+    /// power user, for exercising the USER_ADMIN-gated role wire protocol.
+    async fn admin_test_ctx() -> (Arc<ServerCtx>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = kdx_storage::connect(&dir.path().join("test.db"))
+            .await
+            .unwrap();
+        let phc = hash_password("s3cret").unwrap();
+        accounts::create(&pool, "sysop", &phc, 3).await.unwrap();
+        accounts::create(&pool, "plain", &phc, 1).await.unwrap();
+        let tree = FileTree::load(pool.clone()).await.unwrap();
+        let transfers = TransferManager::new(
+            pool.clone(),
+            crate::transfer::TransferConfig {
+                files_root: dir.path().join("files"),
+                max_upload_bytes_per_sec: 0,
+                max_download_bytes_per_sec: 0,
+            },
+        )
+        .await
+        .unwrap();
+        let ctx = Arc::new(ServerCtx {
+            roles: RoleManager::new(pool.clone()),
+            auth: AuthManager::new(pool, Duration::from_secs(60)),
+            rooms: RoomManager::new(),
+            tree,
+            transfers,
+            presence: crate::presence::Presence::spawn(),
+        });
+        (ctx, dir)
+    }
+
+    /// Send a request and return the next reply frame, skipping unrelated
+    /// pushes (e.g. `PresenceChange` from another connection logging in) that
+    /// can interleave on a connection that's also joined the presence
+    /// roster.
+    async fn send_and_recv(
+        client: &mut Framed<tokio::io::DuplexStream, KdxCodec>,
+        seq: &mut u32,
+        packet_type: PacketType,
+        payload: Bytes,
+    ) -> KdxFrame {
+        client
+            .send(client_frame(packet_type, bump(seq), payload))
+            .await
+            .unwrap();
+        loop {
+            let frame = client.next().await.unwrap().unwrap();
+            if frame.header.packet_type != PacketType::PresenceChange {
+                return frame;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn sysop_can_define_and_assign_a_custom_role() {
+        let (ctx, _dir) = admin_test_ctx().await;
+        let (client, server) = tokio::io::duplex(8192);
+        let conn = tokio::spawn(Connection::new(server, ctx.clone()).run());
+        let mut client = client_framed(client);
+        let mut seq = 0;
+
+        do_handshake(&mut client, &mut seq).await;
+        let login = do_login(&mut client, &mut seq, "sysop", "s3cret").await;
+        assert!(login.success);
+
+        // Define a role beyond any base class's set.
+        let create = RoleCreate {
+            name: "Moderator".into(),
+            privileges: (Privileges::USER_KICK | Privileges::USER_BAN).bits(),
+            rank: 10,
+            color: "#e11b1b".into(),
+        };
+        let frame = send_and_recv(&mut client, &mut seq, PacketType::RoleCreate, create.encode()).await;
+        assert_eq!(frame.header.packet_type, PacketType::RoleListResponse);
+        let list = RoleListResponse::decode(&frame.payload).unwrap();
+        assert_eq!(list.roles.len(), 1);
+        assert_eq!(list.roles[0].name, "Moderator");
+        let role_id = list.roles[0].id;
+
+        // Assign it to another account by username.
+        let assign = RoleAssign {
+            username: "plain".into(),
+            role_id,
+        };
+        let frame = send_and_recv(&mut client, &mut seq, PacketType::RoleAssign, assign.encode()).await;
+        assert_eq!(frame.header.packet_type, PacketType::RoleListResponse);
+
+        // Confirm the assignment stuck via AccountRolesRequest.
+        let frame = send_and_recv(
+            &mut client,
+            &mut seq,
+            PacketType::AccountRolesRequest,
+            (kdx_protocol::messages::AccountRolesRequest {
+                username: "plain".into(),
+            })
+            .encode(),
+        )
+        .await;
+        assert_eq!(frame.header.packet_type, PacketType::AccountRolesResponse);
+        let resp = AccountRolesResponse::decode(&frame.payload).unwrap();
+        assert_eq!(resp.role_ids, vec![role_id]);
+
+        // The role's privileges show up on a fresh login for that account —
+        // not just in the assignment records.
+        let (client2, server2) = tokio::io::duplex(8192);
+        let conn2 = tokio::spawn(Connection::new(server2, ctx.clone()).run());
+        let mut client2 = client_framed(client2);
+        let mut seq2 = 0;
+        do_handshake(&mut client2, &mut seq2).await;
+        let login2 = do_login(&mut client2, &mut seq2, "plain", "s3cret").await;
+        assert!(login2.success);
+        let session2 = ctx
+            .auth
+            .validate(uuid::Uuid::from_bytes(login2.session_id))
+            .unwrap();
+        assert!(session2.privileges.contains(Privileges::USER_KICK));
+        assert!(session2.privileges.contains(Privileges::USER_BAN));
+        client2
+            .send(client_frame(PacketType::Disconnect, bump(&mut seq2), Bytes::new()))
+            .await
+            .unwrap();
+        conn2.await.unwrap().unwrap();
+
+        // Unassign, then delete — list drains back to empty.
+        let unassign = RoleUnassign {
+            username: "plain".into(),
+            role_id,
+        };
+        send_and_recv(&mut client, &mut seq, PacketType::RoleUnassign, unassign.encode()).await;
+
+        let delete = RoleDelete { id: role_id };
+        let frame = send_and_recv(&mut client, &mut seq, PacketType::RoleDelete, delete.encode()).await;
+        let list = RoleListResponse::decode(&frame.payload).unwrap();
+        assert!(list.roles.is_empty());
+
+        client
+            .send(client_frame(PacketType::Disconnect, bump(&mut seq), Bytes::new()))
+            .await
+            .unwrap();
+        conn.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn plain_user_cannot_manage_roles() {
+        let (ctx, _dir) = admin_test_ctx().await;
+        let (client, server) = tokio::io::duplex(8192);
+        let conn = tokio::spawn(Connection::new(server, ctx).run());
+        let mut client = client_framed(client);
+        let mut seq = 0;
+
+        do_handshake(&mut client, &mut seq).await;
+        let login = do_login(&mut client, &mut seq, "plain", "s3cret").await;
+        assert!(login.success);
+
+        let create = RoleCreate {
+            name: "Moderator".into(),
+            privileges: Privileges::USER_KICK.bits(),
+            rank: 1,
+            color: String::new(),
+        };
+        let frame = send_and_recv(&mut client, &mut seq, PacketType::RoleCreate, create.encode()).await;
+        assert_eq!(frame.header.packet_type, PacketType::Error);
+
+        client
+            .send(client_frame(PacketType::Disconnect, bump(&mut seq), Bytes::new()))
+            .await
+            .unwrap();
+        conn.await.unwrap().unwrap();
     }
 }

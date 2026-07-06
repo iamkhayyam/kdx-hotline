@@ -72,7 +72,7 @@ export function buildConnect(onLoggedIn) {
     try {
       localStorage.setItem("kdx.lastServer", JSON.stringify({ host, port, username }));
     } catch (_) {}
-    update({ connection: "online", session: { class: klass }, server: { host, port } });
+    update({ connection: "online", session: { class: klass, username }, server: { host, port } });
     setStatus(`logged in as ${username} (${CLASSES[klass] || "?"})`, "ok");
     go.disabled = false;
     await invoke("join_room", { room: getState().room });

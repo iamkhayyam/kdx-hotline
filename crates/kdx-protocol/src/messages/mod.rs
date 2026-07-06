@@ -7,6 +7,8 @@ mod chat;
 mod file;
 mod handshake;
 mod presence;
+mod private;
+mod roles;
 mod wire;
 
 pub use auth::{AuthChallenge, AuthRequest, AuthResponse, AuthResult};
@@ -22,4 +24,9 @@ pub use handshake::{HandshakeInit, HandshakeResp};
 pub use presence::{
     PresenceChange, PresenceEntry, PresenceListRequest, PresenceListResponse, UserInfoRequest,
     UserInfoResponse,
+};
+pub use private::{PrivateMessage, PrivateSend};
+pub use roles::{
+    AccountRolesRequest, AccountRolesResponse, RoleAssign, RoleCreate, RoleDelete, RoleInfo,
+    RoleListRequest, RoleListResponse, RoleUnassign, RoleUpdate,
 };

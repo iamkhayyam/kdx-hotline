@@ -1,4 +1,5 @@
 use serde::Serialize;
+use uuid::Uuid;
 
 /// Transfer direction, as reported in progress events.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -31,6 +32,30 @@ impl From<kdx_protocol::messages::PresenceEntry> for PresenceUser {
     }
 }
 
+/// A custom, named privilege bundle a SysOp can assign to accounts on top of
+/// their base class — the Discord-style "roles" layer for the Roles window.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct RoleInfo {
+    pub id: String,
+    pub name: String,
+    pub privileges: u32,
+    pub rank: i32,
+    /// Empty string means "no color set".
+    pub color: String,
+}
+
+impl From<kdx_protocol::messages::RoleInfo> for RoleInfo {
+    fn from(r: kdx_protocol::messages::RoleInfo) -> Self {
+        Self {
+            id: Uuid::from_bytes(r.id).to_string(),
+            name: r.name,
+            privileges: r.privileges,
+            rank: r.rank,
+            color: r.color,
+        }
+    }
+}
+
 /// Events pushed from the connection actor to the application. The serde
 /// representation (`{ "type": "chat", ... }`) is the exact contract the
 /// webview consumes, so its shape is covered by a test.
@@ -56,6 +81,15 @@ pub enum Event {
     /// A user came online or went offline (global roster, not room-scoped).
     /// Never sent for your own connection's join.
     Presence { user: PresenceUser, online: bool },
+    /// A private (direct) message. `from` is the sender, `to` the recipient
+    /// (which is also echoed to the sender's own sessions so the sent line
+    /// slots into the right conversation).
+    PrivateMessage {
+        from: String,
+        to: String,
+        timestamp: u64,
+        text: String,
+    },
     /// Progress on an active transfer. `bitmap` is the LSB-first set of
     /// completed chunks, for the chunk-grid visualization.
     TransferProgress {
