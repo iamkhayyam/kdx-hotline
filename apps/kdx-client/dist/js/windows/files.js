@@ -204,6 +204,7 @@ export function buildFiles() {
     try {
       const res = await invoke("delete_path", { path: joinPath(cwd, e.name) });
       entries = res.entries;
+      searchHits = null; // defensive: this response is a folder listing, not search results
       infoEl.classList.add("hidden");
       render();
     } catch (err) {
@@ -233,6 +234,7 @@ export function buildFiles() {
       try {
         const res = await invoke("move_path", { path: moving.path, destPath: cwd });
         entries = res.entries;
+        searchHits = null; // defensive: this response is a folder listing, not search results
         moving = null;
         renderMoveBanner();
         render();

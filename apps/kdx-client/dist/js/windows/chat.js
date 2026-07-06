@@ -55,14 +55,26 @@ export function buildChat(sendMessage, getInfo, inviteToChat) {
     if (previous === room) return;
     try {
       await invoke("join_room", { room });
-      if (previous) await invoke("leave_room", { room: previous });
-      update({ room, users: [], topic: "" });
-      topicTextEl.textContent = "topic: —";
-      renderRoomTag();
-      scroll.innerHTML = "";
-      line("sys", `*** now in ${room === DEFAULT_ROOM ? "the lobby" : "a private chat"}`);
     } catch (err) {
       line("err", "! " + (err.message || err));
+      return; // the join itself failed — we're still in the old room
+    }
+    // The join succeeded, so we ARE in the new room now from the user's
+    // point of view — reflect that immediately. Leaving the old room is
+    // best-effort cleanup after the fact; if it fails, that's a stale
+    // server-side membership to warn about, not a reason to tell the user
+    // they never actually switched.
+    update({ room, users: [], topic: "" });
+    topicTextEl.textContent = "topic: —";
+    renderRoomTag();
+    scroll.innerHTML = "";
+    line("sys", `*** now in ${room === DEFAULT_ROOM ? "the lobby" : "a private chat"}`);
+    if (previous) {
+      try {
+        await invoke("leave_room", { room: previous });
+      } catch (err) {
+        line("warn", "! couldn't leave the previous room: " + (err.message || err));
+      }
     }
   }
 
@@ -191,6 +203,10 @@ export function buildChat(sendMessage, getInfo, inviteToChat) {
       topicTextEl.textContent = "topic: " + (topic || "—");
     },
     onInvited: onInvited,
+    // Called on window open so the room tag / "Back to Lobby" affordance is
+    // correct even if the window is opened after already being switched into
+    // a non-lobby room (e.g. accepted an invite before ever opening Chat).
+    refreshRoomTag: renderRoomTag,
     onWarning(text) {
       line("warn", "! " + esc(text));
     },

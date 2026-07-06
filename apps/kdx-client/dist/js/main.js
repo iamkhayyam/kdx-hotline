@@ -93,6 +93,7 @@ register({
   tag: "0 users",
   rect: { x: 200, y: 24, w: 560, h: 380 },
   build: () => ({ body: chat.body, api: chat }),
+  onOpen: () => chat.refreshRoomTag(),
 });
 register({
   id: "files",

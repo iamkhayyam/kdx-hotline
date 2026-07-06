@@ -278,11 +278,18 @@ impl FileTree {
     /// Delete a node (recursively, for folders), enforcing write access on the
     /// containing folder. The root cannot be deleted. Backing files on disk are
     /// removed for file nodes. Returns the deleted node's kind.
+    ///
+    /// Holds a single write-lock guard for the entire operation (validate →
+    /// DB → in-memory update) rather than a read lock that's dropped and
+    /// later re-acquired — a `tokio::sync::RwLock` guard is safe to hold
+    /// across `.await` (unlike a std mutex), and doing so closes a real race:
+    /// with a drop-and-reacquire split, a concurrent `add_file`/`move_node`
+    /// could land in the gap and get silently swept up (or left dangling) by
+    /// this call's stale snapshot.
     pub async fn delete(&self, path: &str, class: BaseClass) -> Result<NodeKind, TreeError> {
-        // Gather the subtree (post-order: children before parents) and the
-        // parent's write ACL under a read lock, then mutate.
-        let (kind, ordered_ids, storage_paths, parent_id) = {
-            let state = self.state.read().await;
+        let mut state = self.state.write().await;
+
+        let (kind, node_id, parent_id) = {
             let node = state.resolve(path)?;
             if node.id == ROOT_ID {
                 return Err(TreeError::NotAFolder); // root isn't a deletable entry
@@ -290,31 +297,30 @@ impl FileTree {
             // Require write access to the node itself — you may not delete a
             // folder (or its subtree) you couldn't write to.
             acl::check_write(node.kind, node.min_class_write, class)?;
-
-            let mut ordered = Vec::new();
-            let mut storage_paths = Vec::new();
-            collect_subtree(&state, &node.id, &mut ordered, &mut storage_paths);
-            (node.kind, ordered, storage_paths, node.parent_id.clone())
+            (node.kind, node.id.clone(), node.parent_id.clone())
         };
+
+        let mut ordered = Vec::new();
+        let mut storage_paths = Vec::new();
+        collect_subtree(&state, &node_id, &mut ordered, &mut storage_paths);
 
         // Remove backing files first (best-effort), then rows (post-order so a
         // partial failure never orphans a child under enforced FKs).
         for sp in &storage_paths {
             let _ = tokio::fs::remove_file(sp).await;
         }
-        for id in &ordered_ids {
+        for id in &ordered {
             file_tree::delete(&self.pool, id).await?;
         }
 
         // Drop from the in-memory tree.
-        let mut state = self.state.write().await;
-        for id in &ordered_ids {
+        for id in &ordered {
             state.nodes.remove(id);
             state.children.remove(id);
         }
         if let Some(pid) = &parent_id {
             if let Some(siblings) = state.children.get_mut(pid) {
-                siblings.retain(|id| !ordered_ids.contains(id));
+                siblings.retain(|id| !ordered.contains(id));
             }
         }
         Ok(kind)
@@ -327,45 +333,53 @@ impl FileTree {
     /// checks `delete` and `prepare_upload` each apply individually. Refuses
     /// to move the root, move a folder into itself or one of its own
     /// descendants, or move onto a name collision at the destination.
+    ///
+    /// Holds a single write-lock guard for the entire operation — see
+    /// `delete`'s doc comment for why. Without this, two concurrent moves
+    /// (e.g. A moves x into y while B moves y into x) could each pass their
+    /// own cycle check against a stale snapshot and both land, producing an
+    /// actual cycle that permanently orphans the subtree from the root.
     pub async fn move_node(
         &self,
         path: &str,
         dest_path: &str,
         class: BaseClass,
     ) -> Result<(), TreeError> {
-        let (node_id, dest_id) = {
-            let state = self.state.read().await;
+        let mut state = self.state.write().await;
+
+        let (node_id, node_name) = {
             let node = state.resolve(path)?;
             if node.id == ROOT_ID {
                 return Err(TreeError::NotAFolder); // root isn't a movable entry
             }
             acl::check_write(node.kind, node.min_class_write, class)?;
-
+            (node.id.clone(), node.name.clone())
+        };
+        let dest_id = {
             let dest = state.resolve(dest_path)?;
             if !dest.kind.is_folder() {
                 return Err(TreeError::NotAFolder);
             }
             acl::check_write(dest.kind, dest.min_class_write, class)?;
-
-            if dest.id == node.id || is_descendant(&state, &node.id, &dest.id) {
-                return Err(TreeError::WouldCreateCycle);
-            }
-            if let Some(siblings) = state.children.get(&dest.id) {
-                if siblings
-                    .iter()
-                    .filter(|id| id.as_str() != node.id)
-                    .filter_map(|id| state.nodes.get(id))
-                    .any(|n| n.name == node.name)
-                {
-                    return Err(TreeError::Exists);
-                }
-            }
-            (node.id.clone(), dest.id.clone())
+            dest.id.clone()
         };
+
+        if dest_id == node_id || is_descendant(&state, &node_id, &dest_id) {
+            return Err(TreeError::WouldCreateCycle);
+        }
+        if let Some(siblings) = state.children.get(&dest_id) {
+            if siblings
+                .iter()
+                .filter(|id| id.as_str() != node_id)
+                .filter_map(|id| state.nodes.get(id))
+                .any(|n| n.name == node_name)
+            {
+                return Err(TreeError::Exists);
+            }
+        }
 
         file_tree::reparent(&self.pool, &node_id, &dest_id).await?;
 
-        let mut state = self.state.write().await;
         let old_parent = state.nodes.get(&node_id).and_then(|n| n.parent_id.clone());
         if let Some(old_parent) = old_parent {
             if let Some(siblings) = state.children.get_mut(&old_parent) {
@@ -734,6 +748,43 @@ mod tests {
         assert!(tree.resolve("/b/a/doc.txt").await.is_ok());
         assert!(tree.resolve("/b/a/sub").await.is_ok());
         assert_eq!(tree.list("/b", BaseClass::Guest).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn concurrent_opposing_moves_cannot_create_a_cycle() {
+        // Regression test: `move_node` used to validate (including the cycle
+        // check) under a read lock that was dropped before the write-lock
+        // mutation, leaving a window where two racing calls could each pass
+        // their own stale-snapshot cycle check and both land — e.g. A moves
+        // x into y while B concurrently moves y into x, producing an actual
+        // cycle that orphans the subtree from root forever. `move_node` now
+        // holds one write-lock guard for its entire duration, so these two
+        // calls are fully serialized: whichever runs second sees the
+        // first's result and correctly refuses.
+        let (tree, _dir) = tree().await;
+        tree.create_folder("/", "x", NodeKind::Directory, BaseClass::Guest, BaseClass::User)
+            .await
+            .unwrap();
+        tree.create_folder("/", "y", NodeKind::Directory, BaseClass::Guest, BaseClass::User)
+            .await
+            .unwrap();
+
+        let (r1, r2) = tokio::join!(
+            tree.move_node("/x", "/y", BaseClass::User),
+            tree.move_node("/y", "/x", BaseClass::User),
+        );
+
+        // Exactly one of the two opposing moves may succeed — never both.
+        assert_ne!(r1.is_ok(), r2.is_ok(), "r1={r1:?} r2={r2:?}");
+
+        // Whichever won, the tree must still be a tree: both x and y remain
+        // resolvable from root (no orphaned cycle), one nested under the
+        // other.
+        if r1.is_ok() {
+            assert!(tree.resolve("/y/x").await.is_ok());
+        } else {
+            assert!(tree.resolve("/x/y").await.is_ok());
+        }
     }
 
     #[tokio::test]

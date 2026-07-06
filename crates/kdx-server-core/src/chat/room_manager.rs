@@ -144,7 +144,16 @@ impl RoomManager {
             let (reply, rx) = oneshot::channel();
             if tx.send(RoomCommand::MemberCount { reply }).await.is_ok() {
                 if let Ok(0) = rx.await {
-                    self.rooms.remove(room);
+                    // Check-then-remove has an ABA hazard: between our
+                    // MemberCount reply and this call, the same room name
+                    // could in principle have been evicted and recreated
+                    // (e.g. by a concurrent `leave`/`join_private` pair). A
+                    // plain `remove(room)` matches by key alone and would
+                    // delete whatever now sits there — possibly a brand-new,
+                    // non-empty room. `remove_if` makes the removal atomic
+                    // with a same-instance check, so we only ever remove the
+                    // exact entry we just measured as empty.
+                    self.rooms.remove_if(room, |_, e| e.tx.same_channel(&tx));
                 }
             }
         }
@@ -257,5 +266,39 @@ mod tests {
         let (b, _rx_b) = member("bob", BaseClass::User);
         assert!(mgr.join_private("priv-3", b).await.is_ok());
         assert!(mgr.rooms.contains_key("priv-3"));
+    }
+
+    #[tokio::test]
+    async fn stale_eviction_does_not_delete_a_recreated_room_with_the_same_name() {
+        // Regression test for an ABA hazard: `leave()` used to check
+        // emptiness then call a plain `remove(room)`, which matches by key
+        // alone. If the same room name were evicted and then recreated
+        // before a (delayed) stale removal ran, that removal would delete
+        // the brand-new room instead of a no-op. `remove_if` closes this by
+        // requiring the entry removed to be the exact instance measured.
+        let mgr = RoomManager::new();
+        let old_tx = mgr.rooms.get("priv-4").map(|e| e.tx.clone());
+        assert!(old_tx.is_none()); // doesn't exist yet
+
+        let (a, _rx_a) = member("alice", BaseClass::User);
+        let a_id = a.session_id;
+        mgr.join_private("priv-4", a).await.unwrap();
+        let stale_tx = mgr.rooms.get("priv-4").unwrap().tx.clone();
+
+        // Alice leaves — the room is evicted normally.
+        mgr.leave("priv-4", a_id).await;
+        assert!(!mgr.rooms.contains_key("priv-4"));
+
+        // A new room is created under the SAME name (simulating a name
+        // reused right in the eviction window).
+        let (b, _rx_b) = member("bob", BaseClass::User);
+        mgr.join_private("priv-4", b).await.unwrap();
+        let fresh_tx = mgr.rooms.get("priv-4").unwrap().tx.clone();
+        assert!(!fresh_tx.same_channel(&stale_tx), "test setup: must be a different room instance");
+
+        // A delayed, stale removal keyed on the OLD room's sender must NOT
+        // touch the fresh room.
+        mgr.rooms.remove_if("priv-4", |_, e| e.tx.same_channel(&stale_tx));
+        assert!(mgr.rooms.contains_key("priv-4"), "fresh room must survive a stale eviction attempt");
     }
 }

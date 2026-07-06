@@ -72,12 +72,21 @@ export function buildServerAdmin() {
       settingsResult.textContent = "a server name is required";
       return;
     }
+    // parseInt("") and parseInt("abc") both yield NaN — validate explicitly
+    // rather than falling back to 0, which would silently wipe out a
+    // configured cap as "unlimited" on a blank/bad input.
+    const maxUsersRaw = $("#srv-max-users").value.trim();
+    const maxUsers = parseInt(maxUsersRaw, 10);
+    if (!Number.isInteger(maxUsers) || maxUsers < 0) {
+      settingsResult.textContent = "max users must be a non-negative whole number";
+      return;
+    }
     try {
       const s = await invoke("update_server_settings", {
         name,
         description: $("#srv-desc").value,
         greeting: $("#srv-greeting").value,
-        maxUsers: parseInt($("#srv-max-users").value, 10) || 0,
+        maxUsers,
       });
       $("#srv-max-users").value = s.max_users;
       settingsResult.textContent = "saved";
