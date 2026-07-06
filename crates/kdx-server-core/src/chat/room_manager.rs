@@ -24,8 +24,16 @@ pub enum JoinError {
     Unavailable,
 }
 
+/// A room's manager-side entry: its command sender plus whether it should be
+/// dropped once empty (a private, invite-created chat) rather than persist
+/// like the lobby or an admin-created named room.
+struct RoomEntry {
+    tx: mpsc::Sender<RoomCommand>,
+    temporary: bool,
+}
+
 pub struct RoomManager {
-    rooms: DashMap<String, mpsc::Sender<RoomCommand>>,
+    rooms: DashMap<String, RoomEntry>,
 }
 
 impl Default for RoomManager {
@@ -37,12 +45,19 @@ impl Default for RoomManager {
 impl RoomManager {
     pub fn new() -> Self {
         let rooms = DashMap::new();
-        rooms.insert(DEFAULT_ROOM.to_string(), spawn_room(DEFAULT_ROOM.to_string()));
+        rooms.insert(
+            DEFAULT_ROOM.to_string(),
+            RoomEntry {
+                tx: spawn_room(DEFAULT_ROOM.to_string()),
+                temporary: false,
+            },
+        );
         Self { rooms }
     }
 
-    /// Join `member` to `room`, creating it if allowed. Returns the room's
-    /// command sender for subsequent messages/leave.
+    /// Join `member` to `room`, creating it (as a permanent, publicly-listed
+    /// room) if allowed. Returns the room's command sender for subsequent
+    /// messages/leave.
     pub async fn join(
         &self,
         room: &str,
@@ -51,32 +66,87 @@ impl RoomManager {
         if room.is_empty() || room.len() > MAX_ROOM_NAME {
             return Err(JoinError::InvalidName);
         }
-        let handle = match self.rooms.get(room) {
-            Some(existing) => existing.clone(),
+        let tx = match self.rooms.get(room) {
+            Some(existing) => existing.tx.clone(),
             None => {
                 if !member.privileges.contains(Privileges::CHAT_CREATE_ROOM) {
                     return Err(JoinError::CannotCreate);
                 }
                 self.rooms
                     .entry(room.to_string())
-                    .or_insert_with(|| spawn_room(room.to_string()))
+                    .or_insert_with(|| RoomEntry {
+                        tx: spawn_room(room.to_string()),
+                        temporary: false,
+                    })
+                    .tx
                     .clone()
             }
         };
+        self.do_join(&tx, member).await?;
+        Ok(tx)
+    }
 
+    /// Create (if missing) and join a private, invite-only room — bypassing
+    /// `CHAT_CREATE_ROOM`, since starting a private chat is not the same
+    /// privilege as founding a persistent public room. The room is marked
+    /// temporary: once its last member leaves, `leave` drops it so its actor
+    /// task winds down (mirrors real KDX's private chats vanishing when
+    /// empty). Callers should pick a room name unlikely to collide with a
+    /// user-typed public room (a UUID, say).
+    pub async fn join_private(
+        &self,
+        room: &str,
+        member: Member,
+    ) -> Result<mpsc::Sender<RoomCommand>, JoinError> {
+        if room.is_empty() || room.len() > MAX_ROOM_NAME {
+            return Err(JoinError::InvalidName);
+        }
+        let tx = self
+            .rooms
+            .entry(room.to_string())
+            .or_insert_with(|| RoomEntry {
+                tx: spawn_room(room.to_string()),
+                temporary: true,
+            })
+            .tx
+            .clone();
+        self.do_join(&tx, member).await?;
+        Ok(tx)
+    }
+
+    async fn do_join(
+        &self,
+        tx: &mpsc::Sender<RoomCommand>,
+        member: Member,
+    ) -> Result<(), JoinError> {
         let (reply, rx) = oneshot::channel();
-        handle
-            .send(RoomCommand::Join { member, reply })
+        tx.send(RoomCommand::Join { member, reply })
             .await
             .map_err(|_| JoinError::Unavailable)?;
         rx.await.map_err(|_| JoinError::Unavailable)??;
-        Ok(handle)
+        Ok(())
     }
 
-    /// Best-effort leave used on disconnect cleanup.
+    /// Best-effort leave used on disconnect cleanup. If `room` is temporary
+    /// and this was its last member, drops the manager's own sender so the
+    /// room actor's channel closes and its task exits.
     pub async fn leave(&self, room: &str, session_id: Uuid) {
-        if let Some(handle) = self.rooms.get(room) {
-            let _ = handle.send(RoomCommand::Leave { session_id }).await;
+        let Some(entry) = self.rooms.get(room) else {
+            return;
+        };
+        let tx = entry.tx.clone();
+        let temporary = entry.temporary;
+        drop(entry); // release the DashMap shard lock before any `.remove()`
+
+        let _ = tx.send(RoomCommand::Leave { session_id }).await;
+
+        if temporary {
+            let (reply, rx) = oneshot::channel();
+            if tx.send(RoomCommand::MemberCount { reply }).await.is_ok() {
+                if let Ok(0) = rx.await {
+                    self.rooms.remove(room);
+                }
+            }
         }
     }
 }
@@ -142,5 +212,50 @@ mod tests {
             mgr.join(DEFAULT_ROOM, dup).await.unwrap_err(),
             JoinError::Room(RoomError::AlreadyJoined)
         );
+    }
+
+    #[tokio::test]
+    async fn join_private_bypasses_create_room_privilege() {
+        let mgr = RoomManager::new();
+        // A plain user (no CHAT_CREATE_ROOM) can still start a private room.
+        let (guest, _rx) = member("guest", BaseClass::Guest);
+        assert!(mgr.join_private("priv-1", guest).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn private_room_survives_until_the_last_member_leaves() {
+        let mgr = RoomManager::new();
+        let (a, _rx_a) = member("alice", BaseClass::User);
+        let (b, _rx_b) = member("bob", BaseClass::User);
+        let a_id = a.session_id;
+        let b_id = b.session_id;
+
+        mgr.join_private("priv-2", a).await.unwrap();
+        mgr.join_private("priv-2", b).await.unwrap();
+        assert!(mgr.rooms.contains_key("priv-2"));
+
+        // One member leaving doesn't evict the room — bob is still in it.
+        mgr.leave("priv-2", a_id).await;
+        assert!(mgr.rooms.contains_key("priv-2"), "room should survive with bob still in it");
+
+        // The last member leaving does evict it.
+        mgr.leave("priv-2", b_id).await;
+        assert!(!mgr.rooms.contains_key("priv-2"), "room should be gone once empty");
+    }
+
+    #[tokio::test]
+    async fn a_fresh_join_private_after_eviction_starts_a_clean_room() {
+        let mgr = RoomManager::new();
+        let (a, _rx_a) = member("alice", BaseClass::User);
+        let a_id = a.session_id;
+        mgr.join_private("priv-3", a).await.unwrap();
+        mgr.leave("priv-3", a_id).await;
+        assert!(!mgr.rooms.contains_key("priv-3"));
+
+        // Reusing the same name after eviction spins up a brand new room,
+        // not a stale reference to the torn-down one.
+        let (b, _rx_b) = member("bob", BaseClass::User);
+        assert!(mgr.join_private("priv-3", b).await.is_ok());
+        assert!(mgr.rooms.contains_key("priv-3"));
     }
 }

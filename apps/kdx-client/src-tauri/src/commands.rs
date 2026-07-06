@@ -272,6 +272,11 @@ pub async fn send_private(state: State<'_, AppState>, to: String, text: String) 
 }
 
 #[tauri::command]
+pub async fn invite_to_chat(state: State<'_, AppState>, to: String) -> CmdResult<()> {
+    with_client(&state, |c| async move { c.invite_to_chat(&to).await }).await
+}
+
+#[tauri::command]
 pub async fn upload(state: State<'_, AppState>, local: String, remote_dir: String) -> CmdResult<()> {
     with_client(&state, |c| async move {
         c.upload(PathBuf::from(local), &remote_dir).await

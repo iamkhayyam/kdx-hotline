@@ -56,6 +56,24 @@ pub struct ChatTopic {
     pub topic: String,
 }
 
+/// Client → server: invite `to` into a fresh private chat. The server
+/// generates the room, joins the inviter to it immediately, and — if `to` is
+/// online — delivers a `ChatInvited`. Requires `CHAT_PRIVATE`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatInvite {
+    pub to: String,
+}
+
+/// Server → client: `from` has invited you into `room`, a private chat.
+/// Accepting is just an ordinary `ChatJoin` on `room`; ignoring is purely
+/// client-local (no wire message) — the inviter's copy of the room simply
+/// stays at one member until they give up and leave it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatInvited {
+    pub from: String,
+    pub room: String,
+}
+
 impl ChatSend {
     pub fn encode(&self) -> Bytes {
         let mut buf = BytesMut::with_capacity(5 + self.room.len() + self.text.len());
@@ -180,6 +198,34 @@ impl ChatTopic {
     }
 }
 
+impl ChatInvite {
+    pub fn encode(&self) -> Bytes {
+        let mut buf = BytesMut::new();
+        put_str(&mut buf, &self.to);
+        buf.freeze()
+    }
+    pub fn decode(mut payload: &[u8]) -> Result<Self, ProtocolError> {
+        let to = get_str(&mut payload, "ChatInvite")?;
+        expect_end(payload, "ChatInvite")?;
+        Ok(Self { to })
+    }
+}
+
+impl ChatInvited {
+    pub fn encode(&self) -> Bytes {
+        let mut buf = BytesMut::new();
+        put_str(&mut buf, &self.from);
+        put_str(&mut buf, &self.room);
+        buf.freeze()
+    }
+    pub fn decode(mut payload: &[u8]) -> Result<Self, ProtocolError> {
+        let from = get_str(&mut payload, "ChatInvited")?;
+        let room = get_str(&mut payload, "ChatInvited")?;
+        expect_end(payload, "ChatInvited")?;
+        Ok(Self { from, room })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -230,5 +276,20 @@ mod tests {
         assert!(ChatSend::decode(&[0]).is_err());
         assert!(ChatEvent::decode(&[0, 1, 65]).is_err());
         assert!(ChatUserList::decode(&[0, 0, 0, 5]).is_err());
+    }
+
+    #[test]
+    fn invite_round_trip() {
+        let invite = ChatInvite { to: "acidburn".into() };
+        assert_eq!(ChatInvite::decode(&invite.encode()).unwrap(), invite);
+
+        let invited = ChatInvited {
+            from: "phraq".into(),
+            room: "priv-3f9c".into(),
+        };
+        assert_eq!(ChatInvited::decode(&invited.encode()).unwrap(), invited);
+
+        assert!(ChatInvite::decode(&[0, 5, 65]).is_err());
+        assert!(ChatInvited::decode(&[0, 1, 65]).is_err());
     }
 }

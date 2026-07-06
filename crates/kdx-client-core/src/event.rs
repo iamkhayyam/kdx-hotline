@@ -241,6 +241,9 @@ pub enum Event {
         timestamp: u64,
         text: String,
     },
+    /// `from` has invited you into `room`, a private chat. Accepting is just
+    /// an ordinary `join(room)`; ignoring needs no server round-trip.
+    ChatInvited { from: String, room: String },
     /// Progress on an active transfer. `bitmap` is the LSB-first set of
     /// completed chunks, for the chunk-grid visualization.
     TransferProgress {
@@ -332,5 +335,17 @@ mod tests {
             serde_json::to_value(Event::Authenticated { class: 2 }).unwrap()["type"],
             "authenticated"
         );
+    }
+
+    #[test]
+    fn chat_invited_json_shape() {
+        let ev = Event::ChatInvited {
+            from: "phraq".into(),
+            room: "priv-3f9c".into(),
+        };
+        let json = serde_json::to_value(&ev).unwrap();
+        assert_eq!(json["type"], "chat_invited");
+        assert_eq!(json["from"], "phraq");
+        assert_eq!(json["room"], "priv-3f9c");
     }
 }

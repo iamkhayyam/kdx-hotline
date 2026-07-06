@@ -15,8 +15,9 @@ use kdx_crypto::KdfParams;
 use kdx_protocol::messages::{
     AccountCreate, AccountListRequest, AccountListResponse, AccountRolesRequest,
     AccountRolesResponse, AccountUpdate, AdminDisconnect, AuthChallenge, AuthRequest, AuthResponse,
-    AdminBroadcast, AdminShutdown, AuthResult, ChatEvent, ChatJoin, ChatLeave, ChatSend, ChatTopic,
-    ChatUserList, FileCatalogGenerated, FileCreateFolder, FileDelete, FileGenerateCatalog,
+    AdminBroadcast, AdminShutdown, AuthResult, ChatEvent, ChatInvite, ChatInvited, ChatJoin,
+    ChatLeave, ChatSend, ChatTopic, ChatUserList, FileCatalogGenerated, FileCreateFolder,
+    FileDelete, FileGenerateCatalog,
     FileListRequest, FileMove, FileSearchRequest, FileSearchResponse, NewsPostCreate,
     NewsPostDelete, NewsThreadListRequest, NewsThreadListResponse, NewsgroupCreate,
     NewsgroupListRequest, NewsgroupListResponse, ServerSettingsRequest, ServerSettingsResponse,
@@ -431,6 +432,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
                 let r = self
                     .send(PacketType::PrivateSend, PrivateSend { to, text }.encode())
                     .await;
+                let _ = reply.send(r.map_err(Into::into));
+            }
+            Command::InviteToChat { to, reply } => {
+                let r = self.send(PacketType::ChatInvite, ChatInvite { to }.encode()).await;
                 let _ = reply.send(r.map_err(Into::into));
             }
             Command::Upload {
@@ -952,6 +957,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
                     to: msg.to,
                     timestamp: msg.timestamp,
                     text: msg.text,
+                })
+                .await;
+            }
+            PacketType::ChatInvited => {
+                let invited = ChatInvited::decode(&frame.payload)?;
+                self.emit(Event::ChatInvited {
+                    from: invited.from,
+                    room: invited.room,
                 })
                 .await;
             }

@@ -24,7 +24,8 @@ pub use admin::{
 };
 pub use auth::{AuthChallenge, AuthRequest, AuthResponse, AuthResult};
 pub use chat::{
-    ChatEvent, ChatJoin, ChatLeave, ChatSend, ChatTopic, ChatUserList, CHAT_ACTION, CHAT_SYSTEM,
+    ChatEvent, ChatInvite, ChatInvited, ChatJoin, ChatLeave, ChatSend, ChatTopic, ChatUserList,
+    CHAT_ACTION, CHAT_SYSTEM,
 };
 pub use file::{
     FileCatalogGenerated, FileCreateFolder, FileDelete, FileEntry, FileGenerateCatalog,

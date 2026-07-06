@@ -832,6 +832,126 @@ async fn admin_shutdown_disconnects_everyone_and_stops_the_listener() {
 }
 
 #[tokio::test]
+async fn invite_delivers_and_both_parties_share_a_private_room() {
+    let ts = TestServer::start().await;
+    ts.seed_account("alice", "pw", 1).await; // User class: has CHAT_PRIVATE
+    ts.seed_account("bob", "pw", 1).await;
+
+    let (alice, mut ea, _d1) = ts.connect_client().await;
+    next_event(&mut ea).await;
+    alice.login("alice", "pw").await.unwrap();
+
+    let (bob, mut eb, _d2) = ts.connect_client().await;
+    next_event(&mut eb).await;
+    bob.login("bob", "pw").await.unwrap();
+
+    alice.invite_to_chat("bob").await.unwrap();
+
+    // Alice gets an ack naming bob.
+    let mut saw_ack = false;
+    for _ in 0..10 {
+        if let Event::ServerInfo { text } = next_event(&mut ea).await {
+            assert!(text.contains("bob"));
+            saw_ack = true;
+            break;
+        }
+    }
+    assert!(saw_ack);
+
+    // Bob receives the invite and joins the named private room.
+    let mut room = None;
+    for _ in 0..10 {
+        if let Event::ChatInvited { from, room: r } = next_event(&mut eb).await {
+            assert_eq!(from, "alice");
+            assert!(r.starts_with("priv-"));
+            room = Some(r);
+            break;
+        }
+    }
+    let room = room.expect("bob should be invited");
+    bob.join(&room).await.unwrap();
+
+    // Alice's chat in that room reaches bob — they're sharing the same
+    // private room, not just two independent one-member rooms.
+    alice.send_chat(&room, 0, "you there?").await.unwrap();
+    let (sender, text, _) = wait_chat(&mut eb, false).await;
+    assert_eq!(sender, "alice");
+    assert_eq!(text, "you there?");
+
+    ts.stop();
+}
+
+#[tokio::test]
+async fn invite_to_an_offline_user_is_refused() {
+    let ts = TestServer::start().await;
+    ts.seed_account("alice", "pw", 1).await;
+
+    let (alice, mut ea, _d1) = ts.connect_client().await;
+    next_event(&mut ea).await;
+    alice.login("alice", "pw").await.unwrap();
+
+    alice.invite_to_chat("ghost").await.unwrap();
+    let mut saw_err = false;
+    for _ in 0..10 {
+        if let Event::ServerError { text } = next_event(&mut ea).await {
+            assert!(text.contains("ghost") || text.contains("not online"));
+            saw_err = true;
+            break;
+        }
+    }
+    assert!(saw_err);
+
+    ts.stop();
+}
+
+#[tokio::test]
+async fn guest_cannot_invite_to_chat() {
+    let ts = TestServer::start().await;
+    ts.seed_account("guest1", "pw", 0).await; // Guest: no CHAT_PRIVATE
+    ts.seed_account("guest2", "pw", 0).await;
+
+    let (guest1, mut e1, _d1) = ts.connect_client().await;
+    next_event(&mut e1).await;
+    guest1.login("guest1", "pw").await.unwrap();
+
+    guest1.invite_to_chat("guest2").await.unwrap(); // the send itself succeeds...
+    let mut refused = false;
+    for _ in 0..10 {
+        if let Event::ServerError { text } = next_event(&mut e1).await {
+            assert!(text.contains("CHAT_PRIVATE"));
+            refused = true;
+            break;
+        }
+    }
+    assert!(refused);
+
+    ts.stop();
+}
+
+#[tokio::test]
+async fn cannot_invite_yourself() {
+    let ts = TestServer::start().await;
+    ts.seed_account("alice", "pw", 1).await;
+
+    let (alice, mut ea, _d1) = ts.connect_client().await;
+    next_event(&mut ea).await;
+    alice.login("alice", "pw").await.unwrap();
+
+    alice.invite_to_chat("alice").await.unwrap();
+    let mut refused = false;
+    for _ in 0..10 {
+        if let Event::ServerError { text } = next_event(&mut ea).await {
+            assert!(text.contains("yourself"));
+            refused = true;
+            break;
+        }
+    }
+    assert!(refused);
+
+    ts.stop();
+}
+
+#[tokio::test]
 async fn admin_creates_and_deletes_folders() {
     let ts = TestServer::start().await;
     ts.seed_account("sysop", "pw", 3).await; // Admin: has FILE_MANAGE_TREE

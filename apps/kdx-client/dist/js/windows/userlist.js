@@ -6,7 +6,7 @@ import { showMenu } from "../menu.js";
 
 const CLASS_NAME = ["guest", "user", "power user", "admin"];
 
-export function buildUserList(openUserInfo, sendMessage, disconnectUser) {
+export function buildUserList(openUserInfo, sendMessage, disconnectUser, inviteToChat) {
   const body = document.createElement("div");
   body.className = "userlist-win";
   body.innerHTML = `
@@ -50,11 +50,13 @@ export function buildUserList(openUserInfo, sendMessage, disconnectUser) {
       row.addEventListener("click", () => openUserInfo(u.username));
       row.addEventListener("contextmenu", (e) => {
         e.preventDefault();
-        showMenu(e.clientX, e.clientY, [
+        const items = [
           { label: "Send Message", fn: () => sendMessage(u.username) },
           { label: "Get Info", fn: () => openUserInfo(u.username) },
-          { label: "Disconnect…", fn: () => disconnectUser(u.username) },
-        ]);
+        ];
+        if (inviteToChat) items.push({ label: "Invite to Chat…", fn: () => inviteToChat(u.username) });
+        items.push({ label: "Disconnect…", fn: () => disconnectUser(u.username) });
+        showMenu(e.clientX, e.clientY, items);
       });
       listEl.appendChild(row);
     }

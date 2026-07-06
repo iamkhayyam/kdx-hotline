@@ -107,6 +107,10 @@ pub(crate) enum Command {
         text: String,
         reply: oneshot::Sender<Result<(), ClientError>>,
     },
+    InviteToChat {
+        to: String,
+        reply: oneshot::Sender<Result<(), ClientError>>,
+    },
     Upload {
         local: PathBuf,
         remote_dir: String,
@@ -428,6 +432,19 @@ impl ClientHandle {
         self.send(|reply| Command::SendPrivate {
             to: to.to_owned(),
             text: text.to_owned(),
+            reply,
+        })
+        .await
+    }
+
+    /// Invite `to` into a fresh private chat. Resolves once the request is
+    /// written; you're joined to the new room immediately (see
+    /// `Event::UserList`/`Event::Topic` for it), and the invitee — if
+    /// online — gets `Event::ChatInvited`. Errors (offline, missing
+    /// `CHAT_PRIVATE`) surface via `Event::ServerError`.
+    pub async fn invite_to_chat(&self, to: &str) -> Result<(), ClientError> {
+        self.send(|reply| Command::InviteToChat {
+            to: to.to_owned(),
             reply,
         })
         .await

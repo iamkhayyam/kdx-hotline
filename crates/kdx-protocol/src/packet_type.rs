@@ -84,6 +84,11 @@ pub enum PacketType {
     AdminBroadcast = 0x75,
     AdminShutdown = 0x76,
 
+    // Invite to a private chat (0x77-0x78) — logically part of Chat
+    // (0x30-0x3F), but that block filled up before this feature existed.
+    ChatInvite = 0x77,
+    ChatInvited = 0x78,
+
     // System (0xF0-0xFF)
     Error = 0xF0,
     Warning = 0xF1,
@@ -91,7 +96,7 @@ pub enum PacketType {
 }
 
 impl PacketType {
-    pub const ALL: [PacketType; 64] = [
+    pub const ALL: [PacketType; 66] = [
         PacketType::HandshakeInit,
         PacketType::HandshakeResp,
         PacketType::Ping,
@@ -153,6 +158,8 @@ impl PacketType {
         PacketType::ServerSettingsUpdate,
         PacketType::AdminBroadcast,
         PacketType::AdminShutdown,
+        PacketType::ChatInvite,
+        PacketType::ChatInvited,
         PacketType::Error,
         PacketType::Warning,
         PacketType::Info,
@@ -226,6 +233,8 @@ impl TryFrom<u8> for PacketType {
             0x74 => ServerSettingsUpdate,
             0x75 => AdminBroadcast,
             0x76 => AdminShutdown,
+            0x77 => ChatInvite,
+            0x78 => ChatInvited,
             0xF0 => Error,
             0xF1 => Warning,
             0xF2 => Info,

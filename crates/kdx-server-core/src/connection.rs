@@ -15,8 +15,9 @@ use futures_util::{SinkExt, StreamExt};
 use kdx_protocol::messages::{
     AccountCreate, AccountListRequest, AccountListResponse, AccountRolesRequest,
     AccountRolesResponse, AccountSummary, AccountUpdate, AdminBroadcast, AdminDisconnect,
-    AdminShutdown, AuthChallenge, AuthRequest, AuthResponse, AuthResult, ChatJoin, ChatLeave,
-    ChatSend, ChatTopic, FileCatalogGenerated, FileCreateFolder, FileDelete, FileEntry,
+    AdminShutdown, AuthChallenge, AuthRequest, AuthResponse, AuthResult, ChatInvite, ChatInvited,
+    ChatJoin, ChatLeave, ChatSend, ChatTopic, FileCatalogGenerated, FileCreateFolder, FileDelete,
+    FileEntry,
     FileGenerateCatalog, FileListRequest, FileListResponse, FileMove, FileSearchEntry,
     FileSearchRequest, FileSearchResponse, HandshakeInit, HandshakeResp, NewsPost as WireNewsPost,
     NewsPostCreate, NewsPostDelete, NewsThreadListRequest, NewsThreadListResponse, NewsgroupCreate,
@@ -470,11 +471,71 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                         Err(e) => self.send_error(&e.to_string()).await?,
                     }
                 }
+                PacketType::ChatInvite => {
+                    let invite = ChatInvite::decode(&frame.payload)?;
+                    let session = self.session.as_ref().expect("authed").clone();
+                    if !session.privileges.contains(Privileges::CHAT_PRIVATE) {
+                        self.send_error("missing CHAT_PRIVATE privilege").await?;
+                        continue;
+                    }
+                    if invite.to == session.username {
+                        self.send_error("cannot invite yourself").await?;
+                        continue;
+                    }
+                    // A UUID-named room can't collide with a user-typed public
+                    // room name, and marks it temporary in RoomManager (evicted
+                    // once its last member leaves).
+                    let room_id = format!("priv-{}", Uuid::new_v4());
+                    let member = Member {
+                        session_id: session.id,
+                        username: session.username.clone(),
+                        privileges: session.privileges,
+                        tx: outbound_tx.clone(),
+                    };
+                    let handle = match self.ctx.rooms.join_private(&room_id, member).await {
+                        Ok(handle) => handle,
+                        Err(e) => {
+                            self.send_error(&e.to_string()).await?;
+                            continue;
+                        }
+                    };
+                    joined.insert(room_id.clone(), handle);
+
+                    let invited = ChatInvited {
+                        from: session.username.clone(),
+                        room: room_id.clone(),
+                    };
+                    let outbound = Outbound {
+                        packet_type: PacketType::ChatInvited,
+                        flags: PacketFlags::empty(),
+                        payload: invited.encode(),
+                    };
+                    let reached = self.ctx.presence.deliver(&invite.to, outbound).await;
+                    if reached == 0 {
+                        // Nobody to invite — tear the just-created room back
+                        // down rather than leave it stranded with one member.
+                        joined.remove(&room_id);
+                        self.ctx.rooms.leave(&room_id, session.id).await;
+                        self.send_error(&format!("{} is not online", invite.to)).await?;
+                    } else {
+                        self.send(
+                            PacketType::Info,
+                            PacketFlags::SYSTEM_MESSAGE,
+                            Bytes::copy_from_slice(
+                                format!("invited {} — waiting for them to join", invite.to)
+                                    .as_bytes(),
+                            ),
+                        )
+                        .await?;
+                    }
+                }
                 PacketType::ChatLeave => {
                     let leave = ChatLeave::decode(&frame.payload)?;
                     let session_id = self.session.as_ref().expect("authed").id;
-                    if let Some(handle) = joined.remove(&leave.room) {
-                        let _ = handle.send(RoomCommand::Leave { session_id }).await;
+                    if joined.remove(&leave.room).is_some() {
+                        // Routed through RoomManager (not the retained handle
+                        // directly) so it can drop a now-empty temporary room.
+                        self.ctx.rooms.leave(&leave.room, session_id).await;
                     }
                 }
                 PacketType::ChatMessage => {
@@ -1318,12 +1379,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
         // Cleanup regardless of how the loop ended: leave rooms, presence,
         // and end the session.
         if let Some(session) = &self.session {
-            for (room, handle) in joined {
-                let _ = handle
-                    .send(RoomCommand::Leave {
-                        session_id: session.id,
-                    })
-                    .await;
+            for (room, _handle) in joined {
+                self.ctx.rooms.leave(&room, session.id).await;
                 debug!(room, "left on disconnect");
             }
             self.ctx.presence.leave(session.id).await;

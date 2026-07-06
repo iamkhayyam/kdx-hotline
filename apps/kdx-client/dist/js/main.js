@@ -28,12 +28,16 @@ applySettings(loadSettings()); // apply saved theme/prefs at startup
 // whether or not their window is currently open.
 // Chat member verbs reuse the Messages + User Info windows (defined below;
 // these closures run only on user interaction, after those consts init).
+function inviteToChat(username) {
+  invoke("invite_to_chat", { to: username }).catch(() => {});
+}
 const chat = buildChat(
   (username) => openMessagesWith(username),
   (username) => {
     open("userinfo");
     userInfo.show(username);
-  }
+  },
+  inviteToChat
 );
 const files = buildFiles();
 const transfers = buildTransfers();
@@ -71,7 +75,8 @@ const userList = buildUserList(
   (username) => {
     open("admin");
     roles.openDisconnect(username);
-  }
+  },
+  inviteToChat
 );
 
 // Default window positions clear the floating Button Bar (top-left).
@@ -228,6 +233,10 @@ onKdxEvent((ev) => {
       break;
     case "topic":
       chat.onTopic(ev.topic);
+      break;
+    case "chat_invited":
+      chat.onInvited(ev);
+      open("chat");
       break;
     case "presence":
       userList.onPresence(ev.user, ev.online);

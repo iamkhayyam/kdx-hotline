@@ -40,6 +40,7 @@ pub fn run() {
             commands::shutdown_server,
             commands::get_user_info,
             commands::send_private,
+            commands::invite_to_chat,
             commands::upload,
             commands::download,
             commands::disconnect,

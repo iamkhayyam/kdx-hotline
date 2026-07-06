@@ -1,9 +1,10 @@
 import { invoke } from "../bridge.js";
-import { getState } from "../store.js";
+import { getState, update } from "../store.js";
 import { showMenu } from "../menu.js";
 
 const CHAT_ACTION = 1 << 0;
 const CHAT_SYSTEM = 1 << 1;
+const DEFAULT_ROOM = "lobby";
 
 // Slash-command help, shown by /help. Both `/` and `\` prefixes are accepted.
 const SLASH_HELP = [
@@ -14,14 +15,15 @@ const SLASH_HELP = [
   "/help — this list",
 ];
 
-export function buildChat(sendMessage, getInfo) {
+export function buildChat(sendMessage, getInfo, inviteToChat) {
   const body = document.createElement("div");
   body.style.flex = "1";
   body.style.display = "flex";
   body.style.flexDirection = "column";
   body.style.minHeight = "0";
   body.innerHTML = `
-    <div class="topicbar" id="chat-topic">topic: —</div>
+    <div class="topicbar" id="chat-topic"><span id="chat-topic-text">topic: —</span><span class="chat-room-tag" id="chat-room-tag"></span></div>
+    <div class="chat-invite-banner hidden" id="chat-invite-banner"></div>
     <div class="chat-layout">
       <div class="chat-scroll" id="chat-scroll"></div>
       <aside class="userlist"><div class="hdr">online</div><div id="chat-users"></div></aside>
@@ -33,8 +35,52 @@ export function buildChat(sendMessage, getInfo) {
 
   const scroll = body.querySelector("#chat-scroll");
   const usersEl = body.querySelector("#chat-users");
-  const topicEl = body.querySelector("#chat-topic");
+  const topicTextEl = body.querySelector("#chat-topic-text");
+  const roomTagEl = body.querySelector("#chat-room-tag");
+  const inviteBanner = body.querySelector("#chat-invite-banner");
   const entry = body.querySelector("#chat-entry");
+
+  function renderRoomTag() {
+    const room = getState().room;
+    if (room === DEFAULT_ROOM) {
+      roomTagEl.innerHTML = "";
+      return;
+    }
+    roomTagEl.innerHTML = ` · private chat <button class="mini" id="chat-back-to-lobby">Back to Lobby</button>`;
+    roomTagEl.querySelector("#chat-back-to-lobby").onclick = () => switchRoom(DEFAULT_ROOM);
+  }
+
+  async function switchRoom(room) {
+    const previous = getState().room;
+    if (previous === room) return;
+    try {
+      await invoke("join_room", { room });
+      if (previous) await invoke("leave_room", { room: previous });
+      update({ room, users: [], topic: "" });
+      topicTextEl.textContent = "topic: —";
+      renderRoomTag();
+      scroll.innerHTML = "";
+      line("sys", `*** now in ${room === DEFAULT_ROOM ? "the lobby" : "a private chat"}`);
+    } catch (err) {
+      line("err", "! " + (err.message || err));
+    }
+  }
+
+  /** A ChatInvited event — show an accept/ignore banner. */
+  function onInvited(ev) {
+    inviteBanner.innerHTML =
+      `<b>${esc(ev.from)}</b> invited you to a private chat — ` +
+      `<button class="mini" id="chat-invite-join">Join</button>` +
+      `<button class="mini" id="chat-invite-ignore">Ignore</button>`;
+    inviteBanner.classList.remove("hidden");
+    inviteBanner.querySelector("#chat-invite-join").onclick = async () => {
+      inviteBanner.classList.add("hidden");
+      await switchRoom(ev.room);
+    };
+    inviteBanner.querySelector("#chat-invite-ignore").onclick = () => {
+      inviteBanner.classList.add("hidden");
+    };
+  }
 
   function line(cls, html) {
     const div = document.createElement("div");
@@ -133,14 +179,18 @@ export function buildChat(sendMessage, getInfo) {
           const items = [];
           if (sendMessage && u !== me) items.push({ label: "Send Message", fn: () => sendMessage(u) });
           if (getInfo) items.push({ label: "Get Info", fn: () => getInfo(u) });
+          if (inviteToChat && u !== me) {
+            items.push({ label: "Invite to Chat…", fn: () => inviteToChat(u) });
+          }
           if (items.length) showMenu(e.clientX, e.clientY, items);
         });
         usersEl.appendChild(d);
       }
     },
     onTopic(topic) {
-      topicEl.textContent = "topic: " + (topic || "—");
+      topicTextEl.textContent = "topic: " + (topic || "—");
     },
+    onInvited: onInvited,
     onWarning(text) {
       line("warn", "! " + esc(text));
     },
