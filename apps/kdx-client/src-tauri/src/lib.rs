@@ -44,6 +44,11 @@ pub fn run() {
             commands::list_accounts,
             commands::create_account,
             commands::update_account,
+            commands::list_newsgroups,
+            commands::create_newsgroup,
+            commands::list_thread,
+            commands::create_post,
+            commands::delete_post,
         ])
         .run(tauri::generate_context!())
         .expect("error while running KDX");

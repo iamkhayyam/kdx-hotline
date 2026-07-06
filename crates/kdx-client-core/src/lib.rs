@@ -29,7 +29,9 @@ use tokio_util::codec::Framed;
 
 pub use config::{ClientConfig, TrustPolicy};
 pub use error::ClientError;
-pub use event::{AccountSummary, Direction, Event, PresenceUser, RoleInfo};
+pub use event::{
+    AccountSummary, Direction, Event, NewsPost, NewsgroupInfo, PresenceUser, RoleInfo,
+};
 pub use handle::{ClientHandle, Session};
 pub use tls::{spki_fingerprint, KnownHosts};
 

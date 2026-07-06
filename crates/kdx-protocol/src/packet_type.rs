@@ -57,6 +57,15 @@ pub enum PacketType {
     AccountListRequest = 0x5B,
     AccountListResponse = 0x5C,
 
+    // Public News (0x60-0x66)
+    NewsgroupListRequest = 0x60,
+    NewsgroupListResponse = 0x61,
+    NewsThreadListRequest = 0x62,
+    NewsThreadListResponse = 0x63,
+    NewsPostCreate = 0x64,
+    NewsPostDelete = 0x65,
+    NewsgroupCreate = 0x66,
+
     // System (0xF0-0xFF)
     Error = 0xF0,
     Warning = 0xF1,
@@ -64,7 +73,7 @@ pub enum PacketType {
 }
 
 impl PacketType {
-    pub const ALL: [PacketType; 43] = [
+    pub const ALL: [PacketType; 50] = [
         PacketType::HandshakeInit,
         PacketType::HandshakeResp,
         PacketType::Ping,
@@ -105,6 +114,13 @@ impl PacketType {
         PacketType::AccountUpdate,
         PacketType::AccountListRequest,
         PacketType::AccountListResponse,
+        PacketType::NewsgroupListRequest,
+        PacketType::NewsgroupListResponse,
+        PacketType::NewsThreadListRequest,
+        PacketType::NewsThreadListResponse,
+        PacketType::NewsPostCreate,
+        PacketType::NewsPostDelete,
+        PacketType::NewsgroupCreate,
         PacketType::Error,
         PacketType::Warning,
         PacketType::Info,
@@ -157,6 +173,13 @@ impl TryFrom<u8> for PacketType {
             0x5A => AccountUpdate,
             0x5B => AccountListRequest,
             0x5C => AccountListResponse,
+            0x60 => NewsgroupListRequest,
+            0x61 => NewsgroupListResponse,
+            0x62 => NewsThreadListRequest,
+            0x63 => NewsThreadListResponse,
+            0x64 => NewsPostCreate,
+            0x65 => NewsPostDelete,
+            0x66 => NewsgroupCreate,
             0xF0 => Error,
             0xF1 => Warning,
             0xF2 => Info,

@@ -6,7 +6,7 @@ use std::path::PathBuf;
 
 use kdx_client_core::{
     connect as core_connect, trust_server, AccountSummary, ClientConfig, ClientError, Event,
-    PresenceUser, RoleInfo,
+    NewsPost, NewsgroupInfo, PresenceUser, RoleInfo,
 };
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -317,4 +317,51 @@ pub async fn update_account(
         c.update_account(&username, base_class, granted, revoked).await
     })
     .await
+}
+
+#[tauri::command]
+pub async fn list_newsgroups(state: State<'_, AppState>) -> CmdResult<Vec<NewsgroupInfo>> {
+    with_client(&state, |c| async move { c.list_newsgroups().await }).await
+}
+
+#[tauri::command]
+pub async fn create_newsgroup(
+    state: State<'_, AppState>,
+    name: String,
+    description: String,
+    min_read_class: u8,
+    min_post_class: u8,
+) -> CmdResult<Vec<NewsgroupInfo>> {
+    with_client(&state, |c| async move {
+        c.create_newsgroup(&name, &description, min_read_class, min_post_class)
+            .await
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn list_thread(
+    state: State<'_, AppState>,
+    newsgroup_id: String,
+) -> CmdResult<Vec<NewsPost>> {
+    with_client(&state, |c| async move { c.list_thread(&newsgroup_id).await }).await
+}
+
+#[tauri::command]
+pub async fn create_post(
+    state: State<'_, AppState>,
+    newsgroup_id: String,
+    parent_id: String,
+    subject: String,
+    body: String,
+) -> CmdResult<Vec<NewsPost>> {
+    with_client(&state, |c| async move {
+        c.create_post(&newsgroup_id, &parent_id, &subject, &body).await
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn delete_post(state: State<'_, AppState>, post_id: String) -> CmdResult<Vec<NewsPost>> {
+    with_client(&state, |c| async move { c.delete_post(&post_id).await }).await
 }

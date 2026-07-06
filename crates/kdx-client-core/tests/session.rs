@@ -448,6 +448,79 @@ async fn plain_user_cannot_manage_accounts() {
 }
 
 #[tokio::test]
+async fn news_post_read_threaded_and_class_gated() {
+    let ts = TestServer::start().await;
+    ts.seed_account("sysop", "pw", 3).await; // Admin: USER_ADMIN, can create groups
+    ts.seed_account("reader", "pw", 1).await; // plain user
+    ts.seed_account("guest", "pw", 0).await; // guest
+
+    let (sysop, mut es, _d1) = ts.connect_client().await;
+    next_event(&mut es).await;
+    sysop.login("sysop", "pw").await.unwrap();
+
+    // Admin creates a newsgroup readable by all, postable by user+ (class >= 1).
+    let groups = sysop.create_newsgroup("general", "chatter", 0, 1).await.unwrap();
+    assert_eq!(groups.len(), 1);
+    let group_id = groups[0].id.clone();
+
+    // Admin starts a thread; the reader replies to it.
+    let posts = sysop.create_post(&group_id, "", "welcome", "first post").await.unwrap();
+    assert_eq!(posts.len(), 1);
+    let root_id = posts[0].id.clone();
+    assert_eq!(posts[0].parent_id, "");
+
+    let (reader, mut er, _d2) = ts.connect_client().await;
+    next_event(&mut er).await;
+    reader.login("reader", "pw").await.unwrap();
+
+    // The reader sees the admin's thread and replies under the root.
+    let seen = reader.list_thread(&group_id).await.unwrap();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].subject, "welcome");
+
+    let after_reply = reader.create_post(&group_id, &root_id, "re: welcome", "hi there").await.unwrap();
+    assert_eq!(after_reply.len(), 2);
+    let reply = after_reply.iter().find(|p| p.parent_id == root_id).expect("threaded reply");
+    assert_eq!(reply.author, "reader");
+
+    // A guest (class 0) may read (min_read 0) but not post (min_post 1).
+    let (guest, mut eg, _d3) = ts.connect_client().await;
+    next_event(&mut eg).await;
+    guest.login("guest", "pw").await.unwrap();
+    assert_eq!(guest.list_thread(&group_id).await.unwrap().len(), 2);
+    assert!(matches!(
+        guest.create_post(&group_id, "", "sneaky", "nope").await,
+        Err(ClientError::Server(_))
+    ));
+
+    // The reader can delete their own reply; the leftover is the root.
+    let after_delete = reader.delete_post(&reply.id).await.unwrap();
+    assert_eq!(after_delete.len(), 1);
+    assert_eq!(after_delete[0].id, root_id);
+
+    ts.stop();
+}
+
+#[tokio::test]
+async fn plain_user_cannot_create_newsgroup() {
+    let ts = TestServer::start().await;
+    ts.seed_account("plain", "pw", 1).await;
+
+    let (client, mut events, _dd) = ts.connect_client().await;
+    next_event(&mut events).await;
+    client.login("plain", "pw").await.unwrap();
+
+    assert!(matches!(
+        client.create_newsgroup("hax", "", 0, 0).await,
+        Err(ClientError::Server(_))
+    ));
+    // Listing (read) is open to any connected user.
+    assert!(client.list_newsgroups().await.unwrap().is_empty());
+
+    ts.stop();
+}
+
+#[tokio::test]
 async fn plain_user_cannot_disconnect_others() {
     let ts = TestServer::start().await;
     ts.seed_account("nobody", "pw", 1).await; // no USER_KICK

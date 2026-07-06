@@ -8,6 +8,7 @@ mod auth;
 mod chat;
 mod file;
 mod handshake;
+mod news;
 mod presence;
 mod private;
 mod roles;
@@ -27,6 +28,10 @@ pub use file::{
     KIND_UPLOAD, TRANSFER_ABORTED, TRANSFER_HASH_MISMATCH, TRANSFER_VERIFIED,
 };
 pub use handshake::{HandshakeInit, HandshakeResp};
+pub use news::{
+    NewsPost, NewsPostCreate, NewsPostDelete, NewsThreadListRequest, NewsThreadListResponse,
+    NewsgroupCreate, NewsgroupInfo, NewsgroupListRequest, NewsgroupListResponse,
+};
 pub use presence::{
     PresenceChange, PresenceEntry, PresenceListRequest, PresenceListResponse, UserInfoRequest,
     UserInfoResponse,

@@ -7,6 +7,7 @@ pub mod auth;
 pub mod chat;
 pub mod connection;
 pub mod files;
+pub mod news;
 pub mod presence;
 pub mod tracker;
 pub mod transfer;

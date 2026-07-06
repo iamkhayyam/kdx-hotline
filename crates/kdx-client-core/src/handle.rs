@@ -5,7 +5,7 @@ use tokio::sync::{mpsc, oneshot};
 use kdx_protocol::messages::FileListResponse;
 
 use crate::error::ClientError;
-use crate::event::{AccountSummary, PresenceUser, RoleInfo};
+use crate::event::{AccountSummary, NewsPost, NewsgroupInfo, PresenceUser, RoleInfo};
 
 /// A logged-in session's identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -127,6 +127,31 @@ pub(crate) enum Command {
         granted: u32,
         revoked: u32,
         reply: oneshot::Sender<Result<Vec<AccountSummary>, ClientError>>,
+    },
+    ListNewsgroups {
+        reply: oneshot::Sender<Result<Vec<NewsgroupInfo>, ClientError>>,
+    },
+    CreateNewsgroup {
+        name: String,
+        description: String,
+        min_read_class: u8,
+        min_post_class: u8,
+        reply: oneshot::Sender<Result<Vec<NewsgroupInfo>, ClientError>>,
+    },
+    ListThread {
+        newsgroup_id: String,
+        reply: oneshot::Sender<Result<Vec<NewsPost>, ClientError>>,
+    },
+    CreatePost {
+        newsgroup_id: String,
+        parent_id: String,
+        subject: String,
+        body: String,
+        reply: oneshot::Sender<Result<Vec<NewsPost>, ClientError>>,
+    },
+    DeletePost {
+        post_id: String,
+        reply: oneshot::Sender<Result<Vec<NewsPost>, ClientError>>,
     },
     Disconnect,
 }
@@ -405,6 +430,69 @@ impl ClientHandle {
             base_class,
             granted,
             revoked,
+            reply,
+        })
+        .await
+    }
+
+    /// List the newsgroups the caller may read (the News window's tree).
+    pub async fn list_newsgroups(&self) -> Result<Vec<NewsgroupInfo>, ClientError> {
+        self.send(|reply| Command::ListNewsgroups { reply }).await
+    }
+
+    /// Create a newsgroup with class thresholds. Requires `USER_ADMIN`.
+    /// Resolves with the updated newsgroup list.
+    pub async fn create_newsgroup(
+        &self,
+        name: &str,
+        description: &str,
+        min_read_class: u8,
+        min_post_class: u8,
+    ) -> Result<Vec<NewsgroupInfo>, ClientError> {
+        self.send(|reply| Command::CreateNewsgroup {
+            name: name.to_owned(),
+            description: description.to_owned(),
+            min_read_class,
+            min_post_class,
+            reply,
+        })
+        .await
+    }
+
+    /// Every post in a newsgroup, oldest first; the caller builds the thread
+    /// tree from each post's `parent_id`.
+    pub async fn list_thread(&self, newsgroup_id: &str) -> Result<Vec<NewsPost>, ClientError> {
+        self.send(|reply| Command::ListThread {
+            newsgroup_id: newsgroup_id.to_owned(),
+            reply,
+        })
+        .await
+    }
+
+    /// Post to a newsgroup. `parent_id` empty starts a new thread; otherwise it
+    /// replies to that post. Resolves with the newsgroup's updated post list.
+    pub async fn create_post(
+        &self,
+        newsgroup_id: &str,
+        parent_id: &str,
+        subject: &str,
+        body: &str,
+    ) -> Result<Vec<NewsPost>, ClientError> {
+        self.send(|reply| Command::CreatePost {
+            newsgroup_id: newsgroup_id.to_owned(),
+            parent_id: parent_id.to_owned(),
+            subject: subject.to_owned(),
+            body: body.to_owned(),
+            reply,
+        })
+        .await
+    }
+
+    /// Delete a post you authored (admins may delete any). Resolves with the
+    /// newsgroup's updated post list.
+    pub async fn delete_post(&self, post_id: &str) -> Result<Vec<NewsPost>, ClientError> {
+        self.send(|reply| Command::DeletePost {
+            post_id: post_id.to_owned(),
             reply,
         })
         .await

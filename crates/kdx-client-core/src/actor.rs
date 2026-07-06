@@ -16,6 +16,8 @@ use kdx_protocol::messages::{
     AccountCreate, AccountListRequest, AccountListResponse, AccountRolesRequest,
     AccountRolesResponse, AccountUpdate, AdminDisconnect, AuthChallenge, AuthRequest, AuthResponse,
     AuthResult, ChatEvent, ChatJoin, ChatLeave, ChatSend, ChatTopic, ChatUserList, FileListRequest,
+    NewsPostCreate, NewsPostDelete, NewsThreadListRequest, NewsThreadListResponse, NewsgroupCreate,
+    NewsgroupListRequest, NewsgroupListResponse,
     FileListResponse, PresenceChange, PresenceListRequest, PresenceListResponse, PrivateMessage,
     PrivateSend, RoleAssign, RoleCreate, RoleDelete, RoleListRequest, RoleListResponse,
     RoleUnassign, RoleUpdate, TransferAccept, TransferData, TransferEnd, TransferRequest,
@@ -34,7 +36,9 @@ use tracing::{debug, warn};
 use uuid::Uuid;
 
 use crate::error::ClientError;
-use crate::event::{AccountSummary, Direction, Event, PresenceUser, RoleInfo};
+use crate::event::{
+    AccountSummary, Direction, Event, NewsPost, NewsgroupInfo, PresenceUser, RoleInfo,
+};
 use crate::handle::{Command, Session};
 use crate::transfer::{chunk_len, total_chunks, ChunkBitmap, Sidecar, DEFAULT_CHUNK_SIZE};
 
@@ -95,6 +99,8 @@ pub(crate) struct Actor<S> {
     role_waiters: VecDeque<oneshot::Sender<Result<Vec<RoleInfo>, ClientError>>>,
     account_roles_waiters: VecDeque<oneshot::Sender<Result<Vec<String>, ClientError>>>,
     account_waiters: VecDeque<oneshot::Sender<Result<Vec<AccountSummary>, ClientError>>>,
+    newsgroup_waiters: VecDeque<oneshot::Sender<Result<Vec<NewsgroupInfo>, ClientError>>>,
+    thread_waiters: VecDeque<oneshot::Sender<Result<Vec<NewsPost>, ClientError>>>,
     transfer: Option<Transfer>,
 }
 
@@ -117,6 +123,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
             role_waiters: VecDeque::new(),
             account_roles_waiters: VecDeque::new(),
             account_waiters: VecDeque::new(),
+            newsgroup_waiters: VecDeque::new(),
+            thread_waiters: VecDeque::new(),
             transfer: None,
         }
     }
@@ -185,6 +193,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
             let _ = waiter.send(Err(ClientError::Disconnected));
         }
         for waiter in self.account_waiters.drain(..) {
+            let _ = waiter.send(Err(ClientError::Disconnected));
+        }
+        for waiter in self.newsgroup_waiters.drain(..) {
+            let _ = waiter.send(Err(ClientError::Disconnected));
+        }
+        for waiter in self.thread_waiters.drain(..) {
             let _ = waiter.send(Err(ClientError::Disconnected));
         }
         if let Some(reply) = self.transfer.take().and_then(transfer_reply) {
@@ -468,6 +482,102 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
                     }
                 }
             }
+            Command::ListNewsgroups { reply } => {
+                match self
+                    .send(PacketType::NewsgroupListRequest, NewsgroupListRequest.encode())
+                    .await
+                {
+                    Ok(()) => self.newsgroup_waiters.push_back(reply),
+                    Err(e) => {
+                        let _ = reply.send(Err(e.into()));
+                    }
+                }
+            }
+            Command::CreateNewsgroup {
+                name,
+                description,
+                min_read_class,
+                min_post_class,
+                reply,
+            } => {
+                let msg = NewsgroupCreate {
+                    name,
+                    description,
+                    min_read_class,
+                    min_post_class,
+                };
+                match self.send(PacketType::NewsgroupCreate, msg.encode()).await {
+                    Ok(()) => self.newsgroup_waiters.push_back(reply),
+                    Err(e) => {
+                        let _ = reply.send(Err(e.into()));
+                    }
+                }
+            }
+            Command::ListThread {
+                newsgroup_id,
+                reply,
+            } => {
+                let Some(newsgroup_id) = parse_role_id(&newsgroup_id) else {
+                    let _ = reply.send(Err(ClientError::InvalidInput("bad newsgroup id".into())));
+                    return Ok(());
+                };
+                let msg = NewsThreadListRequest { newsgroup_id };
+                match self.send(PacketType::NewsThreadListRequest, msg.encode()).await {
+                    Ok(()) => self.thread_waiters.push_back(reply),
+                    Err(e) => {
+                        let _ = reply.send(Err(e.into()));
+                    }
+                }
+            }
+            Command::CreatePost {
+                newsgroup_id,
+                parent_id,
+                subject,
+                body,
+                reply,
+            } => {
+                let Some(newsgroup_id) = parse_role_id(&newsgroup_id) else {
+                    let _ = reply.send(Err(ClientError::InvalidInput("bad newsgroup id".into())));
+                    return Ok(());
+                };
+                // Empty parent = new thread → all-zeros sentinel.
+                let parent_id = if parent_id.is_empty() {
+                    [0u8; 16]
+                } else {
+                    match parse_role_id(&parent_id) {
+                        Some(id) => id,
+                        None => {
+                            let _ = reply.send(Err(ClientError::InvalidInput("bad parent id".into())));
+                            return Ok(());
+                        }
+                    }
+                };
+                let msg = NewsPostCreate {
+                    newsgroup_id,
+                    parent_id,
+                    subject,
+                    body,
+                };
+                match self.send(PacketType::NewsPostCreate, msg.encode()).await {
+                    Ok(()) => self.thread_waiters.push_back(reply),
+                    Err(e) => {
+                        let _ = reply.send(Err(e.into()));
+                    }
+                }
+            }
+            Command::DeletePost { post_id, reply } => {
+                let Some(post_id) = parse_role_id(&post_id) else {
+                    let _ = reply.send(Err(ClientError::InvalidInput("bad post id".into())));
+                    return Ok(());
+                };
+                let msg = NewsPostDelete { post_id };
+                match self.send(PacketType::NewsPostDelete, msg.encode()).await {
+                    Ok(()) => self.thread_waiters.push_back(reply),
+                    Err(e) => {
+                        let _ = reply.send(Err(e.into()));
+                    }
+                }
+            }
             Command::Disconnect => unreachable!("handled in run loop"),
         }
         Ok(())
@@ -646,6 +756,18 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
                         .into_iter()
                         .map(Into::into)
                         .collect()));
+                }
+            }
+            PacketType::NewsgroupListResponse => {
+                let response = NewsgroupListResponse::decode(&frame.payload)?;
+                if let Some(waiter) = self.newsgroup_waiters.pop_front() {
+                    let _ = waiter.send(Ok(response.groups.into_iter().map(Into::into).collect()));
+                }
+            }
+            PacketType::NewsThreadListResponse => {
+                let response = NewsThreadListResponse::decode(&frame.payload)?;
+                if let Some(waiter) = self.thread_waiters.pop_front() {
+                    let _ = waiter.send(Ok(response.posts.into_iter().map(Into::into).collect()));
                 }
             }
             PacketType::PresenceChange => {
@@ -884,6 +1006,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
         }
         // Account mutations fail on privilege / duplicate-name / not-found.
         if let Some(waiter) = self.account_waiters.pop_front() {
+            let _ = waiter.send(Err(ClientError::Server(text.clone())));
+        }
+        // News ops fail on privilege / class thresholds / not-found.
+        if let Some(waiter) = self.newsgroup_waiters.pop_front() {
+            let _ = waiter.send(Err(ClientError::Server(text.clone())));
+        }
+        if let Some(waiter) = self.thread_waiters.pop_front() {
             let _ = waiter.send(Err(ClientError::Server(text.clone())));
         }
         self.emit(Event::ServerError { text }).await;

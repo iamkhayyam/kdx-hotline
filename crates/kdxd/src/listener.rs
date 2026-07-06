@@ -5,6 +5,7 @@ use std::time::Duration;
 use kdx_server_core::auth::{AuthManager, RoleManager};
 use kdx_server_core::chat::RoomManager;
 use kdx_server_core::files::FileTree;
+use kdx_server_core::news::NewsManager;
 use kdx_server_core::transfer::{TransferConfig, TransferManager};
 use kdx_server_core::{Connection, Presence, ServerCtx};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -70,6 +71,7 @@ pub async fn serve(config: Config) -> Result<Server, ServeError> {
     .map_err(|e| ServeError::Init(e.to_string()))?;
     let ctx = Arc::new(ServerCtx {
         roles: RoleManager::new(pool.clone()),
+        news: NewsManager::new(pool.clone()),
         auth: AuthManager::new(pool, Duration::from_secs(config.session_ttl_secs)),
         rooms: RoomManager::new(),
         tree,

@@ -77,6 +77,61 @@ impl From<kdx_protocol::messages::AccountSummary> for AccountSummary {
     }
 }
 
+/// A newsgroup as shown in the News window. Mirrors
+/// `kdx_protocol::messages::NewsgroupInfo`; ids are stringified UUIDs.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct NewsgroupInfo {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub min_read_class: u8,
+    pub min_post_class: u8,
+}
+
+impl From<kdx_protocol::messages::NewsgroupInfo> for NewsgroupInfo {
+    fn from(g: kdx_protocol::messages::NewsgroupInfo) -> Self {
+        Self {
+            id: Uuid::from_bytes(g.id).to_string(),
+            name: g.name,
+            description: g.description,
+            min_read_class: g.min_read_class,
+            min_post_class: g.min_post_class,
+        }
+    }
+}
+
+/// One post in a newsgroup thread. `parent_id` is an empty string for a thread
+/// root (matching the all-zeros wire sentinel).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct NewsPost {
+    pub id: String,
+    pub newsgroup_id: String,
+    pub parent_id: String,
+    pub author: String,
+    pub subject: String,
+    pub body: String,
+    pub timestamp: u64,
+}
+
+impl From<kdx_protocol::messages::NewsPost> for NewsPost {
+    fn from(p: kdx_protocol::messages::NewsPost) -> Self {
+        let parent_id = if p.parent_id == [0u8; 16] {
+            String::new()
+        } else {
+            Uuid::from_bytes(p.parent_id).to_string()
+        };
+        Self {
+            id: Uuid::from_bytes(p.id).to_string(),
+            newsgroup_id: Uuid::from_bytes(p.newsgroup_id).to_string(),
+            parent_id,
+            author: p.author,
+            subject: p.subject,
+            body: p.body,
+            timestamp: p.timestamp,
+        }
+    }
+}
+
 /// Events pushed from the connection actor to the application. The serde
 /// representation (`{ "type": "chat", ... }`) is the exact contract the
 /// webview consumes, so its shape is covered by a test.

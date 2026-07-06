@@ -16,11 +16,13 @@ use kdx_protocol::messages::{
     AccountCreate, AccountListRequest, AccountListResponse, AccountRolesRequest,
     AccountRolesResponse, AccountSummary, AccountUpdate, AdminDisconnect, AuthChallenge,
     AuthRequest, AuthResponse, AuthResult, ChatJoin, ChatLeave, ChatSend, ChatTopic, FileEntry,
-    FileListRequest,
-    FileListResponse, HandshakeInit, HandshakeResp, PresenceListRequest, PresenceListResponse,
-    PrivateMessage, PrivateSend, RoleAssign, RoleCreate, RoleDelete, RoleInfo, RoleListRequest,
-    RoleListResponse, RoleUnassign, RoleUpdate, TransferAccept, TransferData, TransferEnd,
-    TransferRequest, UserInfoRequest, UserInfoResponse, TRANSFER_HASH_MISMATCH, TRANSFER_VERIFIED,
+    FileListRequest, FileListResponse, HandshakeInit, HandshakeResp, NewsPost as WireNewsPost,
+    NewsPostCreate, NewsPostDelete, NewsThreadListRequest, NewsThreadListResponse, NewsgroupCreate,
+    NewsgroupInfo, NewsgroupListRequest, NewsgroupListResponse, PresenceListRequest,
+    PresenceListResponse, PrivateMessage, PrivateSend, RoleAssign, RoleCreate, RoleDelete, RoleInfo,
+    RoleListRequest, RoleListResponse, RoleUnassign, RoleUpdate, TransferAccept, TransferData,
+    TransferEnd, TransferRequest, UserInfoRequest, UserInfoResponse, TRANSFER_HASH_MISMATCH,
+    TRANSFER_VERIFIED,
 };
 use kdx_protocol::{
     KdxCodec, KdxFrame, PacketFlags, PacketHeader, PacketType, ProtocolError, Reassembler,
@@ -36,6 +38,7 @@ use uuid::Uuid;
 use crate::auth::{AuthManager, Privileges, Role, RoleManager, Session};
 use crate::chat::{Member, Outbound, RoomCommand, RoomManager};
 use crate::files::FileTree;
+use crate::news::{NewsManager, Post as NewsPostDomain};
 use crate::presence::{unix_now, Presence};
 use crate::transfer::{resume_id_from_wire, ActiveUpload, TransferError, TransferManager};
 
@@ -61,6 +64,7 @@ pub const OUTBOUND_QUEUE: usize = 128;
 pub struct ServerCtx {
     pub auth: AuthManager,
     pub roles: RoleManager,
+    pub news: NewsManager,
     pub rooms: RoomManager,
     pub tree: FileTree,
     pub transfers: TransferManager,
@@ -878,6 +882,108 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                         Err(e) => self.send_error(&e.to_string()).await?,
                     }
                 }
+                PacketType::NewsgroupListRequest => {
+                    NewsgroupListRequest::decode(&frame.payload)?;
+                    self.reply_newsgroup_list().await?;
+                }
+                PacketType::NewsgroupCreate => {
+                    let create = NewsgroupCreate::decode(&frame.payload)?;
+                    let privs = self.session.as_ref().expect("authed").privileges;
+                    if !privs.contains(Privileges::USER_ADMIN) {
+                        self.send_error("missing USER_ADMIN privilege").await?;
+                        continue;
+                    }
+                    if create.name.trim().is_empty() {
+                        self.send_error("newsgroup name is required").await?;
+                        continue;
+                    }
+                    match self
+                        .ctx
+                        .news
+                        .create_group(
+                            &create.name,
+                            &create.description,
+                            create.min_read_class,
+                            create.min_post_class,
+                        )
+                        .await
+                    {
+                        Ok(_) => self.reply_newsgroup_list().await?,
+                        Err(e) => self.send_error(&e.to_string()).await?,
+                    }
+                }
+                PacketType::NewsThreadListRequest => {
+                    let req = NewsThreadListRequest::decode(&frame.payload)?;
+                    let group_id = Uuid::from_bytes(req.newsgroup_id);
+                    match self.ctx.news.group(group_id).await {
+                        Ok(group) => {
+                            let my_class = self.session.as_ref().expect("authed").class as u8;
+                            if my_class < group.min_read_class {
+                                self.send_error("you may not read this newsgroup").await?;
+                                continue;
+                            }
+                            self.reply_thread_list(group_id).await?;
+                        }
+                        Err(e) => self.send_error(&e.to_string()).await?,
+                    }
+                }
+                PacketType::NewsPostCreate => {
+                    let post = NewsPostCreate::decode(&frame.payload)?;
+                    let (author, my_class) = {
+                        let s = self.session.as_ref().expect("authed");
+                        (s.username.clone(), s.class as u8)
+                    };
+                    let group_id = Uuid::from_bytes(post.newsgroup_id);
+                    let group = match self.ctx.news.group(group_id).await {
+                        Ok(g) => g,
+                        Err(e) => {
+                            self.send_error(&e.to_string()).await?;
+                            continue;
+                        }
+                    };
+                    if my_class < group.min_post_class {
+                        self.send_error("you may not post to this newsgroup").await?;
+                        continue;
+                    }
+                    if post.subject.trim().is_empty() {
+                        self.send_error("a subject is required").await?;
+                        continue;
+                    }
+                    // All-zero parent id means "thread root".
+                    let parent = (post.parent_id != [0u8; 16]).then(|| Uuid::from_bytes(post.parent_id));
+                    match self
+                        .ctx
+                        .news
+                        .create_post(group_id, parent, &author, &post.subject, &post.body, unix_now())
+                        .await
+                    {
+                        Ok(_) => self.reply_thread_list(group_id).await?,
+                        Err(e) => self.send_error(&e.to_string()).await?,
+                    }
+                }
+                PacketType::NewsPostDelete => {
+                    let del = NewsPostDelete::decode(&frame.payload)?;
+                    let (username, privs) = {
+                        let s = self.session.as_ref().expect("authed");
+                        (s.username.clone(), s.privileges)
+                    };
+                    let post_id = Uuid::from_bytes(del.post_id);
+                    match self.ctx.news.post(post_id).await {
+                        Ok(post) => {
+                            // Authors may delete their own posts; USER_ADMIN may
+                            // delete anyone's.
+                            if post.author != username && !privs.contains(Privileges::USER_ADMIN) {
+                                self.send_error("you can only delete your own posts").await?;
+                                continue;
+                            }
+                            match self.ctx.news.delete_post(post_id).await {
+                                Ok(()) => self.reply_thread_list(post.newsgroup_id).await?,
+                                Err(e) => self.send_error(&e.to_string()).await?,
+                            }
+                        }
+                        Err(e) => self.send_error(&e.to_string()).await?,
+                    }
+                }
                 PacketType::AdminDisconnect => {
                     let req = AdminDisconnect::decode(&frame.payload)?;
                     // Pull what we need as owned values so we don't hold a
@@ -1049,6 +1155,58 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
         Ok(())
     }
 
+    /// Send the newsgroups the caller may read (filtered by their class) — the
+    /// reply to `NewsgroupListRequest` and to a successful create.
+    async fn reply_newsgroup_list(&mut self) -> Result<(), ConnectionError> {
+        let my_class = self.session.as_ref().expect("authed").class as u8;
+        match self.ctx.news.list_groups().await {
+            Ok(groups) => {
+                let groups = groups
+                    .into_iter()
+                    .filter(|g| my_class >= g.min_read_class)
+                    .map(|g| NewsgroupInfo {
+                        id: *g.id.as_bytes(),
+                        name: g.name,
+                        description: g.description,
+                        min_read_class: g.min_read_class,
+                        min_post_class: g.min_post_class,
+                    })
+                    .collect();
+                let response = NewsgroupListResponse { groups };
+                self.send(
+                    PacketType::NewsgroupListResponse,
+                    PacketFlags::empty(),
+                    response.encode(),
+                )
+                .await?;
+            }
+            Err(e) => self.send_error(&e.to_string()).await?,
+        }
+        Ok(())
+    }
+
+    /// Send every post in a newsgroup — the reply to `NewsThreadListRequest`
+    /// and to a successful post/delete, so the News window re-renders from one
+    /// shape. The caller has already passed the read-class check.
+    async fn reply_thread_list(&mut self, group_id: Uuid) -> Result<(), ConnectionError> {
+        match self.ctx.news.posts(group_id).await {
+            Ok(posts) => {
+                let response = NewsThreadListResponse {
+                    newsgroup_id: *group_id.as_bytes(),
+                    posts: posts.into_iter().map(news_post_to_wire).collect(),
+                };
+                self.send(
+                    PacketType::NewsThreadListResponse,
+                    PacketFlags::empty(),
+                    response.encode(),
+                )
+                .await?;
+            }
+            Err(e) => self.send_error(&e.to_string()).await?,
+        }
+        Ok(())
+    }
+
     /// Stream every chunk the client still needs, then the terminal
     /// `TransferEnd`. Runs inline in the dispatch loop — one transfer at a
     /// time per connection, matching the upload model.
@@ -1136,6 +1294,19 @@ fn is_download(payload: &[u8]) -> bool {
     payload.first() == Some(&kdx_protocol::messages::DIRECTION_DOWNLOAD)
 }
 
+fn news_post_to_wire(p: NewsPostDomain) -> WireNewsPost {
+    WireNewsPost {
+        id: *p.id.as_bytes(),
+        newsgroup_id: *p.newsgroup_id.as_bytes(),
+        // Domain uses Option<Uuid>; the wire uses an all-zeros sentinel root.
+        parent_id: p.parent_id.map(|u| *u.as_bytes()).unwrap_or([0u8; 16]),
+        author: p.author,
+        subject: p.subject,
+        body: p.body,
+        timestamp: p.timestamp,
+    }
+}
+
 fn role_to_wire(role: Role) -> RoleInfo {
     RoleInfo {
         id: *role.id.as_bytes(),
@@ -1173,6 +1344,7 @@ mod tests {
         .unwrap();
         let ctx = Arc::new(ServerCtx {
             roles: RoleManager::new(pool.clone()),
+            news: NewsManager::new(pool.clone()),
             auth: AuthManager::new(pool, Duration::from_secs(60)),
             rooms: RoomManager::new(),
             tree,
@@ -1422,6 +1594,7 @@ mod tests {
         .unwrap();
         let ctx = Arc::new(ServerCtx {
             roles: RoleManager::new(pool.clone()),
+            news: NewsManager::new(pool.clone()),
             auth: AuthManager::new(pool, Duration::from_secs(60)),
             rooms: RoomManager::new(),
             tree,
