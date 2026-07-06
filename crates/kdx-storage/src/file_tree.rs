@@ -114,3 +114,19 @@ pub async fn delete(pool: &SqlitePool, id: &str) -> Result<(), StorageError> {
     }
     Ok(())
 }
+
+/// Re-parent a node (a virtual move — the name stays the same, only
+/// `parent_id` changes). The caller has already checked for a name collision
+/// under the new parent; the table's `UNIQUE(parent_id, name)` constraint is
+/// the backstop.
+pub async fn reparent(pool: &SqlitePool, id: &str, new_parent_id: &str) -> Result<(), StorageError> {
+    let result = sqlx::query("UPDATE file_nodes SET parent_id = ? WHERE id = ?")
+        .bind(new_parent_id)
+        .bind(id)
+        .execute(pool)
+        .await?;
+    if result.rows_affected() == 0 {
+        return Err(StorageError::NotFound);
+    }
+    Ok(())
+}

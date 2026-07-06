@@ -385,6 +385,12 @@ body::before {
 .f-searchbar input:focus { outline: none; border-color: var(--alert); }
 .f-search-status { padding: 0 10px; font-size: 10px; color: var(--grey-dim); min-height: 1.4em; }
 .f-search-status:not(:empty) { padding-top: 3px; }
+
+/* Files: Select-for-Move banner */
+.f-move-banner { padding: 5px 10px; border-bottom: 1px solid var(--chrome-dim); background: #0d0606; font-size: 11px; color: var(--ink); display: flex; align-items: center; gap: 6px; }
+.f-move-banner b { color: var(--amber); }
+.f-move-banner .mini { margin-left: 6px; }
+.f-move-banner .err { color: var(--alert); }
 .pathbar .mini { border: 1px solid var(--chrome); color: #f0b8b8; padding: 2px 8px; font-size: 10px; letter-spacing: .1em; cursor: pointer; background: #240707; text-transform: uppercase; }
 .pathbar .mini:hover { border-color: var(--alert); color: #fff; }
 table.files, table.tracker { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }

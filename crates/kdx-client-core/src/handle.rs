@@ -61,6 +61,11 @@ pub(crate) enum Command {
         path: String,
         reply: oneshot::Sender<Result<FileListResponse, ClientError>>,
     },
+    MovePath {
+        path: String,
+        dest_path: String,
+        reply: oneshot::Sender<Result<FileListResponse, ClientError>>,
+    },
     GenerateCatalog {
         reply: oneshot::Sender<Result<u32, ClientError>>,
     },
@@ -282,6 +287,23 @@ impl ClientHandle {
     pub async fn delete_path(&self, path: &str) -> Result<FileListResponse, ClientError> {
         self.send(|reply| Command::DeletePath {
             path: path.to_owned(),
+            reply,
+        })
+        .await
+    }
+
+    /// Move a node into a different folder (Select-for-Move → Move-into),
+    /// keeping its name. Requires FILE_MANAGE_TREE and write access to both
+    /// the node and the destination. Resolves with the updated listing of
+    /// `dest_path`.
+    pub async fn move_path(
+        &self,
+        path: &str,
+        dest_path: &str,
+    ) -> Result<FileListResponse, ClientError> {
+        self.send(|reply| Command::MovePath {
+            path: path.to_owned(),
+            dest_path: dest_path.to_owned(),
             reply,
         })
         .await

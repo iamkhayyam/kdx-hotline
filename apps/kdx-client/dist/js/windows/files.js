@@ -47,6 +47,7 @@ export function buildFiles() {
       <div class="f-mk-result" id="f-mk-result"></div>
     </form>
     <div class="f-info hidden" id="f-info"></div>
+    <div class="f-move-banner hidden" id="f-move-banner"></div>
     <div class="win-body" style="flex:1" id="f-list"></div>`;
 
   const pathEl = body.querySelector("#f-path");
@@ -56,9 +57,11 @@ export function buildFiles() {
   const infoEl = body.querySelector("#f-info");
   const searchbar = body.querySelector("#f-searchbar");
   const searchStatus = body.querySelector("#f-search-status");
+  const moveBanner = body.querySelector("#f-move-banner");
   let cwd = "/";
   let entries = [];
   let searchHits = null; // non-null while showing search results instead of a folder listing
+  let moving = null; // { path, name } selected via "Select for Move", or null
 
   async function refresh() {
     // Navigating/refreshing a folder always leaves search-results mode.
@@ -107,6 +110,7 @@ export function buildFiles() {
         else items.push({ label: "Open", fn: () => onEntry(e) });
         items.push({ label: "Get Info", fn: () => showInfo(e) });
         items.push({ label: "Copy Name", fn: () => copyText(e.name) });
+        items.push({ label: "Select for Move", fn: () => selectForMove(e) });
         items.push({ label: "Delete", fn: () => deleteEntry(e) });
         items.push({ label: "Refresh", fn: refresh });
         showMenu(ev.clientX, ev.clientY, items);
@@ -206,6 +210,45 @@ export function buildFiles() {
       infoEl.innerHTML = `<span class="err">${escapeHtml(err.message || String(err))}</span>`;
       infoEl.classList.remove("hidden");
     }
+  }
+
+  // Select-for-Move → navigate elsewhere → Move Here (a two-step move, since
+  // the destination is "wherever the browser is currently looking").
+  function selectForMove(e) {
+    moving = { path: joinPath(cwd, e.name), name: e.name };
+    renderMoveBanner();
+  }
+
+  function renderMoveBanner() {
+    if (!moving) {
+      moveBanner.classList.add("hidden");
+      return;
+    }
+    moveBanner.innerHTML =
+      `Moving <b>${escapeHtml(moving.name)}</b> — ` +
+      `<button class="mini" id="f-move-here">Move Here</button>` +
+      `<button class="mini" id="f-move-cancel">Cancel</button>`;
+    moveBanner.classList.remove("hidden");
+    moveBanner.querySelector("#f-move-here").onclick = async () => {
+      try {
+        const res = await invoke("move_path", { path: moving.path, destPath: cwd });
+        entries = res.entries;
+        moving = null;
+        renderMoveBanner();
+        render();
+      } catch (err) {
+        moveBanner.innerHTML = `<span class="err">${escapeHtml(err.message || String(err))}</span> ` +
+          `<button class="mini" id="f-move-cancel">Cancel</button>`;
+        moveBanner.querySelector("#f-move-cancel").onclick = () => {
+          moving = null;
+          renderMoveBanner();
+        };
+      }
+    };
+    moveBanner.querySelector("#f-move-cancel").onclick = () => {
+      moving = null;
+      renderMoveBanner();
+    };
   }
 
   filter.addEventListener("input", render);

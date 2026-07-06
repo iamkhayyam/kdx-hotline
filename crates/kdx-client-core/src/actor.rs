@@ -17,7 +17,8 @@ use kdx_protocol::messages::{
     AccountRolesResponse, AccountUpdate, AdminDisconnect, AuthChallenge, AuthRequest, AuthResponse,
     AuthResult, ChatEvent, ChatJoin, ChatLeave, ChatSend, ChatTopic, ChatUserList,
     FileCatalogGenerated, FileCreateFolder, FileDelete, FileGenerateCatalog, FileListRequest,
-    FileSearchRequest, FileSearchResponse, NewsPostCreate, NewsPostDelete, NewsThreadListRequest,
+    FileMove, FileSearchRequest, FileSearchResponse, NewsPostCreate, NewsPostDelete,
+    NewsThreadListRequest,
     NewsThreadListResponse, NewsgroupCreate, NewsgroupListRequest, NewsgroupListResponse,
     TrackerListRequest, TrackerListResponse,
     FileListResponse, PresenceChange, PresenceListRequest, PresenceListResponse, PrivateMessage,
@@ -304,6 +305,19 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
             }
             Command::DeletePath { path, reply } => {
                 match self.send(PacketType::FileDelete, FileDelete { path }.encode()).await {
+                    Ok(()) => self.list_waiters.push_back(reply),
+                    Err(e) => {
+                        let _ = reply.send(Err(e.into()));
+                    }
+                }
+            }
+            Command::MovePath {
+                path,
+                dest_path,
+                reply,
+            } => {
+                let msg = FileMove { path, dest_path };
+                match self.send(PacketType::FileMove, msg.encode()).await {
                     Ok(()) => self.list_waiters.push_back(reply),
                     Err(e) => {
                         let _ = reply.send(Err(e.into()));

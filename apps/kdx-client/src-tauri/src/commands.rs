@@ -180,6 +180,17 @@ pub async fn delete_path(state: State<'_, AppState>, path: String) -> CmdResult<
 }
 
 #[tauri::command]
+pub async fn move_path(
+    state: State<'_, AppState>,
+    path: String,
+    dest_path: String,
+) -> CmdResult<FileListDto> {
+    with_client(&state, |c| async move { c.move_path(&path, &dest_path).await })
+        .await
+        .map(file_list_dto)
+}
+
+#[tauri::command]
 pub async fn generate_catalog(state: State<'_, AppState>) -> CmdResult<u32> {
     with_client(&state, |c| async move { c.generate_catalog().await }).await
 }

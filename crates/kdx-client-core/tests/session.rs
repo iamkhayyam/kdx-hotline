@@ -502,6 +502,60 @@ async fn news_post_read_threaded_and_class_gated() {
 }
 
 #[tokio::test]
+async fn admin_moves_a_folder_into_another() {
+    let ts = TestServer::start().await;
+    ts.seed_account("sysop", "pw", 3).await; // Admin: has FILE_MANAGE_TREE
+
+    let (sysop, mut es, _d1) = ts.connect_client().await;
+    next_event(&mut es).await;
+    sysop.login("sysop", "pw").await.unwrap();
+
+    sysop.create_folder("/", "a", 0, 0, 1).await.unwrap();
+    sysop.create_folder("/", "b", 0, 0, 1).await.unwrap();
+    sysop.create_folder("/a", "sub", 0, 0, 1).await.unwrap();
+
+    // Move /a (carrying /a/sub with it) into /b; the reply is /b's listing.
+    let dest_listing = sysop.move_path("/a", "/b").await.unwrap();
+    assert!(dest_listing.entries.iter().any(|e| e.name == "a"));
+
+    // /a is gone from root; /b/a/sub still resolves.
+    assert!(sysop.list_files("/a").await.is_err());
+    assert!(sysop.list_files("/b/a/sub").await.is_ok());
+
+    // Moving a folder into its own descendant is refused.
+    assert!(matches!(
+        sysop.move_path("/b/a", "/b/a/sub").await,
+        Err(ClientError::Server(_))
+    ));
+
+    ts.stop();
+}
+
+#[tokio::test]
+async fn plain_user_cannot_move_files() {
+    let ts = TestServer::start().await;
+    ts.seed_account("plain", "pw", 1).await; // no FILE_MANAGE_TREE
+    ts.seed_account("sysop", "pw", 3).await;
+
+    let (sysop, mut es, _d1) = ts.connect_client().await;
+    next_event(&mut es).await;
+    sysop.login("sysop", "pw").await.unwrap();
+    sysop.create_folder("/", "a", 0, 0, 1).await.unwrap();
+    sysop.create_folder("/", "b", 0, 0, 1).await.unwrap();
+
+    let (plain, mut ep, _d2) = ts.connect_client().await;
+    next_event(&mut ep).await;
+    plain.login("plain", "pw").await.unwrap();
+
+    assert!(matches!(
+        plain.move_path("/a", "/b").await,
+        Err(ClientError::Server(_))
+    ));
+
+    ts.stop();
+}
+
+#[tokio::test]
 async fn admin_generates_catalog_and_search_is_class_filtered() {
     let ts = TestServer::start().await;
     ts.seed_account("sysop", "pw", 3).await; // Admin

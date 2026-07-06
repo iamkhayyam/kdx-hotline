@@ -98,6 +98,8 @@ pub enum TreeError {
     CorruptKind(i64),
     #[error("no catalog has been generated yet")]
     CatalogNotGenerated,
+    #[error("cannot move a folder into itself or one of its own descendants")]
+    WouldCreateCycle,
 }
 
 struct TreeState {
@@ -318,6 +320,65 @@ impl FileTree {
         Ok(kind)
     }
 
+    /// Move a node to a new parent folder (Select-for-Move → Move-into),
+    /// keeping its name. Requires write access to both the node itself (you
+    /// must be able to remove it from its current spot) and the destination
+    /// folder (you must be able to place something there) — the same two
+    /// checks `delete` and `prepare_upload` each apply individually. Refuses
+    /// to move the root, move a folder into itself or one of its own
+    /// descendants, or move onto a name collision at the destination.
+    pub async fn move_node(
+        &self,
+        path: &str,
+        dest_path: &str,
+        class: BaseClass,
+    ) -> Result<(), TreeError> {
+        let (node_id, dest_id) = {
+            let state = self.state.read().await;
+            let node = state.resolve(path)?;
+            if node.id == ROOT_ID {
+                return Err(TreeError::NotAFolder); // root isn't a movable entry
+            }
+            acl::check_write(node.kind, node.min_class_write, class)?;
+
+            let dest = state.resolve(dest_path)?;
+            if !dest.kind.is_folder() {
+                return Err(TreeError::NotAFolder);
+            }
+            acl::check_write(dest.kind, dest.min_class_write, class)?;
+
+            if dest.id == node.id || is_descendant(&state, &node.id, &dest.id) {
+                return Err(TreeError::WouldCreateCycle);
+            }
+            if let Some(siblings) = state.children.get(&dest.id) {
+                if siblings
+                    .iter()
+                    .filter(|id| id.as_str() != node.id)
+                    .filter_map(|id| state.nodes.get(id))
+                    .any(|n| n.name == node.name)
+                {
+                    return Err(TreeError::Exists);
+                }
+            }
+            (node.id.clone(), dest.id.clone())
+        };
+
+        file_tree::reparent(&self.pool, &node_id, &dest_id).await?;
+
+        let mut state = self.state.write().await;
+        let old_parent = state.nodes.get(&node_id).and_then(|n| n.parent_id.clone());
+        if let Some(old_parent) = old_parent {
+            if let Some(siblings) = state.children.get_mut(&old_parent) {
+                siblings.retain(|id| id != &node_id);
+            }
+        }
+        state.children.entry(dest_id.clone()).or_default().push(node_id.clone());
+        if let Some(node) = state.nodes.get_mut(&node_id) {
+            node.parent_id = Some(dest_id);
+        }
+        Ok(())
+    }
+
     /// (Re)build the search catalog: a flat snapshot of every entry currently
     /// in the tree, excluding drop-box subtrees (their contents can never be
     /// listed by anyone — same structural rule `list()` enforces). Returns the
@@ -389,6 +450,19 @@ fn collect_subtree(
         }
     }
     ordered.push(id.to_owned());
+}
+
+/// Is `candidate` equal to `ancestor` or somewhere in its subtree? Used to
+/// refuse moving a folder into itself or one of its own descendants.
+fn is_descendant(state: &TreeState, ancestor: &str, candidate: &str) -> bool {
+    if ancestor == candidate {
+        return true;
+    }
+    if let Some(children) = state.children.get(ancestor) {
+        children.iter().any(|c| is_descendant(state, c, candidate))
+    } else {
+        false
+    }
 }
 
 /// Recursively flatten `node`'s subtree into `out`, building full `/`-joined
@@ -633,5 +707,94 @@ mod tests {
         let names: Vec<_> = hits.iter().map(|e| e.name.as_str()).collect();
         assert!(names.contains(&"drop")); // the box itself is indexed
         assert!(!names.contains(&"secret.zip")); // its contents are not
+    }
+
+    #[tokio::test]
+    async fn move_reparents_a_node_and_its_subtree() {
+        let (tree, _dir) = tree().await;
+        tree.create_folder("/", "a", NodeKind::Directory, BaseClass::Guest, BaseClass::User)
+            .await
+            .unwrap();
+        tree.create_folder("/", "b", NodeKind::Directory, BaseClass::Guest, BaseClass::User)
+            .await
+            .unwrap();
+        let a = tree.resolve("/a").await.unwrap();
+        tree.add_file(&a.id, "doc.txt", 3, &[0u8; 32], "/tmp/x")
+            .await
+            .unwrap();
+        tree.create_folder("/a", "sub", NodeKind::Directory, BaseClass::Guest, BaseClass::User)
+            .await
+            .unwrap();
+
+        tree.move_node("/a", "/b", BaseClass::User).await.unwrap();
+
+        assert!(matches!(tree.resolve("/a").await, Err(TreeError::NotFound)));
+        assert!(tree.resolve("/b/a").await.is_ok());
+        // The subtree moved with it.
+        assert!(tree.resolve("/b/a/doc.txt").await.is_ok());
+        assert!(tree.resolve("/b/a/sub").await.is_ok());
+        assert_eq!(tree.list("/b", BaseClass::Guest).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn move_refuses_cycle_root_and_name_collision() {
+        let (tree, _dir) = tree().await;
+        tree.create_folder("/", "a", NodeKind::Directory, BaseClass::Guest, BaseClass::User)
+            .await
+            .unwrap();
+        tree.create_folder("/a", "sub", NodeKind::Directory, BaseClass::Guest, BaseClass::User)
+            .await
+            .unwrap();
+
+        // Can't move a folder into its own descendant.
+        assert!(matches!(
+            tree.move_node("/a", "/a/sub", BaseClass::User).await,
+            Err(TreeError::WouldCreateCycle)
+        ));
+        // Can't move a folder into itself.
+        assert!(matches!(
+            tree.move_node("/a", "/a", BaseClass::User).await,
+            Err(TreeError::WouldCreateCycle)
+        ));
+        // Root is not a movable entry.
+        assert!(tree.move_node("/", "/a", BaseClass::Admin).await.is_err());
+
+        // Name collision at the destination is refused. (Root's default write
+        // class is PowerUser, so use that here — this assertion is about the
+        // collision check, not the ACL check exercised above.)
+        tree.create_folder("/", "sub", NodeKind::Directory, BaseClass::Guest, BaseClass::User)
+            .await
+            .unwrap();
+        assert!(matches!(
+            tree.move_node("/a/sub", "/", BaseClass::PowerUser).await,
+            Err(TreeError::Exists)
+        ));
+    }
+
+    #[tokio::test]
+    async fn move_enforces_write_class_on_source_and_destination() {
+        let (tree, _dir) = tree().await;
+        tree.create_folder("/", "movable", NodeKind::Directory, BaseClass::Guest, BaseClass::User)
+            .await
+            .unwrap();
+        tree.create_folder("/", "vault", NodeKind::Directory, BaseClass::Guest, BaseClass::Admin)
+            .await
+            .unwrap();
+        tree.create_folder(
+            "/",
+            "locked",
+            NodeKind::Directory,
+            BaseClass::Guest,
+            BaseClass::Admin,
+        )
+        .await
+        .unwrap();
+
+        // A plain user can't move into an admin-only destination...
+        assert!(tree.move_node("/movable", "/vault", BaseClass::User).await.is_err());
+        // ...nor move a node they can't write to in the first place.
+        assert!(tree.move_node("/locked", "/", BaseClass::User).await.is_err());
+        // An admin can do both.
+        assert!(tree.move_node("/movable", "/vault", BaseClass::Admin).await.is_ok());
     }
 }

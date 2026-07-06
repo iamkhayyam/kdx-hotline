@@ -17,8 +17,8 @@ use kdx_protocol::messages::{
     AccountRolesResponse, AccountSummary, AccountUpdate, AdminDisconnect, AuthChallenge,
     AuthRequest, AuthResponse, AuthResult, ChatJoin, ChatLeave, ChatSend, ChatTopic,
     FileCatalogGenerated, FileCreateFolder, FileDelete, FileEntry, FileGenerateCatalog,
-    FileListRequest, FileListResponse, FileSearchEntry, FileSearchRequest, FileSearchResponse,
-    HandshakeInit, HandshakeResp, NewsPost as WireNewsPost,
+    FileListRequest, FileListResponse, FileMove, FileSearchEntry, FileSearchRequest,
+    FileSearchResponse, HandshakeInit, HandshakeResp, NewsPost as WireNewsPost,
     NewsPostCreate, NewsPostDelete, NewsThreadListRequest, NewsThreadListResponse, NewsgroupCreate,
     NewsgroupInfo, NewsgroupListRequest, NewsgroupListResponse, PresenceListRequest,
     PresenceListResponse, PrivateMessage, PrivateSend, RoleAssign, RoleCreate, RoleDelete, RoleInfo,
@@ -575,6 +575,21 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                             let parent = parent_path(&req.path);
                             self.reply_file_list(&parent, class).await?;
                         }
+                        Err(e) => self.send_error(&e.to_string()).await?,
+                    }
+                }
+                PacketType::FileMove => {
+                    let req = FileMove::decode(&frame.payload)?;
+                    let (class, privs) = {
+                        let s = self.session.as_ref().expect("authed");
+                        (s.class, s.privileges)
+                    };
+                    if !privs.contains(Privileges::FILE_MANAGE_TREE) {
+                        self.send_error("missing FILE_MANAGE_TREE privilege").await?;
+                        continue;
+                    }
+                    match self.ctx.tree.move_node(&req.path, &req.dest_path, class).await {
+                        Ok(()) => self.reply_file_list(&req.dest_path, class).await?,
                         Err(e) => self.send_error(&e.to_string()).await?,
                     }
                 }

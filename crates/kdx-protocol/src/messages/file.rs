@@ -59,6 +59,15 @@ pub struct FileDelete {
     pub path: String,
 }
 
+/// Client → server: move a node into a different folder (Select-for-Move →
+/// Move-into), keeping its name. Requires write access to both the node and
+/// `dest_path`. The server replies with a `FileListResponse` for `dest_path`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileMove {
+    pub path: String,
+    pub dest_path: String,
+}
+
 /// Client → server: (re)build the server's search catalog — a snapshot index
 /// of the whole tree. Requires `FILE_MANAGE_TREE`; the catalog does not
 /// auto-refresh, so search results reflect the tree as of the last call.
@@ -309,6 +318,21 @@ impl FileSearchResponse {
         }
         expect_end(payload, "FileSearchResponse")?;
         Ok(Self { entries })
+    }
+}
+
+impl FileMove {
+    pub fn encode(&self) -> Bytes {
+        let mut buf = BytesMut::new();
+        put_str(&mut buf, &self.path);
+        put_str(&mut buf, &self.dest_path);
+        buf.freeze()
+    }
+    pub fn decode(mut payload: &[u8]) -> Result<Self, ProtocolError> {
+        let path = get_str(&mut payload, "FileMove")?;
+        let dest_path = get_str(&mut payload, "FileMove")?;
+        expect_end(payload, "FileMove")?;
+        Ok(Self { path, dest_path })
     }
 }
 
@@ -591,5 +615,15 @@ mod tests {
 
         assert!(FileCatalogGenerated::decode(&[0, 0]).is_err());
         assert!(FileSearchResponse::decode(&[0, 0]).is_err());
+    }
+
+    #[test]
+    fn file_move_round_trip() {
+        let mv = FileMove {
+            path: "/a/sub".into(),
+            dest_path: "/b".into(),
+        };
+        assert_eq!(FileMove::decode(&mv.encode()).unwrap(), mv);
+        assert!(FileMove::decode(&[0, 1, 65]).is_err());
     }
 }

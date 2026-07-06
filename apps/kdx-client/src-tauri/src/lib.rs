@@ -29,6 +29,7 @@ pub fn run() {
             commands::list_files,
             commands::create_folder,
             commands::delete_path,
+            commands::move_path,
             commands::generate_catalog,
             commands::search_files,
             commands::list_users,

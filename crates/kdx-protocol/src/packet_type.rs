@@ -27,6 +27,7 @@ pub enum PacketType {
     FileCatalogGenerated = 0x28,
     FileSearchRequest = 0x29,
     FileSearchResponse = 0x2A,
+    FileMove = 0x2B,
 
     // Chat (0x30-0x3F)
     ChatMessage = 0x30,
@@ -83,7 +84,7 @@ pub enum PacketType {
 }
 
 impl PacketType {
-    pub const ALL: [PacketType; 58] = [
+    pub const ALL: [PacketType; 59] = [
         PacketType::HandshakeInit,
         PacketType::HandshakeResp,
         PacketType::Ping,
@@ -104,6 +105,7 @@ impl PacketType {
         PacketType::FileCatalogGenerated,
         PacketType::FileSearchRequest,
         PacketType::FileSearchResponse,
+        PacketType::FileMove,
         PacketType::ChatMessage,
         PacketType::ChatJoin,
         PacketType::ChatLeave,
@@ -171,6 +173,7 @@ impl TryFrom<u8> for PacketType {
             0x28 => FileCatalogGenerated,
             0x29 => FileSearchRequest,
             0x2A => FileSearchResponse,
+            0x2B => FileMove,
             0x30 => ChatMessage,
             0x31 => ChatJoin,
             0x32 => ChatLeave,
