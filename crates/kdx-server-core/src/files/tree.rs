@@ -18,6 +18,10 @@ pub enum NodeKind {
     File,
     DropBox,
     UploadFolder,
+    /// Points at another node; behaves like the target for read/download.
+    /// Never contains children of its own, never has storage, never chains
+    /// (an alias may not target another alias — enforced in `create_alias`).
+    Alias,
 }
 
 impl NodeKind {
@@ -27,6 +31,7 @@ impl NodeKind {
             1 => NodeKind::File,
             2 => NodeKind::DropBox,
             3 => NodeKind::UploadFolder,
+            4 => NodeKind::Alias,
             _ => return None,
         })
     }
@@ -37,11 +42,18 @@ impl NodeKind {
             NodeKind::File => 1,
             NodeKind::DropBox => 2,
             NodeKind::UploadFolder => 3,
+            NodeKind::Alias => 4,
         }
     }
 
+    /// True for kinds that structurally contain other nodes. Aliases are
+    /// NOT folders (they never have `children` of their own — reads through
+    /// them go via the target).
     pub fn is_folder(self) -> bool {
-        !matches!(self, NodeKind::File)
+        matches!(
+            self,
+            NodeKind::Directory | NodeKind::DropBox | NodeKind::UploadFolder
+        )
     }
 }
 
@@ -56,6 +68,12 @@ pub struct Node {
     pub min_class_read: BaseClass,
     pub min_class_write: BaseClass,
     pub storage_path: Option<String>,
+    /// For `NodeKind::Alias`: the id of the target node. `None` for every
+    /// other kind. A dangling alias (target deleted) has `Some(...)` but
+    /// no matching row in the tree — resolving through it yields
+    /// `TreeError::NotFound`, matching the alias's intent (it silently
+    /// stops working when the target goes away).
+    pub target_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -100,6 +118,8 @@ pub enum TreeError {
     CatalogNotGenerated,
     #[error("cannot move a folder into itself or one of its own descendants")]
     WouldCreateCycle,
+    #[error("alias target must be a real file or folder, not another alias")]
+    AliasChainRefused,
 }
 
 struct TreeState {
@@ -132,6 +152,7 @@ fn node_from_row(row: FileNodeRow) -> Result<Node, TreeError> {
         min_class_read: class_from_i64(row.min_class_read),
         min_class_write: class_from_i64(row.min_class_write),
         storage_path: row.storage_path,
+        target_id: row.target_id,
     })
 }
 
@@ -163,9 +184,17 @@ impl FileTree {
 
     /// List a folder's entries, enforcing read ACLs. DropBoxes refuse
     /// listing for everyone — write-only is structural, not conventional.
+    ///
+    /// Aliases resolve transparently: `list("/aliases/pubcopy")` where
+    /// `pubcopy` points at `/pub` lists `/pub`'s children (with `/pub`'s
+    /// ACL). Alias children in the result list themselves show up as
+    /// `NodeKind::Alias` entries carrying the target's displayable size,
+    /// so the UI can badge them without a follow-up round-trip.
     pub async fn list(&self, path: &str, class: BaseClass) -> Result<Vec<Entry>, TreeError> {
         let state = self.state.read().await;
         let node = state.resolve(path)?;
+        // If the path landed on an alias, list what it points at.
+        let node = resolve_through_alias(&state, node)?;
         if !node.kind.is_folder() {
             return Err(TreeError::NotAFolder);
         }
@@ -176,10 +205,24 @@ impl FileTree {
             .map(|ids| {
                 ids.iter()
                     .filter_map(|id| state.nodes.get(id))
-                    .map(|n| Entry {
-                        name: n.name.clone(),
-                        kind: n.kind,
-                        size: n.size,
+                    .map(|n| {
+                        // For an alias child, show the target's size so the
+                        // listing is useful — but keep kind = Alias so the
+                        // UI can badge it.
+                        let size = if n.kind == NodeKind::Alias {
+                            n.target_id
+                                .as_ref()
+                                .and_then(|t| state.nodes.get(t))
+                                .map(|t| t.size)
+                                .unwrap_or(0)
+                        } else {
+                            n.size
+                        };
+                        Entry {
+                            name: n.name.clone(),
+                            kind: n.kind,
+                            size,
+                        }
                     })
                     .collect()
             })
@@ -217,13 +260,22 @@ impl FileTree {
     /// Resolve a file for download, enforcing read access on its containing
     /// folder. A file inside a DropBox is refused (write-only is structural,
     /// same rule as listing), as is a file in a folder the class can't read.
+    ///
+    /// Aliases resolve transparently: downloading `/aliases/pubcopy/x.txt`
+    /// where `pubcopy` points at `/pub` reads `/pub/x.txt`'s bytes. The ACL
+    /// check applies to the *target's* containing folder — you can't escalate
+    /// past a class threshold by aliasing something you'd normally be denied.
     pub async fn open_for_read(&self, path: &str, class: BaseClass) -> Result<Node, TreeError> {
         let state = self.state.read().await;
         let node = state.resolve(path)?;
+        let node = resolve_through_alias(&state, node)?;
         if node.kind != NodeKind::File {
             return Err(TreeError::NotAFile);
         }
         // A file always has a parent; apply the parent folder's read ACL.
+        // For an aliased file, this is the *target's* parent — never the
+        // alias's parent, else you could bypass a stricter target ACL by
+        // dropping an alias into a permissive folder.
         let parent = node
             .parent_id
             .as_ref()
@@ -253,6 +305,53 @@ impl FileTree {
             min_class_write as i64,
         )
         .await?;
+        let node = node_from_row(row)?;
+        self.insert_in_memory(node.clone()).await;
+        Ok(node)
+    }
+
+    /// Create an alias entry at `dest_path` pointing to the node at
+    /// `source_path`, with the source's own leaf name. Requires write
+    /// access to `dest_path`. The source may be any real node (file,
+    /// folder, dropbox, or upload folder) but NOT another alias — no
+    /// chains, so `resolve_through_alias` is a single hop and can't loop.
+    /// Name collisions at the destination are refused.
+    pub async fn create_alias(
+        &self,
+        source_path: &str,
+        dest_path: &str,
+        class: BaseClass,
+    ) -> Result<Node, TreeError> {
+        let (source_id, alias_name, dest_id) = {
+            let state = self.state.read().await;
+            let source = state.resolve(source_path)?;
+            if source.kind == NodeKind::Alias {
+                return Err(TreeError::AliasChainRefused);
+            }
+            if source.id == ROOT_ID {
+                // Aliasing the root would let a caller shadow everything
+                // under an arbitrary name — refuse for the same reason we
+                // refuse to move or delete the root.
+                return Err(TreeError::NotAFile);
+            }
+            let dest = state.resolve(dest_path)?;
+            if !dest.kind.is_folder() {
+                return Err(TreeError::NotAFolder);
+            }
+            acl::check_write(dest.kind, dest.min_class_write, class)?;
+            let alias_name = source.name.clone();
+            if let Some(siblings) = state.children.get(&dest.id) {
+                if siblings
+                    .iter()
+                    .filter_map(|id| state.nodes.get(id))
+                    .any(|n| n.name == alias_name)
+                {
+                    return Err(TreeError::Exists);
+                }
+            }
+            (source.id.clone(), alias_name, dest.id.clone())
+        };
+        let row = file_tree::create_alias(&self.pool, &dest_id, &alias_name, &source_id).await?;
         let node = node_from_row(row)?;
         self.insert_in_memory(node.clone()).await;
         Ok(node)
@@ -466,6 +565,27 @@ fn collect_subtree(
     ordered.push(id.to_owned());
 }
 
+/// If `node` is an alias, look up its target once and return that node.
+/// Otherwise return `node` unchanged. Refuses to follow more than one hop —
+/// `create_alias` guards that a target is never itself an alias, so a
+/// well-formed tree can't chain, and if a chain somehow slipped in this
+/// function returns `NotFound` rather than looping. A dangling alias
+/// (target row gone — either the FK's `ON DELETE SET NULL` fired or the
+/// alias was somehow written pointing at nothing) yields `NotFound`.
+fn resolve_through_alias<'a>(state: &'a TreeState, node: &'a Node) -> Result<&'a Node, TreeError> {
+    if node.kind != NodeKind::Alias {
+        return Ok(node);
+    }
+    let target_id = node.target_id.as_deref().ok_or(TreeError::NotFound)?;
+    let target = state.nodes.get(target_id).ok_or(TreeError::NotFound)?;
+    if target.kind == NodeKind::Alias {
+        // Should be impossible if all writes go through `create_alias`, but
+        // fail closed rather than recurse.
+        return Err(TreeError::AliasChainRefused);
+    }
+    Ok(target)
+}
+
 /// Is `candidate` equal to `ancestor` or somewhere in its subtree? Used to
 /// refuse moving a folder into itself or one of its own descendants.
 fn is_descendant(state: &TreeState, ancestor: &str, candidate: &str) -> bool {
@@ -489,7 +609,11 @@ fn collect_catalog(state: &TreeState, node: &Node, parent_path: &str, out: &mut 
     } else {
         format!("{}/{}", parent_path.trim_end_matches('/'), node.name)
     };
-    if node.id != ROOT_ID {
+    if node.id != ROOT_ID && node.kind != NodeKind::Alias {
+        // Aliases aren't indexed — the target already is, and indexing both
+        // would give duplicate hits for the same underlying content. If the
+        // catalog ever needs to surface aliases explicitly, that's an
+        // orthogonal UI feature; the current search stays deduplicated.
         let min_read_class = if node.kind.is_folder() {
             node.min_class_read
         } else {
@@ -509,8 +633,10 @@ fn collect_catalog(state: &TreeState, node: &Node, parent_path: &str, out: &mut 
             min_read_class,
         });
     }
-    if node.kind == NodeKind::DropBox {
-        return; // structurally unlistable — don't index what's inside
+    if node.kind == NodeKind::DropBox || node.kind == NodeKind::Alias {
+        // Structurally unlistable (dropbox) or has no own children (alias) —
+        // in both cases don't recurse.
+        return;
     }
     if let Some(children) = state.children.get(&node.id) {
         for child_id in children {
@@ -522,14 +648,33 @@ fn collect_catalog(state: &TreeState, node: &Node, parent_path: &str, out: &mut 
 }
 
 impl TreeState {
+    /// Walk `path` segment by segment. Aliases are followed at each
+    /// intermediate step so a path like `/aliases/pub/readme.txt` resolves
+    /// correctly when `pub` is an alias pointing at `/pub` (the walk into
+    /// `readme.txt` continues in the target's children, not the alias's
+    /// empty children map). The *final* segment is intentionally NOT
+    /// unwrapped here — callers use `resolve_through_alias` to decide
+    /// whether to see the alias node itself (e.g. `delete` deletes just the
+    /// alias) or the target (e.g. `list` / `open_for_read` read through).
     fn resolve(&self, path: &str) -> Result<&Node, TreeError> {
         let mut current = self.nodes.get(ROOT_ID).ok_or(TreeError::NotFound)?;
         for segment in path.split('/').filter(|s| !s.is_empty()) {
-            let child_ids = self.children.get(&current.id).ok_or(TreeError::NotFound)?;
+            // Before looking up children, hop through any alias — an alias
+            // has no children of its own, so the walk continues in the
+            // target's children map. We hop here (not at the terminal
+            // result) so that a path landing on an alias still returns the
+            // alias node itself; callers use `resolve_through_alias` when
+            // they want the target instead.
+            let walkable = if current.kind == NodeKind::Alias {
+                resolve_through_alias(self, current)?
+            } else {
+                current
+            };
+            let child_ids = self.children.get(&walkable.id).ok_or(TreeError::NotFound)?;
             current = child_ids
                 .iter()
                 .filter_map(|id| self.nodes.get(id))
-                .find(|n| n.name == segment)
+                .find(|n| n.name == *segment)
                 .ok_or(TreeError::NotFound)?;
         }
         Ok(current)
@@ -819,6 +964,202 @@ mod tests {
         assert!(matches!(
             tree.move_node("/a/sub", "/", BaseClass::PowerUser).await,
             Err(TreeError::Exists)
+        ));
+    }
+
+    #[tokio::test]
+    async fn alias_to_a_folder_lists_the_targets_children() {
+        let (tree, _dir) = tree().await;
+        tree.create_folder("/", "pub", NodeKind::Directory, BaseClass::Guest, BaseClass::User)
+            .await
+            .unwrap();
+        let pub_dir = tree.resolve("/pub").await.unwrap();
+        tree.add_file(&pub_dir.id, "a.txt", 42, &[0u8; 32], "/tmp/a")
+            .await
+            .unwrap();
+        tree.create_folder("/", "aliases", NodeKind::Directory, BaseClass::Guest, BaseClass::User)
+            .await
+            .unwrap();
+
+        // Alias /aliases/pub → /pub (inherits the source's leaf name).
+        let alias = tree
+            .create_alias("/pub", "/aliases", BaseClass::User)
+            .await
+            .unwrap();
+        assert_eq!(alias.kind, NodeKind::Alias);
+        assert_eq!(alias.name, "pub");
+
+        // Listing the alias returns the target's children.
+        let entries = tree.list("/aliases/pub", BaseClass::Guest).await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "a.txt");
+        assert_eq!(entries[0].size, 42);
+    }
+
+    #[tokio::test]
+    async fn alias_to_a_file_resolves_for_download() {
+        let (tree, _dir) = tree().await;
+        tree.create_folder("/", "pub", NodeKind::Directory, BaseClass::Guest, BaseClass::User)
+            .await
+            .unwrap();
+        let pub_dir = tree.resolve("/pub").await.unwrap();
+        let file = tree
+            .add_file(&pub_dir.id, "readme.txt", 10, &[0u8; 32], "/tmp/readme")
+            .await
+            .unwrap();
+        tree.create_folder("/", "aliases", NodeKind::Directory, BaseClass::Guest, BaseClass::User)
+            .await
+            .unwrap();
+        tree.create_alias("/pub/readme.txt", "/aliases", BaseClass::User)
+            .await
+            .unwrap();
+
+        // Downloading the alias resolves to the target's node (same id,
+        // same storage_path, same size).
+        let resolved = tree
+            .open_for_read("/aliases/readme.txt", BaseClass::Guest)
+            .await
+            .unwrap();
+        assert_eq!(resolved.id, file.id);
+        assert_eq!(resolved.storage_path, file.storage_path);
+        assert_eq!(resolved.size, 10);
+    }
+
+    #[tokio::test]
+    async fn resolve_walks_through_an_intermediate_alias() {
+        // Regression: `TreeState::resolve` used to look up children directly
+        // under the current node at every step. Once it landed on an alias
+        // (which has no children of its own), the next segment failed with
+        // NotFound even though the target folder had that child. The
+        // real-world hit was any deep read through an alias — e.g. the
+        // integration test `admin_aliases_a_folder_into_another_and_
+        // download_resolves` couldn't download `/links/pub/readme.txt`.
+        let (tree, _dir) = tree().await;
+        tree.create_folder("/", "pub", NodeKind::Directory, BaseClass::Guest, BaseClass::User)
+            .await
+            .unwrap();
+        let pub_dir = tree.resolve("/pub").await.unwrap();
+        tree.add_file(&pub_dir.id, "readme.txt", 5, &[0u8; 32], "/tmp/r")
+            .await
+            .unwrap();
+        tree.create_folder("/", "links", NodeKind::Directory, BaseClass::Guest, BaseClass::User)
+            .await
+            .unwrap();
+        tree.create_alias("/pub", "/links", BaseClass::User).await.unwrap();
+
+        // The whole point: resolving through an intermediate alias reaches
+        // the file. Without the fix this was `Err(NotFound)`.
+        let file = tree.resolve("/links/pub/readme.txt").await.unwrap();
+        assert_eq!(file.name, "readme.txt");
+        assert_eq!(file.kind, NodeKind::File);
+    }
+
+    #[tokio::test]
+    async fn alias_download_applies_targets_acl_not_alias_parents() {
+        // Security-critical: an alias in a permissive folder must NOT let a
+        // low-class user reach a restricted file. The ACL check runs against
+        // the target's containing folder, not the alias's parent.
+        let (tree, _dir) = tree().await;
+        tree.create_folder(
+            "/",
+            "vault",
+            NodeKind::Directory,
+            BaseClass::Admin, // admin-only reads
+            BaseClass::Admin,
+        )
+        .await
+        .unwrap();
+        let vault = tree.resolve("/vault").await.unwrap();
+        tree.add_file(&vault.id, "secret.txt", 1, &[0u8; 32], "/tmp/s")
+            .await
+            .unwrap();
+
+        // The permissive folder anyone can read.
+        tree.create_folder("/", "pub", NodeKind::Directory, BaseClass::Guest, BaseClass::Admin)
+            .await
+            .unwrap();
+        // Only an admin can even create the alias (needs write on /pub).
+        tree.create_alias("/vault/secret.txt", "/pub", BaseClass::Admin)
+            .await
+            .unwrap();
+
+        // A guest can list /pub and see the alias entry, but CANNOT
+        // actually download through it — the vault's admin-only read gate
+        // applies.
+        assert!(tree.list("/pub", BaseClass::Guest).await.is_ok());
+        assert!(matches!(
+            tree.open_for_read("/pub/secret.txt", BaseClass::Guest).await,
+            Err(TreeError::Acl(_))
+        ));
+        // An admin can go through.
+        assert!(tree.open_for_read("/pub/secret.txt", BaseClass::Admin).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn alias_cannot_chain() {
+        let (tree, _dir) = tree().await;
+        tree.create_folder("/", "pub", NodeKind::Directory, BaseClass::Guest, BaseClass::User)
+            .await
+            .unwrap();
+        tree.create_folder("/", "aliases", NodeKind::Directory, BaseClass::Guest, BaseClass::User)
+            .await
+            .unwrap();
+        tree.create_alias("/pub", "/aliases", BaseClass::User)
+            .await
+            .unwrap();
+        // Making an alias to an alias is refused.
+        assert!(matches!(
+            tree.create_alias("/aliases/pub", "/", BaseClass::PowerUser).await,
+            Err(TreeError::AliasChainRefused)
+        ));
+    }
+
+    #[tokio::test]
+    async fn delete_alias_leaves_target_intact() {
+        let (tree, _dir) = tree().await;
+        tree.create_folder("/", "pub", NodeKind::Directory, BaseClass::Guest, BaseClass::User)
+            .await
+            .unwrap();
+        let pub_dir = tree.resolve("/pub").await.unwrap();
+        tree.add_file(&pub_dir.id, "a.txt", 1, &[0u8; 32], "/tmp/a")
+            .await
+            .unwrap();
+        tree.create_folder("/", "aliases", NodeKind::Directory, BaseClass::Guest, BaseClass::User)
+            .await
+            .unwrap();
+        tree.create_alias("/pub", "/aliases", BaseClass::User)
+            .await
+            .unwrap();
+
+        // Delete the alias itself.
+        tree.delete("/aliases/pub", BaseClass::PowerUser).await.unwrap();
+        assert!(matches!(
+            tree.resolve("/aliases/pub").await,
+            Err(TreeError::NotFound)
+        ));
+        // Target still there.
+        assert!(tree.resolve("/pub").await.is_ok());
+        assert!(tree.resolve("/pub/a.txt").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn alias_refuses_root_source_and_dropbox_dest_write_check() {
+        let (tree, _dir) = tree().await;
+        // Root as source is refused (would shadow everything).
+        assert!(tree.create_alias("/", "/", BaseClass::Admin).await.is_err());
+
+        // A dropbox as destination fails the write ACL for anyone below
+        // its min_class_write (aliases are just another write op on the
+        // destination folder).
+        tree.create_folder("/", "drop", NodeKind::DropBox, BaseClass::Guest, BaseClass::Admin)
+            .await
+            .unwrap();
+        tree.create_folder("/", "src", NodeKind::Directory, BaseClass::Guest, BaseClass::User)
+            .await
+            .unwrap();
+        assert!(matches!(
+            tree.create_alias("/src", "/drop", BaseClass::User).await,
+            Err(TreeError::Acl(_))
         ));
     }
 

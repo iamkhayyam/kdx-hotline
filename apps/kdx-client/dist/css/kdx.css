@@ -405,6 +405,8 @@ table.files, table.tracker { width: 100%; border-collapse: collapse; font-varian
 td.fname { color: var(--green); }
 td.fname .kind { color: var(--grey-dim); margin-right: 8px; font-size: 11px; }
 tr.dropbox td.fname { color: var(--amber); }
+tr.alias td.fname { color: var(--grey); font-style: italic; }
+tr.alias td.fname .kind { color: var(--green); }
 td.fsize { color: var(--grey); text-align: right; white-space: nowrap; }
 td.fmeta { color: var(--grey-dim); font-size: 11px; }
 

@@ -8,6 +8,7 @@ pub const KIND_DIR: u8 = 0;
 pub const KIND_FILE: u8 = 1;
 pub const KIND_DROPBOX: u8 = 2;
 pub const KIND_UPLOAD: u8 = 3;
+pub const KIND_ALIAS: u8 = 4;
 
 /// Transfer end/result status codes.
 pub const TRANSFER_VERIFIED: u8 = 0;
@@ -65,6 +66,18 @@ pub struct FileDelete {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileMove {
     pub path: String,
+    pub dest_path: String,
+}
+
+/// Client → server: create an alias entry at `dest_path` pointing to
+/// `source_path` (Select-for-Alias → Alias-into). The alias inherits the
+/// source's leaf name. Requires `FILE_MANAGE_TREE`; the server additionally
+/// enforces write access on `dest_path` and refuses aliases to the root or
+/// to another alias. The server replies with a `FileListResponse` for
+/// `dest_path`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileAlias {
+    pub source_path: String,
     pub dest_path: String,
 }
 
@@ -333,6 +346,21 @@ impl FileMove {
         let dest_path = get_str(&mut payload, "FileMove")?;
         expect_end(payload, "FileMove")?;
         Ok(Self { path, dest_path })
+    }
+}
+
+impl FileAlias {
+    pub fn encode(&self) -> Bytes {
+        let mut buf = BytesMut::new();
+        put_str(&mut buf, &self.source_path);
+        put_str(&mut buf, &self.dest_path);
+        buf.freeze()
+    }
+    pub fn decode(mut payload: &[u8]) -> Result<Self, ProtocolError> {
+        let source_path = get_str(&mut payload, "FileAlias")?;
+        let dest_path = get_str(&mut payload, "FileAlias")?;
+        expect_end(payload, "FileAlias")?;
+        Ok(Self { source_path, dest_path })
     }
 }
 
@@ -625,5 +653,16 @@ mod tests {
         };
         assert_eq!(FileMove::decode(&mv.encode()).unwrap(), mv);
         assert!(FileMove::decode(&[0, 1, 65]).is_err());
+    }
+
+    #[test]
+    fn file_alias_round_trip() {
+        let a = FileAlias {
+            source_path: "/pub/readme.txt".into(),
+            dest_path: "/aliases".into(),
+        };
+        assert_eq!(FileAlias::decode(&a.encode()).unwrap(), a);
+        // Length-prefix declares 5 bytes but only 1 follows.
+        assert!(FileAlias::decode(&[0, 5, 65]).is_err());
     }
 }

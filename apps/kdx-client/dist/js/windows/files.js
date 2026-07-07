@@ -1,9 +1,9 @@
 import { invoke, pickFile, pickSave } from "../bridge.js";
 import { showMenu } from "../menu.js";
 
-const KINDS = { 0: "[DIR]", 1: "[FILE]", 2: "[DROP]", 3: "[UP]" };
-const KIND_NAME = { 0: "folder", 1: "file", 2: "drop box", 3: "upload folder" };
-const KIND_DIR = 0, KIND_FILE = 1, KIND_DROPBOX = 2;
+const KINDS = { 0: "[DIR]", 1: "[FILE]", 2: "[DROP]", 3: "[UP]", 4: "[→]" };
+const KIND_NAME = { 0: "folder", 1: "file", 2: "drop box", 3: "upload folder", 4: "alias" };
+const KIND_DIR = 0, KIND_FILE = 1, KIND_DROPBOX = 2, KIND_ALIAS = 4;
 const CLASS_NAME = ["guest", "user", "power user", "admin"];
 
 export function buildFiles() {
@@ -61,7 +61,10 @@ export function buildFiles() {
   let cwd = "/";
   let entries = [];
   let searchHits = null; // non-null while showing search results instead of a folder listing
-  let moving = null; // { path, name } selected via "Select for Move", or null
+  // Pending Select-for-Move or Select-for-Alias operation. Both work the same
+  // way — select something, navigate elsewhere, "Do Here" — so they share one
+  // banner. `op` is "move" or "alias"; `path`/`name` describe the selection.
+  let pending = null; // { op: "move" | "alias", path, name } or null
 
   async function refresh() {
     // Navigating/refreshing a folder always leaves search-results mode.
@@ -99,9 +102,13 @@ export function buildFiles() {
     for (const e of shown) {
       const tr = document.createElement("tr");
       if (e.kind === KIND_DROPBOX) tr.className = "dropbox";
+      if (e.kind === KIND_ALIAS) tr.className = "alias";
+      // For files (and aliases to files) show size; folders (and aliases to
+      // folders) show em-dash.
+      const showSize = e.kind === KIND_FILE || (e.kind === KIND_ALIAS && e.size > 0);
       tr.innerHTML =
         `<td class="fname"><span class="kind">${KINDS[e.kind] || "[?]"}</span>${escapeHtml(e.name)}</td>` +
-        `<td class="fsize">${e.kind === KIND_FILE ? fmtSize(e.size) : "—"}</td>`;
+        `<td class="fsize">${showSize ? fmtSize(e.size) : "—"}</td>`;
       tr.addEventListener("click", () => onEntry(e));
       tr.addEventListener("contextmenu", (ev) => {
         ev.preventDefault();
@@ -110,7 +117,12 @@ export function buildFiles() {
         else items.push({ label: "Open", fn: () => onEntry(e) });
         items.push({ label: "Get Info", fn: () => showInfo(e) });
         items.push({ label: "Copy Name", fn: () => copyText(e.name) });
-        items.push({ label: "Select for Move", fn: () => selectForMove(e) });
+        items.push({ label: "Select for Move", fn: () => selectForOp(e, "move") });
+        // Alias-into is available for any non-alias entry (chains are
+        // refused server-side too).
+        if (e.kind !== KIND_ALIAS) {
+          items.push({ label: "Select for Alias", fn: () => selectForOp(e, "alias") });
+        }
         items.push({ label: "Delete", fn: () => deleteEntry(e) });
         items.push({ label: "Refresh", fn: refresh });
         showMenu(ev.clientX, ev.clientY, items);
@@ -172,6 +184,18 @@ export function buildFiles() {
       refresh();
     } else if (e.kind === KIND_FILE) {
       downloadEntry(e);
+    } else if (e.kind === KIND_ALIAS) {
+      // Try to list through the alias — if the target is a folder this
+      // navigates into it; if the target is a file the server returns a
+      // NotAFolder error and we fall through to a download attempt.
+      try {
+        await invoke("list_files", { path: joinPath(cwd, e.name) });
+        cwd = joinPath(cwd, e.name);
+        filter.value = "";
+        refresh();
+      } catch {
+        downloadEntry(e);
+      }
     }
   }
 
@@ -213,43 +237,50 @@ export function buildFiles() {
     }
   }
 
-  // Select-for-Move → navigate elsewhere → Move Here (a two-step move, since
-  // the destination is "wherever the browser is currently looking").
-  function selectForMove(e) {
-    moving = { path: joinPath(cwd, e.name), name: e.name };
-    renderMoveBanner();
+  // Select-for-Move / Select-for-Alias → navigate elsewhere → "Do Here" (a
+  // two-step operation, since the destination is "wherever the browser is
+  // currently looking"). Both verbs share this banner; `pending.op`
+  // decides which invoke fires.
+  function selectForOp(e, op) {
+    pending = { op, path: joinPath(cwd, e.name), name: e.name };
+    renderPendingBanner();
   }
 
-  function renderMoveBanner() {
-    if (!moving) {
+  function renderPendingBanner() {
+    if (!pending) {
       moveBanner.classList.add("hidden");
       return;
     }
+    const verb = pending.op === "alias" ? "Aliasing" : "Moving";
+    const doLabel = pending.op === "alias" ? "Alias Here" : "Move Here";
     moveBanner.innerHTML =
-      `Moving <b>${escapeHtml(moving.name)}</b> — ` +
-      `<button class="mini" id="f-move-here">Move Here</button>` +
-      `<button class="mini" id="f-move-cancel">Cancel</button>`;
+      `${verb} <b>${escapeHtml(pending.name)}</b> — ` +
+      `<button class="mini" id="f-op-do">${doLabel}</button>` +
+      `<button class="mini" id="f-op-cancel">Cancel</button>`;
     moveBanner.classList.remove("hidden");
-    moveBanner.querySelector("#f-move-here").onclick = async () => {
+    moveBanner.querySelector("#f-op-do").onclick = async () => {
       try {
-        const res = await invoke("move_path", { path: moving.path, destPath: cwd });
+        const res =
+          pending.op === "alias"
+            ? await invoke("alias_path", { sourcePath: pending.path, destPath: cwd })
+            : await invoke("move_path", { path: pending.path, destPath: cwd });
         entries = res.entries;
         searchHits = null; // defensive: this response is a folder listing, not search results
-        moving = null;
-        renderMoveBanner();
+        pending = null;
+        renderPendingBanner();
         render();
       } catch (err) {
         moveBanner.innerHTML = `<span class="err">${escapeHtml(err.message || String(err))}</span> ` +
-          `<button class="mini" id="f-move-cancel">Cancel</button>`;
-        moveBanner.querySelector("#f-move-cancel").onclick = () => {
-          moving = null;
-          renderMoveBanner();
+          `<button class="mini" id="f-op-cancel">Cancel</button>`;
+        moveBanner.querySelector("#f-op-cancel").onclick = () => {
+          pending = null;
+          renderPendingBanner();
         };
       }
     };
-    moveBanner.querySelector("#f-move-cancel").onclick = () => {
-      moving = null;
-      renderMoveBanner();
+    moveBanner.querySelector("#f-op-cancel").onclick = () => {
+      pending = null;
+      renderPendingBanner();
     };
   }
 

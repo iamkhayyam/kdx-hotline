@@ -192,6 +192,17 @@ pub async fn move_path(
 }
 
 #[tauri::command]
+pub async fn alias_path(
+    state: State<'_, AppState>,
+    source_path: String,
+    dest_path: String,
+) -> CmdResult<FileListDto> {
+    with_client(&state, |c| async move { c.alias_path(&source_path, &dest_path).await })
+        .await
+        .map(file_list_dto)
+}
+
+#[tauri::command]
 pub async fn generate_catalog(state: State<'_, AppState>) -> CmdResult<u32> {
     with_client(&state, |c| async move { c.generate_catalog().await }).await
 }

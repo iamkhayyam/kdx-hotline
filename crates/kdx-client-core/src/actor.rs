@@ -18,7 +18,8 @@ use kdx_protocol::messages::{
     AdminBroadcast, AdminShutdown, AuthResult, ChatEvent, ChatInvite, ChatInvited, ChatJoin,
     ChatLeave, ChatSend, ChatTopic, ChatUserList, FileCatalogGenerated, FileCreateFolder,
     FileDelete, FileGenerateCatalog,
-    FileListRequest, FileMove, FileSearchRequest, FileSearchResponse, HistoryListRequest,
+    FileAlias, FileListRequest, FileMove, FileSearchRequest, FileSearchResponse,
+    HistoryListRequest,
     HistoryListResponse, IpRuleCreate, IpRuleDelete, IpRuleListRequest, IpRuleListResponse,
     NewsPostCreate,
     NewsPostDelete, NewsThreadListRequest, NewsThreadListResponse, NewsgroupCreate,
@@ -336,6 +337,19 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
             } => {
                 let msg = FileMove { path, dest_path };
                 match self.send(PacketType::FileMove, msg.encode()).await {
+                    Ok(()) => self.list_waiters.push_back(reply),
+                    Err(e) => {
+                        let _ = reply.send(Err(e.into()));
+                    }
+                }
+            }
+            Command::AliasPath {
+                source_path,
+                dest_path,
+                reply,
+            } => {
+                let msg = FileAlias { source_path, dest_path };
+                match self.send(PacketType::FileAlias, msg.encode()).await {
                     Ok(()) => self.list_waiters.push_back(reply),
                     Err(e) => {
                         let _ = reply.send(Err(e.into()));

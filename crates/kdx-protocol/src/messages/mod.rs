@@ -29,11 +29,11 @@ pub use chat::{
     CHAT_ACTION, CHAT_SYSTEM,
 };
 pub use file::{
-    FileCatalogGenerated, FileCreateFolder, FileDelete, FileEntry, FileGenerateCatalog,
-    FileListRequest, FileListResponse, FileMove, FileSearchEntry, FileSearchRequest,
-    FileSearchResponse, TransferAccept, TransferData, TransferEnd, TransferRequest,
-    DIRECTION_DOWNLOAD, DIRECTION_UPLOAD, KIND_DIR, KIND_DROPBOX, KIND_FILE, KIND_UPLOAD,
-    TRANSFER_ABORTED, TRANSFER_HASH_MISMATCH, TRANSFER_VERIFIED,
+    FileAlias, FileCatalogGenerated, FileCreateFolder, FileDelete, FileEntry,
+    FileGenerateCatalog, FileListRequest, FileListResponse, FileMove, FileSearchEntry,
+    FileSearchRequest, FileSearchResponse, TransferAccept, TransferData, TransferEnd,
+    TransferRequest, DIRECTION_DOWNLOAD, DIRECTION_UPLOAD, KIND_ALIAS, KIND_DIR, KIND_DROPBOX,
+    KIND_FILE, KIND_UPLOAD, TRANSFER_ABORTED, TRANSFER_HASH_MISMATCH, TRANSFER_VERIFIED,
 };
 pub use handshake::{HandshakeInit, HandshakeResp};
 pub use news::{

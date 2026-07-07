@@ -18,7 +18,7 @@ use kdx_protocol::messages::{
     AdminShutdown, AuthChallenge, AuthRequest, AuthResponse, AuthResult, ChatInvite, ChatInvited,
     ChatJoin, ChatLeave, ChatSend, ChatTopic, FileCatalogGenerated, FileCreateFolder, FileDelete,
     FileEntry,
-    FileGenerateCatalog, FileListRequest, FileListResponse, FileMove, FileSearchEntry,
+    FileAlias, FileGenerateCatalog, FileListRequest, FileListResponse, FileMove, FileSearchEntry,
     FileSearchRequest, FileSearchResponse, HandshakeInit, HandshakeResp, HistoryEntry as WireHistoryEntry,
     HistoryListRequest, HistoryListResponse, IpRuleCreate, IpRuleDelete,
     IpRuleEntry as WireIpRule, IpRuleListRequest, IpRuleListResponse, NewsPost as WireNewsPost,
@@ -691,6 +691,26 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                     }
                     match self.ctx.tree.move_node(&req.path, &req.dest_path, class).await {
                         Ok(()) => self.reply_file_list(&req.dest_path, class).await?,
+                        Err(e) => self.send_error(&e.to_string()).await?,
+                    }
+                }
+                PacketType::FileAlias => {
+                    let req = FileAlias::decode(&frame.payload)?;
+                    let (class, privs) = {
+                        let s = self.session.as_ref().expect("authed");
+                        (s.class, s.privileges)
+                    };
+                    if !privs.contains(Privileges::FILE_MANAGE_TREE) {
+                        self.send_error("missing FILE_MANAGE_TREE privilege").await?;
+                        continue;
+                    }
+                    match self
+                        .ctx
+                        .tree
+                        .create_alias(&req.source_path, &req.dest_path, class)
+                        .await
+                    {
+                        Ok(_) => self.reply_file_list(&req.dest_path, class).await?,
                         Err(e) => self.send_error(&e.to_string()).await?,
                     }
                 }

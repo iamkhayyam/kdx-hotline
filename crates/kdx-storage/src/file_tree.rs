@@ -6,7 +6,7 @@ use crate::StorageError;
 pub const ROOT_ID: &str = "root";
 
 /// One row of `file_nodes`. Kind constants: 0 dir, 1 file, 2 dropbox,
-/// 3 upload folder — semantics live in kdx-server-core.
+/// 3 upload folder, 4 alias — semantics live in kdx-server-core.
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct FileNodeRow {
     pub id: String,
@@ -18,12 +18,17 @@ pub struct FileNodeRow {
     pub min_class_read: i64,
     pub min_class_write: i64,
     pub storage_path: Option<String>,
+    /// For alias rows (`kind == 4`): the UUID of the pointed-to node.
+    /// `None` for every other kind. The FK has `ON DELETE SET NULL`, so
+    /// deleting a target leaves the alias as a dangling row that resolves
+    /// to "not found" at runtime rather than silently disappearing.
+    pub target_id: Option<String>,
 }
 
 pub async fn all(pool: &SqlitePool) -> Result<Vec<FileNodeRow>, StorageError> {
     let rows = sqlx::query_as::<_, FileNodeRow>(
         "SELECT id, parent_id, name, kind, size, sha256, min_class_read, min_class_write,
-                storage_path
+                storage_path, target_id
          FROM file_nodes",
     )
     .fetch_all(pool)
@@ -63,6 +68,7 @@ pub async fn create_folder(
         min_class_read,
         min_class_write,
         storage_path: None,
+        target_id: None,
     })
 }
 
@@ -98,6 +104,42 @@ pub async fn create_file(
         min_class_read: 0,
         min_class_write: 2,
         storage_path: Some(storage_path.to_owned()),
+        target_id: None,
+    })
+}
+
+/// Insert an alias node — kind = 4, points to `target_id`. The alias itself
+/// carries no size or storage; those are resolved through to the target at
+/// read time. The domain layer guards that `target_id` is a real, non-alias
+/// node before calling this.
+pub async fn create_alias(
+    pool: &SqlitePool,
+    parent_id: &str,
+    name: &str,
+    target_id: &str,
+) -> Result<FileNodeRow, StorageError> {
+    let id = Uuid::new_v4().to_string();
+    sqlx::query(
+        "INSERT INTO file_nodes (id, parent_id, name, kind, target_id)
+         VALUES (?, ?, ?, 4, ?)",
+    )
+    .bind(&id)
+    .bind(parent_id)
+    .bind(name)
+    .bind(target_id)
+    .execute(pool)
+    .await?;
+    Ok(FileNodeRow {
+        id,
+        parent_id: Some(parent_id.to_owned()),
+        name: name.to_owned(),
+        kind: 4,
+        size: 0,
+        sha256: None,
+        min_class_read: 0,
+        min_class_write: 2,
+        storage_path: None,
+        target_id: Some(target_id.to_owned()),
     })
 }
 

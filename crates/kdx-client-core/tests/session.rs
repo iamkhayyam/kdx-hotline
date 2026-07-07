@@ -532,6 +532,118 @@ async fn admin_moves_a_folder_into_another() {
 }
 
 #[tokio::test]
+async fn admin_aliases_a_folder_into_another_and_download_resolves() {
+    // End-to-end: sysop creates /pub with a file, then aliases /pub into
+    // /links (an admin-writable folder). Any listing of /links/pub reflects
+    // /pub's contents, and downloading /links/pub/readme.txt reads the real
+    // file — proving the alias resolves transparently for reads.
+    let ts = TestServer::start().await;
+    ts.seed_account("sysop", "pw", 3).await;
+
+    let (sysop, mut es, dd) = ts.connect_client().await;
+    next_event(&mut es).await;
+    sysop.login("sysop", "pw").await.unwrap();
+
+    sysop.create_folder("/", "pub", 0, 0, 1).await.unwrap();
+    sysop.create_folder("/", "links", 0, 0, 1).await.unwrap();
+
+    // Upload a real file into /pub.
+    let payload = b"the target's bytes";
+    let up = dd.path().join("readme.txt");
+    std::fs::write(&up, payload).unwrap();
+    sysop.upload(up, "/pub").await.unwrap();
+
+    // Alias /pub into /links (inherits the source's leaf name).
+    let dest_listing = sysop.alias_path("/pub", "/links").await.unwrap();
+    let alias_entry = dest_listing
+        .entries
+        .iter()
+        .find(|e| e.name == "pub")
+        .expect("alias appears in dest listing");
+    assert_eq!(alias_entry.kind, kdx_protocol::messages::KIND_ALIAS);
+
+    // Listing the alias returns /pub's children — the alias is transparent.
+    let through = sysop.list_files("/links/pub").await.unwrap();
+    assert!(through.entries.iter().any(|e| e.name == "readme.txt"));
+
+    // Downloading through the alias reads the real bytes.
+    let dst = dd.path().join("got.bin");
+    sysop.download("/links/pub/readme.txt", dst.clone()).await.unwrap();
+    assert_eq!(std::fs::read(&dst).unwrap(), payload);
+
+    ts.stop();
+}
+
+#[tokio::test]
+async fn alias_download_still_enforces_targets_acl() {
+    // Security-critical end-to-end: aliasing a restricted file into a
+    // permissive folder does NOT let a low-class user download it. The
+    // ACL check runs against the target's containing folder.
+    let ts = TestServer::start().await;
+    ts.seed_account("sysop", "pw", 3).await;
+    ts.seed_account("plain", "pw", 1).await; // no FILE_MANAGE_TREE and only User-class reads
+
+    let (sysop, mut es, dd) = ts.connect_client().await;
+    next_event(&mut es).await;
+    sysop.login("sysop", "pw").await.unwrap();
+
+    // Admin-only vault with a real file.
+    sysop.create_folder("/", "vault", 0, /*min_read*/ 3, /*min_write*/ 3).await.unwrap();
+    let payload = b"top secret";
+    let up = dd.path().join("secret.txt");
+    std::fs::write(&up, payload).unwrap();
+    sysop.upload(up, "/vault").await.unwrap();
+
+    // Public folder everyone can read.
+    sysop.create_folder("/", "pub", 0, /*min_read*/ 0, /*min_write*/ 3).await.unwrap();
+    // Only sysop can create the alias (needs write on /pub).
+    sysop.alias_path("/vault/secret.txt", "/pub").await.unwrap();
+
+    // A plain user connects and tries to download through the alias.
+    let (plain, mut ep, _d2) = ts.connect_client().await;
+    next_event(&mut ep).await;
+    plain.login("plain", "pw").await.unwrap();
+
+    // Listing /pub is fine — the alias entry is visible.
+    let pub_listing = plain.list_files("/pub").await.unwrap();
+    assert!(pub_listing.entries.iter().any(|e| e.name == "secret.txt"));
+
+    // But downloading through it is refused — the vault's admin-only read
+    // gate applies to the alias, not /pub's more permissive gate.
+    let dst = dd.path().join("got.bin");
+    assert!(matches!(
+        plain.download("/pub/secret.txt", dst).await,
+        Err(ClientError::Transfer(_)) | Err(ClientError::Server(_))
+    ));
+
+    ts.stop();
+}
+
+#[tokio::test]
+async fn plain_user_cannot_create_aliases() {
+    let ts = TestServer::start().await;
+    ts.seed_account("plain", "pw", 1).await; // no FILE_MANAGE_TREE
+    ts.seed_account("sysop", "pw", 3).await;
+
+    let (sysop, mut es, _d1) = ts.connect_client().await;
+    next_event(&mut es).await;
+    sysop.login("sysop", "pw").await.unwrap();
+    sysop.create_folder("/", "src", 0, 0, 1).await.unwrap();
+    sysop.create_folder("/", "dst", 0, 0, 1).await.unwrap();
+
+    let (plain, mut ep, _d2) = ts.connect_client().await;
+    next_event(&mut ep).await;
+    plain.login("plain", "pw").await.unwrap();
+
+    assert!(matches!(
+        plain.alias_path("/src", "/dst").await,
+        Err(ClientError::Server(_))
+    ));
+
+    ts.stop();
+}
+
+#[tokio::test]
 async fn plain_user_cannot_move_files() {
     let ts = TestServer::start().await;
     ts.seed_account("plain", "pw", 1).await; // no FILE_MANAGE_TREE

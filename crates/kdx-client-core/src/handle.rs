@@ -66,6 +66,11 @@ pub(crate) enum Command {
         dest_path: String,
         reply: oneshot::Sender<Result<FileListResponse, ClientError>>,
     },
+    AliasPath {
+        source_path: String,
+        dest_path: String,
+        reply: oneshot::Sender<Result<FileListResponse, ClientError>>,
+    },
     GenerateCatalog {
         reply: oneshot::Sender<Result<u32, ClientError>>,
     },
@@ -343,6 +348,24 @@ impl ClientHandle {
     ) -> Result<FileListResponse, ClientError> {
         self.send(|reply| Command::MovePath {
             path: path.to_owned(),
+            dest_path: dest_path.to_owned(),
+            reply,
+        })
+        .await
+    }
+
+    /// Create an alias at `dest_path` pointing to `source_path`
+    /// (Select-for-Alias → Alias-into). The alias inherits the source's leaf
+    /// name and behaves like the target for read/download. Requires
+    /// FILE_MANAGE_TREE and write access to the destination. Resolves with
+    /// the updated listing of `dest_path`.
+    pub async fn alias_path(
+        &self,
+        source_path: &str,
+        dest_path: &str,
+    ) -> Result<FileListResponse, ClientError> {
+        self.send(|reply| Command::AliasPath {
+            source_path: source_path.to_owned(),
             dest_path: dest_path.to_owned(),
             reply,
         })
