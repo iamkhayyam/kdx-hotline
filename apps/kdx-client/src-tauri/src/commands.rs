@@ -302,6 +302,24 @@ pub async fn delete_ip_rule(state: State<'_, AppState>, id: String) -> CmdResult
 }
 
 #[tauri::command]
+pub async fn list_connections(state: State<'_, AppState>) -> CmdResult<Vec<PresenceUser>> {
+    with_client(&state, |c| async move { c.list_connections().await }).await
+}
+
+#[tauri::command]
+pub async fn set_room_flags(
+    state: State<'_, AppState>,
+    room: String,
+    min_class_join: u8,
+    interview_mode: bool,
+) -> CmdResult<()> {
+    with_client(&state, |c| async move {
+        c.set_room_flags(&room, min_class_join, interview_mode).await
+    })
+    .await
+}
+
+#[tauri::command]
 pub async fn get_user_info(state: State<'_, AppState>, username: String) -> CmdResult<PresenceUser> {
     with_client(&state, |c| async move { c.get_user_info(&username).await }).await
 }

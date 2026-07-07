@@ -407,6 +407,73 @@ impl IpRuleDelete {
     }
 }
 
+/// Client → server: request the live-connection roster (the Connection
+/// Monitor window). Same information as `PresenceListRequest`, but gated
+/// on `USER_KICK` so plain users cannot enumerate everyone's IP/idle
+/// details.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConnectionListRequest;
+
+/// Server → client: full connection snapshot in reply to
+/// `ConnectionListRequest`. Reuses the `PresenceEntry` shape from
+/// `presence.rs` — nothing structural differs between the User List and
+/// the Connection Monitor except *who* is allowed to see it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnectionListResponse {
+    pub connections: Vec<super::presence::PresenceEntry>,
+}
+
+impl ConnectionListRequest {
+    pub fn encode(&self) -> Bytes {
+        Bytes::new()
+    }
+    pub fn decode(payload: &[u8]) -> Result<Self, ProtocolError> {
+        expect_end(payload, "ConnectionListRequest")?;
+        Ok(Self)
+    }
+}
+
+impl ConnectionListResponse {
+    pub fn encode(&self) -> Bytes {
+        let mut buf = BytesMut::new();
+        buf.put_u16(self.connections.len() as u16);
+        for e in &self.connections {
+            put_str(&mut buf, &e.username);
+            buf.put_u8(e.class);
+            buf.put_u64(e.login_at);
+            buf.put_u32(e.idle_secs);
+            put_str(&mut buf, &e.address);
+        }
+        buf.freeze()
+    }
+    pub fn decode(mut payload: &[u8]) -> Result<Self, ProtocolError> {
+        if payload.remaining() < 2 {
+            return Err(ProtocolError::MalformedPayload("ConnectionListResponse"));
+        }
+        let count = payload.get_u16() as usize;
+        let mut connections = Vec::with_capacity(count.min(1024));
+        for _ in 0..count {
+            let username = get_str(&mut payload, "ConnectionListResponse")?;
+            if payload.remaining() < 1 + 8 + 4 {
+                return Err(ProtocolError::MalformedPayload("ConnectionListResponse"));
+            }
+            let class = payload.get_u8();
+            let login_at = payload.get_u64();
+            let idle_secs = payload.get_u32();
+            let address = get_str(&mut payload, "ConnectionListResponse")?;
+            connections.push(super::presence::PresenceEntry {
+                username,
+                class,
+                login_at,
+                idle_secs,
+                address,
+            });
+        }
+        expect_end(payload, "ConnectionListResponse")?;
+        Ok(Self { connections })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -507,6 +574,27 @@ mod tests {
 
         assert!(HistoryListRequest::decode(&[0]).is_err());
         assert!(HistoryListResponse::decode(&[0, 0]).is_err());
+    }
+
+    #[test]
+    fn connection_list_round_trip() {
+        assert!(ConnectionListRequest::decode(&ConnectionListRequest.encode()).is_ok());
+
+        let resp = ConnectionListResponse {
+            connections: vec![super::super::presence::PresenceEntry {
+                username: "phraq".into(),
+                class: 2,
+                login_at: 1_700_000_000,
+                idle_secs: 12,
+                address: "10.0.0.5:52341".into(),
+            }],
+        };
+        assert_eq!(ConnectionListResponse::decode(&resp.encode()).unwrap(), resp);
+
+        let empty = ConnectionListResponse { connections: vec![] };
+        assert_eq!(ConnectionListResponse::decode(&empty.encode()).unwrap(), empty);
+
+        assert!(ConnectionListResponse::decode(&[0]).is_err());
     }
 
     #[test]

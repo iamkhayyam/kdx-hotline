@@ -43,6 +43,8 @@ pub fn run() {
             commands::list_ip_rules,
             commands::create_ip_rule,
             commands::delete_ip_rule,
+            commands::list_connections,
+            commands::set_room_flags,
             commands::get_user_info,
             commands::send_private,
             commands::invite_to_chat,

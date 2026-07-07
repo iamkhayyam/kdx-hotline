@@ -19,14 +19,15 @@ pub use account::{
     AccountCreate, AccountListRequest, AccountListResponse, AccountSummary, AccountUpdate,
 };
 pub use admin::{
-    AdminBroadcast, AdminDisconnect, AdminShutdown, HistoryEntry, HistoryListRequest,
-    HistoryListResponse, IpRuleCreate, IpRuleDelete, IpRuleEntry, IpRuleListRequest,
-    IpRuleListResponse, ServerSettingsRequest, ServerSettingsResponse, ServerSettingsUpdate,
+    AdminBroadcast, AdminDisconnect, AdminShutdown, ConnectionListRequest,
+    ConnectionListResponse, HistoryEntry, HistoryListRequest, HistoryListResponse, IpRuleCreate,
+    IpRuleDelete, IpRuleEntry, IpRuleListRequest, IpRuleListResponse, ServerSettingsRequest,
+    ServerSettingsResponse, ServerSettingsUpdate,
 };
 pub use auth::{AuthChallenge, AuthRequest, AuthResponse, AuthResult};
 pub use chat::{
-    ChatEvent, ChatInvite, ChatInvited, ChatJoin, ChatLeave, ChatSend, ChatTopic, ChatUserList,
-    CHAT_ACTION, CHAT_SYSTEM,
+    ChatEvent, ChatInvite, ChatInvited, ChatJoin, ChatLeave, ChatRoomFlags, ChatSend, ChatTopic,
+    ChatUserList, CHAT_ACTION, CHAT_SYSTEM,
 };
 pub use file::{
     FileAlias, FileCatalogGenerated, FileCreateFolder, FileDelete, FileEntry,

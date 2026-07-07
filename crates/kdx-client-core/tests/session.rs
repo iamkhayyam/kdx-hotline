@@ -1336,3 +1336,175 @@ async fn deny_rule_refuses_new_connections_from_localhost() {
 
     ts.stop();
 }
+
+#[tokio::test]
+async fn admin_sees_every_connection_in_the_monitor() {
+    let ts = TestServer::start().await;
+    ts.seed_account("sysop", "pw", 3).await; // has USER_KICK
+    ts.seed_account("phraq", "pw", 2).await;
+    ts.seed_account("guest", "pw", 0).await;
+
+    let (sysop, mut es, _d1) = ts.connect_client().await;
+    next_event(&mut es).await;
+    sysop.login("sysop", "pw").await.unwrap();
+
+    let (phraq, mut ep, _d2) = ts.connect_client().await;
+    next_event(&mut ep).await;
+    phraq.login("phraq", "pw").await.unwrap();
+
+    let (guest, mut eg, _d3) = ts.connect_client().await;
+    next_event(&mut eg).await;
+    guest.login("guest", "pw").await.unwrap();
+
+    let conns = sysop.list_connections().await.unwrap();
+    let names: std::collections::HashSet<_> =
+        conns.iter().map(|c| c.username.as_str()).collect();
+    assert!(names.contains("sysop"));
+    assert!(names.contains("phraq"));
+    assert!(names.contains("guest"));
+    // Every entry carries a real address (127.0.0.1:something).
+    assert!(conns.iter().all(|c| c.address.starts_with("127.0.0.1")));
+
+    ts.stop();
+}
+
+#[tokio::test]
+async fn plain_user_cannot_open_connection_monitor() {
+    let ts = TestServer::start().await;
+    ts.seed_account("plain", "pw", 1).await; // no USER_KICK
+
+    let (client, mut events, _dd) = ts.connect_client().await;
+    next_event(&mut events).await;
+    client.login("plain", "pw").await.unwrap();
+
+    assert!(matches!(
+        client.list_connections().await,
+        Err(ClientError::Server(_))
+    ));
+
+    ts.stop();
+}
+
+#[tokio::test]
+async fn interview_mode_mutes_non_panelists_and_toggles_off() {
+    let ts = TestServer::start().await;
+    ts.seed_account("panel", "pw", 2).await; // PowerUser: has CHAT_SET_TOPIC
+    ts.seed_account("attendee", "pw", 1).await; // User: no CHAT_SET_TOPIC
+
+    let (panel, mut e_panel, _d1) = ts.connect_client().await;
+    next_event(&mut e_panel).await;
+    panel.login("panel", "pw").await.unwrap();
+
+    let (attendee, mut e_att, _d2) = ts.connect_client().await;
+    next_event(&mut e_att).await;
+    attendee.login("attendee", "pw").await.unwrap();
+
+    // Both join the lobby.
+    panel.join("lobby").await.unwrap();
+    attendee.join("lobby").await.unwrap();
+
+    // Panelist turns interview mode on.
+    panel.set_room_flags("lobby", 0, true).await.unwrap();
+
+    // Attendee's send is silently dropped (they get an Info notice; the
+    // panel does NOT see the attendee's line).
+    attendee.send_chat("lobby", 0, "am I allowed to speak?").await.unwrap();
+
+    // Panel's send goes through fine.
+    panel.send_chat("lobby", 0, "welcome").await.unwrap();
+
+    // Wait for the panel's own line to appear on their own transcript —
+    // the attendee's must NOT be seen among the panel's chat events.
+    let mut saw_panel = false;
+    for _ in 0..30 {
+        let ev = next_event(&mut e_panel).await;
+        if let Event::Chat { sender, text, flags, .. } = ev {
+            if flags & kdx_protocol::messages::CHAT_SYSTEM == 0 {
+                assert_ne!(sender, "attendee", "muted attendee reached the room");
+                if sender == "panel" && text == "welcome" {
+                    saw_panel = true;
+                    break;
+                }
+            }
+        }
+    }
+    assert!(saw_panel, "panel's own line should reach the room");
+
+    // Toggle interview mode off — attendee can speak again.
+    panel.set_room_flags("lobby", 0, false).await.unwrap();
+    attendee.send_chat("lobby", 0, "thanks").await.unwrap();
+    let mut saw_attendee = false;
+    for _ in 0..30 {
+        let ev = next_event(&mut e_panel).await;
+        if let Event::Chat { sender, text, flags, .. } = ev {
+            if flags & kdx_protocol::messages::CHAT_SYSTEM == 0
+                && sender == "attendee"
+                && text == "thanks"
+            {
+                saw_attendee = true;
+                break;
+            }
+        }
+    }
+    assert!(saw_attendee, "attendee should be heard after interview mode ends");
+
+    ts.stop();
+}
+
+#[tokio::test]
+async fn min_class_join_gate_refuses_below_threshold() {
+    let ts = TestServer::start().await;
+    ts.seed_account("power", "pw", 2).await; // PowerUser: can create rooms and set flags
+    ts.seed_account("user", "pw", 1).await; // User: below the PowerUser gate
+
+    let (power, mut e_power, _d1) = ts.connect_client().await;
+    next_event(&mut e_power).await;
+    power.login("power", "pw").await.unwrap();
+
+    // Founder creates the room and tightens the join gate to PowerUser (2).
+    power.join("green-room").await.unwrap();
+    power.set_room_flags("green-room", 2, false).await.unwrap();
+
+    // A plain User tries to join and is refused.
+    let (user, mut e_user, _d2) = ts.connect_client().await;
+    next_event(&mut e_user).await;
+    user.login("user", "pw").await.unwrap();
+    user.join("green-room").await.unwrap();
+    // The refusal comes back as a ServerError.
+    let mut saw_err = false;
+    for _ in 0..10 {
+        if let Event::ServerError { text } = next_event(&mut e_user).await {
+            assert!(text.contains("class"));
+            saw_err = true;
+            break;
+        }
+    }
+    assert!(saw_err, "user should have been refused with a class error");
+
+    ts.stop();
+}
+
+#[tokio::test]
+async fn plain_member_cannot_change_room_flags() {
+    let ts = TestServer::start().await;
+    ts.seed_account("user", "pw", 1).await; // no CHAT_SET_TOPIC
+
+    let (client, mut events, _dd) = ts.connect_client().await;
+    next_event(&mut events).await;
+    client.login("user", "pw").await.unwrap();
+    client.join("lobby").await.unwrap();
+
+    client.set_room_flags("lobby", 2, true).await.unwrap();
+    // The refusal comes back as a ServerError.
+    let mut saw_err = false;
+    for _ in 0..10 {
+        if let Event::ServerError { text } = next_event(&mut events).await {
+            assert!(text.contains("privilege") || text.contains("class"));
+            saw_err = true;
+            break;
+        }
+    }
+    assert!(saw_err, "non-privileged member should get a privilege error");
+
+    ts.stop();
+}

@@ -16,7 +16,9 @@ use kdx_protocol::messages::{
     AccountCreate, AccountListRequest, AccountListResponse, AccountRolesRequest,
     AccountRolesResponse, AccountSummary, AccountUpdate, AdminBroadcast, AdminDisconnect,
     AdminShutdown, AuthChallenge, AuthRequest, AuthResponse, AuthResult, ChatInvite, ChatInvited,
-    ChatJoin, ChatLeave, ChatSend, ChatTopic, FileCatalogGenerated, FileCreateFolder, FileDelete,
+    ChatJoin, ChatLeave, ChatRoomFlags as WireChatRoomFlags, ChatSend, ChatTopic,
+    ConnectionListRequest, ConnectionListResponse, FileCatalogGenerated, FileCreateFolder,
+    FileDelete,
     FileEntry,
     FileAlias, FileGenerateCatalog, FileListRequest, FileListResponse, FileMove, FileSearchEntry,
     FileSearchRequest, FileSearchResponse, HandshakeInit, HandshakeResp, HistoryEntry as WireHistoryEntry,
@@ -425,6 +427,26 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                     )
                     .await?;
                 }
+                PacketType::ConnectionListRequest => {
+                    ConnectionListRequest::decode(&frame.payload)?;
+                    let privs = self.session.as_ref().expect("authed").privileges;
+                    // USER_KICK matches "who is allowed to see and act on
+                    // everyone's live session" — same privilege that lets
+                    // you kick, so gating both under one bit keeps the
+                    // admin model simple.
+                    if !privs.contains(Privileges::USER_KICK) {
+                        self.send_error("missing USER_KICK privilege").await?;
+                        continue;
+                    }
+                    let connections = self.ctx.presence.list().await;
+                    let response = ConnectionListResponse { connections };
+                    self.send(
+                        PacketType::ConnectionListResponse,
+                        PacketFlags::empty(),
+                        response.encode(),
+                    )
+                    .await?;
+                }
                 PacketType::UserInfoRequest => {
                     let request = UserInfoRequest::decode(&frame.payload)?;
                     match self.ctx.presence.get(&request.username).await {
@@ -481,6 +503,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                     let member = Member {
                         session_id: session.id,
                         username: session.username.clone(),
+                        class: session.class as u8,
                         privileges: session.privileges,
                         tx: outbound_tx.clone(),
                     };
@@ -509,6 +532,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                     let member = Member {
                         session_id: session.id,
                         username: session.username.clone(),
+                        class: session.class as u8,
                         privileges: session.privileges,
                         tx: outbound_tx.clone(),
                     };
@@ -597,6 +621,30 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                             }
                         }
                         None => self.send_error("not in that room").await?,
+                    }
+                }
+                PacketType::ChatRoomFlags => {
+                    let flags = WireChatRoomFlags::decode(&frame.payload)?;
+                    let session_id = self.session.as_ref().expect("authed").id;
+                    // Route through the manager (not the joined map) so we
+                    // return the same NotMember/NoPrivilege errors regardless
+                    // of whether this connection's copy has an in-memory
+                    // handle — a member's `join` above tracks its own
+                    // handles, but the flag change is still valid from any
+                    // joined session.
+                    match self
+                        .ctx
+                        .rooms
+                        .set_flags(
+                            &flags.room,
+                            session_id,
+                            flags.min_class_join,
+                            flags.interview_mode,
+                        )
+                        .await
+                    {
+                        Ok(()) => {}
+                        Err(e) => self.send_error(&e.to_string()).await?,
                     }
                 }
                 PacketType::FileListRequest => {

@@ -74,6 +74,26 @@ pub struct ChatInvited {
     pub room: String,
 }
 
+/// Client → server: change a room's admin-configurable flags. Requires
+/// `CHAT_SET_TOPIC` — the same privilege that already lets you rewrite the
+/// room's greeting — on the grounds that "moderator of this room" is the
+/// role that owns both. The server replies with an updated system chat
+/// event so every joined member sees the change.
+///
+/// * `min_class_join` — the minimum `BaseClass` (0-3) required to join
+///   this room. New joiners below this class are refused; existing
+///   members stay put (this is a gate on future joins, not an eviction).
+/// * `interview_mode` — when set, only members with `CHAT_SET_TOPIC` may
+///   send messages. Every other member's `ChatSend` is refused with an
+///   Info that names the mode. The canonical "one panelist takes
+///   questions, everyone else watches" pattern from the reference doc.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatRoomFlags {
+    pub room: String,
+    pub min_class_join: u8,
+    pub interview_mode: bool,
+}
+
 impl ChatSend {
     pub fn encode(&self) -> Bytes {
         let mut buf = BytesMut::with_capacity(5 + self.room.len() + self.text.len());
@@ -226,6 +246,30 @@ impl ChatInvited {
     }
 }
 
+impl ChatRoomFlags {
+    pub fn encode(&self) -> Bytes {
+        let mut buf = BytesMut::new();
+        put_str(&mut buf, &self.room);
+        buf.put_u8(self.min_class_join);
+        buf.put_u8(self.interview_mode as u8);
+        buf.freeze()
+    }
+    pub fn decode(mut payload: &[u8]) -> Result<Self, ProtocolError> {
+        let room = get_str(&mut payload, "ChatRoomFlags")?;
+        if payload.remaining() < 2 {
+            return Err(ProtocolError::MalformedPayload("ChatRoomFlags"));
+        }
+        let min_class_join = payload.get_u8();
+        let interview_mode = payload.get_u8() != 0;
+        expect_end(payload, "ChatRoomFlags")?;
+        Ok(Self {
+            room,
+            min_class_join,
+            interview_mode,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -291,5 +335,20 @@ mod tests {
 
         assert!(ChatInvite::decode(&[0, 5, 65]).is_err());
         assert!(ChatInvited::decode(&[0, 1, 65]).is_err());
+
+        let flags = ChatRoomFlags {
+            room: "green-room".into(),
+            min_class_join: 2,
+            interview_mode: true,
+        };
+        assert_eq!(ChatRoomFlags::decode(&flags.encode()).unwrap(), flags);
+        let flags_off = ChatRoomFlags {
+            room: "lobby".into(),
+            min_class_join: 0,
+            interview_mode: false,
+        };
+        assert_eq!(ChatRoomFlags::decode(&flags_off.encode()).unwrap(), flags_off);
+        // Room string present but the two flag bytes are missing.
+        assert!(ChatRoomFlags::decode(&[0, 1, 65]).is_err());
     }
 }

@@ -6,6 +6,9 @@ use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
 use super::room::{spawn_room, Member, RoomCommand, RoomError};
+// Re-export so `RoomError` (used as this manager's set_flags result) is
+// reachable from the `chat` module even for callers that only imported
+// the manager.
 use crate::auth::Privileges;
 
 pub const DEFAULT_ROOM: &str = "lobby";
@@ -127,6 +130,33 @@ impl RoomManager {
         Ok(())
     }
 
+    /// Change `room`'s admin-configurable flags on behalf of the member with
+    /// `session_id`. The room actor enforces `CHAT_SET_TOPIC` on the caller;
+    /// non-members receive `NotMember`.
+    pub async fn set_flags(
+        &self,
+        room: &str,
+        session_id: Uuid,
+        min_class_join: u8,
+        interview_mode: bool,
+    ) -> Result<(), RoomError> {
+        let tx = self
+            .rooms
+            .get(room)
+            .map(|e| e.tx.clone())
+            .ok_or(RoomError::NotMember)?;
+        let (reply, rx) = oneshot::channel();
+        tx.send(RoomCommand::SetFlags {
+            session_id,
+            min_class_join,
+            interview_mode,
+            reply,
+        })
+        .await
+        .map_err(|_| RoomError::NotMember)?;
+        rx.await.map_err(|_| RoomError::NotMember)?
+    }
+
     /// Best-effort leave used on disconnect cleanup. If `room` is temporary
     /// and this was its last member, drops the manager's own sender so the
     /// room actor's channel closes and its task exits.
@@ -172,6 +202,7 @@ mod tests {
             Member {
                 session_id: Uuid::new_v4(),
                 username: username.into(),
+                class: class as u8,
                 privileges: class.privileges(),
                 tx,
             },
@@ -213,6 +244,7 @@ mod tests {
         let dup = Member {
             session_id: m.session_id,
             username: m.username.clone(),
+            class: m.class,
             privileges: m.privileges,
             tx: m.tx.clone(),
         };
@@ -266,6 +298,53 @@ mod tests {
         let (b, _rx_b) = member("bob", BaseClass::User);
         assert!(mgr.join_private("priv-3", b).await.is_ok());
         assert!(mgr.rooms.contains_key("priv-3"));
+    }
+
+    #[tokio::test]
+    async fn min_class_join_flag_refuses_below_threshold() {
+        let mgr = RoomManager::new();
+        // A PowerUser (has CHAT_SET_TOPIC) founds the room and tightens
+        // the class gate to PowerUser (2) — anyone below is refused.
+        let (power, _rx1) = member("power", BaseClass::PowerUser);
+        let power_id = power.session_id;
+        mgr.join("green-room", power).await.unwrap();
+        mgr.set_flags("green-room", power_id, /*min*/ 2, /*interview*/ false)
+            .await
+            .unwrap();
+
+        // A plain User can't join the tightened room…
+        let (user, _rx2) = member("user", BaseClass::User);
+        assert_eq!(
+            mgr.join("green-room", user).await.unwrap_err(),
+            JoinError::Room(RoomError::ClassTooLow)
+        );
+        // …but another PowerUser or above can.
+        let (poweruser2, _rx3) = member("admin", BaseClass::Admin);
+        assert!(mgr.join("green-room", poweruser2).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn plain_member_cannot_change_flags() {
+        let mgr = RoomManager::new();
+        let (m, _rx) = member("user", BaseClass::User);
+        let m_id = m.session_id;
+        mgr.join(DEFAULT_ROOM, m).await.unwrap();
+        assert_eq!(
+            mgr.set_flags(DEFAULT_ROOM, m_id, 2, true).await.unwrap_err(),
+            RoomError::NoPrivilege
+        );
+    }
+
+    #[tokio::test]
+    async fn non_member_cannot_change_flags() {
+        let mgr = RoomManager::new();
+        let (m, _rx) = member("power", BaseClass::PowerUser);
+        // Deliberately NOT joining: we're testing that a caller who
+        // isn't in the room can't change its flags.
+        assert_eq!(
+            mgr.set_flags(DEFAULT_ROOM, m.session_id, 2, true).await.unwrap_err(),
+            RoomError::NotMember
+        );
     }
 
     #[tokio::test]

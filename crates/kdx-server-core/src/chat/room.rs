@@ -35,6 +35,11 @@ pub struct Outbound {
 pub struct Member {
     pub session_id: Uuid,
     pub username: String,
+    /// The member's `BaseClass` as a raw u8 (0..=3). Kept as a plain integer
+    /// here so the room actor stays independent of the auth module's type;
+    /// callers just pass `session.class as u8`. Used for the per-room
+    /// `min_class_join` gate.
+    pub class: u8,
     pub privileges: Privileges,
     /// The member's connection outbound channel.
     pub tx: mpsc::Sender<Outbound>,
@@ -63,6 +68,19 @@ pub enum RoomCommand {
     MemberCount {
         reply: oneshot::Sender<usize>,
     },
+    /// Change the room's admin-configurable flags. Requires CHAT_SET_TOPIC.
+    SetFlags {
+        session_id: Uuid,
+        min_class_join: u8,
+        interview_mode: bool,
+        reply: oneshot::Sender<Result<(), RoomError>>,
+    },
+    /// Read back the current flags — used by the manager's join gate so a
+    /// class-below-threshold caller is refused at the manager, not left
+    /// hanging as an in-room error.
+    GetFlags {
+        reply: oneshot::Sender<(u8, bool)>,
+    },
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -73,6 +91,10 @@ pub enum RoomError {
     NoPrivilege,
     #[error("already joined")]
     AlreadyJoined,
+    #[error("class too low for this room")]
+    ClassTooLow,
+    #[error("interview mode: only the panelist may speak")]
+    InterviewMuted,
 }
 
 struct RoomState {
@@ -80,6 +102,14 @@ struct RoomState {
     topic: String,
     members: HashMap<Uuid, Member>,
     gates: HashMap<Uuid, FloodGate>,
+    /// Minimum `BaseClass` (0..=3) needed to join. Defaults to 0 (open to
+    /// everyone connected). Existing members are never evicted when this
+    /// tightens — the gate only applies to future joins.
+    min_class_join: u8,
+    /// When set, only members with `CHAT_SET_TOPIC` may `Message`. Every
+    /// other member's send is refused with an `Info` naming the mode; the
+    /// message is silently dropped (not surfaced to the room).
+    interview_mode: bool,
 }
 
 /// Spawn a room actor; returns its command sender. The task exits when every
@@ -91,6 +121,8 @@ pub fn spawn_room(name: String) -> mpsc::Sender<RoomCommand> {
         topic: String::new(),
         members: HashMap::new(),
         gates: HashMap::new(),
+        min_class_join: 0,
+        interview_mode: false,
     };
     tokio::spawn(async move {
         while let Some(command) = rx.recv().await {
@@ -107,6 +139,13 @@ impl RoomState {
             RoomCommand::Join { member, reply } => {
                 if self.members.contains_key(&member.session_id) {
                     let _ = reply.send(Err(RoomError::AlreadyJoined));
+                    return;
+                }
+                // Per-room class gate — checked here in the actor so a
+                // client that raced the manager's cache still gets a
+                // clean refusal.
+                if member.class < self.min_class_join {
+                    let _ = reply.send(Err(RoomError::ClassTooLow));
                     return;
                 }
                 let session_id = member.session_id;
@@ -152,6 +191,27 @@ impl RoomState {
                 let Some(member) = self.members.get(&session_id) else {
                     return; // silently drop from non-members
                 };
+                // Interview mode: only panelists (CHAT_SET_TOPIC) may speak.
+                // Rejected sends get an Info back to the sender explaining
+                // the mode, and are NOT broadcast to the room.
+                if self.interview_mode
+                    && !member.privileges.contains(Privileges::CHAT_SET_TOPIC)
+                {
+                    let notice = format!(
+                        "#{}: interview mode is on — only the panelist may speak",
+                        self.name
+                    );
+                    self.send_to(
+                        session_id,
+                        Outbound {
+                            packet_type: PacketType::Info,
+                            flags: PacketFlags::SYSTEM_MESSAGE,
+                            payload: Bytes::copy_from_slice(notice.as_bytes()),
+                        },
+                    )
+                    .await;
+                    return;
+                }
                 let sender = member.username.clone();
                 let gate = self
                     .gates
@@ -211,6 +271,41 @@ impl RoomState {
             }
             RoomCommand::MemberCount { reply } => {
                 let _ = reply.send(self.members.len());
+            }
+            RoomCommand::SetFlags {
+                session_id,
+                min_class_join,
+                interview_mode,
+                reply,
+            } => {
+                let Some(member) = self.members.get(&session_id) else {
+                    let _ = reply.send(Err(RoomError::NotMember));
+                    return;
+                };
+                if !member.privileges.contains(Privileges::CHAT_SET_TOPIC) {
+                    let _ = reply.send(Err(RoomError::NoPrivilege));
+                    return;
+                }
+                let clamped = min_class_join.min(3);
+                let prior_interview = self.interview_mode;
+                self.min_class_join = clamped;
+                self.interview_mode = interview_mode;
+                let _ = reply.send(Ok(()));
+                // System-message the room so every joined member sees the
+                // change without having to poll.
+                let mut parts = Vec::new();
+                if prior_interview != interview_mode {
+                    parts.push(
+                        if interview_mode { "interview mode on" } else { "interview mode off" }
+                            .to_string(),
+                    );
+                }
+                parts.push(format!("min class {clamped}"));
+                self.broadcast_system(format!("room flags: {}", parts.join(", ")))
+                    .await;
+            }
+            RoomCommand::GetFlags { reply } => {
+                let _ = reply.send((self.min_class_join, self.interview_mode));
             }
         }
     }

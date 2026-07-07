@@ -121,6 +121,15 @@ pub(crate) enum Command {
         id: String,
         reply: oneshot::Sender<Result<Vec<IpRule>, ClientError>>,
     },
+    ListConnections {
+        reply: oneshot::Sender<Result<Vec<PresenceUser>, ClientError>>,
+    },
+    SetRoomFlags {
+        room: String,
+        min_class_join: u8,
+        interview_mode: bool,
+        reply: oneshot::Sender<Result<(), ClientError>>,
+    },
     GetUserInfo {
         username: String,
         reply: oneshot::Sender<Result<PresenceUser, ClientError>>,
@@ -495,6 +504,36 @@ impl ClientHandle {
     pub async fn delete_ip_rule(&self, id: &str) -> Result<Vec<IpRule>, ClientError> {
         self.send(|reply| Command::DeleteIpRule {
             id: id.to_owned(),
+            reply,
+        })
+        .await
+    }
+
+    /// Fetch the live connection roster (Connection Monitor). Returns the same
+    /// shape as `list_users`, but the server gates it on `USER_KICK` — plain
+    /// users get `ClientError::Server`. Refresh at whatever cadence you like;
+    /// there's no push channel for connection changes distinct from
+    /// presence.
+    pub async fn list_connections(&self) -> Result<Vec<PresenceUser>, ClientError> {
+        self.send(|reply| Command::ListConnections { reply }).await
+    }
+
+    /// Change a chat room's admin-configurable flags. Requires membership
+    /// in `room` and `CHAT_SET_TOPIC`. `min_class_join` is clamped 0..=3;
+    /// setting `interview_mode = true` mutes every member who lacks
+    /// `CHAT_SET_TOPIC` until it's toggled off. Resolves once the request
+    /// is written; the room's own system-message event announces the
+    /// change to every joined member.
+    pub async fn set_room_flags(
+        &self,
+        room: &str,
+        min_class_join: u8,
+        interview_mode: bool,
+    ) -> Result<(), ClientError> {
+        self.send(|reply| Command::SetRoomFlags {
+            room: room.to_owned(),
+            min_class_join,
+            interview_mode,
             reply,
         })
         .await

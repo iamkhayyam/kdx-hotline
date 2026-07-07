@@ -18,8 +18,8 @@ use kdx_protocol::messages::{
     AdminBroadcast, AdminShutdown, AuthResult, ChatEvent, ChatInvite, ChatInvited, ChatJoin,
     ChatLeave, ChatSend, ChatTopic, ChatUserList, FileCatalogGenerated, FileCreateFolder,
     FileDelete, FileGenerateCatalog,
-    FileAlias, FileListRequest, FileMove, FileSearchRequest, FileSearchResponse,
-    HistoryListRequest,
+    ChatRoomFlags as WireChatRoomFlags, ConnectionListRequest, ConnectionListResponse, FileAlias,
+    FileListRequest, FileMove, FileSearchRequest, FileSearchResponse, HistoryListRequest,
     HistoryListResponse, IpRuleCreate, IpRuleDelete, IpRuleListRequest, IpRuleListResponse,
     NewsPostCreate,
     NewsPostDelete, NewsThreadListRequest, NewsThreadListResponse, NewsgroupCreate,
@@ -115,6 +115,10 @@ pub(crate) struct Actor<S> {
     thread_waiters: VecDeque<oneshot::Sender<Result<Vec<NewsPost>, ClientError>>>,
     history_waiters: VecDeque<oneshot::Sender<Result<Vec<HistoryEntry>, ClientError>>>,
     ip_rule_waiters: VecDeque<oneshot::Sender<Result<Vec<IpRule>, ClientError>>>,
+    /// FIFO queue for `list_connections()` replies — the wire response
+    /// (`ConnectionListResponse`) carries no correlation id, matching every
+    /// other request/response pair in this actor.
+    connection_waiters: VecDeque<oneshot::Sender<Result<Vec<PresenceUser>, ClientError>>>,
     transfer: Option<Transfer>,
 }
 
@@ -145,6 +149,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
             thread_waiters: VecDeque::new(),
             history_waiters: VecDeque::new(),
             ip_rule_waiters: VecDeque::new(),
+            connection_waiters: VecDeque::new(),
             transfer: None,
         }
     }
@@ -237,6 +242,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
             let _ = waiter.send(Err(ClientError::Disconnected));
         }
         for waiter in self.ip_rule_waiters.drain(..) {
+            let _ = waiter.send(Err(ClientError::Disconnected));
+        }
+        for waiter in self.connection_waiters.drain(..) {
             let _ = waiter.send(Err(ClientError::Disconnected));
         }
         if let Some(reply) = self.transfer.take().and_then(transfer_reply) {
@@ -493,6 +501,38 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
                         let _ = reply.send(Err(e.into()));
                     }
                 }
+            }
+            Command::ListConnections { reply } => {
+                match self
+                    .send(
+                        PacketType::ConnectionListRequest,
+                        ConnectionListRequest.encode(),
+                    )
+                    .await
+                {
+                    Ok(()) => self.connection_waiters.push_back(reply),
+                    Err(e) => {
+                        let _ = reply.send(Err(e.into()));
+                    }
+                }
+            }
+            Command::SetRoomFlags {
+                room,
+                min_class_join,
+                interview_mode,
+                reply,
+            } => {
+                let msg = WireChatRoomFlags {
+                    room,
+                    min_class_join,
+                    interview_mode,
+                };
+                // Fire-and-forget over the wire: server acks by broadcasting
+                // a room-system message to every joined member (including
+                // us). No dedicated response, matching how ChatTopicSet
+                // already works.
+                let r = self.send(PacketType::ChatRoomFlags, msg.encode()).await;
+                let _ = reply.send(r.map_err(Into::into));
             }
             Command::GetUserInfo { username, reply } => {
                 match self
@@ -993,6 +1033,16 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
                     let _ = waiter.send(Ok(response.rules.into_iter().map(Into::into).collect()));
                 }
             }
+            PacketType::ConnectionListResponse => {
+                let response = ConnectionListResponse::decode(&frame.payload)?;
+                if let Some(waiter) = self.connection_waiters.pop_front() {
+                    let _ = waiter.send(Ok(response
+                        .connections
+                        .into_iter()
+                        .map(Into::into)
+                        .collect()));
+                }
+            }
             PacketType::RoleListResponse => {
                 let response = RoleListResponse::decode(&frame.payload)?;
                 if let Some(waiter) = self.role_waiters.pop_front() {
@@ -1307,6 +1357,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
         }
         // IP rule ops fail on missing SERVER_ADMIN or bad action/CIDR input.
         if let Some(waiter) = self.ip_rule_waiters.pop_front() {
+            let _ = waiter.send(Err(ClientError::Server(text.clone())));
+        }
+        // Connection Monitor requests fail on missing USER_KICK.
+        if let Some(waiter) = self.connection_waiters.pop_front() {
             let _ = waiter.send(Err(ClientError::Server(text.clone())));
         }
         self.emit(Event::ServerError { text }).await;

@@ -19,6 +19,7 @@ import { buildTrackers } from "./windows/trackers.js";
 import { buildServerAdmin } from "./windows/serveradmin.js";
 import { buildServerHistory } from "./windows/serverhistory.js";
 import { buildIpRules } from "./windows/iprules.js";
+import { buildConnections } from "./windows/connections.js";
 
 const desktop = document.getElementById("desktop");
 
@@ -63,14 +64,20 @@ const trackers = buildTrackers((host, port) => {
   connectApi.fill({ host, port: String(port) });
   open("connect");
 });
-const serverAdmin = buildServerAdmin(() => open("history"), () => open("iprules"));
+const serverAdmin = buildServerAdmin(
+  () => open("history"),
+  () => open("iprules"),
+  () => open("connections")
+);
 const serverHistory = buildServerHistory();
 const ipRules = buildIpRules();
+const connections = buildConnections();
 const roles = buildRoles(
   () => open("accounts"),
   () => open("server"),
   () => open("history"),
-  () => open("iprules")
+  () => open("iprules"),
+  () => open("connections")
 );
 const userList = buildUserList(
   (username) => {
@@ -191,6 +198,17 @@ register({
   rect: { x: 320, y: 100, w: 620, h: 440 },
   build: () => ({ body: ipRules.body }),
   onOpen: () => ipRules.refresh(),
+});
+register({
+  id: "connections",
+  title: "Connections",
+  rect: { x: 260, y: 60, w: 720, h: 460 },
+  build: () => ({ body: connections.body }),
+  // Start the auto-refresh loop when the window opens; the loop stops
+  // itself if the request errors (e.g. missing USER_KICK), so plain
+  // users don't cause a hidden 5s-polling storm on the server.
+  onOpen: () => connections.start(),
+  onClose: () => connections.stop(),
 });
 register({
   id: "news",

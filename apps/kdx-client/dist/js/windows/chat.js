@@ -11,6 +11,7 @@ const SLASH_HELP = [
   "/me <action> — pose an action (also \\me)",
   "/away [reason] · /back · /afk — announce your status",
   "/topic <text> — set the room topic",
+  "/roomflags <min-class 0-3> <on|off> — set join gate + interview mode",
   "/clear — clear this transcript",
   "/help — this list",
 ];
@@ -148,6 +149,36 @@ export function buildChat(sendMessage, getInfo, inviteToChat) {
       case "topic":
         await invoke("set_topic", { room, topic: rest });
         break;
+      case "roomflags": {
+        // Two positional args: `<minclass 0-3> <on|off>`. Both required, so
+        // the caller thinks about both at once rather than clobbering one
+        // accidentally.
+        const parts = rest.trim().split(/\s+/);
+        if (parts.length < 2) {
+          line("err", "! usage: /roomflags <min-class 0-3> <on|off>");
+          break;
+        }
+        const minClassJoin = parseInt(parts[0], 10);
+        if (!Number.isInteger(minClassJoin) || minClassJoin < 0 || minClassJoin > 3) {
+          line("err", "! min-class must be 0..3");
+          break;
+        }
+        const modeArg = parts[1].toLowerCase();
+        if (modeArg !== "on" && modeArg !== "off") {
+          line("err", "! interview mode must be 'on' or 'off'");
+          break;
+        }
+        try {
+          await invoke("set_room_flags", {
+            room,
+            minClassJoin,
+            interviewMode: modeArg === "on",
+          });
+        } catch (err) {
+          line("err", "! " + (err.message || err));
+        }
+        break;
+      }
       case "clear":
         scroll.innerHTML = "";
         break;

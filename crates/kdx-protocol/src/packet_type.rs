@@ -100,6 +100,13 @@ pub enum PacketType {
     IpRuleCreate = 0x7D,
     IpRuleDelete = 0x7E,
 
+    // Connection Monitor (0x7F-0x80)
+    ConnectionListRequest = 0x7F,
+    ConnectionListResponse = 0x80,
+
+    // Per-room flags (0x81) — set by a chat admin (CHAT_SET_TOPIC)
+    ChatRoomFlags = 0x81,
+
     // System (0xF0-0xFF)
     Error = 0xF0,
     Warning = 0xF1,
@@ -107,7 +114,7 @@ pub enum PacketType {
 }
 
 impl PacketType {
-    pub const ALL: [PacketType; 73] = [
+    pub const ALL: [PacketType; 76] = [
         PacketType::HandshakeInit,
         PacketType::HandshakeResp,
         PacketType::Ping,
@@ -178,6 +185,9 @@ impl PacketType {
         PacketType::IpRuleListResponse,
         PacketType::IpRuleCreate,
         PacketType::IpRuleDelete,
+        PacketType::ConnectionListRequest,
+        PacketType::ConnectionListResponse,
+        PacketType::ChatRoomFlags,
         PacketType::Error,
         PacketType::Warning,
         PacketType::Info,
@@ -260,6 +270,9 @@ impl TryFrom<u8> for PacketType {
             0x7C => IpRuleListResponse,
             0x7D => IpRuleCreate,
             0x7E => IpRuleDelete,
+            0x7F => ConnectionListRequest,
+            0x80 => ConnectionListResponse,
+            0x81 => ChatRoomFlags,
             0xF0 => Error,
             0xF1 => Warning,
             0xF2 => Info,
