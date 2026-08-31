@@ -2,9 +2,10 @@
 // left pane of people (the bar turns red on unread) and a right transcript +
 // input for the selected person. Mirrors the original KDX Messages window.
 
-import { invoke } from "../bridge.js";
+import { invoke, emitUi } from "../bridge.js";
+import { getState } from "../store.js";
 
-export function buildMessages(getMe, onUnreadChange) {
+export function buildMessages() {
   const body = document.createElement("div");
   body.className = "messages-win";
   body.innerHTML = `
@@ -48,15 +49,16 @@ export function buildMessages(getMe, onUnreadChange) {
       row.addEventListener("click", () => select(user));
       peopleEl.appendChild(row);
     }
-    onUnreadChange && onUnreadChange(totalUnread());
+    emitUi("main", "set-led", { unread: totalUnread() });
   }
 
   function renderThread() {
     scrollEl.innerHTML = "";
     if (!active) return;
+    const me = getState().session && getState().session.username;
     for (const l of ensure(active).lines) {
       const div = document.createElement("div");
-      const mine = l.from === getMe();
+      const mine = l.from === me;
       div.className = "chat-line" + (mine ? " pm-mine" : "");
       div.innerHTML = `<span class="ts">${hhmm(l.ts)}</span><span class="nick">&lt;${esc(l.from)}&gt;</span> ${esc(l.text)}`;
       scrollEl.appendChild(div);
@@ -93,7 +95,7 @@ export function buildMessages(getMe, onUnreadChange) {
     body,
     /** Handle an incoming/echoed private message event. */
     onMessage(ev) {
-      const me = getMe();
+      const me = getState().session && getState().session.username;
       // The other party in this conversation.
       const other = ev.from === me ? ev.to : ev.from;
       const c = ensure(other);

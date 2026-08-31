@@ -36,48 +36,30 @@ body::before {
   z-index: 999;
 }
 
-.menubar {
-  display: flex; align-items: center; gap: 18px;
-  padding: 6px 14px;
-  background: linear-gradient(#1a0808, #120606);
-  border-bottom: 1px solid var(--chrome);
-  font-size: 12px;
-  flex: 0 0 auto;
-}
-.menubar .brand { color: var(--alert); font-weight: 700; letter-spacing: .22em; }
-.menubar .item { color: var(--grey); letter-spacing: .08em; }
-.menubar .spacer { flex: 1; }
-.menubar .conn { font-size: 11px; letter-spacing: .06em; }
-.menubar .conn::before { content: "●"; margin-right: 6px; }
-.conn[data-state="offline"] { color: var(--grey-dim); }
-.conn[data-state="offline"]::before { color: var(--grey-dim); }
-.conn[data-state="connecting"] { color: var(--amber); }
-.conn[data-state="connecting"]::before { color: var(--amber); }
-.conn[data-state="online"] { color: var(--green); }
-.conn[data-state="online"]::before { color: var(--green); animation: pulse 2.4s ease-in-out infinite; }
-@keyframes pulse { 0%,100% { opacity: 1 } 50% { opacity: .35 } }
 
 .desktop { position: relative; flex: 1 1 auto; overflow: hidden; }
 
-/* Button Bar — a floating window on the desktop, sized to its content */
+/* Button Bar — the launcher is its own native window; the strip fills it */
 .buttonbar {
-  position: absolute; z-index: 6;
-  width: 158px;
+  width: 100%; height: 100%;
   display: flex; flex-direction: column;
-  max-height: calc(100% - 24px);
   background: linear-gradient(#160909, #0c0606);
-  border: 1px solid var(--chrome);
-  box-shadow: 0 0 0 1px #000, 0 14px 40px rgba(0,0,0,.7), 0 0 20px rgba(122,10,10,.2);
+  border: 1px solid var(--chrome-dim);
+  box-shadow: inset 0 0 20px rgba(122,10,10,.2);
+  transition: border-color .15s ease;
 }
+.buttonbar.focused { border-color: var(--alert); }
 .bb-titlebar {
-  display: flex; align-items: center;
-  padding: 3px 7px;
+  display: flex; align-items: center; gap: 4px;
+  padding: 3px 6px;
   background: linear-gradient(#5c0d0d, #340808);
   border-bottom: 1px solid var(--chrome);
   cursor: grab;
+  flex: 0 0 auto;
 }
 .bb-titlebar:active { cursor: grabbing; }
 .bb-brand { color: var(--alert); font-family: var(--mono); font-weight: 700; letter-spacing: .26em; font-size: 12px; }
+.bb-spacer { flex: 1; }
 .bb-header { padding: 8px 8px 6px; border-bottom: 1px solid var(--chrome-dim); }
 .bb-banner {
   height: 40px; margin-bottom: 6px; display: none;
@@ -230,10 +212,13 @@ body::before {
   display: flex; flex-direction: column;
   min-width: 240px;
 }
+/* A floating KDX window is a REAL native window: the chrome fills it and the
+   OS provides the shadow. */
+.win.native { position: relative; width: 100%; height: 100%; min-width: 0; box-shadow: none; }
+/* Preview mode (plain browser): stacked sections. */
+.win.preview { position: relative; margin: 8px; width: calc(100% - 16px); }
+.win.preview .win-body { max-height: 60vh; }
 .win.focused { border-color: var(--alert); box-shadow: 0 0 0 1px #000, 0 18px 50px rgba(0,0,0,.8), 0 0 26px rgba(225,27,27,.22); }
-.win.hidden { display: none; }
-.win.maximized { left: 0 !important; top: 0 !important; width: 100% !important; height: 100% !important; }
-.win.pinned { border-top: 2px solid var(--amber); }
 
 .titlebar {
   display: flex; align-items: center; gap: 6px;
@@ -264,22 +249,32 @@ body::before {
 .titlebar .tag { font-size: 10px; color: var(--grey); letter-spacing: .1em; margin-right: 2px; }
 .win-body { flex: 1; overflow: auto; display: flex; flex-direction: column; }
 
+/* Resize grip — the classic double-triangle corner marker (outer triangle
+   with a nested notch), the timeless "pull here to resize" affordance.
+   Purely visual: the window resizes via native edge-drag, so the grip is
+   pointer-transparent and sits exactly in the bottom-right corner. */
 .resize-grip {
-  position: absolute; right: 0; bottom: 0; width: 14px; height: 14px;
-  cursor: nwse-resize;
-  background: repeating-linear-gradient(135deg, var(--chrome) 0 1px, transparent 1px 3px);
+  position: absolute; right: 2px; bottom: 2px;
+  width: 0; height: 0;
+  border-left: 11px solid transparent;
+  border-bottom: 11px solid var(--chrome-dim);
+  opacity: .9;
+  pointer-events: none;
+  z-index: 2;
 }
+.resize-grip::after {
+  content: "";
+  position: absolute;
+  right: 3px; bottom: 3px;
+  border-left: 6px solid transparent;
+  border-bottom: 6px solid var(--panel);
+}
+.win.focused .resize-grip { border-bottom-color: var(--chrome); }
+/* Shaded (rolled-up) windows show only their head: no grip, no body. */
+.win.shaded .resize-grip { display: none; }
+.win.shaded .win-body { display: none; }
+.win.shaded .titlebar h2::after { content: " ▾"; color: var(--alert); }
 
-/* Dock — collects minimized windows */
-.win.dock { top: auto; min-width: 150px; }
-.dock-bar { cursor: default; }
-.dock-body { padding: 4px; gap: 2px; }
-.dock-row {
-  font-family: var(--mono); font-size: 11px; color: var(--green);
-  padding: 3px 6px; border: 1px solid var(--chrome-dim); background: var(--panel-deep);
-  cursor: pointer; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-}
-.dock-row:hover { border-color: var(--alert); color: #b6ffcb; }
 
 /* popup / context menus */
 .popup-menu {

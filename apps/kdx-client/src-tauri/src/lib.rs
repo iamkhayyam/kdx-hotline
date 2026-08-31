@@ -67,6 +67,8 @@ pub fn run() {
             commands::list_thread,
             commands::create_post,
             commands::delete_post,
+            commands::get_file_info,
+            commands::set_identity,
         ])
         .run(tauri::generate_context!())
         .expect("error while running KDX");

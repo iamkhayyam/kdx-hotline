@@ -273,7 +273,7 @@ async fn dropbox_download_is_refused() {
     let pool = kdx_storage::connect(&dir.path().join("kdx.db")).await.unwrap();
     let phc = hash_password("pw").unwrap();
     accounts::create(&pool, "user", &phc, 2).await.unwrap();
-    kdx_storage::file_tree::create_folder(&pool, kdx_storage::file_tree::ROOT_ID, "drop", 2, 0, 1)
+    kdx_storage::file_tree::create_folder(&pool, kdx_storage::file_tree::ROOT_ID, "drop", 2, 0, 1, None)
         .await
         .unwrap();
     let server = serve(test_config(&dir)).await.unwrap();

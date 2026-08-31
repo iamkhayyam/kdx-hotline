@@ -70,7 +70,7 @@ impl TransferManager {
         if !(MIN_CHUNK..=MAX_CHUNK).contains(&chunk_size) {
             return Err(TransferError::BadChunkSize);
         }
-        let node = tree.open_for_read(path, session.class).await?;
+        let node = tree.open_for_read(path, session).await?;
         let storage_path = node
             .storage_path
             .clone()

@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use tokio::sync::{mpsc, oneshot};
 
-use kdx_protocol::messages::FileListResponse;
+use kdx_protocol::messages::{FileInfoResponse, FileListResponse};
 
 use crate::error::ClientError;
 use crate::event::{
@@ -55,6 +55,7 @@ pub(crate) enum Command {
         kind: u8,
         min_read_class: u8,
         min_write_class: u8,
+        owner: Option<String>,
         reply: oneshot::Sender<Result<FileListResponse, ClientError>>,
     },
     DeletePath {
@@ -70,6 +71,15 @@ pub(crate) enum Command {
         source_path: String,
         dest_path: String,
         reply: oneshot::Sender<Result<FileListResponse, ClientError>>,
+    },
+    GetFileInfo {
+        path: String,
+        reply: oneshot::Sender<Result<FileInfoResponse, ClientError>>,
+    },
+    /// No reply: the server just applies the identity change (fire-and-forget).
+    SetIdentity {
+        name: String,
+        description: String,
     },
     GenerateCatalog {
         reply: oneshot::Sender<Result<u32, ClientError>>,
@@ -314,6 +324,29 @@ impl ClientHandle {
         .await
     }
 
+    /// Fetch node metadata for the Files "Get Info" verb. Requires read
+    /// access to the node; aliases resolve to their target.
+    pub async fn get_file_info(&self, path: &str) -> Result<FileInfoResponse, ClientError> {
+        self.send(|reply| Command::GetFileInfo {
+            path: path.to_owned(),
+            reply,
+        })
+        .await
+    }
+
+    /// Set your own display name / description (`/name`, `/desc`). The
+    /// server rebroadcasts presence so everyone sees the change live.
+    /// Fire-and-forget: the server applies it without a reply.
+    pub async fn set_identity(&self, name: &str, description: &str) -> Result<(), ClientError> {
+        self.tx
+            .send(Command::SetIdentity {
+                name: name.to_owned(),
+                description: description.to_owned(),
+            })
+            .await
+            .map_err(|_| ClientError::Disconnected)
+    }
+
     /// Create a folder-like node (`kind`: 0 directory, 2 drop box, 3 upload
     /// folder) under `path` with class thresholds. Requires FILE_MANAGE_TREE.
     /// Resolves with the updated listing of `path`.
@@ -324,6 +357,7 @@ impl ClientHandle {
         kind: u8,
         min_read_class: u8,
         min_write_class: u8,
+        owner: Option<&str>,
     ) -> Result<FileListResponse, ClientError> {
         self.send(|reply| Command::CreateFolder {
             path: path.to_owned(),
@@ -331,6 +365,7 @@ impl ClientHandle {
             kind,
             min_read_class,
             min_write_class,
+            owner: owner.map(str::to_owned),
             reply,
         })
         .await

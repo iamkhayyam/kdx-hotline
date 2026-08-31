@@ -25,9 +25,11 @@ use kdx_protocol::messages::{
     NewsPostDelete, NewsThreadListRequest, NewsThreadListResponse, NewsgroupCreate,
     NewsgroupListRequest, NewsgroupListResponse, ServerSettingsRequest, ServerSettingsResponse,
     ServerSettingsUpdate, TrackerListRequest, TrackerListResponse,
-    FileListResponse, PresenceChange, PresenceListRequest, PresenceListResponse, PrivateMessage,
+    FileInfoRequest, FileInfoResponse, FileListResponse, PresenceChange,
+    PresenceListRequest, PresenceListResponse, PrivateMessage,
     PrivateSend, RoleAssign, RoleCreate, RoleDelete, RoleListRequest, RoleListResponse,
-    RoleUnassign, RoleUpdate, TransferAccept, TransferData, TransferEnd, TransferRequest,
+    RoleUnassign, RoleUpdate, SetIdentity, TransferAccept, TransferData, TransferEnd,
+    TransferRequest,
     UserInfoRequest, UserInfoResponse, DIRECTION_DOWNLOAD, DIRECTION_UPLOAD, TRANSFER_VERIFIED,
 };
 use kdx_protocol::{
@@ -102,6 +104,7 @@ pub(crate) struct Actor<S> {
     seq: u32,
     login: Option<PendingLogin>,
     list_waiters: VecDeque<oneshot::Sender<Result<FileListResponse, ClientError>>>,
+    info_waiters: VecDeque<oneshot::Sender<Result<FileInfoResponse, ClientError>>>,
     user_list_waiters: VecDeque<oneshot::Sender<Result<Vec<PresenceUser>, ClientError>>>,
     server_list_waiters: VecDeque<oneshot::Sender<Result<Vec<TrackerServer>, ClientError>>>,
     settings_waiters: VecDeque<oneshot::Sender<Result<ServerSettings, ClientError>>>,
@@ -136,6 +139,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
             seq: 0,
             login: None,
             list_waiters: VecDeque::new(),
+            info_waiters: VecDeque::new(),
             user_list_waiters: VecDeque::new(),
             server_list_waiters: VecDeque::new(),
             settings_waiters: VecDeque::new(),
@@ -201,6 +205,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
         // Fail any outstanding waiters, then announce the disconnect.
         if let Some(login) = self.login.take() {
             let _ = login.reply.send(Err(ClientError::Disconnected));
+        }
+        for waiter in self.info_waiters.drain(..) {
+            let _ = waiter.send(Err(ClientError::Disconnected));
         }
         for waiter in self.list_waiters.drain(..) {
             let _ = waiter.send(Err(ClientError::Disconnected));
@@ -314,6 +321,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
                 kind,
                 min_read_class,
                 min_write_class,
+                owner,
                 reply,
             } => {
                 let msg = FileCreateFolder {
@@ -322,6 +330,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
                     kind,
                     min_read_class,
                     min_write_class,
+                    owner,
                 };
                 match self.send(PacketType::FileCreateFolder, msg.encode()).await {
                     Ok(()) => self.list_waiters.push_back(reply),
@@ -350,6 +359,25 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
                         let _ = reply.send(Err(e.into()));
                     }
                 }
+            }
+            Command::GetFileInfo { path, reply } => {
+                match self
+                    .send(PacketType::FileInfoRequest, FileInfoRequest { path }.encode())
+                    .await
+                {
+                    Ok(()) => self.info_waiters.push_back(reply),
+                    Err(e) => {
+                        let _ = reply.send(Err(e.into()));
+                    }
+                }
+            }
+            Command::SetIdentity { name, description } => {
+                let _ = self
+                    .send(
+                        PacketType::SetIdentity,
+                        SetIdentity { name, description }.encode(),
+                    )
+                    .await;
             }
             Command::AliasPath {
                 source_path,
@@ -982,6 +1010,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
             PacketType::FileListResponse => {
                 let response = FileListResponse::decode(&frame.payload)?;
                 if let Some(waiter) = self.list_waiters.pop_front() {
+                    let _ = waiter.send(Ok(response));
+                }
+            }
+            PacketType::FileInfoResponse => {
+                let response = FileInfoResponse::decode(&frame.payload)?;
+                if let Some(waiter) = self.info_waiters.pop_front() {
                     let _ = waiter.send(Ok(response));
                 }
             }

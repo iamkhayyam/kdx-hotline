@@ -1,9 +1,9 @@
-import { invoke } from "../bridge.js";
+import { invoke, emitUi } from "../bridge.js";
 import { update, getState } from "../store.js";
 
 const CLASSES = ["guest", "user", "power user", "admin"];
 
-export function buildConnect(onLoggedIn) {
+export function buildConnect() {
   const body = document.createElement("div");
   body.className = "login";
   body.innerHTML = `
@@ -76,7 +76,10 @@ export function buildConnect(onLoggedIn) {
     setStatus(`logged in as ${username} (${CLASSES[klass] || "?"})`, "ok");
     go.disabled = false;
     await invoke("join_room", { room: getState().room });
-    onLoggedIn();
+    // Tell every other window who we are (they keep their own store), and
+    // let the launcher open the chat window + snapshot the roster.
+    emitUi("*", "session", { session: { username, class: klass }, server: { host, port } });
+    emitUi("main", "login-success");
   }
 
   function showTofu(err, host, port, username, password) {

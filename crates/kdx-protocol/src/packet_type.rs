@@ -29,6 +29,8 @@ pub enum PacketType {
     FileSearchResponse = 0x2A,
     FileMove = 0x2B,
     FileAlias = 0x2C,
+    FileInfoRequest = 0x2D,
+    FileInfoResponse = 0x2E,
 
     // Chat (0x30-0x3F)
     ChatMessage = 0x30,
@@ -36,6 +38,7 @@ pub enum PacketType {
     ChatLeave = 0x32,
     ChatUserList = 0x33,
     ChatTopicSet = 0x34,
+    SetIdentity = 0x3A,
 
     // Presence (0x35-0x39)
     PresenceListRequest = 0x35,
@@ -222,11 +225,14 @@ impl TryFrom<u8> for PacketType {
             0x2A => FileSearchResponse,
             0x2B => FileMove,
             0x2C => FileAlias,
+            0x2D => FileInfoRequest,
+            0x2E => FileInfoResponse,
             0x30 => ChatMessage,
             0x31 => ChatJoin,
             0x32 => ChatLeave,
             0x33 => ChatUserList,
             0x34 => ChatTopicSet,
+            0x3A => SetIdentity,
             0x35 => PresenceListRequest,
             0x36 => PresenceListResponse,
             0x37 => PresenceChange,

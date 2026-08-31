@@ -13,3 +13,6 @@ _github/
 
 # Local dev playground (accounts, db, served files)
 .dev/
+
+# Release staging (built installers; CI reproduces them)
+/dist/

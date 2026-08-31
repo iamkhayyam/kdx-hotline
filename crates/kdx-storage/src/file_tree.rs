@@ -23,12 +23,15 @@ pub struct FileNodeRow {
     /// deleting a target leaves the alias as a dangling row that resolves
     /// to "not found" at runtime rather than silently disappearing.
     pub target_id: Option<String>,
+    /// Optional owner login (dropboxes / [DB] folders): the owner may read
+    /// and delete inside even though the folder is write-only to others.
+    pub owner: Option<String>,
 }
 
 pub async fn all(pool: &SqlitePool) -> Result<Vec<FileNodeRow>, StorageError> {
     let rows = sqlx::query_as::<_, FileNodeRow>(
         "SELECT id, parent_id, name, kind, size, sha256, min_class_read, min_class_write,
-                storage_path, target_id
+                storage_path, target_id, owner
          FROM file_nodes",
     )
     .fetch_all(pool)
@@ -44,11 +47,12 @@ pub async fn create_folder(
     kind: i64,
     min_class_read: i64,
     min_class_write: i64,
+    owner: Option<&str>,
 ) -> Result<FileNodeRow, StorageError> {
     let id = Uuid::new_v4().to_string();
     sqlx::query(
-        "INSERT INTO file_nodes (id, parent_id, name, kind, min_class_read, min_class_write)
-         VALUES (?, ?, ?, ?, ?, ?)",
+        "INSERT INTO file_nodes (id, parent_id, name, kind, min_class_read, min_class_write, owner)
+         VALUES (?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&id)
     .bind(parent_id)
@@ -56,6 +60,7 @@ pub async fn create_folder(
     .bind(kind)
     .bind(min_class_read)
     .bind(min_class_write)
+    .bind(owner)
     .execute(pool)
     .await?;
     Ok(FileNodeRow {
@@ -69,6 +74,7 @@ pub async fn create_folder(
         min_class_write,
         storage_path: None,
         target_id: None,
+        owner: owner.map(str::to_owned),
     })
 }
 
@@ -105,6 +111,7 @@ pub async fn create_file(
         min_class_write: 2,
         storage_path: Some(storage_path.to_owned()),
         target_id: None,
+        owner: None,
     })
 }
 
@@ -140,6 +147,7 @@ pub async fn create_alias(
         min_class_write: 2,
         storage_path: None,
         target_id: Some(target_id.to_owned()),
+        owner: None,
     })
 }
 

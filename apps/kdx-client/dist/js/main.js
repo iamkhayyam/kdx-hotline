@@ -1,321 +1,208 @@
-import { invoke, onKdxEvent } from "./bridge.js";
-import { initDesktop, register, open, toggle, isOpen, onChange } from "./wm.js";
+// KDX entry point. Every window loads index.html and runs this file; the
+// ?win= query param decides what mounts:
+//   ?win=<id>  ->  a floating feature window (see windows/registry.js)
+//   (none)     ->  the launcher: a small floating KDX control strip that
+//                  opens every other window. Closing it quits the app.
+//
+// Server events ("kdx") are broadcast to every window by the Rust forwarder;
+// window-to-window UI commands ride the "kdx-ui" channel. Each window keeps
+// its own copy of store.js — shared facts (session, server, presence) arrive
+// via the session broadcast / kdx events.
+
+import {
+  invoke,
+  inTauri,
+  windowLabel,
+  getCurrentWindow,
+  onKdxEvent,
+  onUi,
+  logicalPosition,
+  logicalSize,
+} from "./bridge.js";
+import { initDesktop, open, toggle, hide, show, onChange } from "./wm.js";
 import { getState, subscribe, update, updateTransfer } from "./store.js";
 import { buildButtonBar } from "./buttonbar.js";
-import { buildConnect } from "./windows/connect.js";
-import { buildChat } from "./windows/chat.js";
-import { buildFiles } from "./windows/files.js";
-import { buildTransfers } from "./windows/transfers.js";
-import { buildAddressBook } from "./windows/addressbook.js";
-import { buildSettings, applySettings, loadSettings } from "./windows/settings.js";
-import { buildAbout } from "./windows/about.js";
-import { buildUserList } from "./windows/userlist.js";
-import { buildUserInfo } from "./windows/userinfo.js";
-import { buildMessages } from "./windows/messages.js";
-import { buildRoles } from "./windows/roles.js";
-import { buildAccounts } from "./windows/accounts.js";
-import { buildNews } from "./windows/news.js";
-import { buildTrackers } from "./windows/trackers.js";
-import { buildServerAdmin } from "./windows/serveradmin.js";
-import { buildServerHistory } from "./windows/serverhistory.js";
-import { buildIpRules } from "./windows/iprules.js";
-import { buildConnections } from "./windows/connections.js";
+import { mountFeature, registerAll, FEATURES } from "./windows/registry.js";
+import { showMenu } from "./menu.js";
+import { applySettings, loadSettings } from "./windows/settings.js";
 
 const desktop = document.getElementById("desktop");
 
-initDesktop(desktop);
-applySettings(loadSettings()); // apply saved theme/prefs at startup
-
-// Build feature instances eagerly (cheap DOM); the window manager wraps each
-// in floating chrome lazily on first open. Events route to these instances
-// whether or not their window is currently open.
-// Chat member verbs reuse the Messages + User Info windows (defined below;
-// these closures run only on user interaction, after those consts init).
-function inviteToChat(username) {
-  invoke("invite_to_chat", { to: username }).catch(() => {});
-}
-const chat = buildChat(
-  (username) => openMessagesWith(username),
-  (username) => {
-    open("userinfo");
-    userInfo.show(username);
-  },
-  inviteToChat
-);
-const files = buildFiles();
-const transfers = buildTransfers();
-const connectApi = buildConnect(onLoggedIn);
-const addressbook = buildAddressBook(connectApi, () => open("connect"));
-const settings = buildSettings();
-const about = buildAbout();
-const userInfo = buildUserInfo();
-const messages = buildMessages(
-  () => getState().session && getState().session.username,
-  (unread) => buttonBar.setLed(unread > 0)
-);
-function openMessagesWith(username) {
-  open("messages");
-  messages.openWith(username);
-}
-const accounts = buildAccounts();
-const news = buildNews(() => getState().session && getState().session.username);
-// Trackers: picking a server pre-fills the Connect window with its address.
-const trackers = buildTrackers((host, port) => {
-  connectApi.fill({ host, port: String(port) });
-  open("connect");
-});
-const serverAdmin = buildServerAdmin(
-  () => open("history"),
-  () => open("iprules"),
-  () => open("connections")
-);
-const serverHistory = buildServerHistory();
-const ipRules = buildIpRules();
-const connections = buildConnections();
-const roles = buildRoles(
-  () => open("accounts"),
-  () => open("server"),
-  () => open("history"),
-  () => open("iprules"),
-  () => open("connections")
-);
-const userList = buildUserList(
-  (username) => {
-    open("userinfo");
-    userInfo.show(username);
-  },
-  openMessagesWith,
-  (username) => {
-    open("admin");
-    roles.openDisconnect(username);
-  },
-  inviteToChat
-);
-
-// Default window positions clear the floating Button Bar (top-left).
-register({
-  id: "connect",
-  title: "Connect",
-  rect: { x: 200, y: 24, w: 300 },
-  resizable: false,
-  build: () => ({ body: connectApi.body }),
-});
-register({
-  id: "chat",
-  title: "Public Chat",
-  tag: "0 users",
-  rect: { x: 200, y: 24, w: 560, h: 380 },
-  build: () => ({ body: chat.body, api: chat }),
-  onOpen: () => chat.refreshRoomTag(),
-});
-register({
-  id: "files",
-  title: "Files",
-  tag: "/",
-  rect: { x: 200, y: 430, w: 440, h: 300 },
-  build: () => ({ body: files.body }),
-  onOpen: () => files.refresh(),
-});
-register({
-  id: "transfers",
-  title: "File Transfers",
-  rect: { x: 790, y: 24, w: 320, h: 360 },
-  build: () => ({ body: transfers.body }),
-});
-register({
-  id: "addressbook",
-  title: "Address Book",
-  rect: { x: 200, y: 90, w: 460, h: 320 },
-  build: () => ({ body: addressbook.body }),
-});
-register({
-  id: "settings",
-  title: "Settings",
-  rect: { x: 240, y: 120, w: 360 },
-  resizable: false,
-  build: () => ({ body: settings.body }),
-});
-register({
-  id: "about",
-  title: "About KDX",
-  rect: { x: 280, y: 150, w: 360 },
-  resizable: false,
-  build: () => ({ body: about.body }),
-});
-register({
-  id: "userlist",
-  title: "User List",
-  rect: { x: 630, y: 430, w: 300, h: 320 },
-  build: () => ({ body: userList.body }),
-  onOpen: () => {
-    userList.refresh().then(() => update({ presenceCount: userList.count }));
-  },
-});
-register({
-  id: "userinfo",
-  title: "User Info",
-  rect: { x: 940, y: 430, w: 280, h: 260 },
-  resizable: false,
-  build: () => ({ body: userInfo.body }),
-});
-register({
-  id: "messages",
-  title: "Messages",
-  rect: { x: 340, y: 120, w: 500, h: 340 },
-  build: () => ({ body: messages.body }),
-});
-register({
-  id: "admin",
-  title: "Administration",
-  rect: { x: 380, y: 90, w: 520, h: 460 },
-  build: () => ({ body: roles.body }),
-  onOpen: () => roles.refresh(),
-});
-register({
-  id: "accounts",
-  title: "Accounts",
-  rect: { x: 420, y: 70, w: 560, h: 480 },
-  build: () => ({ body: accounts.body }),
-  onOpen: () => accounts.refresh(),
-});
-register({
-  id: "server",
-  title: "Server",
-  rect: { x: 440, y: 90, w: 460, h: 460 },
-  build: () => ({ body: serverAdmin.body }),
-  onOpen: () => serverAdmin.refresh(),
-});
-register({
-  id: "history",
-  title: "Server History",
-  rect: { x: 300, y: 80, w: 640, h: 460 },
-  build: () => ({ body: serverHistory.body }),
-  onOpen: () => serverHistory.refresh(),
-});
-register({
-  id: "iprules",
-  title: "IP Rules",
-  rect: { x: 320, y: 100, w: 620, h: 440 },
-  build: () => ({ body: ipRules.body }),
-  onOpen: () => ipRules.refresh(),
-});
-register({
-  id: "connections",
-  title: "Connections",
-  rect: { x: 260, y: 60, w: 720, h: 460 },
-  build: () => ({ body: connections.body }),
-  // Start the auto-refresh loop when the window opens; the loop stops
-  // itself if the request errors (e.g. missing USER_KICK), so plain
-  // users don't cause a hidden 5s-polling storm on the server.
-  onOpen: () => connections.start(),
-  onClose: () => connections.stop(),
-});
-register({
-  id: "news",
-  title: "Public News",
-  rect: { x: 240, y: 60, w: 640, h: 460 },
-  build: () => ({ body: news.body }),
-  onOpen: () => news.refresh(),
-});
-register({
-  id: "trackers",
-  title: "Trackers",
-  rect: { x: 300, y: 120, w: 420, h: 360 },
-  build: () => ({ body: trackers.body }),
-  onOpen: () => trackers.refresh(),
-});
-
-// The Button Bar — the always-present launcher, itself a floating window on
-// the desktop.
-const buttonBar = buildButtonBar(desktop, {
-  onAction: (name) => {
-    if (name === "disconnect") {
-      invoke("disconnect").catch(() => {});
-      update({ connection: "offline", session: null, presenceCount: 0 });
-    } else if (name === "server") {
-      toggle("connect");
-    } else if (name === "exit") {
-      if (window.__TAURI__) window.__TAURI__.window.getCurrentWindow().close();
-    }
-  },
-});
-
-// Open the Connect window on start.
-open("connect");
-
-function onLoggedIn() {
-  open("chat");
-  chat.focusEntry();
-  // Populate the global roster (and Button Bar count) even if the User List
-  // window is never opened.
-  userList.refresh().then(() => update({ presenceCount: userList.count }));
+// ---- dispatch ----
+if (windowLabel() === "main") {
+  mountLauncher();
+} else {
+  initDesktop(desktop);
+  registerAll();
+  mountFeature(windowLabel());
 }
 
-// Reflect connection + window state in the Button Bar (on store changes and
-// on window open/close/minimize).
-subscribe((s) => buttonBar.update(s));
-onChange(() => buttonBar.update(getState()));
-buttonBar.update(getState());
+// ---- the launcher window ----
 
-// Route server events into the windows (instances always exist).
-onKdxEvent((ev) => {
-  switch (ev.type) {
-    case "connected":
-      break;
-    case "chat":
-      chat.onChat(ev);
-      break;
-    case "user_list":
-      chat.onUsers(ev.users);
-      setChatTag(ev.users.length);
-      update({ users: ev.users });
-      break;
-    case "topic":
-      chat.onTopic(ev.topic);
-      break;
-    case "chat_invited":
-      chat.onInvited(ev);
-      open("chat");
-      break;
-    case "presence":
-      userList.onPresence(ev.user, ev.online);
-      update({ presenceCount: userList.count });
-      break;
-    case "private_message":
-      messages.onMessage(ev);
-      if (!isOpen("messages")) open("messages");
-      break;
-    case "transfer_progress":
-      transfers.onProgress(ev);
-      updateTransfer(ev.id, { done: ev.done, total: ev.total });
-      if (!isOpen("transfers")) open("transfers");
-      break;
-    case "transfer_complete":
-      transfers.onComplete(ev);
-      updateTransfer(ev.id, { status: ev.status });
-      if (ev.direction === "upload" || ev.direction === "download") files.refresh();
-      break;
-    case "server_warning":
-      chat.onWarning(ev.text);
-      break;
-    case "server_error":
-      chat.onError(ev.text);
-      break;
-    case "server_info":
-      chat.onChat({ sender: "", text: ev.text, timestamp: Date.now() / 1000, flags: 2 });
-      break;
-    case "disconnected":
-      update({ connection: "offline", session: null, presenceCount: 0 });
-      chat.onError("disconnected: " + ev.reason + " — reconnect from the Connect window");
-      setChatTag(0);
-      open("connect");
-      break;
-    default:
-      console.warn("unhandled event", ev);
+function mountLauncher() {
+  initDesktop(desktop);
+  registerAll();
+  applySettings(loadSettings());
+
+  const buttonBar = buildButtonBar(desktop, {
+    onAction: (name, at) => {
+      if (name === "disconnect") {
+        invoke("disconnect").catch(() => {});
+        update({ connection: "offline", session: null, presenceCount: 0 });
+      } else if (name === "server") {
+        toggle("connect");
+      } else if (name === "windows") {
+        openWindowsMenu(at && at.x != null ? at : null);
+      } else if (name === "exit") {
+        const win = getCurrentWindow();
+        if (win) win.close();
+      }
+    },
+  });
+
+  // Windows hide/show menu. KDX has no Dock-minimize: hiding makes a window
+  // disappear until it's restored here (or via F1 / Cmd+H).
+  const hidden = new Set(); // labels currently hidden (but alive)
+  function openWindowsMenu(at) {
+    const items = FEATURES.map((f) => {
+      const exists = isOpen(f.id);
+      const visible = exists && !hidden.has(f.id);
+      return {
+        label: (visible ? "✓ " : "   ") + f.title,
+        fn: () => {
+          if (visible) hide(f.id);
+          else if (exists) show(f.id);
+          else open(f.id);
+        },
+      };
+    });
+    if (at && at.x != null) showMenu(at.x, at.y, items);
+    else showMenu(24, 120, items);
   }
-});
 
-function setChatTag(n) {
-  const el = document.querySelector('.win[data-id="chat"] .titlebar .tag');
-  if (el) el.textContent = `${n} user${n === 1 ? "" : "s"}`;
+  // Reflect store + window state in the Button Bar.
+  subscribe((s) => buttonBar.update(s));
+  onChange(() => buttonBar.update(getState()));
+  buttonBar.update(getState());
+
+  // Restore the launcher's own saved geometry, then keep it in sync.
+  if (inTauri) {
+    const win = getCurrentWindow();
+    win
+      .outerPosition()
+      .then((p) => {
+        const saved = loadLauncherPos();
+        if (saved) {
+          win.setPosition(logicalPosition(saved.x, saved.y));
+          if (saved.w) win.setSize(logicalSize(saved.w, saved.h));
+        }
+      })
+      .catch(() => {});
+    const savePos = () => {
+      Promise.all([win.outerPosition(), win.outerSize(), win.scaleFactor()]).then(([p, s, sf]) => {
+        try {
+          localStorage.setItem(
+            "kdx.win.main",
+            JSON.stringify({ x: p.x, y: p.y, w: Math.round(s.width / sf), h: Math.round(s.height / sf) })
+          );
+        } catch (_) {}
+      });
+    };
+    win.onMoved(savePos);
+    win.onResized(savePos);
+  }
+
+  // Server events the launcher cares about: unread/LED, auto-open windows,
+  // presence count, transfer count, disconnect handling.
+  const online = new Set();
+  let unread = 0;
+
+  onKdxEvent((ev) => {
+    switch (ev.type) {
+      case "private_message":
+        unread += 1;
+        buttonBar.setLed(true);
+        open("messages");
+        break;
+      case "chat_invited":
+        open("chat");
+        break;
+      case "presence":
+        if (ev.online) online.add(ev.user.username);
+        else online.delete(ev.user.username);
+        update({ presenceCount: online.size });
+        break;
+      case "transfer_progress":
+        updateTransfer(ev.id, { direction: ev.direction, done: ev.done, total: ev.total });
+        break;
+      case "transfer_complete":
+        updateTransfer(ev.id, { status: ev.status });
+        break;
+      case "disconnected":
+        unread = 0;
+        online.clear();
+        update({ connection: "offline", session: null, presenceCount: 0 });
+        open("connect");
+        break;
+    }
+  });
+
+  // UI commands addressed to the launcher.
+  onUi((msg) => {
+    if (msg.to !== "main" && msg.to !== "*") return;
+    switch (msg.action) {
+      case "session":
+        update({ connection: "online", session: msg.session, server: msg.server });
+        break;
+      case "login-success":
+        unread = 0;
+        buttonBar.setLed(false);
+        open("chat");
+        invoke("list_users")
+          .then((users) => {
+            online.clear();
+            for (const u of users) online.add(u.username);
+            update({ presenceCount: online.size });
+          })
+          .catch(() => {});
+        break;
+      case "set-led":
+        buttonBar.setLed(msg.unread > 0);
+        break;
+      case "window-hidden":
+        hidden.add(msg.label);
+        break;
+      case "window-shown":
+        hidden.delete(msg.label);
+        break;
+      case "window-opened":
+        hidden.delete(msg.label);
+        break;
+      case "window-closed":
+        hidden.delete(msg.label);
+        break;
+      case "windows-menu":
+        openWindowsMenu(null);
+        break;
+    }
+  });
+
+  // F1 opens the Windows menu from the launcher itself.
+  window.addEventListener("keydown", (e) => {
+    if (e.key === "F1") {
+      e.preventDefault();
+      openWindowsMenu(null);
+    }
+  });
+
+  // Open the Connect window on start.
+  open("connect");
+}
+
+function loadLauncherPos() {
+  try {
+    return JSON.parse(localStorage.getItem("kdx.win.main") || "null");
+  } catch (_) {
+    return null;
+  }
 }

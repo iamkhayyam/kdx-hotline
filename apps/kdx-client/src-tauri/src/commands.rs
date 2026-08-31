@@ -6,8 +6,8 @@ use std::path::PathBuf;
 
 use kdx_client_core::{
     connect as core_connect, trust_server, AccountSummary, ClientConfig, ClientError, Event,
-    FileSearchEntry, HistoryEntry, IpRule, NewsPost, NewsgroupInfo, PresenceUser, RoleInfo,
-    ServerSettings, TrackerServer,
+    FileInfoResponse, FileSearchEntry, HistoryEntry, IpRule, NewsPost, NewsgroupInfo,
+    PresenceUser, RoleInfo, ServerSettings, TrackerServer,
 };
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -164,9 +164,10 @@ pub async fn create_folder(
     kind: u8,
     min_read_class: u8,
     min_write_class: u8,
+    owner: Option<String>,
 ) -> CmdResult<FileListDto> {
     with_client(&state, |c| async move {
-        c.create_folder(&path, &name, kind, min_read_class, min_write_class)
+        c.create_folder(&path, &name, kind, min_read_class, min_write_class, owner.as_deref())
             .await
     })
     .await
@@ -517,4 +518,49 @@ pub async fn create_post(
 #[tauri::command]
 pub async fn delete_post(state: State<'_, AppState>, post_id: String) -> CmdResult<Vec<NewsPost>> {
     with_client(&state, |c| async move { c.delete_post(&post_id).await }).await
+}
+
+#[derive(Serialize)]
+pub struct FileInfoDto {
+    pub name: String,
+    pub kind: u8,
+    pub size: u64,
+    pub sha256: Option<String>,
+    pub min_read_class: u8,
+    pub min_write_class: u8,
+    pub owner: Option<String>,
+}
+
+impl From<FileInfoResponse> for FileInfoDto {
+    fn from(r: FileInfoResponse) -> Self {
+        Self {
+            name: r.name,
+            kind: r.kind,
+            size: r.size,
+            sha256: r.sha256.map(|h| hex(h)),
+            min_read_class: r.min_read_class,
+            min_write_class: r.min_write_class,
+            owner: r.owner,
+        }
+    }
+}
+
+fn hex(bytes: [u8; 32]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+#[tauri::command]
+pub async fn get_file_info(state: State<'_, AppState>, path: String) -> CmdResult<FileInfoDto> {
+    with_client(&state, |c| async move { c.get_file_info(&path).await })
+        .await
+        .map(FileInfoDto::from)
+}
+
+#[tauri::command]
+pub async fn set_identity(
+    state: State<'_, AppState>,
+    name: String,
+    description: String,
+) -> CmdResult<()> {
+    with_client(&state, |c| async move { c.set_identity(&name, &description).await }).await
 }

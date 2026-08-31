@@ -1,0 +1,70 @@
+ 
+ Haxial KDX Client 1.6 review and download 
+ rbytes reviews 
+ Apps 
+ Search 
+ Reviews and Downloads 
+ Mac 
+ Internet Utilities 
+ Haxial KDX Client 1.6 review 
+ Haxial KDX Client 1.6 review 
+ Download 
+ by rbytes.net on 
+ KDX is a BBS-style encrypted internet communications system that provides file transfer, voice chat, text chat, messaging, news, trackers and more. 
+ License: 
+ Shareware 
+ OS: 
+ Mac OS X 
+ File size: 
+ 768K 
+ Developer: 
+ Haxial Software P/L 
+ Buy Now 
+ Price: 
+ $30.00 
+ Updated: 
+ 07 Sep 2006 
+ 0 
+ KDX is a BBS-style encrypted internet communications system that provides file transfer, voice chat, text chat, messaging, news, trackers and more. It uses strong encryption to protect your communications for security and privacy. 
+For administrators, it includes many powerful administration features such as Server History, Connection Monitor, Account Classes, etc. 
+What's New: 
+ New access privilege "Can See All Volumes". Turn this on for your account and then refresh the base of your files, and it will change to a list of the volumes on the server computer, and you can navigate inside them, giving you access to all files. 
+ You can also Get Info on a volume using the context menu. 
+ Added a "1 Up Q For All, 1 Down Q Per Server" file transfer queuing option in the client that is good for people with large download bandwidth, but capped/low upload bandwidth. 
+ The preview text in the Font Chooser window now displays samples for a number of languages, not only English. You can also type into it. 
+ In future, warnings about the client and server versions being different will only be displayed if there is sufficient difference. Minor upgrades with no compatibility issues will not cause a warning. 
+ Fixed a couple of bugs when changing the admin login via the local settings window in the server. 
+ Fixed top secret feature for Jin. 
+ Mac: As per Apple's convention, added .app to the names of the program files. The differing file name will cause remote server upgrade to fail this one time, sorry. Don't forget to upgrade KDXUpgradeHelper to the new version as well. 
+ Mac: Does not always display the correct icon for volumes, despite 8+ hours trying to solve this single problem, due to pathetic Mac APIs. 
+ Mac: Fixed a memory leak noticeable when cataloging (thanks Searcher!). 
+ MS Windows: Fixed bug which sometimes caused an endless stream of errors when disconnected from a server. 
+ Unix: Fixed bug with deleting files. 
+ Unix: Remote server upgrade now preserves the unix RWXS/UGO access permissions on the server program file. This is important if you use SUID. 
+ Zoom 
+ × 
+ Haxial KDX Client screenshot 
+Haxial KDX Client 1.6 keywords   
+ Alternative/similar 
+ Haxial KDX Tracker Server 1.110 
+ KDX is a BBS-style encrypted internet communications system that provides file transfer, voice chat, text chat, messaging, news, trackers and more.
+ Haxial KDX Server 1.6 
+ KDX is like a swiss army knife for internet and intranet communications.
+ KDX LogView 1.120 
+ KDX is a BBS-style encrypted internet communications system that provides file transfer, voice chat, text chat, messaging, news, trackers and more.
+ Haxial KDX Client 1.6 
+ KDX is a BBS-style encrypted internet communications system that provides file transfer, voice chat, text chat, messaging, news, trackers and more.
+ Haxial KDX Sound List Edit 1.0 
+ Haxial KDX Sound Lists Edit allows you to produce Sound List files that can be used with KDX.
+ Get-To-Know-You 1.0.1 
+ Get-To-Know-You presents the BBS visitor with 35 questions in an easy-to-use menu.
+ SyncTERM 0.8 
+ SyncTERM gives you an ANSI-BBS terminal created to connect to remote BBSs via telnet, rlogin, or SSH.
+ © 2004– rbytes.net: 
+ software reviews , kostenlose software , programas , logiciels 
+rbytes.network: kostenlose software , programas , logiciels 
+ Contact 
+ Privacy Policy 
+ Sitemap 
+ Submit 
+ 

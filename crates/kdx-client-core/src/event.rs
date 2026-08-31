@@ -18,6 +18,10 @@ pub struct PresenceUser {
     pub login_at: u64,
     pub idle_secs: u32,
     pub address: String,
+    /// Display name set via `/name` (empty = none, fall back to username).
+    pub name: String,
+    /// Description set via `/desc` (empty = none).
+    pub description: String,
 }
 
 impl From<kdx_protocol::messages::PresenceEntry> for PresenceUser {
@@ -28,6 +32,8 @@ impl From<kdx_protocol::messages::PresenceEntry> for PresenceUser {
             login_at: e.login_at,
             idle_secs: e.idle_secs,
             address: e.address,
+            name: e.name,
+            description: e.description,
         }
     }
 }
@@ -365,6 +371,8 @@ mod tests {
                 login_at: 1_751_600_000,
                 idle_secs: 5,
                 address: "127.0.0.1:1234".into(),
+                name: "Captain Phraq".into(),
+                description: "just visiting".into(),
             },
             online: true,
         };

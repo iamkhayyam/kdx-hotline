@@ -1,0 +1,79 @@
+ 
+ Hotline Client (software) - Higher Intellect Vintage Wiki 
+ Search Log in ↓ Personal tools Log in Request account 
+ Navigation menu
+ Navigation Main Page Random page List Categories Definitions Sections Amiga Apple Companies Compaq Computing DEC Hewlett-Packard Hotline IBM Internet Microsoft Networking NeXT Packard Bell SGI Software Sun Telephony Toshiba Our Network Higher Intellect Home Documents Wiki Get Hotline/KDX Tech Museum Donate Blog Retro Software Old Driver Software Apple Dev Archives Partners OMGWTFBBQ Tech Blog Paul Lezica Altexxa Group ALTEXXANET 
+ Namespaces Page Discussion Actions Views Read View source View history Tools Tools What links here Related changes Printable version Permanent link Page information 
+ Hotline Client (software) 
+ From Higher Intellect Vintage Wiki 
+ Hotline Client is the client side end of the Hotline software suite created by Adam Hinkley and released by Hotline Communications. The client application can connect directly to the Hotline Server (software) via DNS or IP, or interface with the Hotline Tracker (software) to view an index of servers registered with a tracker.
+ The Hotline protocol was also unofficially ported to *nix based operating systems. Unofficial clones are also available under Macintosh and Windows along with the official software. A complete list of Hotline related downloads can be found at https://preterhuman.net/gethotlinekdx.php .
+ The Hotline Client is the vehicle which allows users to navigate the wired Hotline world. The Client is a simple and elegant application that enables the user to connect to a server, chat with other users, read and post news, and simultaneously transfer files with speed and ease. All this is presented in a user-friendly and polished interface. The Client incorporates cutting-edge features such as resumable downloads and uploads, private personal messaging, news, and real-time chat. Both the Server and the Client multi-task seamlessly, even while the user is checking e-mail, browsing the web, or running other applications in the background or foreground.
+ Summary of Key Features: 
+ Resumable uploads and downloads 
+ Chat - including private chat 
+ Private messaging 
+ News posting and reading 
+ Can create bookmarks for often visited Hotline Servers 
+ Cross-platform - Macs and PCs can connect to a Hotline Server regardless of the platform and chat, post news and transfer files 
+ Used to easily administer a Hotline Server 
+ Low RAM requirements 
+ Hotline protocols maximize net work bandwidth and are optimized for both high-speed connections as well as for the average user on a 28.8 kbps modem. 
+ Contents 
+ 1 Hotline Client 1.2.3 
+ 1.1 Macintosh 
+ 1.2 Windows 
+ 2 Hotline Client 1.5.5 
+ 2.1 Macintosh 
+ 3 Hotline Client 1.8.1 
+ 3.1 Macintosh 
+ 3.2 Windows 
+ 4 Hotline Client 1.8.4 
+ 4.1 Macintosh 
+ 5 Hotline Client 1.8.5 
+ 5.1 Macintosh 
+ 5.2 Windows 
+ 6 Hotline Client 1.9.1 
+ 6.1 Windows 
+ 7 Hotline Client 1.9.2 
+ 7.1 Macintosh 
+ 8 See Also 
+ Hotline Client 1.2.3 
+ Version 1.2.3 of the Hotline software suite was widely used and can be considered the most popular version of the software.
+ Macintosh 
+ Hotline Client 1.2.3 for Macintosh 68K 
+ Hotline Client 1.2.3 for Macintosh PPC 
+ Windows 
+ Hotline Client 1.2.3 for Windows x86 
+ Hotline Client 1.5.5 
+ This version introduced threaded news as opposed to the older style used by version 1.2.3. 
+ Macintosh 
+ Hotline Client 1.5.5 for Macintosh PPC 
+ Hotline Client 1.8.1 
+ Macintosh 
+ Hotline Client 1.8.1 for Macintosh PPC 
+ Windows 
+ Hotline Client 1.8.1 for Windows x86 
+ Hotline Client 1.8.4 
+ Macintosh 
+ Hotline Client 1.8.4 for Macintosh PPC 
+ Hotline Client 1.8.5 
+ Macintosh 
+ Hotline Client 1.8.5 for Macintosh PPC 
+ Windows 
+ Hotline Client 1.8.5 for Windows x86 
+ Hotline Client 1.9.1 
+ Windows 
+ Hotline Client 1.9.1 for Windows x86 (Super Tracker Edition) 
+ Hotline Client 1.9.2 
+ Macintosh 
+ Hotline Client 1.9.2 for Macintosh PPC 
+ See Also 
+ Hotline Clones 
+ Hotline Icons 
+ Hotline Icon Lists 
+ Hotline Users 
+ Retrieved from " https://wiki.preterhuman.net/index.php?title=Hotline_Client_(software)&oldid=92993 " 
+ Categories : Hotline Software 
+ This page was last edited on 11 April 2024, at 02:26. Privacy policy About Higher Intellect Vintage Wiki Go to preterhuman.net 
+ 

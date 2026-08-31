@@ -1,0 +1,55 @@
+ 
+ Hotline Server (software) - Higher Intellect Vintage Wiki 
+ Search Log in ↓ Personal tools Log in Request account 
+ Navigation menu
+ Navigation Main Page Random page List Categories Definitions Sections Amiga Apple Companies Compaq Computing DEC Hewlett-Packard Hotline IBM Internet Microsoft Networking NeXT Packard Bell SGI Software Sun Telephony Toshiba Our Network Higher Intellect Home Documents Wiki Get Hotline/KDX Tech Museum Donate Blog Retro Software Old Driver Software Apple Dev Archives Partners OMGWTFBBQ Tech Blog Paul Lezica Altexxa Group ALTEXXANET 
+ Namespaces Page Discussion Actions Views Read View source View history Tools Tools What links here Related changes Printable version Permanent link Page information 
+ Hotline Server (software) 
+ From Higher Intellect Vintage Wiki 
+ The Hotline server application receives connections from the Hotline Client (software) and may also list on trackers running the Hotline Tracker (software) . A default installation of the server software features a guest account for general public access and a full administration account allowing you to manipulate files, create/modify user accounts, etc.
+ The official Hotline server software was released under Macintosh and Windows, though the protocol was unofficially available on other operating systems such as *nix variants.
+ The Hotline Server enables you to easily and safely run your own personal server on almost any Macintosh and PC running Windows 95 and Windows NT. The Hotline Server is a powerful yet easy to use tool for anyone who needs a way to stay in contact and share files, information and ideas. To allow others to easily find and connect to your server, you can register your Server with a Hotline Tracker, which acts like an Internet Phonebook. Once registered, your server becomes available for anyone to look-up and connect to. There exists the concern that some users might not be comfortable with the idea of allowing other users, especially on the Internet, to connect to and access their own personal computer. However, security was a key consideration when developing Hotline, and the Company has built the server to incorporate several levels of security, providing reliable protection for your files and your computer.
+ Summary of Key Features: 
+ Can turn any Mac or PC into a server 
+ Capable of hosting chat, peer groups, news and messaging 
+ Chat - including private chat 
+ Cross-platform - Macs and PCs can connect to a Hotline Server regardless of the platform and chat, post news and transfer files 
+ Hotline Server can be easily administered using the Hotline Client 
+ Low RAM requirements 
+ Hotline protocols maximize net work bandwidth and are optimized for both high-speed connections as well as for the average user on a 28.8 kbps modem. 
+ Contents 
+ 1 Hotline Server 1.2.3 
+ 1.1 Macintosh 
+ 1.2 Windows 
+ 2 Hotline Server 1.8.4 
+ 2.1 Macintosh 
+ 3 Hotline Server 1.8.5 
+ 3.1 Macintosh 
+ 4 Hotline Server 1.9.1 
+ 4.1 Macintosh 
+ 4.2 Windows 
+ 5 See Also 
+ Hotline Server 1.2.3 
+ Macintosh 
+ Hotline Server 1.2.3 for Macintosh 68K 
+ Hotline Server 1.2.3 for Macintosh PPC 
+ Windows 
+ Hotline Server 1.2.3 for Windows x86 
+ Hotline Server 1.8.4 
+ Macintosh 
+ Hotline Server 1.8.4 for Macintosh PPC 
+ Hotline Server 1.8.5 
+ Macintosh 
+ Hotline Server 1.8.5 for Macintosh PPC 
+ Hotline Server 1.9.1 
+ Macintosh 
+ Hotline Server 1.9.1 for Macintosh PPC 
+ Windows 
+ Hotline Server 1.9.1 for Windows x86 
+ See Also 
+ Hotline Clones 
+ Hotline Server Protocol Guide 
+ Retrieved from " https://wiki.preterhuman.net/index.php?title=Hotline_Server_(software)&oldid=92994 " 
+ Categories : Hotline Software 
+ This page was last edited on 11 April 2024, at 02:27. Privacy policy About Higher Intellect Vintage Wiki Go to preterhuman.net 
+ 

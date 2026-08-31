@@ -1,12 +1,13 @@
 // User List — the server-wide roster (distinct from a chat room's member
 // list). Class color bars per row, type-to-filter, right-click "Get Info".
 
-import { invoke } from "../bridge.js";
+import { invoke, emitUi } from "../bridge.js";
+import { open } from "../wm.js";
 import { showMenu } from "../menu.js";
 
 const CLASS_NAME = ["guest", "user", "power user", "admin"];
 
-export function buildUserList(openUserInfo, sendMessage, disconnectUser, inviteToChat) {
+export function buildUserList() {
   const body = document.createElement("div");
   body.className = "userlist-win";
   body.innerHTML = `
@@ -45,17 +46,38 @@ export function buildUserList(openUserInfo, sendMessage, disconnectUser, inviteT
       row.className = "ul-row";
       row.innerHTML =
         `<span class="classbar" data-class="${u.class}"></span>` +
-        `<span class="ul-name">${esc(u.username)}</span>` +
-        `<span class="ul-meta">${CLASS_NAME[u.class] || "?"} · idle ${fmtIdle(u.idle_secs)}</span>`;
-      row.addEventListener("click", () => openUserInfo(u.username));
+        `<span class="ul-name">${esc(u.name && u.name.trim() ? u.name + " (" + u.username + ")" : u.username)}</span>` +
+        `<span class="ul-meta">${CLASS_NAME[u.class] || "?"} · idle ${fmtIdle(u.idle_secs)}${u.description && u.description.trim() ? " · " + esc(u.description) : ""}</span>`;
+      row.addEventListener("click", () => {
+        open("userinfo");
+        emitUi("userinfo", "show", { user: u.username });
+      });
       row.addEventListener("contextmenu", (e) => {
         e.preventDefault();
         const items = [
-          { label: "Send Message", fn: () => sendMessage(u.username) },
-          { label: "Get Info", fn: () => openUserInfo(u.username) },
+          {
+            label: "Send Message",
+            fn: () => {
+              open("messages");
+              emitUi("messages", "open-with", { user: u.username });
+            },
+          },
+          {
+            label: "Get Info",
+            fn: () => {
+              open("userinfo");
+              emitUi("userinfo", "show", { user: u.username });
+            },
+          },
         ];
-        if (inviteToChat) items.push({ label: "Invite to Chat…", fn: () => inviteToChat(u.username) });
-        items.push({ label: "Disconnect…", fn: () => disconnectUser(u.username) });
+        items.push({ label: "Invite to Chat…", fn: () => invoke("invite_to_chat", { to: u.username }).catch(() => {}) });
+        items.push({
+          label: "Disconnect…",
+          fn: () => {
+            open("admin");
+            emitUi("admin", "open-disconnect", { user: u.username });
+          },
+        });
         showMenu(e.clientX, e.clientY, items);
       });
       listEl.appendChild(row);

@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>net.kdx.hotline.server</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/bin/kdxd</string>
+    <string>/etc/kdx/kdxd.toml</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>/var/kdx</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ProcessType</key>
+  <string>Interactive</string>
+  <key>StandardOutPath</key>
+  <string>/var/kdx/kdxd.log</string>
+  <key>StandardErrorPath</key>
+  <string>/var/kdx/kdxd.err.log</string>
+</dict>
+</plist>

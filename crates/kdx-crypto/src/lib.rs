@@ -4,12 +4,17 @@
 
 pub mod challenge;
 pub mod password;
+pub mod shamir;
 
 pub use challenge::{
     client_response, expected_response, extract_kdf, generate_challenge, verify_response,
     KdfParams,
 };
 pub use password::{hash_password, verify_password};
+pub use shamir::{
+    combine, split, verify_share, Commitments, MerkleProof, ProofStep, Share, SplitResult,
+    MAX_SHARES,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum CryptoError {
@@ -19,4 +24,10 @@ pub enum CryptoError {
     Params(argon2::Error),
     #[error("stored hash is missing salt or digest")]
     MissingSalt,
+    #[error("shamir: invalid parameters: {0}")]
+    ShamirParams(String),
+    #[error("shamir: need at least {required} shares to reconstruct, got {got}")]
+    ShamirThreshold { required: u8, got: usize },
+    #[error("shamir: share payload lengths differ")]
+    ShamirLengthMismatch,
 }

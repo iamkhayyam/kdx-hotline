@@ -1,9 +1,11 @@
-// The Button Bar — KDX's authentic vertical launcher. The only always-present
-// element: a server header, a list of feature buttons (each opens/focuses a
-// window), a WonderLight LED on Messages, and footer counters. Feature buttons
-// auto-enable as their window gets registered with the window manager, so
-// later milestones light up their entry without touching this file.
+// The Button Bar — KDX's authentic vertical launcher, now its OWN native
+// window (the "main" window). Always present; every other window floats free
+// on the desktop. Its titlebar is a native drag region; − minimizes to the
+// OS Dock, ✕ quits the app. Feature buttons auto-enable as their window gets
+// registered, so later milestones light up their entry without touching this
+// file.
 
+import { inTauri, getCurrentWindow } from "./bridge.js";
 import { isRegistered, isOpen, toggle } from "./wm.js";
 
 // Order mirrors the real KDX client's left strip.
@@ -34,15 +36,40 @@ const FEATURES = [
 export function buildButtonBar(mount, handlers) {
   const bar = document.createElement("nav");
   bar.className = "buttonbar";
-  // A floating window on the desktop — positioned, not a fixed rail.
-  const pos = loadPos();
-  bar.style.left = pos.x + "px";
-  bar.style.top = pos.y + "px";
 
   const titlebar = document.createElement("div");
   titlebar.className = "bb-titlebar";
-  titlebar.innerHTML = '<span class="bb-brand">KDX</span>';
-  makeDraggable(bar, titlebar, mount);
+  titlebar.innerHTML =
+    '<span class="bb-brand">KDX</span>' +
+    '<span class="bb-spacer"></span>' +
+    '<button class="tb-btn tb-menu" id="bb-windows" title="Windows (F1)">☰</button>' +
+    '<button class="tb-btn tb-close" title="Quit KDX">✕</button>';
+  // The whole titlebar is a native drag region except the buttons.
+  if (inTauri) {
+    titlebar.setAttribute("data-tauri-drag-region", "");
+    titlebar.querySelectorAll("*").forEach((n) => {
+      if (!n.closest("button")) n.setAttribute("data-tauri-drag-region", "");
+    });
+    const win = getCurrentWindow();
+    const windowsBtn = titlebar.querySelector("#bb-windows");
+    windowsBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      const r = windowsBtn.getBoundingClientRect();
+      handlers.onAction("windows", { x: r.left, y: r.bottom + 2 });
+    });
+    titlebar.querySelector(".tb-close").addEventListener("click", () => win.close());
+    // Focus glow on the launcher itself.
+    win.onFocusChanged(({ payload }) => bar.classList.toggle("focused", !!payload));
+    win.isFocused().then((f) => bar.classList.toggle("focused", !!f)).catch(() => {});
+  } else {
+    titlebar.querySelector("#bb-windows").style.display = "none";
+    titlebar.querySelector(".tb-close").style.display = "none";
+  }
+
+  bar.addEventListener("contextmenu", (e) => {
+    e.preventDefault();
+    handlers.onAction("windows", { x: e.clientX, y: e.clientY });
+  });
 
   const header = document.createElement("div");
   header.className = "bb-header";
@@ -133,41 +160,4 @@ export function buildButtonBar(mount, handlers) {
   }
 
   return { update, setLed };
-}
-
-function loadPos() {
-  try {
-    const p = JSON.parse(localStorage.getItem("kdx.win.buttonbar") || "null");
-    if (p && typeof p.x === "number") return p;
-  } catch (_) {}
-  return { x: 12, y: 12 };
-}
-
-function makeDraggable(el, handle, desk) {
-  handle.addEventListener("pointerdown", (e) => {
-    if (e.target.closest("button")) return;
-    e.preventDefault();
-    const rect = el.getBoundingClientRect();
-    const deskRect = desk.getBoundingClientRect();
-    const offX = e.clientX - rect.left;
-    const offY = e.clientY - rect.top;
-    const move = (ev) => {
-      const x = Math.min(Math.max(0, ev.clientX - deskRect.left - offX), deskRect.width - 60);
-      const y = Math.min(Math.max(0, ev.clientY - deskRect.top - offY), deskRect.height - 24);
-      el.style.left = x + "px";
-      el.style.top = y + "px";
-    };
-    const up = () => {
-      window.removeEventListener("pointermove", move);
-      window.removeEventListener("pointerup", up);
-      try {
-        localStorage.setItem(
-          "kdx.win.buttonbar",
-          JSON.stringify({ x: parseInt(el.style.left, 10) || 0, y: parseInt(el.style.top, 10) || 0 })
-        );
-      } catch (_) {}
-    };
-    window.addEventListener("pointermove", move);
-    window.addEventListener("pointerup", up);
-  });
 }

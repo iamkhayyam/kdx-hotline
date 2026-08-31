@@ -181,7 +181,7 @@ async fn dropbox_accepts_upload_but_refuses_listing() {
     let phc = hash_password("pw").unwrap();
     accounts::create(&pool, "dropper", &phc, 1).await.unwrap(); // plain User
     // DropBox writable by class User(1); kind 2 = dropbox.
-    file_tree::create_folder(&pool, file_tree::ROOT_ID, "dropbox", 2, 0, 1)
+    file_tree::create_folder(&pool, file_tree::ROOT_ID, "dropbox", 2, 0, 1, None)
         .await
         .unwrap();
     // Restart tree state by reconnecting — the server loaded its tree before

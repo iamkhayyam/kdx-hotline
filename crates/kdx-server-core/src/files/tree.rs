@@ -9,8 +9,8 @@ use kdx_storage::file_tree::{self, FileNodeRow, ROOT_ID};
 use kdx_storage::SqlitePool;
 use tokio::sync::RwLock;
 
-use super::acl::{self, AclError};
-use crate::auth::BaseClass;
+use super::acl::{self, AccessItem, AclError};
+use crate::auth::{BaseClass, Session};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NodeKind {
@@ -74,6 +74,13 @@ pub struct Node {
     /// `TreeError::NotFound`, matching the alias's intent (it silently
     /// stops working when the target goes away).
     pub target_id: Option<String>,
+    /// Access-item bundle derived from the node name's `[tag]` suffix
+    /// (original KDX semantics). Meaningful on folders; files inherit the
+    /// containing folder's item at ACL time.
+    pub access_item: AccessItem,
+    /// Optional owner login — the owner may read/delete inside a drop box
+    /// (or a `[db]` folder) that is write-only to everyone else.
+    pub owner: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -142,6 +149,7 @@ fn class_from_i64(v: i64) -> BaseClass {
 }
 
 fn node_from_row(row: FileNodeRow) -> Result<Node, TreeError> {
+    let access_item = AccessItem::parse(&row.name);
     Ok(Node {
         kind: NodeKind::from_i64(row.kind).ok_or(TreeError::CorruptKind(row.kind))?,
         id: row.id,
@@ -153,6 +161,8 @@ fn node_from_row(row: FileNodeRow) -> Result<Node, TreeError> {
         min_class_write: class_from_i64(row.min_class_write),
         storage_path: row.storage_path,
         target_id: row.target_id,
+        access_item,
+        owner: row.owner,
     })
 }
 
@@ -190,7 +200,7 @@ impl FileTree {
     /// ACL). Alias children in the result list themselves show up as
     /// `NodeKind::Alias` entries carrying the target's displayable size,
     /// so the UI can badge them without a follow-up round-trip.
-    pub async fn list(&self, path: &str, class: BaseClass) -> Result<Vec<Entry>, TreeError> {
+    pub async fn list(&self, path: &str, session: &Session) -> Result<Vec<Entry>, TreeError> {
         let state = self.state.read().await;
         let node = state.resolve(path)?;
         // If the path landed on an alias, list what it points at.
@@ -198,7 +208,15 @@ impl FileTree {
         if !node.kind.is_folder() {
             return Err(TreeError::NotAFolder);
         }
-        acl::check_list(node.kind, node.min_class_read, class)?;
+        acl::check_read(
+            node.kind,
+            node.access_item,
+            node.min_class_read,
+            session.class,
+            session.privileges,
+            node.owner.as_deref(),
+            &session.username,
+        )?;
         let mut entries: Vec<Entry> = state
             .children
             .get(&node.id)
@@ -237,14 +255,20 @@ impl FileTree {
         &self,
         path: &str,
         name: &str,
-        class: BaseClass,
+        session: &Session,
     ) -> Result<Node, TreeError> {
         let state = self.state.read().await;
         let node = state.resolve(path)?;
         if !node.kind.is_folder() {
             return Err(TreeError::NotAFolder);
         }
-        acl::check_write(node.kind, node.min_class_write, class)?;
+        acl::check_write(
+            node.kind,
+            node.access_item,
+            node.min_class_write,
+            session.class,
+            session.privileges,
+        )?;
         if let Some(ids) = state.children.get(&node.id) {
             if ids
                 .iter()
@@ -265,7 +289,7 @@ impl FileTree {
     /// where `pubcopy` points at `/pub` reads `/pub/x.txt`'s bytes. The ACL
     /// check applies to the *target's* containing folder — you can't escalate
     /// past a class threshold by aliasing something you'd normally be denied.
-    pub async fn open_for_read(&self, path: &str, class: BaseClass) -> Result<Node, TreeError> {
+    pub async fn open_for_read(&self, path: &str, session: &Session) -> Result<Node, TreeError> {
         let state = self.state.read().await;
         let node = state.resolve(path)?;
         let node = resolve_through_alias(&state, node)?;
@@ -281,7 +305,51 @@ impl FileTree {
             .as_ref()
             .and_then(|id| state.nodes.get(id))
             .ok_or(TreeError::NotFound)?;
-        acl::check_list(parent.kind, parent.min_class_read, class)?;
+        acl::check_read(
+            parent.kind,
+            parent.access_item,
+            parent.min_class_read,
+            session.class,
+            session.privileges,
+            parent.owner.as_deref(),
+            &session.username,
+        )?;
+        Ok(node.clone())
+    }
+
+    /// Node metadata for the Files "Get Info" verb. Aliases resolve to their
+    /// target. Read ACL: files gate on their containing folder, folders on
+    /// themselves (so Get Info can't probe a drop box you can't read).
+    pub async fn info(&self, path: &str, session: &Session) -> Result<Node, TreeError> {
+        let state = self.state.read().await;
+        let node = state.resolve(path)?;
+        let node = resolve_through_alias(&state, node)?;
+        if node.kind.is_folder() {
+            acl::check_read(
+                node.kind,
+                node.access_item,
+                node.min_class_read,
+                session.class,
+                session.privileges,
+                node.owner.as_deref(),
+                &session.username,
+            )?;
+        } else {
+            let parent = node
+                .parent_id
+                .as_ref()
+                .and_then(|id| state.nodes.get(id))
+                .ok_or(TreeError::NotFound)?;
+            acl::check_read(
+                parent.kind,
+                parent.access_item,
+                parent.min_class_read,
+                session.class,
+                session.privileges,
+                parent.owner.as_deref(),
+                &session.username,
+            )?;
+        }
         Ok(node.clone())
     }
 
@@ -293,6 +361,7 @@ impl FileTree {
         kind: NodeKind,
         min_class_read: BaseClass,
         min_class_write: BaseClass,
+        owner: Option<&str>,
     ) -> Result<Node, TreeError> {
         debug_assert!(kind.is_folder());
         let parent = self.resolve(parent_path).await?;
@@ -303,6 +372,7 @@ impl FileTree {
             kind.as_u8() as i64,
             min_class_read as i64,
             min_class_write as i64,
+            owner,
         )
         .await?;
         let node = node_from_row(row)?;
@@ -320,7 +390,7 @@ impl FileTree {
         &self,
         source_path: &str,
         dest_path: &str,
-        class: BaseClass,
+        session: &Session,
     ) -> Result<Node, TreeError> {
         let (source_id, alias_name, dest_id) = {
             let state = self.state.read().await;
@@ -338,7 +408,13 @@ impl FileTree {
             if !dest.kind.is_folder() {
                 return Err(TreeError::NotAFolder);
             }
-            acl::check_write(dest.kind, dest.min_class_write, class)?;
+            acl::check_write(
+                dest.kind,
+                dest.access_item,
+                dest.min_class_write,
+                session.class,
+                session.privileges,
+            )?;
             let alias_name = source.name.clone();
             if let Some(siblings) = state.children.get(&dest.id) {
                 if siblings
@@ -385,7 +461,7 @@ impl FileTree {
     /// with a drop-and-reacquire split, a concurrent `add_file`/`move_node`
     /// could land in the gap and get silently swept up (or left dangling) by
     /// this call's stale snapshot.
-    pub async fn delete(&self, path: &str, class: BaseClass) -> Result<NodeKind, TreeError> {
+    pub async fn delete(&self, path: &str, session: &Session) -> Result<NodeKind, TreeError> {
         let mut state = self.state.write().await;
 
         let (kind, node_id, parent_id) = {
@@ -393,9 +469,29 @@ impl FileTree {
             if node.id == ROOT_ID {
                 return Err(TreeError::NotAFolder); // root isn't a deletable entry
             }
-            // Require write access to the node itself — you may not delete a
-            // folder (or its subtree) you couldn't write to.
-            acl::check_write(node.kind, node.min_class_write, class)?;
+            // Write access to the node itself is the class gate (original
+            // KDX behavior). The access-item rule ([ul] admin-only delete,
+            // [db] owner/admin delete) comes from the node's own item for a
+            // folder, or the containing folder's item for a file.
+            let parent = node
+                .parent_id
+                .as_ref()
+                .and_then(|id| state.nodes.get(id))
+                .ok_or(TreeError::NotFound)?;
+            let (item, owner) = if node.kind.is_folder() {
+                (node.access_item, node.owner.as_deref())
+            } else {
+                (parent.access_item, parent.owner.as_deref())
+            };
+            acl::check_delete(
+                node.kind,
+                item,
+                node.min_class_write,
+                session.class,
+                session.privileges,
+                owner,
+                &session.username,
+            )?;
             (node.kind, node.id.clone(), node.parent_id.clone())
         };
 
@@ -442,7 +538,7 @@ impl FileTree {
         &self,
         path: &str,
         dest_path: &str,
-        class: BaseClass,
+        session: &Session,
     ) -> Result<(), TreeError> {
         let mut state = self.state.write().await;
 
@@ -451,7 +547,13 @@ impl FileTree {
             if node.id == ROOT_ID {
                 return Err(TreeError::NotAFolder); // root isn't a movable entry
             }
-            acl::check_write(node.kind, node.min_class_write, class)?;
+            acl::check_write(
+                node.kind,
+                node.access_item,
+                node.min_class_write,
+                session.class,
+                session.privileges,
+            )?;
             (node.id.clone(), node.name.clone())
         };
         let dest_id = {
@@ -459,7 +561,13 @@ impl FileTree {
             if !dest.kind.is_folder() {
                 return Err(TreeError::NotAFolder);
             }
-            acl::check_write(dest.kind, dest.min_class_write, class)?;
+            acl::check_write(
+                dest.kind,
+                dest.access_item,
+                dest.min_class_write,
+                session.class,
+                session.privileges,
+            )?;
             dest.id.clone()
         };
 
@@ -684,6 +792,20 @@ impl TreeState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::Session;
+    use tokio::time::Instant;
+    use uuid::Uuid;
+
+    fn sess(class: BaseClass) -> Session {
+        Session {
+            id: Uuid::new_v4(),
+            account_id: "a".into(),
+            username: "tester".into(),
+            class,
+            privileges: BaseClass::privileges(class),
+            expires_at: Instant::now(),
+        }
+    }
 
     async fn tree() -> (FileTree, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
@@ -695,32 +817,35 @@ mod tests {
     async fn root_resolves_and_lists_empty() {
         let (tree, _dir) = tree().await;
         assert!(tree.resolve("/").await.is_ok());
-        assert!(tree.list("/", BaseClass::Guest).await.unwrap().is_empty());
+        assert!(tree.list("/", &sess(BaseClass::Guest)).await.unwrap().is_empty());
     }
 
     #[tokio::test]
     async fn nested_folders_resolve_by_path() {
         let (tree, _dir) = tree().await;
-        tree.create_folder("/", "pub", NodeKind::Directory, BaseClass::Guest, BaseClass::PowerUser)
+        tree.create_folder("/", "pub", NodeKind::Directory, BaseClass::Guest, BaseClass::PowerUser, None)
             .await
             .unwrap();
-        tree.create_folder("/pub", "docs", NodeKind::Directory, BaseClass::Guest, BaseClass::User)
+        tree.create_folder("/pub", "docs", NodeKind::Directory, BaseClass::Guest, BaseClass::User, None)
             .await
             .unwrap();
         let node = tree.resolve("/pub/docs").await.unwrap();
         assert_eq!(node.name, "docs");
-        let entries = tree.list("/pub", BaseClass::Guest).await.unwrap();
+        let entries = tree.list("/pub", &sess(BaseClass::Guest)).await.unwrap();
         assert_eq!(entries.len(), 1);
     }
 
     #[tokio::test]
-    async fn dropbox_rejects_listing_even_for_admin() {
+    async fn dropbox_listable_only_by_admin() {
         let (tree, _dir) = tree().await;
-        tree.create_folder("/", "drop", NodeKind::DropBox, BaseClass::Guest, BaseClass::User)
+        tree.create_folder("/", "drop", NodeKind::DropBox, BaseClass::Guest, BaseClass::User, None)
             .await
             .unwrap();
+        // Converged semantics (P1-4): admins may list/read a drop box …
+        assert!(tree.list("/drop", &sess(BaseClass::Admin)).await.is_ok());
+        // … but everyone else is structurally refused.
         assert!(matches!(
-            tree.list("/drop", BaseClass::Admin).await,
+            tree.list("/drop", &sess(BaseClass::Guest)).await,
             Err(TreeError::Acl(AclError::DropBoxIsWriteOnly))
         ));
     }
@@ -734,17 +859,18 @@ mod tests {
             NodeKind::Directory,
             BaseClass::PowerUser, // read: power user and up
             BaseClass::Admin,     // write: admin only
+            None,
         )
         .await
         .unwrap();
-        assert!(tree.list("/staff", BaseClass::User).await.is_err());
-        assert!(tree.list("/staff", BaseClass::PowerUser).await.is_ok());
+        assert!(tree.list("/staff", &sess(BaseClass::User)).await.is_err());
+        assert!(tree.list("/staff", &sess(BaseClass::PowerUser)).await.is_ok());
         assert!(tree
-            .prepare_upload("/staff", "x.bin", BaseClass::PowerUser)
+            .prepare_upload("/staff", "x.bin", &sess(BaseClass::PowerUser))
             .await
             .is_err());
         assert!(tree
-            .prepare_upload("/staff", "x.bin", BaseClass::Admin)
+            .prepare_upload("/staff", "x.bin", &sess(BaseClass::Admin))
             .await
             .is_ok());
     }
@@ -752,10 +878,10 @@ mod tests {
     #[tokio::test]
     async fn delete_removes_folder_and_children() {
         let (tree, _dir) = tree().await;
-        tree.create_folder("/", "pub", NodeKind::Directory, BaseClass::Guest, BaseClass::User)
+        tree.create_folder("/", "pub", NodeKind::Directory, BaseClass::Guest, BaseClass::User, None)
             .await
             .unwrap();
-        tree.create_folder("/pub", "docs", NodeKind::Directory, BaseClass::Guest, BaseClass::User)
+        tree.create_folder("/pub", "docs", NodeKind::Directory, BaseClass::Guest, BaseClass::User, None)
             .await
             .unwrap();
         let parent = tree.resolve("/pub/docs").await.unwrap();
@@ -764,26 +890,71 @@ mod tests {
             .unwrap();
 
         // A user may delete under /pub (write class User).
-        tree.delete("/pub", BaseClass::User).await.unwrap();
+        tree.delete("/pub", &sess(BaseClass::User)).await.unwrap();
         assert!(matches!(tree.resolve("/pub").await, Err(TreeError::NotFound)));
         assert!(matches!(
             tree.resolve("/pub/docs").await,
             Err(TreeError::NotFound)
         ));
-        assert!(tree.list("/", BaseClass::Guest).await.unwrap().is_empty());
+        assert!(tree.list("/", &sess(BaseClass::Guest)).await.unwrap().is_empty());
     }
 
     #[tokio::test]
     async fn delete_enforces_parent_write_class_and_guards_root() {
         let (tree, _dir) = tree().await;
         // /staff is writable only by admin.
-        tree.create_folder("/", "staff", NodeKind::Directory, BaseClass::Guest, BaseClass::Admin)
+        tree.create_folder("/", "staff", NodeKind::Directory, BaseClass::Guest, BaseClass::Admin, None)
             .await
             .unwrap();
-        assert!(tree.delete("/staff", BaseClass::PowerUser).await.is_err());
-        assert!(tree.delete("/staff", BaseClass::Admin).await.is_ok());
+        assert!(tree.delete("/staff", &sess(BaseClass::PowerUser)).await.is_err());
+        assert!(tree.delete("/staff", &sess(BaseClass::Admin)).await.is_ok());
         // Root is not a deletable entry.
-        assert!(tree.delete("/", BaseClass::Admin).await.is_err());
+        assert!(tree.delete("/", &sess(BaseClass::Admin)).await.is_err());
+    }
+
+
+    #[tokio::test]
+    async fn access_item_db_folder_owner_can_read_stranger_cannot() {
+        let (tree, _dir) = tree().await;
+        // A folder whose name carries the [DB] suffix becomes a drop box;
+        // owner "bob" is set explicitly.
+        tree.create_folder("/", "inbox [DB]", NodeKind::Directory, BaseClass::Guest, BaseClass::User, Some("bob"))
+            .await
+            .unwrap();
+        // The item is parsed from the name suffix.
+        let node = tree.resolve("/inbox [DB]").await.unwrap();
+        assert_eq!(node.access_item, AccessItem::DropBox);
+        assert_eq!(node.owner.as_deref(), Some("bob"));
+
+        // A stranger cannot list it…
+        let mut stranger = sess(BaseClass::User);
+        stranger.username = "alice".into();
+        assert!(matches!(
+            tree.list("/inbox [DB]", &stranger).await,
+            Err(TreeError::Acl(AclError::DropBoxIsWriteOnly))
+        ));
+        // …the owner can…
+        let mut owner = sess(BaseClass::User);
+        owner.username = "bob".into();
+        assert!(tree.list("/inbox [DB]", &owner).await.is_ok());
+        // …and so can an admin.
+        assert!(tree.list("/inbox [DB]", &sess(BaseClass::Admin)).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn access_item_ul_folder_delete_is_admin_only() {
+        let (tree, _dir) = tree().await;
+        tree.create_folder("/", "uploads [UL]", NodeKind::Directory, BaseClass::Guest, BaseClass::Guest, None)
+            .await
+            .unwrap();
+        let parent = tree.resolve("/uploads [UL]").await.unwrap();
+        tree.add_file(&parent.id, "a.txt", 5, &[0u8; 32], "/tmp/a.txt")
+            .await
+            .unwrap();
+        // A power user may not delete inside an [UL] folder…
+        assert!(tree.delete("/uploads [UL]/a.txt", &sess(BaseClass::PowerUser)).await.is_err());
+        // …but an admin may.
+        assert!(tree.delete("/uploads [UL]/a.txt", &sess(BaseClass::Admin)).await.is_ok());
     }
 
     #[tokio::test]
@@ -794,7 +965,7 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(
-            tree.prepare_upload("/", "dup.bin", BaseClass::Admin).await,
+            tree.prepare_upload("/", "dup.bin", &sess(BaseClass::Admin)).await,
             Err(TreeError::Exists)
         ));
     }
@@ -811,7 +982,7 @@ mod tests {
     #[tokio::test]
     async fn catalog_indexes_the_tree_and_search_filters_by_name_and_class() {
         let (tree, _dir) = tree().await;
-        tree.create_folder("/", "pub", NodeKind::Directory, BaseClass::Guest, BaseClass::User)
+        tree.create_folder("/", "pub", NodeKind::Directory, BaseClass::Guest, BaseClass::User, None)
             .await
             .unwrap();
         let pub_dir = tree.resolve("/pub").await.unwrap();
@@ -823,8 +994,7 @@ mod tests {
             "staff",
             NodeKind::Directory,
             BaseClass::Admin, // only admins may even see this folder
-            BaseClass::Admin,
-        )
+            BaseClass::Admin, None)
         .await
         .unwrap();
         let staff_dir = tree.resolve("/staff").await.unwrap();
@@ -853,7 +1023,7 @@ mod tests {
     #[tokio::test]
     async fn catalog_excludes_dropbox_contents() {
         let (tree, _dir) = tree().await;
-        tree.create_folder("/", "drop", NodeKind::DropBox, BaseClass::Guest, BaseClass::User)
+        tree.create_folder("/", "drop", NodeKind::DropBox, BaseClass::Guest, BaseClass::User, None)
             .await
             .unwrap();
         let drop = tree.resolve("/drop").await.unwrap();
@@ -871,28 +1041,28 @@ mod tests {
     #[tokio::test]
     async fn move_reparents_a_node_and_its_subtree() {
         let (tree, _dir) = tree().await;
-        tree.create_folder("/", "a", NodeKind::Directory, BaseClass::Guest, BaseClass::User)
+        tree.create_folder("/", "a", NodeKind::Directory, BaseClass::Guest, BaseClass::User, None)
             .await
             .unwrap();
-        tree.create_folder("/", "b", NodeKind::Directory, BaseClass::Guest, BaseClass::User)
+        tree.create_folder("/", "b", NodeKind::Directory, BaseClass::Guest, BaseClass::User, None)
             .await
             .unwrap();
         let a = tree.resolve("/a").await.unwrap();
         tree.add_file(&a.id, "doc.txt", 3, &[0u8; 32], "/tmp/x")
             .await
             .unwrap();
-        tree.create_folder("/a", "sub", NodeKind::Directory, BaseClass::Guest, BaseClass::User)
+        tree.create_folder("/a", "sub", NodeKind::Directory, BaseClass::Guest, BaseClass::User, None)
             .await
             .unwrap();
 
-        tree.move_node("/a", "/b", BaseClass::User).await.unwrap();
+        tree.move_node("/a", "/b", &sess(BaseClass::User)).await.unwrap();
 
         assert!(matches!(tree.resolve("/a").await, Err(TreeError::NotFound)));
         assert!(tree.resolve("/b/a").await.is_ok());
         // The subtree moved with it.
         assert!(tree.resolve("/b/a/doc.txt").await.is_ok());
         assert!(tree.resolve("/b/a/sub").await.is_ok());
-        assert_eq!(tree.list("/b", BaseClass::Guest).await.unwrap().len(), 1);
+        assert_eq!(tree.list("/b", &sess(BaseClass::Guest)).await.unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -907,16 +1077,17 @@ mod tests {
         // calls are fully serialized: whichever runs second sees the
         // first's result and correctly refuses.
         let (tree, _dir) = tree().await;
-        tree.create_folder("/", "x", NodeKind::Directory, BaseClass::Guest, BaseClass::User)
+        tree.create_folder("/", "x", NodeKind::Directory, BaseClass::Guest, BaseClass::User, None)
             .await
             .unwrap();
-        tree.create_folder("/", "y", NodeKind::Directory, BaseClass::Guest, BaseClass::User)
+        tree.create_folder("/", "y", NodeKind::Directory, BaseClass::Guest, BaseClass::User, None)
             .await
             .unwrap();
 
+        let u = sess(BaseClass::User);
         let (r1, r2) = tokio::join!(
-            tree.move_node("/x", "/y", BaseClass::User),
-            tree.move_node("/y", "/x", BaseClass::User),
+            tree.move_node("/x", "/y", &u),
+            tree.move_node("/y", "/x", &u),
         );
 
         // Exactly one of the two opposing moves may succeed — never both.
@@ -935,34 +1106,34 @@ mod tests {
     #[tokio::test]
     async fn move_refuses_cycle_root_and_name_collision() {
         let (tree, _dir) = tree().await;
-        tree.create_folder("/", "a", NodeKind::Directory, BaseClass::Guest, BaseClass::User)
+        tree.create_folder("/", "a", NodeKind::Directory, BaseClass::Guest, BaseClass::User, None)
             .await
             .unwrap();
-        tree.create_folder("/a", "sub", NodeKind::Directory, BaseClass::Guest, BaseClass::User)
+        tree.create_folder("/a", "sub", NodeKind::Directory, BaseClass::Guest, BaseClass::User, None)
             .await
             .unwrap();
 
         // Can't move a folder into its own descendant.
         assert!(matches!(
-            tree.move_node("/a", "/a/sub", BaseClass::User).await,
+            tree.move_node("/a", "/a/sub", &sess(BaseClass::User)).await,
             Err(TreeError::WouldCreateCycle)
         ));
         // Can't move a folder into itself.
         assert!(matches!(
-            tree.move_node("/a", "/a", BaseClass::User).await,
+            tree.move_node("/a", "/a", &sess(BaseClass::User)).await,
             Err(TreeError::WouldCreateCycle)
         ));
         // Root is not a movable entry.
-        assert!(tree.move_node("/", "/a", BaseClass::Admin).await.is_err());
+        assert!(tree.move_node("/", "/a", &sess(BaseClass::Admin)).await.is_err());
 
         // Name collision at the destination is refused. (Root's default write
         // class is PowerUser, so use that here — this assertion is about the
         // collision check, not the ACL check exercised above.)
-        tree.create_folder("/", "sub", NodeKind::Directory, BaseClass::Guest, BaseClass::User)
+        tree.create_folder("/", "sub", NodeKind::Directory, BaseClass::Guest, BaseClass::User, None)
             .await
             .unwrap();
         assert!(matches!(
-            tree.move_node("/a/sub", "/", BaseClass::PowerUser).await,
+            tree.move_node("/a/sub", "/", &sess(BaseClass::PowerUser)).await,
             Err(TreeError::Exists)
         ));
     }
@@ -970,27 +1141,27 @@ mod tests {
     #[tokio::test]
     async fn alias_to_a_folder_lists_the_targets_children() {
         let (tree, _dir) = tree().await;
-        tree.create_folder("/", "pub", NodeKind::Directory, BaseClass::Guest, BaseClass::User)
+        tree.create_folder("/", "pub", NodeKind::Directory, BaseClass::Guest, BaseClass::User, None)
             .await
             .unwrap();
         let pub_dir = tree.resolve("/pub").await.unwrap();
         tree.add_file(&pub_dir.id, "a.txt", 42, &[0u8; 32], "/tmp/a")
             .await
             .unwrap();
-        tree.create_folder("/", "aliases", NodeKind::Directory, BaseClass::Guest, BaseClass::User)
+        tree.create_folder("/", "aliases", NodeKind::Directory, BaseClass::Guest, BaseClass::User, None)
             .await
             .unwrap();
 
         // Alias /aliases/pub → /pub (inherits the source's leaf name).
         let alias = tree
-            .create_alias("/pub", "/aliases", BaseClass::User)
+            .create_alias("/pub", "/aliases", &sess(BaseClass::User))
             .await
             .unwrap();
         assert_eq!(alias.kind, NodeKind::Alias);
         assert_eq!(alias.name, "pub");
 
         // Listing the alias returns the target's children.
-        let entries = tree.list("/aliases/pub", BaseClass::Guest).await.unwrap();
+        let entries = tree.list("/aliases/pub", &sess(BaseClass::Guest)).await.unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].name, "a.txt");
         assert_eq!(entries[0].size, 42);
@@ -999,7 +1170,7 @@ mod tests {
     #[tokio::test]
     async fn alias_to_a_file_resolves_for_download() {
         let (tree, _dir) = tree().await;
-        tree.create_folder("/", "pub", NodeKind::Directory, BaseClass::Guest, BaseClass::User)
+        tree.create_folder("/", "pub", NodeKind::Directory, BaseClass::Guest, BaseClass::User, None)
             .await
             .unwrap();
         let pub_dir = tree.resolve("/pub").await.unwrap();
@@ -1007,17 +1178,17 @@ mod tests {
             .add_file(&pub_dir.id, "readme.txt", 10, &[0u8; 32], "/tmp/readme")
             .await
             .unwrap();
-        tree.create_folder("/", "aliases", NodeKind::Directory, BaseClass::Guest, BaseClass::User)
+        tree.create_folder("/", "aliases", NodeKind::Directory, BaseClass::Guest, BaseClass::User, None)
             .await
             .unwrap();
-        tree.create_alias("/pub/readme.txt", "/aliases", BaseClass::User)
+        tree.create_alias("/pub/readme.txt", "/aliases", &sess(BaseClass::User))
             .await
             .unwrap();
 
         // Downloading the alias resolves to the target's node (same id,
         // same storage_path, same size).
         let resolved = tree
-            .open_for_read("/aliases/readme.txt", BaseClass::Guest)
+            .open_for_read("/aliases/readme.txt", &sess(BaseClass::Guest))
             .await
             .unwrap();
         assert_eq!(resolved.id, file.id);
@@ -1035,17 +1206,17 @@ mod tests {
         // integration test `admin_aliases_a_folder_into_another_and_
         // download_resolves` couldn't download `/links/pub/readme.txt`.
         let (tree, _dir) = tree().await;
-        tree.create_folder("/", "pub", NodeKind::Directory, BaseClass::Guest, BaseClass::User)
+        tree.create_folder("/", "pub", NodeKind::Directory, BaseClass::Guest, BaseClass::User, None)
             .await
             .unwrap();
         let pub_dir = tree.resolve("/pub").await.unwrap();
         tree.add_file(&pub_dir.id, "readme.txt", 5, &[0u8; 32], "/tmp/r")
             .await
             .unwrap();
-        tree.create_folder("/", "links", NodeKind::Directory, BaseClass::Guest, BaseClass::User)
+        tree.create_folder("/", "links", NodeKind::Directory, BaseClass::Guest, BaseClass::User, None)
             .await
             .unwrap();
-        tree.create_alias("/pub", "/links", BaseClass::User).await.unwrap();
+        tree.create_alias("/pub", "/links", &sess(BaseClass::User)).await.unwrap();
 
         // The whole point: resolving through an intermediate alias reaches
         // the file. Without the fix this was `Err(NotFound)`.
@@ -1065,8 +1236,7 @@ mod tests {
             "vault",
             NodeKind::Directory,
             BaseClass::Admin, // admin-only reads
-            BaseClass::Admin,
-        )
+            BaseClass::Admin, None)
         .await
         .unwrap();
         let vault = tree.resolve("/vault").await.unwrap();
@@ -1075,41 +1245,41 @@ mod tests {
             .unwrap();
 
         // The permissive folder anyone can read.
-        tree.create_folder("/", "pub", NodeKind::Directory, BaseClass::Guest, BaseClass::Admin)
+        tree.create_folder("/", "pub", NodeKind::Directory, BaseClass::Guest, BaseClass::Admin, None)
             .await
             .unwrap();
         // Only an admin can even create the alias (needs write on /pub).
-        tree.create_alias("/vault/secret.txt", "/pub", BaseClass::Admin)
+        tree.create_alias("/vault/secret.txt", "/pub", &sess(BaseClass::Admin))
             .await
             .unwrap();
 
         // A guest can list /pub and see the alias entry, but CANNOT
         // actually download through it — the vault's admin-only read gate
         // applies.
-        assert!(tree.list("/pub", BaseClass::Guest).await.is_ok());
+        assert!(tree.list("/pub", &sess(BaseClass::Guest)).await.is_ok());
         assert!(matches!(
-            tree.open_for_read("/pub/secret.txt", BaseClass::Guest).await,
+            tree.open_for_read("/pub/secret.txt", &sess(BaseClass::Guest)).await,
             Err(TreeError::Acl(_))
         ));
         // An admin can go through.
-        assert!(tree.open_for_read("/pub/secret.txt", BaseClass::Admin).await.is_ok());
+        assert!(tree.open_for_read("/pub/secret.txt", &sess(BaseClass::Admin)).await.is_ok());
     }
 
     #[tokio::test]
     async fn alias_cannot_chain() {
         let (tree, _dir) = tree().await;
-        tree.create_folder("/", "pub", NodeKind::Directory, BaseClass::Guest, BaseClass::User)
+        tree.create_folder("/", "pub", NodeKind::Directory, BaseClass::Guest, BaseClass::User, None)
             .await
             .unwrap();
-        tree.create_folder("/", "aliases", NodeKind::Directory, BaseClass::Guest, BaseClass::User)
+        tree.create_folder("/", "aliases", NodeKind::Directory, BaseClass::Guest, BaseClass::User, None)
             .await
             .unwrap();
-        tree.create_alias("/pub", "/aliases", BaseClass::User)
+        tree.create_alias("/pub", "/aliases", &sess(BaseClass::User))
             .await
             .unwrap();
         // Making an alias to an alias is refused.
         assert!(matches!(
-            tree.create_alias("/aliases/pub", "/", BaseClass::PowerUser).await,
+            tree.create_alias("/aliases/pub", "/", &sess(BaseClass::PowerUser)).await,
             Err(TreeError::AliasChainRefused)
         ));
     }
@@ -1117,22 +1287,22 @@ mod tests {
     #[tokio::test]
     async fn delete_alias_leaves_target_intact() {
         let (tree, _dir) = tree().await;
-        tree.create_folder("/", "pub", NodeKind::Directory, BaseClass::Guest, BaseClass::User)
+        tree.create_folder("/", "pub", NodeKind::Directory, BaseClass::Guest, BaseClass::User, None)
             .await
             .unwrap();
         let pub_dir = tree.resolve("/pub").await.unwrap();
         tree.add_file(&pub_dir.id, "a.txt", 1, &[0u8; 32], "/tmp/a")
             .await
             .unwrap();
-        tree.create_folder("/", "aliases", NodeKind::Directory, BaseClass::Guest, BaseClass::User)
+        tree.create_folder("/", "aliases", NodeKind::Directory, BaseClass::Guest, BaseClass::User, None)
             .await
             .unwrap();
-        tree.create_alias("/pub", "/aliases", BaseClass::User)
+        tree.create_alias("/pub", "/aliases", &sess(BaseClass::User))
             .await
             .unwrap();
 
         // Delete the alias itself.
-        tree.delete("/aliases/pub", BaseClass::PowerUser).await.unwrap();
+        tree.delete("/aliases/pub", &sess(BaseClass::PowerUser)).await.unwrap();
         assert!(matches!(
             tree.resolve("/aliases/pub").await,
             Err(TreeError::NotFound)
@@ -1146,19 +1316,19 @@ mod tests {
     async fn alias_refuses_root_source_and_dropbox_dest_write_check() {
         let (tree, _dir) = tree().await;
         // Root as source is refused (would shadow everything).
-        assert!(tree.create_alias("/", "/", BaseClass::Admin).await.is_err());
+        assert!(tree.create_alias("/", "/", &sess(BaseClass::Admin)).await.is_err());
 
         // A dropbox as destination fails the write ACL for anyone below
         // its min_class_write (aliases are just another write op on the
         // destination folder).
-        tree.create_folder("/", "drop", NodeKind::DropBox, BaseClass::Guest, BaseClass::Admin)
+        tree.create_folder("/", "drop", NodeKind::DropBox, BaseClass::Guest, BaseClass::Admin, None)
             .await
             .unwrap();
-        tree.create_folder("/", "src", NodeKind::Directory, BaseClass::Guest, BaseClass::User)
+        tree.create_folder("/", "src", NodeKind::Directory, BaseClass::Guest, BaseClass::User, None)
             .await
             .unwrap();
         assert!(matches!(
-            tree.create_alias("/src", "/drop", BaseClass::User).await,
+            tree.create_alias("/src", "/drop", &sess(BaseClass::User)).await,
             Err(TreeError::Acl(_))
         ));
     }
@@ -1166,10 +1336,10 @@ mod tests {
     #[tokio::test]
     async fn move_enforces_write_class_on_source_and_destination() {
         let (tree, _dir) = tree().await;
-        tree.create_folder("/", "movable", NodeKind::Directory, BaseClass::Guest, BaseClass::User)
+        tree.create_folder("/", "movable", NodeKind::Directory, BaseClass::Guest, BaseClass::User, None)
             .await
             .unwrap();
-        tree.create_folder("/", "vault", NodeKind::Directory, BaseClass::Guest, BaseClass::Admin)
+        tree.create_folder("/", "vault", NodeKind::Directory, BaseClass::Guest, BaseClass::Admin, None)
             .await
             .unwrap();
         tree.create_folder(
@@ -1177,16 +1347,15 @@ mod tests {
             "locked",
             NodeKind::Directory,
             BaseClass::Guest,
-            BaseClass::Admin,
-        )
+            BaseClass::Admin, None)
         .await
         .unwrap();
 
         // A plain user can't move into an admin-only destination...
-        assert!(tree.move_node("/movable", "/vault", BaseClass::User).await.is_err());
+        assert!(tree.move_node("/movable", "/vault", &sess(BaseClass::User)).await.is_err());
         // ...nor move a node they can't write to in the first place.
-        assert!(tree.move_node("/locked", "/", BaseClass::User).await.is_err());
+        assert!(tree.move_node("/locked", "/", &sess(BaseClass::User)).await.is_err());
         // An admin can do both.
-        assert!(tree.move_node("/movable", "/vault", BaseClass::Admin).await.is_ok());
+        assert!(tree.move_node("/movable", "/vault", &sess(BaseClass::Admin)).await.is_ok());
     }
 }

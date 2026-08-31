@@ -1,0 +1,117 @@
+ 
+ How to use Hotline - Higher Intellect Vintage Wiki 
+ Search Log in ↓ Personal tools Log in Request account 
+ Navigation menu
+ Navigation Main Page Random page List Categories Definitions Sections Amiga Apple Companies Compaq Computing DEC Hewlett-Packard Hotline IBM Internet Microsoft Networking NeXT Packard Bell SGI Software Sun Telephony Toshiba Our Network Higher Intellect Home Documents Wiki Get Hotline/KDX Tech Museum Donate Blog Retro Software Old Driver Software Apple Dev Archives Partners OMGWTFBBQ Tech Blog Paul Lezica Altexxa Group ALTEXXANET 
+ Namespaces Page Discussion Actions Views Read View source View history Tools Tools What links here Related changes Printable version Permanent link Page information 
+ How to use Hotline 
+ From Higher Intellect Vintage Wiki 
+ Contents 
+ 1 Welcome to Hotline! 
+ 1.1 The Basics 
+ 1.2 After You've Connected 
+ 1.3 The User Window 
+ 1.4 The Files Area 
+ 1.5 The News 
+ 1.6 The Chat Window 
+ 1.7 The Tasks Window 
+ 2 What Now? 
+ 2.1 The Tracker 
+ 2.2 Adding Bookmarks 
+ 3 Tips, Tricks and Other Misc. Info 
+ 3.1 More Icons 
+ 3.2 Common Abbreviations 
+ Welcome to Hotline! 
+ Hotline is a communications program that gives you access to the Internet that is very different from the Web. Hotline combines the principles of bulletin board systems, ftp, and IRC . There is a news area that is similar to a BBS , a files for downloading files, and a chat area for, well, chatting.
+ Hotline is a huge community with a lot of users interacting and exchanging ideas. Don't let that slow you down! Eventually you'll find yourself right in the middle of the community and having a lot of fun. There's a lot to learn, so it is a good idea to read this file.
+ Please not that this file assumes you are using version 1.5 of Hotline or greater. There are some notes on the bottom for those of you with older versions. If you are using an older version, I highly recommend that you upgrade.
+ The Basics 
+ Hotline is full of servers. If you are familiar with IRC , think of them as channels. You connect to them through the Hotline client, and each server has a unique set of files and news. When you first open up the client, you will see 4 windows open: a chat window where chat will appear, a tasks window that displays the status of various things that may be happening in whatever server you are connected to, a users window that shows every user connected to the same server that you are, and the toolbar.
+ At servers, there are server administrators, or admin for short. These people's names will appear red. Admin are similar to sysops in IRC . They can disconnect you if you are being too rowdy or are breaking server rules, or even ban you (can't connect again for half an hour). They are usually nice people, but you want to pay close attention to what they say and ask you to do.
+ The toolbar is your command console, you can use it to customize Hotline through the options window, open windows, and connect to other servers. Each button on the toolbar corresponds to an item in the Hotline menu.
+ After you first open up Hotline, the first thing you'll want to do is connect to a server. The client isn't any good unless you're connected to a server.
+ To connect to a server, you can do 1 of 3 things: one, connect to a server from the tracker (I'll explain that more later on), two, choose the connect button on the toolbar, or three, choose 'Connect...' from the Hotline menu. We won't worry about the tracker just yet, so either click the connect button on the toolbar (It has the 2 arrows pointing opposite directions), or choose 'Connect...' from the Hotline menu.
+ After you do that, a window will appear with 'Connect' at the top and 3 areas that you can type into. The top is labelled 'Server:' and is where you type the address of a server. The next two are for entering a login and a password. You don't need to worry about having a login or a password just yet. Those are for people who have accounts at the server. When the time comes, you may be offered one and will be told what to do.
+ Unless you happen to know a Hotline server, you won't know anything to type in the server box. Next to it is a button with an arrow on it. Click on it, and you will see a lost of bookmarks you have saved. I'll explain how to save a bookmark later. For now, choose 'Hotline Communications, Ltd.' from the menu. The address should appear in the server area. Click the 'Connect' button.
+ In the tasks window, you should start to see some action. Various progress bars will appear as you connect to the server. Then, you should be all connected. The user list should be full of names of various users connected and their icons. Maybe some people will be chatting. As new users come in they will appear at the bottom.
+ After You've Connected 
+ Well, you're all connected, so now we can look around at Hotline's features. The first thing you'll want to do is give yourself a nickname. To everyone else, you appear as 'unnamed,' and we don't want that. To give yourself a name and icon, click on the options button on the toolbar (it has the 2 dots with lines next to them) or choose 'Options...' from the bottom of the Hotline menu. There are a lot of things you can do in this window, so I'll explain them all.
+ At the top is a group of tabs that take you to different groups of settings. We'll start on the first one, and the default one you're seeing: General
+ At the top of this section is an area labelled 'Your Name:' This is where you type your nickname that will appear in the user window as well as in the chat window. Think of a good name to give yourself and type it there. It can have any character you want in it, spaces, numbers, letters, and can be very long.
+ Underneath that are some other options. Directly below the 'Your Name:' box is a checkbox for 'Queue File Transfers.' It is a common courtesy to have this on, and some server admins may disconnect you for not queuing. What this does is it restricts you to one download or upload at a time, this saves bandwidth on the server, and is why admins will get mad at you if you do not queue.
+ Beneath that is an option labelled 'Show Join/Leave in Chat.' When this is on, a notice will appear in the chat window every time a user logs on giving their nickname. In addition, when this is on you can choose to have the time displayed.
+ Continuing down is an option to have private messages, messages only you can see, in back.
+ The item beneath that applies to the files area. With this on, every time you double-click a folder, its contents will appear in a separate window.
+ The bottom 3 choices are for privacy, they block incoming messages and invitations to private chat. The third option is where you type a response to private messages sent to you. It will be sent automatically.
+ That's all for the General tab, click on the next tab, labelled 'Icon.' What you do there is pretty simple. Click which icon you want displayed next to your name. The next tab labelled 'Display' is where you customize how the client looks. The top four rows affect 4 different ares of Hotline: general chat, private chat, view text, and news posts. Click a box to change it. Here's what the bottom 3 options do: 'Toolbar Buttons on Top' puts the buttons on the toolbar above the banner. 'Magnetic Windows' applies to 1.5.5 users only. With this on, when you move a window around, when you near its original location, it will snap to its original location. 'Show ToolTips' either turns on or off the little yellow messages that tell you what various buttons do. The 'Sounds' tab turns on and off sounds for various events that can happen, and the 'Advanced' tab is for firewall users only. Instructions on what to do are right there on the tab.
+ Phew. You're all set to use Hotline. Let's take a look at the User window.
+ The User Window 
+ As I said, the user window is where you can see everyone connected to the same server as you. There are other things you can do from there too. At the top right of the user window is the Private Chat button. It had a picture of two people looking at each other. To use this, first select a user (by clicking on him/her) and click the private chat button. The other user will see a window telling them who invited them to chat as well as giving them an offer to join the chat or leave. If they accept the invitation, a new chat window will appear showing everyone in the private chat as well as a new chat area and a place to enter a subject. Click the subject area to change it.
+ The other button (the one with the !) is the private message button. Select a user and click this person to send a private message to that user. That user will see a window pop up with the message and an option to reply to the message, or simply ot acknowledge it and close the window (the OK button). Instead of clicking this button, you can just double-click a user's name.
+ The Files Area 
+ If you are interested in downloading the server's files are uploading to the server, you'll need to get to the files area. You get there by either clicking the Files button on the toolbar (it's the one with the picture of a folder) or select 'Show Files' from the Hotline menu. 
+ A new window will appear with files and folders just as you'd see in your regular OS. Double-click a folder to open it and double-click a file to download it. At the top of the window there are some other things you can do. From left to right:
+The button with the folder and the red arrow will take you to the folder that the current one is in (think of the Back button in your web browser.
+To the right of that button is the download button. if you don't feel like double-clicking, select a file and use this button to download it.
+To the right of that is the upload button. If you are inside the uploads folder, click this button to choose a file from your computer to upload to the server you're connected to.
+Next to that is the View button. If you have a text file or a picture selected, click this button to view the file inside of Hotline, as opposed to having to open the file in another application.
+Next to that is the Info button, clicking this with a selected file gives some information about that file.
+Next to that is a faded folder icon, which would let you make a folder, but you can only do that with an account, and that is up to the server admin to give to you.
+Next to that is the refresh button, click that to see if there have been any changes to the folder since you first opened it. Just like the reload button in your web browser.
+ If you get disconnected half-way through downloading or uploading a file, don't worry! Just re-connect to the server and go back and download or upload the same file. You'll start right where you left off!
+ The News 
+ The News area is just like a BBS . It is divided into Bundles and Categories. Bundles have a brown icon that looks like a news tray. Categories have an icon that looks like a news paper. Posts are inside categories. They have a pencil icon. Double-click a post to see it. To get to the news area, either click the 'Show News' button (It has a picture of a newspaper on it) or select 'Show News' from the Hotline menu.
+ At the top of the news window when you first open it, are 4 buttons. At the right is the standard refresh button, and at the left is a button that looks like the bindle icon with a red arrow. This takes you back a level, again like the back button in your web browser. When you are inside a category, there are only 2 buttons: a button to post (it has a pencil) and the refresh button. To post a message, click the post button, type the subject and the contents, then click the button at the top (it has a paper with a thumbtack in it). When you are viewing a message, there are 5 buttons. A group of 4 used for navigating the category, up and down take you to diff posts at the same level (i.e. not replies) and the left and right buttons take you through the replies. The button with the person is the reply button, click that to post a reply.
+ The Chat Window 
+ If you can't see the chat window, you can open it by either clicking on the chat button on the tool bar (it has a picture of a person and a word balloon) or choosing 'Show Chat' from the Hotline menu.
+ After you've taken a look at the Files and News areas, you'll most definitely want to chat. After you connect to a server, it is a good idea to wait and see what people are talking about before diving in. Chatting is simple. Type what you want to in the bottom part of the window and press Return or Enter to chat it. Simple. Some times you will see things like this in the chat: '*** Crusher4 is having fun.' To do that type what you want to say without your nickname. (Crusher would have typed 'is having fun'), when press option-return. It is the same as the '/me' command on IRC .
+ The Tasks Window 
+ To see the Tasks window, click the Tasks button on the toolbar (It has a picture of two interlocking arrows) or choose 'Show Tasks' from the Hotline menu.
+ The tasks menu shows you that status of whatever you happen to be doing on the server. If you are downloading or uploading a file, you will see how far into the transfer you are, the transfer rate (in K/sec), as well as the approximate time remaining. If you want to stop a task, select it by clicking on it then clicking the 'Kill Task' button in the Tasks window (it is the red circle with a slash). If you want a file that is queued to start being downloaded or uploaded, select it and click the start button (picture of a green light).
+ That's it! That's really all you can do at that server. But that's not all you can do with Hotline.
+ What Now? 
+ The Tracker 
+ I'm sure that by now you're wondering how to find other servers. To see other servers, you need to use the tracker. There are many trackers on Hotline, and you connect to them, not through the connect window, but through the Tracker window. To see the tracker, either click the 'Show Tracker' button on the toolbar (it has a picture of the earth, and yes it IS round) or select 'Show Servers' from the Hotline menu.
+ A new window should appear. If it is blank, click the refresh button (looks the same with the green arrow in a circle). A list of servers should appear. To connect to a server, either double-click it or select it and click the 'Connect To' button (it is on the far left and has the 2 arrows pointing in opposite directions). You will be immediately connected to that server. You can search the tracker by typing a word in the search box and pressing Return or Enter. This searches through all the server names and descriptions and displays all the servers that contain what you searched for.
+ There are other trackers out there with more servers listed with more variety. The default tracker is the Hotline tracker with an address of hltracker.com. Click the 'Edit Tracker List' button (it's in the middle and has 3 blue dots connected with lines) to see all the trackers you have saved and their status (how many servers are listed with it, or a reason why it isn't displayed). You can turn individual ones on and off.
+ To add more trackers to the list, click the button on the left in the window with the list of trackers. A window should pop up with 2 areas to type: 'Name:' and 'Address:' In the name area give the tracker a name (whatever you want; it doesn't matter), in the address area type the tracker address. Once you have entered all the information, click the save button. You will need to click the refresh button to have that tracker's listing added to what is already displayed. If you want to delete a server, select it and click the 'Delete' button (has a picture of a trash can).
+ For a list of trackers, go to the Hotline server called Erik's Hangout (address: 38.223.189.2), at that server there is a list of just about every tracker and how many servers it lists. Look in the news for the list. On the web go to www.tracker-tracker.com. There is also a list of trackers there. Also, on the web, go to www.hotlinecentral.com for tracker info.
+ Adding Bookmarks 
+ Once you've been using Hotline for a while you'll probably discover that you have a few favorite servers that you like to hang out at. Instead of re-typing the address over and over or always clicking their name in the tracker, you can add that server to your Bookmarks, so you can get to it easily from the connect window. There are 3 ways you can make a bookmark:
+ 1) Option-Click (Alt-Click for PC users) a server in the tracker to open up the connect window with the address already filled in. Click the 'Save...' button at the bottom to save the bookmark. Make sure to save it in the Bookmarks folder, which is inside the same folder as Hotline so that it will appear in the menu.
+ You can also use this method to enter the log-in and password for a server on the tracker that you have an account for (remember: a server admin will offer you one, don't worry about asking for one). Note: you can save the Login and Password with the bookmark. Make sure to enter it before you click save.
+ 2) This method is used when you have the address memorized. Select 'Connect' from the Hotline menu or click the connect button on the toolbar (has the earth). Type in the address and Login and password, if any. Click the 'Save...' button. Make sure to save it in the Bookmarks folder, which is in the same folder as Hotline.
+ 3) Sometimes servers will have bookmarks available for download. Download it, then put it in the Bookmarks folder, which is in the same folder as Hotline.
+ And that's it! You are now ready to go out and be a part of the Hotline community. All that's left now are a few tips and tricks that you may find useful.
+ Tips, Tricks and Other Misc. Info 
+ More Icons 
+ The icons offered in the Options window arenÕt all the icons that you can use. There are plenty more available that you can use. To see them, open up a copy of the Hotline app in ResEdit or Resorcerer (only if you are on a Mac, if you are on a PC, I donÕt think there is a way for you to see other icons). Open up the 'cicn' resource (it has the yellow triangle with a !). You should see a windowful of icons that you can use. When you see one you like, write down the number underneath it. When you are done, go back to Hotline. Press Control and F12 at the same time. A window should appear with 'Secret' at the top. Type 'icon' (no quotes, all lowercase) in the top box and the number on the bottom. Then click the execute button. Go to the Options window and click the Save button. Enjoy your new icon.
+ There are many other things that you can type (top box only). They are all lowercase:
+ stats - tells (in chat) how much you have downloaded and uploaded, the amount of chat you have chatted, in K, and the time you have spent online. 
+ fuelharp - tells (in chat) your 'Leech Rating.' Your Leech Rating is the amount you have downloaded divided by the ammount you have uploaded. If you have uploaded more than you have downloaded, than it is upload divided by download and the result is negative. 
+ beertilxx - I'll let you figure this one out. 
+ Common Abbreviations 
+ Hotline is full of abbreviations that you may be unfamiliar with. Here is a list of some of the more common ones.
+ brb - be right back 
+ bbiab - be back in a bit 
+ bbl - be back later 
+ gtg - gotta go 
+ lol - laughing out loud 
+ rofl - rolling on the floor laughing 
+ roflmao - rolling on the floor laughing my a** off 
+ j/k - just kidding (variants include: j/w - just wondering and j/p - just playing) 
+ b/c - because 
+ w/ - with 
+ w/o -without 
+ mb - maybe 
+ afk - away from keyboard 
+ afhl - away from Hotline 
+ d/l - download 
+ u/l - upload 
+Congratulations! You now know just about everything you need to know to fit in on Hotline. Maybe I'll see you around.
+ Internet Relay Chat
+ Bulletin Board System
+ Retrieved from " https://wiki.preterhuman.net/index.php?title=How_to_use_Hotline&oldid=10328 " 
+ Category : Hotline 
+ This page was last edited on 23 July 2019, at 06:29. Privacy policy About Higher Intellect Vintage Wiki Go to preterhuman.net 
+ 

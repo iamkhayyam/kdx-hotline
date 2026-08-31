@@ -1,0 +1,119 @@
+name: Release
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            artifact: kdx-macos
+          - os: windows-latest
+            artifact: kdx-windows
+          - os: ubuntu-latest
+            artifact: kdx-linux
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install tauri-cli
+        run: cargo install tauri-cli --version "^2"
+
+      # ---- Server: plain release binary (no Tauri, builds everywhere) ----
+      - name: Build kdxd (release)
+        run: cargo build -p kdxd --release
+
+      # ---- Client: Tauri bundle. macOS builds the .app here and the .dmg is
+      #      produced by the bundled create-dmg script manually (the tauri CLI
+      #      invocation trips the script's option parser on this version).
+      - name: Build client bundle (macOS app)
+        if: runner.os == 'macOS'
+        working-directory: apps/kdx-client/src-tauri
+        run: cargo tauri build --bundles app
+
+      - name: Build client bundle (Windows / Linux)
+        if: runner.os != 'macOS'
+        working-directory: apps/kdx-client/src-tauri
+        run: cargo tauri build
+
+      - name: Create macOS dmg (workaround for create-dmg arg parsing)
+        if: runner.os == 'macOS'
+        working-directory: target/release/bundle/dmg
+        run: |
+          sh bundle_dmg.sh --volname "KDX" KDX_0.1.0_aarch64.dmg ../macos/KDX.app || \
+          sh bundle_dmg.sh --volname "KDX" KDX_0.1.0_x64.dmg ../macos/KDX.app
+
+      # ---- Package the server per-OS: binary + example config + service ----
+      - name: Package server (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          mkdir -p dist/kdxd
+          cp target/release/kdxd dist/kdxd/
+          cp crates/kdxd/kdxd.example.toml dist/kdxd/
+          cp crates/kdxd/net.kdx.hotline.server.plist dist/kdxd/
+          cd dist && zip -r ../kdxd-macos.zip kdxd
+
+      - name: Package server (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist\kdxd
+          Copy-Item target\release\kdxd.exe dist\kdxd\
+          Copy-Item crates\kdxd\kdxd.example.toml dist\kdxd\
+          Compress-Archive -Path dist\kdxd -DestinationPath kdxd-windows.zip
+
+      - name: Package server (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          mkdir -p dist/kdxd
+          cp target/release/kdxd dist/kdxd/
+          cp crates/kdxd/kdxd.example.toml dist/kdxd/
+          cp crates/kdxd/kdxd.service dist/kdxd/
+          cd dist && zip -r ../kdxd-linux.zip kdxd
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            target/release/bundle/**
+            kdxd-*.zip
+          if-no-files-found: error
+
+  # On a version tag, collect every platform's artifacts into one Release.
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/**/*

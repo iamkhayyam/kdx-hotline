@@ -1,0 +1,39 @@
+ 
+ Haxial KDX (software) - Higher Intellect Vintage Wiki 
+ Search Log in ↓ Personal tools Log in Request account 
+ Navigation menu
+ Navigation Main Page Random page List Categories Definitions Sections Amiga Apple Companies Compaq Computing DEC Hewlett-Packard Hotline IBM Internet Microsoft Networking NeXT Packard Bell SGI Software Sun Telephony Toshiba Our Network Higher Intellect Home Documents Wiki Get Hotline/KDX Tech Museum Donate Blog Retro Software Old Driver Software Apple Dev Archives Partners OMGWTFBBQ Tech Blog Paul Lezica Altexxa Group ALTEXXANET 
+ Namespaces Page Discussion Actions Views Read View source View history Tools Tools What links here Related changes Printable version Permanent link Page information 
+ Haxial KDX (software) 
+ From Higher Intellect Vintage Wiki 
+ The KDX software is a sequel of sorts to the Hotline protocol as it was also created by the same original developer.
+ As of 2019 there are still a handful of KDX servers and trackers still in operation. You can also connect to the official preterhuman.net KDX server using URL kdx.preterhuman.net. 
+ Contents 
+ 1 KDX 1.6 Client/Server 
+ 1.1 Macintosh 
+ 1.2 Windows 
+ 1.3 Linux 
+ 2 KDX 1.110 Tracker 
+ 2.1 Macintosh 
+ 2.2 Windows 
+ 2.3 Linux 
+ KDX 1.6 Client/Server 
+ Macintosh 
+ KDX Client 1.600 for Macintosh PPC 
+ KDX Server 1.600 for Macintosh PPC 
+ Windows 
+ KDX Client 1.600 for Windows x86 
+ KDX Server 1.600 for Windows x86 
+ Linux 
+ KDX Server 1.620 for Linux x86 
+ KDX 1.110 Tracker 
+ Macintosh 
+ KDX Tracker Server 1.110 for Macintosh PPC 
+ Windows 
+ KDX Tracker Server 1.110 for Windows x86 
+ Linux 
+ KDX Tracker Server 1.110 for Linux x86 
+ Retrieved from " https://wiki.preterhuman.net/index.php?title=Haxial_KDX_(software)&oldid=6817 " 
+ Categories : KDX Software 
+ This page was last edited on 6 April 2019, at 22:04. Privacy policy About Higher Intellect Vintage Wiki Go to preterhuman.net 
+ 

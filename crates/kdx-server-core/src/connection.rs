@@ -20,13 +20,15 @@ use kdx_protocol::messages::{
     ConnectionListRequest, ConnectionListResponse, FileCatalogGenerated, FileCreateFolder,
     FileDelete,
     FileEntry,
-    FileAlias, FileGenerateCatalog, FileListRequest, FileListResponse, FileMove, FileSearchEntry,
-    FileSearchRequest, FileSearchResponse, HandshakeInit, HandshakeResp, HistoryEntry as WireHistoryEntry,
+    FileAlias, FileGenerateCatalog, FileInfoRequest, FileInfoResponse, FileListRequest,
+    FileListResponse, FileMove, FileSearchEntry, FileSearchRequest, FileSearchResponse,
+    HandshakeInit, HandshakeResp, HistoryEntry as WireHistoryEntry,
     HistoryListRequest, HistoryListResponse, IpRuleCreate, IpRuleDelete,
     IpRuleEntry as WireIpRule, IpRuleListRequest, IpRuleListResponse, NewsPost as WireNewsPost,
     NewsPostCreate, NewsPostDelete, NewsThreadListRequest, NewsThreadListResponse, NewsgroupCreate,
     NewsgroupInfo, NewsgroupListRequest, NewsgroupListResponse, PresenceListRequest,
     PresenceListResponse, PrivateMessage, PrivateSend, RoleAssign, RoleCreate, RoleDelete, RoleInfo,
+    SetIdentity,
     RoleListRequest, RoleListResponse, RoleUnassign, RoleUpdate, ServerSettingsRequest,
     ServerSettingsResponse, ServerSettingsUpdate, TrackerListRequest, TrackerListResponse,
     TrackerServer, TransferAccept, TransferData, TransferEnd, TransferRequest, UserInfoRequest,
@@ -416,6 +418,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                     debug!("client disconnected cleanly");
                     break Ok(());
                 }
+                PacketType::SetIdentity => {
+                    let req = SetIdentity::decode(&frame.payload)?;
+                    let session_id = self.session.as_ref().expect("authed").id;
+                    self.ctx.presence.set_identity(session_id, req.name, req.description).await;
+                }
                 PacketType::PresenceListRequest => {
                     PresenceListRequest::decode(&frame.payload)?;
                     let users = self.ctx.presence.list().await;
@@ -464,7 +471,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                 }
                 PacketType::PrivateSend => {
                     let send = PrivateSend::decode(&frame.payload)?;
-                    let session = self.session.as_ref().expect("authed");
+                    let session = self.session.as_ref().expect("authed").clone();
                     if !session.privileges.contains(Privileges::CHAT_PRIVATE) {
                         self.send_error("missing CHAT_PRIVATE privilege").await?;
                         continue;
@@ -584,7 +591,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                 }
                 PacketType::ChatMessage => {
                     let send = ChatSend::decode(&frame.payload)?;
-                    let session = self.session.as_ref().expect("authed");
+                    let session = self.session.as_ref().expect("authed").clone();
                     if !session.privileges.contains(Privileges::CHAT_SEND) {
                         self.send_error("missing CHAT_SEND privilege").await?;
                         continue;
@@ -649,12 +656,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                 }
                 PacketType::FileListRequest => {
                     let request = FileListRequest::decode(&frame.payload)?;
-                    let session = self.session.as_ref().expect("authed");
+                    let session = self.session.as_ref().expect("authed").clone();
                     if !session.privileges.contains(Privileges::FILE_LIST) {
                         self.send_error("missing FILE_LIST privilege").await?;
                         continue;
                     }
-                    match self.ctx.tree.list(&request.path, session.class).await {
+                    match self.ctx.tree.list(&request.path, &session).await {
                         Ok(entries) => {
                             let response = FileListResponse {
                                 path: request.path,
@@ -677,13 +684,40 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                         Err(e) => self.send_error(&e.to_string()).await?,
                     }
                 }
+                PacketType::FileInfoRequest => {
+                    let req = FileInfoRequest::decode(&frame.payload)?;
+                    let session = self.session.as_ref().expect("authed").clone();
+                    if !session.privileges.contains(Privileges::FILE_LIST) {
+                        self.send_error("missing FILE_LIST privilege").await?;
+                        continue;
+                    }
+                    match self.ctx.tree.info(&req.path, &session).await {
+                        Ok(node) => {
+                            let response = FileInfoResponse {
+                                name: node.name.clone(),
+                                kind: node.kind.as_u8(),
+                                size: node.size,
+                                sha256: node.sha256.clone().and_then(|h| {
+                                    <[u8; 32]>::try_from(h).ok()
+                                }),
+                                min_read_class: node.min_class_read as u8,
+                                min_write_class: node.min_class_write as u8,
+                                owner: node.owner.clone(),
+                            };
+                            self.send(
+                                PacketType::FileInfoResponse,
+                                PacketFlags::empty(),
+                                response.encode(),
+                            )
+                            .await?;
+                        }
+                        Err(e) => self.send_error(&e.to_string()).await?,
+                    }
+                }
                 PacketType::FileCreateFolder => {
                     let req = FileCreateFolder::decode(&frame.payload)?;
-                    let (class, privs) = {
-                        let s = self.session.as_ref().expect("authed");
-                        (s.class, s.privileges)
-                    };
-                    if !privs.contains(Privileges::FILE_MANAGE_TREE) {
+                    let session = self.session.as_ref().expect("authed").clone();
+                    if !session.privileges.contains(Privileges::FILE_MANAGE_TREE) {
                         self.send_error("missing FILE_MANAGE_TREE privilege").await?;
                         continue;
                     }
@@ -701,64 +735,62 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                     match self
                         .ctx
                         .tree
-                        .create_folder(&req.path, &req.name, kind, read, write)
+                        .create_folder(
+                            &req.path,
+                            &req.name,
+                            kind,
+                            read,
+                            write,
+                            req.owner.as_deref(),
+                        )
                         .await
                     {
-                        Ok(_) => self.reply_file_list(&req.path, class).await?,
+                        Ok(_) => self.reply_file_list(&req.path, &session).await?,
                         Err(e) => self.send_error(&e.to_string()).await?,
                     }
                 }
                 PacketType::FileDelete => {
                     let req = FileDelete::decode(&frame.payload)?;
-                    let (class, privs) = {
-                        let s = self.session.as_ref().expect("authed");
-                        (s.class, s.privileges)
-                    };
-                    if !privs.contains(Privileges::FILE_MANAGE_TREE) {
+                    let session = self.session.as_ref().expect("authed").clone();
+                    if !session.privileges.contains(Privileges::FILE_MANAGE_TREE) {
                         self.send_error("missing FILE_MANAGE_TREE privilege").await?;
                         continue;
                     }
-                    match self.ctx.tree.delete(&req.path, class).await {
+                    match self.ctx.tree.delete(&req.path, &session).await {
                         Ok(_) => {
                             // Re-list the deleted node's parent directory.
                             let parent = parent_path(&req.path);
-                            self.reply_file_list(&parent, class).await?;
+                            self.reply_file_list(&parent, &session).await?;
                         }
                         Err(e) => self.send_error(&e.to_string()).await?,
                     }
                 }
                 PacketType::FileMove => {
                     let req = FileMove::decode(&frame.payload)?;
-                    let (class, privs) = {
-                        let s = self.session.as_ref().expect("authed");
-                        (s.class, s.privileges)
-                    };
-                    if !privs.contains(Privileges::FILE_MANAGE_TREE) {
+                    let session = self.session.as_ref().expect("authed").clone();
+                    if !session.privileges.contains(Privileges::FILE_MANAGE_TREE) {
                         self.send_error("missing FILE_MANAGE_TREE privilege").await?;
                         continue;
                     }
-                    match self.ctx.tree.move_node(&req.path, &req.dest_path, class).await {
-                        Ok(()) => self.reply_file_list(&req.dest_path, class).await?,
+                    match self.ctx.tree.move_node(&req.path, &req.dest_path, &session).await {
+                        Ok(()) => self.reply_file_list(&req.dest_path, &session).await?,
                         Err(e) => self.send_error(&e.to_string()).await?,
                     }
                 }
                 PacketType::FileAlias => {
                     let req = FileAlias::decode(&frame.payload)?;
-                    let (class, privs) = {
-                        let s = self.session.as_ref().expect("authed");
-                        (s.class, s.privileges)
-                    };
-                    if !privs.contains(Privileges::FILE_MANAGE_TREE) {
+                    let session = self.session.as_ref().expect("authed").clone();
+                    if !session.privileges.contains(Privileges::FILE_MANAGE_TREE) {
                         self.send_error("missing FILE_MANAGE_TREE privilege").await?;
                         continue;
                     }
                     match self
                         .ctx
                         .tree
-                        .create_alias(&req.source_path, &req.dest_path, class)
+                        .create_alias(&req.source_path, &req.dest_path, &session)
                         .await
                     {
-                        Ok(_) => self.reply_file_list(&req.dest_path, class).await?,
+                        Ok(_) => self.reply_file_list(&req.dest_path, &session).await?,
                         Err(e) => self.send_error(&e.to_string()).await?,
                     }
                 }
@@ -969,7 +1001,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                 }
                 PacketType::RoleCreate => {
                     let create = RoleCreate::decode(&frame.payload)?;
-                    let session = self.session.as_ref().expect("authed");
+                    let session = self.session.as_ref().expect("authed").clone();
                     if !session.privileges.contains(Privileges::USER_ADMIN) {
                         self.send_error("missing USER_ADMIN privilege").await?;
                         continue;
@@ -1000,7 +1032,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                 }
                 PacketType::RoleUpdate => {
                     let update = RoleUpdate::decode(&frame.payload)?;
-                    let session = self.session.as_ref().expect("authed");
+                    let session = self.session.as_ref().expect("authed").clone();
                     if !session.privileges.contains(Privileges::USER_ADMIN) {
                         self.send_error("missing USER_ADMIN privilege").await?;
                         continue;
@@ -1032,7 +1064,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                 }
                 PacketType::RoleDelete => {
                     let delete = RoleDelete::decode(&frame.payload)?;
-                    let session = self.session.as_ref().expect("authed");
+                    let session = self.session.as_ref().expect("authed").clone();
                     if !session.privileges.contains(Privileges::USER_ADMIN) {
                         self.send_error("missing USER_ADMIN privilege").await?;
                         continue;
@@ -1053,7 +1085,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                 }
                 PacketType::RoleAssign => {
                     let assign = RoleAssign::decode(&frame.payload)?;
-                    let session = self.session.as_ref().expect("authed");
+                    let session = self.session.as_ref().expect("authed").clone();
                     if !session.privileges.contains(Privileges::USER_ADMIN) {
                         self.send_error("missing USER_ADMIN privilege").await?;
                         continue;
@@ -1088,7 +1120,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                 }
                 PacketType::RoleUnassign => {
                     let unassign = RoleUnassign::decode(&frame.payload)?;
-                    let session = self.session.as_ref().expect("authed");
+                    let session = self.session.as_ref().expect("authed").clone();
                     if !session.privileges.contains(Privileges::USER_ADMIN) {
                         self.send_error("missing USER_ADMIN privilege").await?;
                         continue;
@@ -1123,7 +1155,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                 }
                 PacketType::AccountRolesRequest => {
                     let request = AccountRolesRequest::decode(&frame.payload)?;
-                    let session = self.session.as_ref().expect("authed");
+                    let session = self.session.as_ref().expect("authed").clone();
                     if !session.privileges.contains(Privileges::USER_ADMIN) {
                         self.send_error("missing USER_ADMIN privilege").await?;
                         continue;
@@ -1149,7 +1181,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                 }
                 PacketType::AccountListRequest => {
                     AccountListRequest::decode(&frame.payload)?;
-                    let session = self.session.as_ref().expect("authed");
+                    let session = self.session.as_ref().expect("authed").clone();
                     if !session.privileges.contains(Privileges::USER_ADMIN) {
                         self.send_error("missing USER_ADMIN privilege").await?;
                         continue;
@@ -1340,7 +1372,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                 }
                 PacketType::IpRuleCreate => {
                     let create = IpRuleCreate::decode(&frame.payload)?;
-                    let session = self.session.as_ref().expect("authed");
+                    let session = self.session.as_ref().expect("authed").clone();
                     if !session.privileges.contains(Privileges::SERVER_ADMIN) {
                         self.send_error("missing SERVER_ADMIN privilege").await?;
                         continue;
@@ -1385,7 +1417,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                 }
                 PacketType::IpRuleDelete => {
                     let del = IpRuleDelete::decode(&frame.payload)?;
-                    let session = self.session.as_ref().expect("authed");
+                    let session = self.session.as_ref().expect("authed").clone();
                     if !session.privileges.contains(Privileges::SERVER_ADMIN) {
                         self.send_error("missing SERVER_ADMIN privilege").await?;
                         continue;
@@ -1405,7 +1437,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                 }
                 PacketType::ServerSettingsUpdate => {
                     let update = ServerSettingsUpdate::decode(&frame.payload)?;
-                    let session = self.session.as_ref().expect("authed");
+                    let session = self.session.as_ref().expect("authed").clone();
                     if !session.privileges.contains(Privileges::SERVER_ADMIN) {
                         self.send_error("missing SERVER_ADMIN privilege").await?;
                         continue;
@@ -1429,7 +1461,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                 }
                 PacketType::AdminBroadcast => {
                     let broadcast = AdminBroadcast::decode(&frame.payload)?;
-                    let session = self.session.as_ref().expect("authed");
+                    let session = self.session.as_ref().expect("authed").clone();
                     if !session.privileges.contains(Privileges::SERVER_ADMIN) {
                         self.send_error("missing SERVER_ADMIN privilege").await?;
                         continue;
@@ -1455,7 +1487,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                 }
                 PacketType::AdminShutdown => {
                     let shutdown = AdminShutdown::decode(&frame.payload)?;
-                    let session = self.session.as_ref().expect("authed");
+                    let session = self.session.as_ref().expect("authed").clone();
                     if !session.privileges.contains(Privileges::SERVER_ADMIN) {
                         self.send_error("missing SERVER_ADMIN privilege").await?;
                         continue;
@@ -1489,7 +1521,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                 }
                 PacketType::NewsgroupCreate => {
                     let create = NewsgroupCreate::decode(&frame.payload)?;
-                    let session = self.session.as_ref().expect("authed");
+                    let session = self.session.as_ref().expect("authed").clone();
                     if !session.privileges.contains(Privileges::USER_ADMIN) {
                         self.send_error("missing USER_ADMIN privilege").await?;
                         continue;
@@ -1792,8 +1824,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
 
     /// List `path` for `class` and send it as a `FileListResponse` — the reply
     /// to a successful folder create/delete so the Files window re-renders.
-    async fn reply_file_list(&mut self, path: &str, class: BaseClass) -> Result<(), ConnectionError> {
-        match self.ctx.tree.list(path, class).await {
+    async fn reply_file_list(&mut self, path: &str, session: &Session) -> Result<(), ConnectionError> {
+        match self.ctx.tree.list(path, &session).await {
             Ok(entries) => {
                 let response = FileListResponse {
                     path: path.to_owned(),

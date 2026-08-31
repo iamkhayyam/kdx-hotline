@@ -3,6 +3,11 @@ name = "kdxd"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "KDX server daemon — early-2000s Hotline-style chat and file sharing over TLS 1.3"
+authors = ["theusual"]
+keywords = ["hotline", "chat", "file-sharing", "server", "tls"]
+categories = ["network-programming", "command-line-utilities"]
+readme = "../../README.md"
 
 [dependencies]
 kdx-protocol = { workspace = true }

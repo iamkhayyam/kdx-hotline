@@ -1,0 +1,80 @@
+/##############################################################################\
+#                       Hotline Uncovered (for PC) v1.1                        #
+#  Tips/secrets to make your Hotline experience more productive and enjoyable. #
+#                             by /\/odib`//icttbb                              #
+\##############################################################################/
+
+CONTENTS:
+
+A.0 - CLIENT SIDE TIPS
+   A.1 - FILE/WORD SEARCHING
+   A.2 - SECRET KEYWORDS
+     A.2.1 - CHANGING YOUR ICON NUMBER
+     A.2.2 - OTHER SECRET KEYWORDS
+   A.3 - ANNOUNCE IN CHAT
+   A.4 - ALT FUNCTIONS
+     A.4.1 - SERVER LOGIN/PASS WINDOW
+     A.4.2 - SPECIFY DOWNLOAD DIRECTORY
+     A.4.3 - OPEN FOLDER IN CURRENT FOLDER
+B.0 - SERVER SIDE TIPS
+   B.1 - DOWNLOADED A "HACKED" SERVER?
+   B.2 - BANNING A USER
+   B.3 - ALT FUNCTION
+C.0 - THANX
+_______________________________________________________________________________
+A.0 - CLIENT SIDE TIPS
+
+A.1 - FILE/WORD SEARCHING
+   If you are looking for a particular file, and you know the name or a word the name contains, then you are lucky, for Hotline has a built in search function that works on any server. This is very simple. Simply enter a folder and type what you wish to search for, then press ENTER. If any matches are found in that folder, the first occurance will be highlighted. The only downfall of this function is that it only allows you to search in the current folder and not through a whole server.
+   A great use I have found for this feature is to search for a certain word in the tracker listing. For example, let's say I wanted to search for "free porn". Then simply type that in when the tracker window is highligted, press enter, and voila! If there is a match, it will be highlighted. You can do this in just about any window in Hotline!
+
+A.2 - SECRET KEYWORDS
+   In Hotline, all secret keywords are entered in the box that appears after you press CONTROL-F12.   
+
+   A.2.1 - CHANGING YOUR ICON NUMBER
+       After pressing CTRL-F12, type "icon" in the top box, and the icon number you wish to change to in the bottom. (You will have to guess if you don't have a list of icon numbers)
+
+   A.2.2 - OTHER SECRET KEYWORDS
+       Press CTRL-F12 and then type in the following keywords:
+       fuelharp     <- leech rating report (not sure what this means exactly)
+       bngamya      <- changes your icon to the crappy default face one.*
+       evynies      <- changes your icon to a boring "M" hotline letter. (Macline)*
+       copperprod   <- same as evynies.*
+       anthedge     <- changes your icon to the red "H" hotline icon.*
+
+       *You have to go into options and then save after typing in this keyword to enable it.
+
+A.3 - ANNOUNCE IN CHAT
+   In the server chat box type what you want to announce, and then hold OPTION and press RETURN. Now what you typed will appear with three stars. (similar to "/me" in IRC chat)
+
+A.4 - ALT FUNCTIONS
+   Holding the ALT key while performing a function in Hotline usually does an alternative one. There may be some more I don't know about, so just try holding ALT when performing a function.
+
+   A.4.1 - SERVER LOGIN/PASS WINDOW
+       Hold ALT when connecting to a server in the tracker and it will bring up the connect dialog box so you can enter a log/pass.
+
+   A.4.2 - SPECIFY DOWNLOAD DIRECTORY
+       Hold ALT when starting a download and you can specify the directory. You have to press the down arrow to start the download, not just double click.
+
+   A.4.3 - OPEN FOLDER IN CURRENT FOLDER
+       Hold ALT when opening a folder so it opens in the same folder. This stops you from having to close numerous folders.
+_______________________________________________________________________________
+B.0 - SERVER SIDE TIPS
+
+B.1 - DOWNLOADED A "HACKED" SERVER?
+   If you have downloaded a the Hotline Server program from a server, then you could have downloaded a copy which allows a user (the hacker) access to all your files! After downloading the file, look into the "USERS" directory. If you find anything in their other than "ADMIN" and "GUEST", you've been hacked! To fix this "hack", simply delete any other directories other than "ADMIN" and "GUEST". Now the hacker won't be able to enter your site as he hoped!
+
+B.2 - BANNING A USER
+   Have you ever been running your server and some dork comes by and starts spamming your page or cussing you out. Well, you can kick him all you want, but he can keep coming back for more. The alternative is to ban him. simply highlight the victim and instead of just pressing the kick button, (red circle with a slash through it- found in users listing box) press and hold ALT and then press the kick button while holding ALT. This will keep any person with that IP address from entering your server. That user will have to reconnect if he wishes to fuck with you again! (Because his IP will be different)
+
+B.3 - ALT FUNCTION
+   Hold ALT immediately after you launch the server program. This will bring up the options menu right away.
+_______________________________________________________________________________
+C.0 - THANX
+
+Special thanks go out to:  
+   Chris Housser (for the ALT FUNCTIONS)
+
+   Thanks guy(s) =) 
+_______________________________________________________________________________
+If you know about or have discovered any other PC Hotline tips, please send them to me at nodibwicttbb@hotmail.com. I will be grateful and add your name to the thanx section at the end of this file.

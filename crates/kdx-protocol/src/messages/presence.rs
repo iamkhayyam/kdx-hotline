@@ -11,6 +11,10 @@ pub struct PresenceEntry {
     pub login_at: u64,  // unix seconds
     pub idle_secs: u32, // seconds since last observed activity
     pub address: String,
+    /// Display name set via `/name` (empty = none, fall back to username).
+    pub name: String,
+    /// Description set via `/desc` (empty = none).
+    pub description: String,
 }
 
 /// Client → server: request the full roster. Empty payload.
@@ -31,6 +35,29 @@ pub struct PresenceChange {
     pub online: bool,
 }
 
+/// Client → server: set your own display name / description (`/name`, `/desc`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SetIdentity {
+    pub name: String,
+    pub description: String,
+}
+
+impl SetIdentity {
+    pub fn encode(&self) -> Bytes {
+        let mut buf = BytesMut::new();
+        put_str(&mut buf, &self.name);
+        put_str(&mut buf, &self.description);
+        buf.freeze()
+    }
+
+    pub fn decode(mut payload: &[u8]) -> Result<Self, ProtocolError> {
+        let name = get_str(&mut payload, "SetIdentity")?;
+        let description = get_str(&mut payload, "SetIdentity")?;
+        expect_end(payload, "SetIdentity")?;
+        Ok(Self { name, description })
+    }
+}
+
 /// Client → server: ask for one user's detail (User Info window).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UserInfoRequest {
@@ -49,6 +76,8 @@ fn encode_entry(buf: &mut BytesMut, e: &PresenceEntry) {
     buf.put_u64(e.login_at);
     buf.put_u32(e.idle_secs);
     put_str(buf, &e.address);
+    put_str(buf, &e.name);
+    put_str(buf, &e.description);
 }
 
 fn decode_entry(payload: &mut &[u8]) -> Result<PresenceEntry, ProtocolError> {
@@ -60,12 +89,16 @@ fn decode_entry(payload: &mut &[u8]) -> Result<PresenceEntry, ProtocolError> {
     let login_at = payload.get_u64();
     let idle_secs = payload.get_u32();
     let address = get_str(payload, "PresenceEntry")?;
+    let name = get_str(payload, "PresenceEntry")?;
+    let description = get_str(payload, "PresenceEntry")?;
     Ok(PresenceEntry {
         username,
         class,
         login_at,
         idle_secs,
         address,
+        name,
+        description,
     })
 }
 
@@ -162,6 +195,8 @@ mod tests {
             login_at: 1_751_600_000,
             idle_secs: 42,
             address: "127.0.0.1:55123".into(),
+            name: String::new(),
+            description: String::new(),
         }
     }
 
@@ -195,6 +230,12 @@ mod tests {
             entry: sample_entry(),
         };
         assert_eq!(UserInfoResponse::decode(&info_resp.encode()).unwrap(), info_resp);
+
+        let identity = SetIdentity {
+            name: "Captain Phraq".into(),
+            description: "just visiting".into(),
+        };
+        assert_eq!(SetIdentity::decode(&identity.encode()).unwrap(), identity);
     }
 
     #[test]

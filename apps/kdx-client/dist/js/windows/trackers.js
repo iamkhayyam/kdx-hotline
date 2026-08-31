@@ -3,9 +3,10 @@
 // type-to-filter box. "Connect" pre-fills the Connect window with a server's
 // address so the user can authenticate to it.
 
-import { invoke } from "../bridge.js";
+import { invoke, emitUi } from "../bridge.js";
+import { open } from "../wm.js";
 
-export function buildTrackers(onConnect) {
+export function buildTrackers() {
   const body = document.createElement("div");
   body.className = "trk-win";
   body.innerHTML = `
@@ -52,7 +53,10 @@ export function buildTrackers(onConnect) {
         `<div class="trk-sub">${esc(s.description || "—")}</div>` +
         `<div class="trk-addr">${esc(s.host)}:${s.port}` +
         `<button class="mini" data-host="${esc(s.host)}" data-port="${s.port}">Connect</button></div>`;
-      row.querySelector("button").addEventListener("click", () => onConnect(s.host, s.port));
+      row.querySelector("button").addEventListener("click", () => {
+        open("connect");
+        emitUi("connect", "fill", { host: s.host, port: s.port });
+      });
       listEl.appendChild(row);
     }
   }

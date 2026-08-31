@@ -510,9 +510,9 @@ async fn admin_moves_a_folder_into_another() {
     next_event(&mut es).await;
     sysop.login("sysop", "pw").await.unwrap();
 
-    sysop.create_folder("/", "a", 0, 0, 1).await.unwrap();
-    sysop.create_folder("/", "b", 0, 0, 1).await.unwrap();
-    sysop.create_folder("/a", "sub", 0, 0, 1).await.unwrap();
+    sysop.create_folder("/", "a", 0, 0, 1, None).await.unwrap();
+    sysop.create_folder("/", "b", 0, 0, 1, None).await.unwrap();
+    sysop.create_folder("/a", "sub", 0, 0, 1, None).await.unwrap();
 
     // Move /a (carrying /a/sub with it) into /b; the reply is /b's listing.
     let dest_listing = sysop.move_path("/a", "/b").await.unwrap();
@@ -544,8 +544,8 @@ async fn admin_aliases_a_folder_into_another_and_download_resolves() {
     next_event(&mut es).await;
     sysop.login("sysop", "pw").await.unwrap();
 
-    sysop.create_folder("/", "pub", 0, 0, 1).await.unwrap();
-    sysop.create_folder("/", "links", 0, 0, 1).await.unwrap();
+    sysop.create_folder("/", "pub", 0, 0, 1, None).await.unwrap();
+    sysop.create_folder("/", "links", 0, 0, 1, None).await.unwrap();
 
     // Upload a real file into /pub.
     let payload = b"the target's bytes";
@@ -588,14 +588,14 @@ async fn alias_download_still_enforces_targets_acl() {
     sysop.login("sysop", "pw").await.unwrap();
 
     // Admin-only vault with a real file.
-    sysop.create_folder("/", "vault", 0, /*min_read*/ 3, /*min_write*/ 3).await.unwrap();
+    sysop.create_folder("/", "vault", 0, 3, 3, None).await.unwrap();
     let payload = b"top secret";
     let up = dd.path().join("secret.txt");
     std::fs::write(&up, payload).unwrap();
     sysop.upload(up, "/vault").await.unwrap();
 
     // Public folder everyone can read.
-    sysop.create_folder("/", "pub", 0, /*min_read*/ 0, /*min_write*/ 3).await.unwrap();
+    sysop.create_folder("/", "pub", 0, 0, 3, None).await.unwrap();
     // Only sysop can create the alias (needs write on /pub).
     sysop.alias_path("/vault/secret.txt", "/pub").await.unwrap();
 
@@ -628,8 +628,8 @@ async fn plain_user_cannot_create_aliases() {
     let (sysop, mut es, _d1) = ts.connect_client().await;
     next_event(&mut es).await;
     sysop.login("sysop", "pw").await.unwrap();
-    sysop.create_folder("/", "src", 0, 0, 1).await.unwrap();
-    sysop.create_folder("/", "dst", 0, 0, 1).await.unwrap();
+    sysop.create_folder("/", "src", 0, 0, 1, None).await.unwrap();
+    sysop.create_folder("/", "dst", 0, 0, 1, None).await.unwrap();
 
     let (plain, mut ep, _d2) = ts.connect_client().await;
     next_event(&mut ep).await;
@@ -652,8 +652,8 @@ async fn plain_user_cannot_move_files() {
     let (sysop, mut es, _d1) = ts.connect_client().await;
     next_event(&mut es).await;
     sysop.login("sysop", "pw").await.unwrap();
-    sysop.create_folder("/", "a", 0, 0, 1).await.unwrap();
-    sysop.create_folder("/", "b", 0, 0, 1).await.unwrap();
+    sysop.create_folder("/", "a", 0, 0, 1, None).await.unwrap();
+    sysop.create_folder("/", "b", 0, 0, 1, None).await.unwrap();
 
     let (plain, mut ep, _d2) = ts.connect_client().await;
     next_event(&mut ep).await;
@@ -677,10 +677,10 @@ async fn admin_generates_catalog_and_search_is_class_filtered() {
     next_event(&mut es).await;
     sysop.login("sysop", "pw").await.unwrap();
 
-    sysop.create_folder("/", "pub", 0, 0, 1).await.unwrap();
+    sysop.create_folder("/", "pub", 0, 0, 1, None).await.unwrap();
     let listing = sysop.list_files("/pub").await.unwrap();
     let _ = listing; // just to exercise the freshly-created folder
-    sysop.create_folder("/", "staff", 0, 3, 3).await.unwrap(); // admin-only
+    sysop.create_folder("/", "staff", 0, 3, 3, None).await.unwrap(); // admin-only
 
     // Before generating a catalog, search is refused.
     assert!(matches!(
@@ -1073,12 +1073,12 @@ async fn admin_creates_and_deletes_folders() {
     sysop.login("sysop", "pw").await.unwrap();
 
     // Create a normal folder and an upload folder at the root.
-    let listing = sysop.create_folder("/", "pub", 0, 0, 1).await.unwrap();
+    let listing = sysop.create_folder("/", "pub", 0, 0, 1, None).await.unwrap();
     assert!(listing.entries.iter().any(|e| e.name == "pub"));
-    sysop.create_folder("/", "incoming", 3, 0, 0).await.unwrap();
+    sysop.create_folder("/", "incoming", 3, 0, 0, None).await.unwrap();
 
     // Nest a subfolder, then delete the whole /pub subtree.
-    sysop.create_folder("/pub", "docs", 0, 0, 1).await.unwrap();
+    sysop.create_folder("/pub", "docs", 0, 0, 1, None).await.unwrap();
     let after = sysop.delete_path("/pub").await.unwrap();
     assert!(!after.entries.iter().any(|e| e.name == "pub"));
     assert!(after.entries.iter().any(|e| e.name == "incoming"));
@@ -1098,7 +1098,7 @@ async fn plain_user_cannot_manage_the_tree() {
     client.login("plain", "pw").await.unwrap();
 
     assert!(matches!(
-        client.create_folder("/", "mine", 0, 0, 0).await,
+        client.create_folder("/", "mine", 0, 0, 0, None).await,
         Err(ClientError::Server(_))
     ));
     assert!(matches!(
@@ -1364,6 +1364,67 @@ async fn admin_sees_every_connection_in_the_monitor() {
     assert!(names.contains("guest"));
     // Every entry carries a real address (127.0.0.1:something).
     assert!(conns.iter().all(|c| c.address.starts_with("127.0.0.1")));
+
+    ts.stop();
+}
+
+
+#[tokio::test]
+async fn set_identity_updates_presence_and_user_info() {
+    let ts = TestServer::start().await;
+    ts.seed_account("phraq", "pw", 2).await;
+
+    let (client, mut events, _d1) = ts.connect_client().await;
+    next_event(&mut events).await;
+    client.login("phraq", "pw").await.unwrap();
+
+    // Nobody has set an identity yet.
+    let before = client.list_users().await.unwrap();
+    let me = before.iter().find(|u| u.username == "phraq").unwrap();
+    assert_eq!(me.name, "");
+    assert_eq!(me.description, "");
+
+    // /name + /desc (fire-and-forget) — the server rebroadcasts presence.
+    client.set_identity("Captain Phraq", "just visiting").await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+    let after = client.list_users().await.unwrap();
+    let me = after.iter().find(|u| u.username == "phraq").unwrap();
+    assert_eq!(me.name, "Captain Phraq");
+    assert_eq!(me.description, "just visiting");
+
+    let info = client.get_user_info("phraq").await.unwrap();
+    assert_eq!(info.name, "Captain Phraq");
+    assert_eq!(info.description, "just visiting");
+
+    ts.stop();
+}
+
+
+#[tokio::test]
+async fn get_file_info_returns_metadata() {
+    let ts = TestServer::start().await;
+    ts.seed_account("sysop", "pw", 3).await;
+
+    let (sysop, mut es, dd) = ts.connect_client().await;
+    next_event(&mut es).await;
+    sysop.login("sysop", "pw").await.unwrap();
+    sysop.create_folder("/", "pub", 0, 0, 1, Some("sysop")).await.unwrap();
+
+    let payload = b"hello get info";
+    let up = dd.path().join("note.txt");
+    std::fs::write(&up, payload).unwrap();
+    sysop.upload(up, "/pub").await.unwrap();
+
+    let info = sysop.get_file_info("/pub/note.txt").await.unwrap();
+    assert_eq!(info.name, "note.txt");
+    assert_eq!(info.kind, 1); // file
+    assert_eq!(info.size, payload.len() as u64);
+    assert!(info.sha256.is_some());
+    // Folder with an owner reports it.
+    let folder = sysop.get_file_info("/pub").await.unwrap();
+    assert_eq!(folder.owner.as_deref(), Some("sysop"));
+    assert_eq!(folder.kind, 0);
 
     ts.stop();
 }

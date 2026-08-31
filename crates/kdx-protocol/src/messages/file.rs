@@ -50,6 +50,107 @@ pub struct FileCreateFolder {
     pub kind: u8,
     pub min_read_class: u8,
     pub min_write_class: u8,
+    /// Optional owner login — meaningful for drop boxes / `[db]` folders;
+    /// the owner may read/delete inside the write-only folder. Empty = none.
+    pub owner: Option<String>,
+}
+
+
+/// Client → server: request metadata for one node (the Files "Get Info"
+/// verb). Requires read access to the node; the server resolves aliases.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileInfoRequest {
+    pub path: String,
+}
+
+/// Server → client: node metadata. `sha256` is `Some` for real files only;
+/// `owner` is `Some` for folders with an access-item owner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileInfoResponse {
+    pub name: String,
+    pub kind: u8,
+    pub size: u64,
+    pub sha256: Option<[u8; 32]>,
+    pub min_read_class: u8,
+    pub min_write_class: u8,
+    pub owner: Option<String>,
+}
+
+impl FileInfoRequest {
+    pub fn encode(&self) -> Bytes {
+        let mut buf = BytesMut::new();
+        put_str(&mut buf, &self.path);
+        buf.freeze()
+    }
+
+    pub fn decode(mut payload: &[u8]) -> Result<Self, ProtocolError> {
+        let path = get_str(&mut payload, "FileInfoRequest")?;
+        expect_end(payload, "FileInfoRequest")?;
+        Ok(Self { path })
+    }
+}
+
+impl FileInfoResponse {
+    pub fn encode(&self) -> Bytes {
+        let mut buf = BytesMut::new();
+        put_str(&mut buf, &self.name);
+        buf.put_u8(self.kind);
+        buf.put_u64(self.size);
+        match &self.sha256 {
+            Some(h) => {
+                buf.put_u8(1);
+                buf.put_slice(h);
+            }
+            None => buf.put_u8(0),
+        }
+        buf.put_u8(self.min_read_class);
+        buf.put_u8(self.min_write_class);
+        match &self.owner {
+            Some(o) => {
+                buf.put_u8(1);
+                put_str(&mut buf, o);
+            }
+            None => buf.put_u8(0),
+        }
+        buf.freeze()
+    }
+
+    pub fn decode(mut payload: &[u8]) -> Result<Self, ProtocolError> {
+        let name = get_str(&mut payload, "FileInfoResponse")?;
+        // Minimum: kind + size + sha-presence + 2 classes + owner-presence.
+        // sha256 and owner are optional, so the fixed tail is small.
+        if payload.remaining() < 1 + 8 + 1 + 1 + 1 + 1 {
+            return Err(ProtocolError::MalformedPayload("FileInfoResponse"));
+        }
+        let kind = payload.get_u8();
+        let size = payload.get_u64();
+        let has_sha = payload.get_u8();
+        let sha256 = if has_sha == 1 {
+            let mut h = [0u8; 32];
+            payload.copy_to_slice(&mut h);
+            Some(h)
+        } else {
+            None
+        };
+        let min_read_class = payload.get_u8();
+        let min_write_class = payload.get_u8();
+        let has_owner = payload.get_u8();
+        let owner = if has_owner == 1 {
+            Some(get_str(&mut payload, "FileInfoResponse")?)
+        } else {
+            None
+        };
+        expect_end(payload, "FileInfoResponse")?;
+        Ok(Self {
+            name,
+            kind,
+            size,
+            sha256,
+            min_read_class,
+            min_write_class,
+            owner,
+        })
+    }
 }
 
 /// Client → server: delete a node (recursively, for folders). Requires write
@@ -225,18 +326,32 @@ impl FileCreateFolder {
         buf.put_u8(self.kind);
         buf.put_u8(self.min_read_class);
         buf.put_u8(self.min_write_class);
+        // optional owner: presence flag + string
+        match &self.owner {
+            Some(o) => {
+                buf.put_u8(1);
+                put_str(&mut buf, o);
+            }
+            None => buf.put_u8(0),
+        }
         buf.freeze()
     }
 
     pub fn decode(mut payload: &[u8]) -> Result<Self, ProtocolError> {
         let path = get_str(&mut payload, "FileCreateFolder")?;
         let name = get_str(&mut payload, "FileCreateFolder")?;
-        if payload.remaining() < 3 {
+        if payload.remaining() < 4 {
             return Err(ProtocolError::MalformedPayload("FileCreateFolder"));
         }
         let kind = payload.get_u8();
         let min_read_class = payload.get_u8();
         let min_write_class = payload.get_u8();
+        let has_owner = payload.get_u8();
+        let owner = if has_owner == 1 {
+            Some(get_str(&mut payload, "FileCreateFolder")?)
+        } else {
+            None
+        };
         expect_end(payload, "FileCreateFolder")?;
         Ok(Self {
             path,
@@ -244,6 +359,7 @@ impl FileCreateFolder {
             kind,
             min_read_class,
             min_write_class,
+            owner,
         })
     }
 }
@@ -596,6 +712,27 @@ mod tests {
         assert!(TransferData::decode(&[0u8; 20]).is_err());
     }
 
+
+    #[test]
+    fn file_info_round_trip() {
+        let req = FileInfoRequest { path: "/pub/a.txt".into() };
+        assert_eq!(FileInfoRequest::decode(&req.encode()).unwrap(), req);
+
+        let resp = FileInfoResponse {
+            name: "a.txt".into(),
+            kind: KIND_FILE,
+            size: 1234,
+            sha256: Some([7u8; 32]),
+            min_read_class: 0,
+            min_write_class: 2,
+            owner: None,
+        };
+        assert_eq!(FileInfoResponse::decode(&resp.encode()).unwrap(), resp);
+
+        let owner = FileInfoResponse { owner: Some("bob".into()), ..resp };
+        assert_eq!(FileInfoResponse::decode(&owner.encode()).unwrap(), owner);
+    }
+
     #[test]
     fn create_folder_and_delete_round_trip() {
         let mk = FileCreateFolder {
@@ -604,7 +741,19 @@ mod tests {
             kind: KIND_DROPBOX,
             min_read_class: 0,
             min_write_class: 1,
+            owner: Some("bob".into()),
         };
+        assert_eq!(
+            FileCreateFolder::decode(&mk.encode()).unwrap(),
+            mk,
+            "owner survives a wire round-trip"
+        );
+        // owner-less encoding is still decodable
+        let bare = FileCreateFolder {
+            owner: None,
+            ..mk.clone()
+        };
+        assert_eq!(FileCreateFolder::decode(&bare.encode()).unwrap(), bare);
         assert_eq!(FileCreateFolder::decode(&mk.encode()).unwrap(), mk);
 
         let del = FileDelete { path: "/pub/docs".into() };

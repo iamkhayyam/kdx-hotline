@@ -4,8 +4,9 @@
 // (gracefully stops the server — never touches the host machine).
 
 import { invoke } from "../bridge.js";
+import { open } from "../wm.js";
 
-export function buildServerAdmin(openHistory, openIpRules, openConnections) {
+export function buildServerAdmin() {
   const body = document.createElement("div");
   body.className = "srv-win";
   body.innerHTML = `
@@ -98,9 +99,9 @@ export function buildServerAdmin(openHistory, openIpRules, openConnections) {
     }
   });
   $("#srv-refresh").addEventListener("click", refresh);
-  if (openHistory) $("#srv-history").addEventListener("click", openHistory);
-  if (openIpRules) $("#srv-iprules").addEventListener("click", openIpRules);
-  if (openConnections) $("#srv-connections").addEventListener("click", openConnections);
+  $("#srv-history").addEventListener("click", () => open("history"));
+  $("#srv-iprules").addEventListener("click", () => open("iprules"));
+  $("#srv-connections").addEventListener("click", () => open("connections"));
 
   $("#srv-broadcast-form").addEventListener("submit", async (e) => {
     e.preventDefault();

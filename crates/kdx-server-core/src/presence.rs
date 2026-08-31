@@ -36,6 +36,13 @@ pub enum PresenceCommand {
     Touch {
         session_id: Uuid,
     },
+    /// Set a user's display name / description (`/name`, `/desc`) and
+    /// rebroadcast their presence so every client sees the change live.
+    SetIdentity {
+        session_id: Uuid,
+        name: String,
+        description: String,
+    },
     /// Full roster, sorted by username.
     List {
         reply: oneshot::Sender<Vec<WireEntry>>,
@@ -81,6 +88,8 @@ struct Entry {
     login_at: u64,
     last_active: Instant,
     address: String,
+    name: String,
+    description: String,
     tx: mpsc::Sender<Outbound>,
 }
 
@@ -92,6 +101,8 @@ impl Entry {
             login_at: self.login_at,
             idle_secs: now.duration_since(self.last_active).as_secs() as u32,
             address: self.address.clone(),
+            name: self.name.clone(),
+            description: self.description.clone(),
         }
     }
 }
@@ -146,6 +157,18 @@ impl Presence {
 
     pub async fn touch(&self, session_id: Uuid) {
         let _ = self.tx.send(PresenceCommand::Touch { session_id }).await;
+    }
+
+    /// Set the display name / description of one session (`/name`, `/desc`).
+    pub async fn set_identity(&self, session_id: Uuid, name: String, description: String) {
+        let _ = self
+            .tx
+            .send(PresenceCommand::SetIdentity {
+                session_id,
+                name,
+                description,
+            })
+            .await;
     }
 
     pub async fn list(&self) -> Vec<WireEntry> {
@@ -262,6 +285,8 @@ async fn handle(entries: &mut HashMap<Uuid, Entry>, command: PresenceCommand) {
                 login_at: unix_now(),
                 last_active: now,
                 address,
+                name: String::new(),
+                description: String::new(),
                 tx,
             };
             entries.insert(session_id, entry);
@@ -297,6 +322,26 @@ async fn handle(entries: &mut HashMap<Uuid, Entry>, command: PresenceCommand) {
         PresenceCommand::Touch { session_id } => {
             if let Some(entry) = entries.get_mut(&session_id) {
                 entry.last_active = Instant::now();
+            }
+        }
+        PresenceCommand::SetIdentity {
+            session_id,
+            name,
+            description,
+        } => {
+            if let Some(entry) = entries.get_mut(&session_id) {
+                entry.name = name;
+                entry.description = description;
+                // Re-broadcast so every client sees the new identity live.
+                let wire = entry.to_wire(Instant::now());
+                broadcast(
+                    entries,
+                    PresenceChange {
+                        entry: wire,
+                        online: true,
+                    },
+                )
+                .await;
             }
         }
         PresenceCommand::List { reply } => {

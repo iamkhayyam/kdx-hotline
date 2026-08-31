@@ -443,6 +443,8 @@ impl ConnectionListResponse {
             buf.put_u64(e.login_at);
             buf.put_u32(e.idle_secs);
             put_str(&mut buf, &e.address);
+            put_str(&mut buf, &e.name);
+            put_str(&mut buf, &e.description);
         }
         buf.freeze()
     }
@@ -461,12 +463,16 @@ impl ConnectionListResponse {
             let login_at = payload.get_u64();
             let idle_secs = payload.get_u32();
             let address = get_str(&mut payload, "ConnectionListResponse")?;
+            let name = get_str(&mut payload, "ConnectionListResponse")?;
+            let description = get_str(&mut payload, "ConnectionListResponse")?;
             connections.push(super::presence::PresenceEntry {
                 username,
                 class,
                 login_at,
                 idle_secs,
                 address,
+                name,
+                description,
             });
         }
         expect_end(payload, "ConnectionListResponse")?;
@@ -587,6 +593,8 @@ mod tests {
                 login_at: 1_700_000_000,
                 idle_secs: 12,
                 address: "10.0.0.5:52341".into(),
+                name: String::new(),
+                description: String::new(),
             }],
         };
         assert_eq!(ConnectionListResponse::decode(&resp.encode()).unwrap(), resp);

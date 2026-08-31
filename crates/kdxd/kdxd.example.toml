@@ -1,0 +1,41 @@
+# KDX server configuration. Copy this file to kdxd.toml (or anywhere) and
+# pass it as the first argument to the daemon:
+#
+#   kdxd kdxd.toml
+#
+# Every field shown here is the built-in default, so an empty file behaves
+# identically — this file exists to document what can be tuned. Uncomment
+# and change only what you need.
+
+# Address and port to listen on. KDX's traditional port is 10700.
+bind = "0.0.0.0:10700"
+
+# SQLite database path. Created automatically on first run.
+database = "kdx.db"
+
+# Directory where uploaded file bytes are stored. Created automatically.
+files_root = "files"
+
+# Idle session lifetime in seconds before the client must reauthenticate.
+session_ttl_secs = 1800
+
+# Per-transfer throttle in bytes/sec. 0 = unlimited.
+max_upload_bytes_per_sec = 0
+max_download_bytes_per_sec = 0
+
+# Display name and one-line description advertised to the tracker directory.
+server_name = "KDX Server"
+server_description = ""
+
+# Advertised capacity, shown as "users/max" in the tracker directory.
+max_users = 256
+
+# TLS certificate and private key (PEM). When omitted, a self-signed dev
+# certificate is generated at startup and cached next to the database —
+# fine for local testing only. Clients that pinned the dev cert will warn
+# loudly if the key ever changes, so supply real certificates for any real
+# deployment:
+#
+# [tls]
+# cert_pem = "/etc/kdx/cert.pem"
+# key_pem  = "/etc/kdx/key.pem"

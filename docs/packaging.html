@@ -1,0 +1,423 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>KDX — Packaging &amp; Distribution Handoff</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  :root {
+    --bg: #0d0d0d;
+    --surface: #141414;
+    --card: #1a1a1a;
+    --border: #2a2a2a;
+    --accent: #cc2200;
+    --accent2: #39ff88;
+    --text: #e8e8e8;
+    --muted: #666;
+    --label: #999;
+    --done: #1a7a3a;
+    --todo: #7a4800;
+    --warn: #7a6500;
+    --mono: 'SF Mono', 'Cascadia Code', 'Fira Code', monospace;
+    --sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  }
+  body { background: var(--bg); color: var(--text); font-family: var(--sans); font-size: 14px; line-height: 1.6; }
+  .page { max-width: 860px; margin: 0 auto; padding: 3rem 2rem 6rem; }
+
+  /* Header */
+  .doc-title { font-size: 22px; font-weight: 600; letter-spacing: -0.02em; margin-bottom: 4px; }
+  .doc-sub { color: var(--muted); font-size: 13px; margin-bottom: 2.5rem; }
+  .doc-sub a { color: var(--muted); text-decoration: none; border-bottom: 1px solid var(--border); }
+  .doc-sub a:hover { color: var(--text); }
+
+  /* TOC */
+  .toc { background: var(--card); border: 1px solid var(--border); border-radius: 6px; padding: 1.2rem 1.4rem; margin-bottom: 2.5rem; }
+  .toc-title { font-size: 11px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); margin-bottom: 0.6rem; }
+  .toc ol { padding-left: 1.2rem; }
+  .toc li { margin: 3px 0; }
+  .toc a { color: var(--label); text-decoration: none; font-size: 13px; }
+  .toc a:hover { color: var(--text); }
+
+  /* Sections */
+  h2 { font-size: 15px; font-weight: 600; color: var(--accent); text-transform: uppercase; letter-spacing: 0.06em; margin: 2.4rem 0 1rem; padding-bottom: 6px; border-bottom: 1px solid var(--border); }
+  h3 { font-size: 13px; font-weight: 600; color: var(--label); text-transform: uppercase; letter-spacing: 0.05em; margin: 1.4rem 0 0.6rem; }
+  p { color: var(--text); margin-bottom: 0.75rem; }
+  p:last-child { margin-bottom: 0; }
+
+  /* Status badges */
+  .badge { display: inline-block; font-size: 10px; font-weight: 600; letter-spacing: 0.05em; text-transform: uppercase; padding: 2px 7px; border-radius: 3px; vertical-align: middle; margin-left: 6px; }
+  .badge-done  { background: var(--done); color: #7cffa8; }
+  .badge-todo  { background: var(--todo); color: #ffb84d; }
+  .badge-open  { background: var(--warn); color: #ffe066; }
+  .badge-skip  { background: #222; color: var(--muted); }
+
+  /* Task cards */
+  .task-group { display: flex; flex-direction: column; gap: 8px; margin-bottom: 1.2rem; }
+  .task { background: var(--card); border: 1px solid var(--border); border-radius: 5px; padding: 0.8rem 1rem; }
+  .task-head { display: flex; align-items: baseline; gap: 8px; margin-bottom: 4px; }
+  .task-head strong { font-size: 13px; }
+  .task p { font-size: 13px; color: var(--label); margin-bottom: 4px; }
+  .task p:last-child { margin-bottom: 0; }
+  .task code { font-family: var(--mono); font-size: 11.5px; background: #0d0d0d; padding: 1px 5px; border-radius: 3px; color: #bbb; }
+
+  /* Code blocks */
+  pre { background: #0d0d0d; border: 1px solid var(--border); border-radius: 5px; padding: 0.85rem 1rem; margin: 0.6rem 0 1rem; font-family: var(--mono); font-size: 12px; color: #bbb; overflow-x: auto; line-height: 1.55; }
+  pre .cm { color: var(--muted); }
+  pre .key { color: #7ec8e3; }
+  pre .val { color: #98c379; }
+  pre .str { color: #e5c07b; }
+  pre .cmd { color: var(--accent2); }
+
+  /* Two-col current state */
+  .state-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; margin-bottom: 1.5rem; }
+  .state-card { background: var(--card); border: 1px solid var(--border); border-radius: 5px; padding: 0.9rem 1rem; }
+  .state-card h4 { font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); margin-bottom: 0.5rem; }
+  .state-row { display: flex; justify-content: space-between; align-items: center; font-size: 12px; padding: 3px 0; border-bottom: 1px solid #1f1f1f; }
+  .state-row:last-child { border-bottom: none; }
+  .state-row .field { color: var(--label); font-family: var(--mono); font-size: 11px; }
+  .state-row .present { color: #7cffa8; }
+  .state-row .missing { color: #ff6b4d; }
+
+  /* Questions */
+  .q-list { display: flex; flex-direction: column; gap: 6px; }
+  .q-item { background: var(--card); border-left: 3px solid var(--warn); border-radius: 0 5px 5px 0; padding: 0.7rem 1rem; font-size: 13px; }
+  .q-item strong { color: #ffe066; display: block; margin-bottom: 3px; }
+  .q-item span { color: var(--label); }
+
+  /* Context box */
+  .context { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 1rem 1.2rem; margin-bottom: 1.5rem; font-size: 13px; color: var(--label); }
+  .context strong { color: var(--text); }
+
+  /* Footer */
+  .footer { margin-top: 4rem; padding-top: 1.2rem; border-top: 1px solid var(--border); font-size: 12px; color: var(--muted); display: flex; justify-content: space-between; }
+  .footer a { color: var(--muted); text-decoration: none; }
+
+  @media (max-width: 600px) { .state-grid { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<div class="page">
+
+  <p class="doc-sub">
+    KDX Hotline · Packaging &amp; Distribution ·
+    <a href="handoff.html">Handoff v0.1</a> ·
+    <a href="handoff-v0.2.html">Handoff v0.2</a> ·
+    <a href="ui-concept.html">UI Concept</a>
+  </p>
+  <div class="doc-title">Packaging &amp; Distribution</div>
+  <p class="doc-sub">Work order for the next session — server daemon + desktop client, ready to ship.</p>
+
+  <div class="toc">
+    <div class="toc-title">Contents</div>
+    <ol>
+      <li><a href="#context">Context &amp; scope</a></li>
+      <li><a href="#current">Current state</a></li>
+      <li><a href="#questions">Open questions</a></li>
+      <li><a href="#server">Server — kdxd</a></li>
+      <li><a href="#client">Client — KDX.app</a></li>
+      <li><a href="#readme">README</a></li>
+      <li><a href="#order">Suggested order of work</a></li>
+    </ol>
+  </div>
+
+  <!-- Context -->
+  <h2 id="context">Context &amp; scope</h2>
+  <div class="context">
+    <strong>Repo:</strong> <code>~/claude-code/kdx-hotline</code> · Rust workspace, 7 crates ·
+    <strong>Server binary:</strong> <code>crates/kdxd</code> ·
+    <strong>Desktop client:</strong> <code>apps/kdx-client</code> (Tauri v2, vanilla JS)
+    <br><br>
+    All features are shipped and tested (237 tests, 0 TODOs). This session is purely about making both products
+    distributable: clean metadata, a real icon set, bundle config, an example server config, and a
+    tightened README. No new features, no refactoring.
+  </div>
+  <p>Two products to package:</p>
+  <div class="task-group">
+    <div class="task">
+      <div class="task-head"><strong>kdxd</strong> <span class="badge badge-todo">daemon</span></div>
+      <p>The server binary. Distributed as a compiled executable. SysOps install it on a machine, point it at a TLS cert, run <code>kdxd useradd</code>, start it. Config via <code>kdxd.toml</code>. Traditional port 10700.</p>
+    </div>
+    <div class="task">
+      <div class="task-head"><strong>KDX</strong> <span class="badge badge-todo">desktop app</span></div>
+      <p>The Tauri v2 desktop client. Targets macOS first (<code>.app</code> + <code>.dmg</code>), with Windows and Linux as stretch goals. Needs a proper icon set, bundle metadata, and entitlements.</p>
+    </div>
+  </div>
+
+  <!-- Current state -->
+  <h2 id="current">Current state</h2>
+  <div class="state-grid">
+    <div class="state-card">
+      <h4>kdxd — Cargo.toml</h4>
+      <div class="state-row"><span class="field">name</span><span class="present">kdxd ✓</span></div>
+      <div class="state-row"><span class="field">version</span><span class="present">0.1.0 (workspace) ✓</span></div>
+      <div class="state-row"><span class="field">license</span><span class="present">MIT (workspace) ✓</span></div>
+      <div class="state-row"><span class="field">description</span><span class="present">"KDX server daemon — early-2000s Hotline-style chat and file sharing over TLS 1.3" ✓</span></div>
+      <div class="state-row"><span class="field">authors</span><span class="present">theusual ✓</span></div>
+      <div class="state-row"><span class="field">keywords</span><span class="present">hotline, chat, file-sharing, server, tls ✓</span></div>
+      <div class="state-row"><span class="field">categories</span><span class="present">network-programming, command-line-utilities ✓</span></div>
+      <div class="state-row"><span class="field">readme</span><span class="present">../../README.md ✓</span></div>
+      <div class="state-row"><span class="field">example config</span><span class="present">kdxd.example.toml ✓</span></div>
+      <div class="state-row"><span class="field">service files</span><span class="present">systemd + launchd ✓</span></div>
+    </div>
+    <div class="state-card">
+      <h4>KDX.app — tauri.conf.json</h4>
+      <div class="state-row"><span class="field">productName</span><span class="present">KDX ✓</span></div>
+      <div class="state-row"><span class="field">version</span><span class="present">0.1.0 ✓</span></div>
+      <div class="state-row"><span class="field">identifier</span><span class="present">net.kdx.hotline.client ✓</span></div>
+      <div class="state-row"><span class="field">targets</span><span class="present">app, dmg ✓</span></div>
+      <div class="state-row"><span class="field">icon set</span><span class="present">full set (icns, ico, pngs) ✓</span></div>
+      <div class="state-row"><span class="field">shortDescription</span><span class="present">"Hotline-style chat and file sharing" ✓</span></div>
+      <div class="state-row"><span class="field">copyright</span><span class="present">© 2024–2026 theusual ✓</span></div>
+      <div class="state-row"><span class="field">category</span><span class="present">SocialNetworking ✓</span></div>
+      <div class="state-row"><span class="field">macOS min version</span><span class="present">10.15 ✓</span></div>
+      <div class="state-row"><span class="field">entitlements</span><span class="present">entitlements.plist ✓</span></div>
+    </div>
+  </div>
+  <div class="state-card" style="margin-bottom:1.5rem;">
+    <h4>README.md</h4>
+    <div class="state-row"><span class="field">project description</span><span class="present">good ✓</span></div>
+    <div class="state-row"><span class="field">workspace overview</span><span class="present">good ✓</span></div>
+    <div class="state-row"><span class="field">build &amp; test instructions</span><span class="present">good ✓</span></div>
+    <div class="state-row"><span class="field">test count</span><span class="present">243 ✓ (was stale at "~110")</span></div>
+    <div class="state-row"><span class="field">"not yet implemented" section</span><span class="present">replaced with Status section ✓</span></div>
+    <div class="state-row"><span class="field">config reference</span><span class="present">points to kdxd.example.toml ✓</span></div>
+    <div class="state-row"><span class="field">packaging section</span><span class="present">macOS stub present ✓ (needs flesh-out)</span></div>
+  </div>
+
+  <!-- Open questions -->
+  <h2 id="questions">Open questions — decide before starting</h2>
+  <div class="q-list">
+    <div class="q-item">
+      <strong>Icon source</strong>
+      <span>The current <code>icons/icon.png</code> is a placeholder. Does a real icon design exist, or does one need to be created? <code>cargo tauri icon &lt;source.png&gt;</code> generates the full set (32×32 through 512×512, .icns, .ico) from one 1024×1024 source. The source must be provided before the icon step can run.</span>
+    </div>
+    <div class="q-item">
+      <strong>App Store category</strong>
+      <span>Tauri accepts a macOS app category string. Closest fits: <code>public.app-category.social-networking</code>, <code>public.app-category.utilities</code>, or <code>public.app-category.productivity</code>. Pick one — it affects App Store placement if submitted.<br><em>Resolved: <code>SocialNetworking</code> (chat app).</em></span>
+    </div>
+    <div class="q-item">
+      <strong>macOS minimum version</strong>
+      <span>Tauri v2 supports macOS 10.13+. rustls requires 10.13+. Reasonable targets: <code>10.15</code> (Catalina, 2019) or <code>11.0</code> (Big Sur, 2020). Most users are 12+; 10.15 is the broadest reasonable floor.<br><em>Resolved: <code>10.15</code>.</em></span>
+    </div>
+    <div class="q-item">
+      <strong>Target platforms</strong>
+      <span>macOS is confirmed (app + dmg). Windows (NSIS installer) and Linux (AppImage, .deb) are possible with Tauri but each needs its own bundle config block and an OS-specific CI runner. In scope for this session or deferred?</span>
+    </div>
+    <div class="q-item">
+      <strong>Server distribution format</strong>
+      <span>Options: (a) GitHub release pre-built binary only, (b) Homebrew tap formula, (c) Docker image, (d) systemd/launchd service files bundled alongside the binary. Minimum is (a); (b) is the most SysOp-friendly for macOS.<br><em>Resolved: (a) GitHub release artifacts per OS (zip + service files), built by the CI matrix; (d) service files ship inside each zip.</em></span>
+    </div>
+    <div class="q-item">
+      <strong>Copyright holder / year</strong>
+      <span>Tauri bundles a copyright string. Suggest: <em>© 2024–2026 theusual</em>. Confirm the name/entity before writing it into config.<br><em>Resolved: <code>© 2024–2026 theusual</code>.</em></span>
+    </div>
+  </div>
+
+  <!-- Server tasks -->
+  <h2 id="server">Server — kdxd</h2>
+
+  <h3>1. Cargo.toml metadata <span class="badge badge-done">done</span></h3>
+  <div class="task-group">
+    <div class="task">
+      <div class="task-head"><strong>Add to <code>crates/kdxd/Cargo.toml</code></strong></div>
+      <p>The workspace already has <code>version</code>, <code>edition</code>, <code>license</code>, <code>repository</code>. Add the crate-specific fields:</p>
+      <pre><span class="cm"># add inside [package]</span>
+<span class="key">description</span> = <span class="str">"KDX server daemon — early-2000s Hotline-style chat and file sharing over TLS 1.3"</span>
+<span class="key">authors</span>     = [<span class="str">"theusual"</span>]
+<span class="key">keywords</span>    = [<span class="str">"hotline"</span>, <span class="str">"chat"</span>, <span class="str">"file-sharing"</span>, <span class="str">"server"</span>, <span class="str">"tls"</span>]
+<span class="key">categories</span>  = [<span class="str">"network-programming"</span>, <span class="str">"command-line-utilities"</span>]
+<span class="key">readme</span>      = <span class="str">"../../README.md"</span></pre>
+    </div>
+  </div>
+
+  <h3>2. Example config file <span class="badge badge-done">done</span></h3>
+  <div class="task-group">
+    <div class="task">
+      <div class="task-head"><strong>Create <code>crates/kdxd/kdxd.example.toml</code></strong></div>
+      <p>Mirrors every field in <code>src/config.rs</code> with its default value and a comment explaining each. SysOps copy it to <code>kdxd.toml</code> and uncomment what they need. Current fields to document:</p>
+      <pre><span class="cm"># KDX server configuration. Copy to kdxd.toml and pass as the first argument:</span>
+<span class="cm">#   kdxd kdxd.toml</span>
+
+<span class="cm"># Address and port to listen on. Traditional KDX port is 10700.</span>
+<span class="key">bind</span>                    = <span class="str">"0.0.0.0:10700"</span>
+
+<span class="cm"># SQLite database path. Created automatically on first run.</span>
+<span class="key">database</span>                = <span class="str">"kdx.db"</span>
+
+<span class="cm"># Directory where uploaded file bytes are stored. Created automatically.</span>
+<span class="key">files_root</span>              = <span class="str">"files"</span>
+
+<span class="cm"># Session idle timeout in seconds before the server closes the connection.</span>
+<span class="key">session_ttl_secs</span>        = <span class="val">1800</span>
+
+<span class="cm"># Per-transfer throttles in bytes/sec. 0 = unlimited.</span>
+<span class="key">max_upload_bytes_per_sec</span>   = <span class="val">0</span>
+<span class="key">max_download_bytes_per_sec</span> = <span class="val">0</span>
+
+<span class="cm"># Tracker directory display name and description.</span>
+<span class="key">server_name</span>        = <span class="str">"KDX Server"</span>
+<span class="key">server_description</span> = <span class="str">""</span>
+<span class="key">max_users</span>          = <span class="val">256</span>
+
+<span class="cm"># TLS certificate and private key (PEM). When omitted, a self-signed</span>
+<span class="cm"># dev certificate is generated at startup — fine for local testing only.</span>
+<span class="cm"># [tls]</span>
+<span class="cm"># cert_pem = "/etc/kdx/cert.pem"</span>
+<span class="cm"># key_pem  = "/etc/kdx/key.pem"</span></pre>
+    </div>
+  </div>
+
+  <h3>3. Service files <span class="badge badge-done">done</span></h3>
+  <div class="task-group">
+    <div class="task">
+      <div class="task-head"><strong>Create <code>crates/kdxd/kdxd.service</code> (systemd, Linux)</strong> <span class="badge badge-skip">stretch</span></div>
+      <p>Standard <code>[Unit]</code>/<code>[Service]</code>/<code>[Install]</code> unit. Runs as a dedicated <code>kdx</code> system user. Restarts on failure.</p>
+    </div>
+    <div class="task">
+      <div class="task-head"><strong>Create <code>crates/kdxd/net.kdx.hotline.server.plist</code> (launchd, macOS)</strong> <span class="badge badge-skip">stretch</span></div>
+      <p>Standard launchd plist for <code>/Library/LaunchDaemons/</code>. Runs at boot under a dedicated user.</p>
+    </div>
+  </div>
+
+  <!-- Client tasks -->
+  <h2 id="client">Client — KDX.app</h2>
+
+  <h3>1. Icon set <span class="badge badge-done">done</span></h3>
+  <div class="task-group">
+    <div class="task">
+      <div class="task-head"><strong>Generate via <code>cargo tauri icon</code></strong></div>
+      <p>Tauri CLI generates all required sizes from one 1024×1024 PNG source. Produces: <code>32x32.png</code>, <code>128x128.png</code>, <code>128x128@2x.png</code>, <code>icon.icns</code> (macOS), <code>icon.ico</code> (Windows), and square PNGs for Linux. Destination: <code>apps/kdx-client/src-tauri/icons/</code>.</p>
+      <pre><span class="cmd">cargo tauri icon apps/kdx-client/src-tauri/icons/source-1024.png</span></pre>
+      <p>After running, update <code>tauri.conf.json</code> <code>bundle.icon</code> to the full list:</p>
+      <pre><span class="key">"icon"</span>: [
+  <span class="str">"icons/32x32.png"</span>,
+  <span class="str">"icons/128x128.png"</span>,
+  <span class="str">"icons/128x128@2x.png"</span>,
+  <span class="str">"icons/icon.icns"</span>,
+  <span class="str">"icons/icon.ico"</span>
+]</pre>
+    </div>
+  </div>
+
+  <h3>2. Bundle metadata <span class="badge badge-done">done</span></h3>
+  <div class="task-group">
+    <div class="task">
+      <div class="task-head"><strong>Add to <code>apps/kdx-client/src-tauri/tauri.conf.json</code> → <code>bundle</code></strong></div>
+      <p>Fields that are currently missing from the <code>"bundle"</code> block:</p>
+      <pre><span class="key">"shortDescription"</span>: <span class="str">"Hotline-style chat and file sharing"</span>,
+<span class="key">"longDescription"</span>:  <span class="str">"KDX is a modern rebuild of the early-2000s Hotline client — private servers, chat rooms, file browsing, and resumable transfers, all over TLS 1.3 with challenge-response auth."</span>,
+<span class="key">"copyright"</span>:        <span class="str">"© 2024–2026 theusual"</span>,
+<span class="key">"category"</span>:         <span class="str">"SocialNetworking"</span>,  <span class="cm">// or "Utilities" — open question</span>
+<span class="key">"macOS"</span>: {
+  <span class="key">"minimumSystemVersion"</span>: <span class="str">"10.15"</span>,
+  <span class="key">"entitlements"</span>:         <span class="str">"entitlements.plist"</span>
+}</pre>
+    </div>
+  </div>
+
+  <h3>3. Entitlements plist <span class="badge badge-done">done</span></h3>
+  <div class="task-group">
+    <div class="task">
+      <div class="task-head"><strong>Create <code>apps/kdx-client/src-tauri/entitlements.plist</code></strong></div>
+      <p>Required for macOS app sandboxing and network access. KDX needs outbound TCP connections only.</p>
+      <pre><span class="cm">&lt;?xml version="1.0" encoding="UTF-8"?&gt;</span>
+&lt;!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd"&gt;
+&lt;plist version="1.0"&gt;&lt;dict&gt;
+  &lt;key&gt;com.apple.security.network.client&lt;/key&gt;&lt;true/&gt;
+  &lt;key&gt;com.apple.security.files.user-selected.read-write&lt;/key&gt;&lt;true/&gt;
+&lt;/dict&gt;&lt;/plist&gt;</pre>
+      <p><code>files.user-selected.read-write</code> is needed for the file-open/save dialogs used in upload and download. Add other entitlements only if sandboxing requires it at build time.</p>
+    </div>
+  </div>
+
+  <h3>4. Windows / Linux bundle config <span class="badge badge-done">done (CI)</span></h3>
+  <div class="task-group">
+    <div class="task">
+      <div class="task-head"><strong>Windows (NSIS installer)</strong> <span class="badge badge-skip">stretch</span></div>
+      <p>Add <code>"windows": { "nsis": { "displayLanguageSelector": false } }</code> inside <code>bundle</code>. Requires a Windows runner to build; cross-compilation from macOS is not supported by Tauri.</p>
+    </div>
+    <div class="task">
+      <div class="task-head"><strong>Linux (AppImage + deb)</strong> <span class="badge badge-skip">stretch</span></div>
+      <p>Add <code>"linux": { "deb": { "depends": [] } }</code>. Requires a Linux runner. Add <code>"appimage"</code> and <code>"deb"</code> to <code>targets</code>.</p>
+    </div>
+  </div>
+
+  <!-- README -->
+  <h2 id="readme">README.md</h2>
+  <div class="task-group">
+    <div class="task">
+      <div class="task-head"><strong>Fix stale test count</strong> <span class="badge badge-done">done</span></div>
+      <p>Line says <code>~110 tests</code>. Current count is <code>237</code>. Update inline.</p>
+    </div>
+    <div class="task">
+      <div class="task-head"><strong>Remove "Not yet implemented" section</strong> <span class="badge badge-done">done</span></div>
+      <p>Lists tracker and in-app account management as missing. Both shipped (commits <code>b4cef10</code>, <code>da0a43a</code>). Delete the section entirely or replace it with a brief "what's missing" note limited to identity fields (display name / description not yet server-enforced).</p>
+    </div>
+    <div class="task">
+      <div class="task-head"><strong>Replace hand-wavy config note with pointer to example file</strong> <span class="badge badge-done">done</span></div>
+      <p>Current text: <em>"Pass a TOML config path to either to override — see Config in crates/kdxd/src/config.rs for the fields."</em> After creating <code>kdxd.example.toml</code>, update to: <em>"Copy <code>crates/kdxd/kdxd.example.toml</code> to <code>kdxd.toml</code> and edit as needed."</em></p>
+    </div>
+    <div class="task">
+      <div class="task-head"><strong>Expand "Package the client" section</strong> <span class="badge badge-done">done</span></div>
+      <p>Current section only covers macOS. After the bundle config work, update it with the full build command and note which platforms are supported. Mention that <code>cargo tauri icon</code> only needs to be run once.</p>
+    </div>
+  </div>
+
+  <!-- Order of work -->
+  <h2 id="order">Suggested order of work</h2>
+  <div class="task-group">
+    <div class="task">
+      <div class="task-head"><strong>1. Decide the open questions</strong></div>
+      <p>Icon, category, copyright holder, macOS min version, target platforms, server distribution format. These gate everything else.</p>
+    </div>
+    <div class="task">
+      <div class="task-head"><strong>2. Get or create the icon source</strong></div>
+      <p>1024×1024 PNG. If designing from scratch, do it before touching any configs so the icon step isn't blocked.</p>
+    </div>
+    <div class="task">
+      <div class="task-head"><strong>3. Run <code>cargo tauri icon</code></strong></div>
+      <p>Generates the full icon set in <code>icons/</code>. One command, no manual resizing.</p>
+    </div>
+    <div class="task">
+      <div class="task-head"><strong>4. Update <code>tauri.conf.json</code></strong></div>
+      <p>Add <code>shortDescription</code>, <code>longDescription</code>, <code>copyright</code>, <code>category</code>, <code>macOS</code> block, updated <code>icon</code> list.</p>
+    </div>
+    <div class="task">
+      <div class="task-head"><strong>5. Create <code>entitlements.plist</code></strong></div>
+      <p>Two entitlements: <code>network.client</code> + <code>files.user-selected.read-write</code>.</p>
+    </div>
+    <div class="task">
+      <div class="task-head"><strong>6. Update <code>crates/kdxd/Cargo.toml</code></strong></div>
+      <p>Add description, authors, keywords, categories, readme.</p>
+    </div>
+    <div class="task">
+      <div class="task-head"><strong>7. Create <code>crates/kdxd/kdxd.example.toml</code></strong></div>
+      <p>All config fields documented with defaults and comments.</p>
+    </div>
+    <div class="task">
+      <div class="task-head"><strong>8. Fix <code>README.md</code></strong></div>
+      <p>Test count, remove stale section, update config note, expand packaging section.</p>
+    </div>
+    <div class="task">
+      <div class="task-head"><strong>9. Smoke-test the build</strong></div>
+      <p>Run <code>cargo tauri build</code> from <code>apps/kdx-client/src-tauri</code>. Verify the <code>.app</code> launches, the DMG mounts, the app icon appears correctly in Finder and the Dock. Check <code>cargo build -p kdxd --release</code> still compiles clean.</p>
+    </div>
+    <div class="task">
+      <div class="task-head"><strong>10. Service files (if in scope)</strong></div>
+      <p>systemd unit (<code>kdxd.service</code>) and/or launchd plist. Drop them in <code>crates/kdxd/</code> with install instructions appended to the README.</p>
+    </div>
+  </div>
+
+  <div class="footer">
+    <span>KDX — Packaging &amp; Distribution Handoff · 2026-07-07</span>
+    <span>
+      <a href="handoff.html">Handoff v0.1</a> ·
+      <a href="handoff-v0.2.html">Handoff v0.2</a> ·
+      <a href="ui-concept.html">UI Concept</a>
+    </span>
+  </div>
+</div>
+</body>
+</html>

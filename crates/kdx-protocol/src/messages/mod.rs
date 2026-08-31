@@ -31,8 +31,9 @@ pub use chat::{
 };
 pub use file::{
     FileAlias, FileCatalogGenerated, FileCreateFolder, FileDelete, FileEntry,
-    FileGenerateCatalog, FileListRequest, FileListResponse, FileMove, FileSearchEntry,
-    FileSearchRequest, FileSearchResponse, TransferAccept, TransferData, TransferEnd,
+    FileGenerateCatalog, FileInfoRequest, FileInfoResponse, FileListRequest,
+    FileListResponse, FileMove, FileSearchEntry, FileSearchRequest, FileSearchResponse,
+    TransferAccept, TransferData, TransferEnd,
     TransferRequest, DIRECTION_DOWNLOAD, DIRECTION_UPLOAD, KIND_ALIAS, KIND_DIR, KIND_DROPBOX,
     KIND_FILE, KIND_UPLOAD, TRANSFER_ABORTED, TRANSFER_HASH_MISMATCH, TRANSFER_VERIFIED,
 };
@@ -42,8 +43,8 @@ pub use news::{
     NewsgroupCreate, NewsgroupInfo, NewsgroupListRequest, NewsgroupListResponse,
 };
 pub use presence::{
-    PresenceChange, PresenceEntry, PresenceListRequest, PresenceListResponse, UserInfoRequest,
-    UserInfoResponse,
+    PresenceChange, PresenceEntry, PresenceListRequest, PresenceListResponse, SetIdentity,
+    UserInfoRequest, UserInfoResponse,
 };
 pub use private::{PrivateMessage, PrivateSend};
 pub use roles::{

@@ -2,6 +2,9 @@
 // fills the Connect window and connects. Mirrors KDX: name, address, login,
 // password, comments, plus Connects count and Last Connect.
 
+import { emitUi } from "../bridge.js";
+import { open } from "../wm.js";
+
 const KEY = "kdx.addressbook";
 
 function load() {
@@ -17,8 +20,8 @@ function save(list) {
   } catch (_) {}
 }
 
-/** `connectApi`: { fill(fields), submit() } from the Connect window. */
-export function buildAddressBook(connectApi, openConnect) {
+/** Cross-window: fill + submit live in the Connect window via kdx-ui. */
+export function buildAddressBook() {
   const body = document.createElement("div");
   body.className = "addressbook";
   body.innerHTML = `
@@ -92,9 +95,9 @@ export function buildAddressBook(connectApi, openConnect) {
     b.lastConnect = Date.now();
     save(list);
     render();
-    openConnect();
-    connectApi.fill({ host: b.host, port: b.port, login: b.login, password: b.password });
-    connectApi.submit();
+    open("connect");
+    emitUi("connect", "fill", { host: b.host, port: b.port, login: b.login, password: b.password });
+    emitUi("connect", "submit");
   }
 
   function openEditor(idx) {

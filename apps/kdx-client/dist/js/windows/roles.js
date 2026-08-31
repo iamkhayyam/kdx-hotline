@@ -4,6 +4,7 @@
 // mutations are server-enforced on USER_ADMIN and simply error otherwise.
 
 import { invoke } from "../bridge.js";
+import { open } from "../wm.js";
 
 const PRIVILEGES = [
   { bit: 1 << 0, name: "CHAT_SEND", label: "Chat: send" },
@@ -21,7 +22,7 @@ const PRIVILEGES = [
   { bit: 1 << 19, name: "SERVER_ADMIN", label: "Server: config/shutdown" },
 ];
 
-export function buildRoles(openAccounts, openServer, openHistory, openIpRules, openConnections) {
+export function buildRoles() {
   const body = document.createElement("div");
   body.className = "roles-win";
   body.innerHTML = `
@@ -166,11 +167,11 @@ export function buildRoles(openAccounts, openServer, openHistory, openIpRules, o
   $("#rl-new").addEventListener("click", () => openEditor(null));
   $("#rl-cancel").addEventListener("click", closeEditor);
   $("#rl-refresh").addEventListener("click", refresh);
-  if (openAccounts) $("#rl-accounts").addEventListener("click", openAccounts);
-  if (openServer) $("#rl-server").addEventListener("click", openServer);
-  if (openHistory) $("#rl-history").addEventListener("click", openHistory);
-  if (openIpRules) $("#rl-iprules").addEventListener("click", openIpRules);
-  if (openConnections) $("#rl-connections").addEventListener("click", openConnections);
+  $("#rl-accounts").addEventListener("click", () => open("accounts"));
+  $("#rl-server").addEventListener("click", () => open("server"));
+  $("#rl-history").addEventListener("click", () => open("history"));
+  $("#rl-iprules").addEventListener("click", () => open("iprules"));
+  $("#rl-connections").addEventListener("click", () => open("connections"));
   filter.addEventListener("input", render);
 
   editor.addEventListener("submit", async (e) => {

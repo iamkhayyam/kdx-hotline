@@ -5,10 +5,11 @@
 // server-enforced on USER_ADMIN; posting is gated by the group's post class.
 
 import { invoke } from "../bridge.js";
+import { getState } from "../store.js";
 
 const CLASS_NAME = ["guest", "user", "power user", "admin"];
 
-export function buildNews(getMe) {
+export function buildNews() {
   const body = document.createElement("div");
   body.className = "news-win";
   body.innerHTML = `
@@ -155,7 +156,7 @@ export function buildNews(getMe) {
   function selectPost(post) {
     selected = post;
     renderThreads();
-    const mine = getMe && getMe() === post.author;
+    const mine = getState().session && getState().session.username === post.author;
     readingEl.innerHTML = `
       <div class="news-read-head">
         <span class="news-read-subj">${esc(post.subject)}</span>

@@ -1,0 +1,25 @@
+[Unit]
+Description=KDX server daemon — Hotline-style chat and file sharing over TLS 1.3
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Runs as a dedicated system user. Create it with:
+#   useradd --system --home /var/lib/kdx --shell /usr/sbin/nologin kdx
+User=kdx
+Group=kdx
+WorkingDirectory=/var/lib/kdx
+ExecStart=/usr/local/bin/kdxd /etc/kdx/kdxd.toml
+Restart=on-failure
+RestartSec=3
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/kdx
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

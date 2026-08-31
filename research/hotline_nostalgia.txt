@@ -1,0 +1,44 @@
+ 
+ Hotline Nostalgia - Codebox Software 
+ Home 
+ Pages 
+ Tags 
+ News 
+ Github 
+ Contact 
+ About 
+ Codebox Software 
+ Hotline Nostalgia 
+ article hotline 
+ Published: 02 Jan 2011 
+Hotline (or 'Hotline Connect') was one of the early P2P file sharing networks ,
+starting up around the same time as Napster. It has since
+been almost completely replaced by BitTorrent, and the Gnutella and eDonkey networks, however a handful of Hotline servers are still quietly
+running to this day. As well as allowing files to be exchanged, Hotline provides chat, news and messaging features, and gives server 
+administrators a high degree of control over user accounts and their privileges.
+Although the original Hotline Client and 
+ Server applications are no longer maintained, a number of 
+ open source alternatives still exist.
+These screenshots show the Client and Server displays, and the User List, with server administrators shown in red.
+I collected the following documents from many obscure, long since dead, Hotline servers in the early 2000s. They contain
+technical information about the network protocols used by Hotline, provide advice for server administrators,
+and explain some of the idiosyncrasies of the client software. These documents were mostly written by hackers 
+independent programming enthusiasts, and are presented here only for reasons of historical interest, and to provide a flavour of
+the community that existed during Hotline's early days . 
+ How To Use Hotline 
+ SADwyw Spider 
+ Nodib's Hotline Tips (PC) v1.2 
+ hotline_tracker_protocol by Virtual1 
+ hotline_server_protocol by Virtual1 
+ hotline_priv_bits by Virtual1 
+ Hotline File Transfer Protocol by Virtual1 
+ Hotline Secrets 30b2 
+ Hotline Hacker's Handbook by TheSquirrel 
+ Hotline Protocol by Virtual1 
+ HL Secret Commands List 
+ Hacking Hotlines Prefs 
+ change your Hotline icon 
+ [h4ck0p]HackHL 
+ Hotline Icon Sheet 
+ HLProtocol.doc 
+ © 2004-2026 Rob Dawson 

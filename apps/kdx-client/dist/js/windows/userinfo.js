@@ -16,6 +16,8 @@ export function buildUserInfo() {
       <div class="ui-row"><span>Logged in</span><span id="ui-login"></span></div>
       <div class="ui-row"><span>Idle</span><span id="ui-idle"></span></div>
       <div class="ui-row"><span>Address</span><span id="ui-addr"></span></div>
+      <div class="ui-row hidden" id="ui-name-row"><span>Name</span><span id="ui-name-val"></span></div>
+      <div class="ui-row hidden" id="ui-desc-row"><span>Description</span><span id="ui-desc-val"></span></div>
       <button class="btn" id="ui-refresh">Refresh</button>
     </div>
   `;
@@ -31,11 +33,17 @@ export function buildUserInfo() {
       const info = await invoke("get_user_info", { username });
       $("#ui-empty").classList.add("hidden");
       $("#ui-detail").classList.remove("hidden");
-      $("#ui-name").textContent = info.username;
+      $("#ui-name").textContent = info.name ? `${info.name} (${info.username})` : info.username;
       $("#ui-class").textContent = CLASS_NAME[info.class] || "?";
       $("#ui-login").textContent = new Date(info.login_at * 1000).toLocaleString();
       $("#ui-idle").textContent = fmtDur(info.idle_secs);
       $("#ui-addr").textContent = info.address;
+      const hasName = !!(info.name && info.name.trim());
+      const hasDesc = !!(info.description && info.description.trim());
+      $("#ui-name-row").classList.toggle("hidden", !hasName);
+      $("#ui-desc-row").classList.toggle("hidden", !hasDesc);
+      if (hasName) $("#ui-name-val").textContent = info.name;
+      if (hasDesc) $("#ui-desc-val").textContent = info.description;
     } catch (err) {
       $("#ui-empty").textContent = `${username}: ${err.message || err}`;
       $("#ui-empty").classList.remove("hidden");

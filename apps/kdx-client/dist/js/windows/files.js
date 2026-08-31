@@ -41,6 +41,9 @@ export function buildFiles() {
       <div class="f-mkrow">
         <label class="f-mklbl">Read<select id="f-mk-read">${classOptions(0)}</select></label>
         <label class="f-mklbl">Write<select id="f-mk-write">${classOptions(1)}</select></label>
+      </div>
+      <div class="f-mkrow">
+        <label class="f-mklbl wide">Owner (optional, for drop boxes)<input id="f-mk-owner" placeholder="login" spellcheck="false" autocomplete="off" /></label>
         <button type="submit" class="mini">Create</button>
         <button type="button" class="mini" id="f-mk-cancel">Cancel</button>
       </div>
@@ -209,7 +212,7 @@ export function buildFiles() {
     invoke("download", { remotePath, local: dest }).catch(() => {});
   }
 
-  function showInfo(e) {
+  async function showInfo(e) {
     infoEl.innerHTML =
       `<span class="kind">${KINDS[e.kind] || "[?]"}</span> ` +
       `<b>${escapeHtml(e.name)}</b> — ${KIND_NAME[e.kind] || "?"}` +
@@ -218,6 +221,28 @@ export function buildFiles() {
       ` <button class="mini" id="f-info-close">×</button>`;
     infoEl.classList.remove("hidden");
     infoEl.querySelector("#f-info-close").onclick = () => infoEl.classList.add("hidden");
+    // Server-side detail (Get Info): sha256, ACL classes, owner, access item.
+    try {
+      const info = await invoke("get_file_info", { path: joinPath(cwd, e.name) });
+      const cls = ["guest", "user", "power", "admin"];
+      const itemTag = { 1: "[UL]", 2: "[DB]" }[info.kind] || (info.name.match(/\[([a-z]+)\]\s*$/i) || [])[1] || "";
+      infoEl.innerHTML =
+        `<span class="kind">${KINDS[info.kind] || "[?]"}</span> ` +
+        `<b>${escapeHtml(info.name)}</b> — ${KIND_NAME[info.kind] || "?"}` +
+        (info.kind === 1 ? ` · ${fmtSize(info.size)}` : "") +
+        ` <button class="mini" id="f-info-close">×</button>` +
+        `<div class="f-info-grid">` +
+        `<span>Read</span><span>${cls[info.min_read_class] || info.min_read_class}</span>` +
+        `<span>Write</span><span>${cls[info.min_write_class] || info.min_write_class}</span>` +
+        (itemTag ? `<span>Access</span><span>${itemTag}</span>` : "") +
+        (info.owner ? `<span>Owner</span><span>${escapeHtml(info.owner)}</span>` : "") +
+        (info.sha256 ? `<span>SHA-256</span><span class="f-info-hash">${info.sha256}</span>` : "") +
+        `</div>`;
+      infoEl.querySelector("#f-info-close").onclick = () => infoEl.classList.add("hidden");
+    } catch (err) {
+      infoEl.innerHTML = infoEl.innerHTML +
+        `<div class="err">${escapeHtml(err.message || String(err))}</div>`;
+    }
   }
 
   async function deleteEntry(e) {
@@ -341,6 +366,7 @@ export function buildFiles() {
     searchbar.classList.add("hidden");
     mkform.classList.remove("hidden");
     body.querySelector("#f-mk-name").value = "";
+    body.querySelector("#f-mk-owner").value = "";
     body.querySelector("#f-mk-result").textContent = "";
     body.querySelector("#f-mk-name").focus();
   };
@@ -356,6 +382,7 @@ export function buildFiles() {
         kind: parseInt(body.querySelector("#f-mk-kind").value, 10) || 0,
         minReadClass: parseInt(body.querySelector("#f-mk-read").value, 10) || 0,
         minWriteClass: parseInt(body.querySelector("#f-mk-write").value, 10) || 0,
+        owner: body.querySelector("#f-mk-owner").value.trim() || null,
       });
       entries = res.entries;
       mkform.classList.add("hidden");

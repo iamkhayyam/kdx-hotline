@@ -146,7 +146,7 @@ impl TransferManager {
         if size > MAX_FILE_SIZE {
             return Err(TransferError::TooLarge);
         }
-        let parent = tree.prepare_upload(path, name, session.class).await?;
+        let parent = tree.prepare_upload(path, name, session).await?;
 
         let id = Uuid::new_v4();
         let chunks = total_chunks(size, chunk_size);
@@ -391,6 +391,17 @@ pub fn resume_id_from_wire(bytes: [u8; 16]) -> Option<Uuid> {
 
 #[cfg(test)]
 mod tests {
+    fn sess(class: BaseClass) -> Session {
+        Session {
+            id: Uuid::new_v4(),
+            account_id: "a".into(),
+            username: "tester".into(),
+            class,
+            privileges: BaseClass::privileges(class),
+            expires_at: tokio::time::Instant::now(),
+        }
+    }
+
     use super::*;
     use crate::auth::{BaseClass, Privileges};
     use tokio::time::Instant;
@@ -460,7 +471,7 @@ mod tests {
         assert!(complete);
         f.manager.finish(&f.tree, upload).await.unwrap();
 
-        let entries = f.tree.list("/", BaseClass::Guest).await.unwrap();
+        let entries = f.tree.list("/", &sess(BaseClass::Guest)).await.unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].name, "big.bin");
         assert_eq!(entries[0].size, data.len() as u64);
@@ -513,7 +524,7 @@ mod tests {
         }
         assert!(complete);
         f.manager.finish(&f.tree, upload).await.unwrap();
-        assert_eq!(f.tree.list("/", BaseClass::Guest).await.unwrap().len(), 1);
+        assert_eq!(f.tree.list("/", &sess(BaseClass::Guest)).await.unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -580,7 +591,7 @@ mod tests {
         assert!(complete);
         let result = f.manager.finish(&f.tree, upload).await;
         assert!(matches!(result, Err(TransferError::FileHashMismatch)));
-        assert!(f.tree.list("/", BaseClass::Guest).await.unwrap().is_empty());
+        assert!(f.tree.list("/", &sess(BaseClass::Guest)).await.unwrap().is_empty());
     }
 
     #[tokio::test]

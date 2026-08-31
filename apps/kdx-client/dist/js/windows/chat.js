@@ -1,10 +1,15 @@
-import { invoke } from "../bridge.js";
+import { invoke, emitUi } from "../bridge.js";
 import { getState, update } from "../store.js";
+import { open } from "../wm.js";
 import { showMenu } from "../menu.js";
 
 const CHAT_ACTION = 1 << 0;
 const CHAT_SYSTEM = 1 << 1;
 const DEFAULT_ROOM = "lobby";
+
+// Your own identity (set via /name and /desc); kept module-side so setting
+// one never wipes the other.
+const identity = { name: "", description: "" };
 
 // Slash-command help, shown by /help. Both `/` and `\` prefixes are accepted.
 const SLASH_HELP = [
@@ -16,7 +21,7 @@ const SLASH_HELP = [
   "/help — this list",
 ];
 
-export function buildChat(sendMessage, getInfo, inviteToChat) {
+export function buildChat() {
   const body = document.createElement("div");
   body.style.flex = "1";
   body.style.display = "flex";
@@ -187,9 +192,15 @@ export function buildChat(sendMessage, getInfo, inviteToChat) {
         break;
       case "name":
       case "n":
+        identity.name = rest.trim();
+        await invoke("set_identity", { name: identity.name, description: identity.description });
+        line("sys", `*** display name set to ${esc(identity.name || "(none)")}`);
+        break;
       case "desc":
       case "d":
-        line("sys", `*** changing your ${cmd.startsWith("d") ? "description" : "name"} isn't supported yet`);
+        identity.description = rest.trim();
+        await invoke("set_identity", { name: identity.name, description: identity.description });
+        line("sys", `*** description set to ${esc(identity.description || "(none)")}`);
         break;
       default:
         line("err", `! unknown command: /${esc(cmd)} — try /help`);
@@ -220,10 +231,24 @@ export function buildChat(sendMessage, getInfo, inviteToChat) {
         d.addEventListener("contextmenu", (e) => {
           e.preventDefault();
           const items = [];
-          if (sendMessage && u !== me) items.push({ label: "Send Message", fn: () => sendMessage(u) });
-          if (getInfo) items.push({ label: "Get Info", fn: () => getInfo(u) });
-          if (inviteToChat && u !== me) {
-            items.push({ label: "Invite to Chat…", fn: () => inviteToChat(u) });
+          if (u !== me) {
+            items.push({
+              label: "Send Message",
+              fn: () => {
+                open("messages");
+                emitUi("messages", "open-with", { user: u });
+              },
+            });
+          }
+          items.push({
+            label: "Get Info",
+            fn: () => {
+              open("userinfo");
+              emitUi("userinfo", "show", { user: u });
+            },
+          });
+          if (u !== me) {
+            items.push({ label: "Invite to Chat…", fn: () => invoke("invite_to_chat", { to: u }).catch(() => {}) });
           }
           if (items.length) showMenu(e.clientX, e.clientY, items);
         });
