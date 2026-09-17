@@ -4,542 +4,148 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>KDX Hotline</title>
-<meta name="description" content="A ground-up Rust rebuild of KDX — Hotline-style TCP chat and file sharing. Custom binary protocol over TLS 1.3, Argon2id auth, resumable transfers, virtual file trees. Runs on macOS, Windows, and Linux.">
-<meta property="og:title" content="KDX Hotline">
-<meta property="og:description" content="A Hotline revival, rebuilt from scratch in Rust.">
-<meta property="og:type" content="website">
+<meta name="description" content="A Hotline revival, rebuilt from scratch in Rust. Custom binary protocol over TLS 1.3, challenge-response auth, chat rooms, file transfers.">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600;700&display=swap">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;700&display=swap">
 <style>
 :root {
-  --bg:        #060404;
-  --panel:     #0d0808;
-  --panel-2:   #110a0a;
-  --line:      #2a1414;
-  --chrome:    #7a0a0a;
-  --alert:     #e11b1b;
-  --green:     #3df56e;
-  --green-dim: #1e7a38;
-  --amber:     #ffb020;
-  --ink:       #cbb6b6;
-  --bright:    #ecdede;
-  --grey:      #9c8080;
-  --grey-dim:  #6b5555;
+  --bg:       #060404;
+  --line:     #2a1414;
+  --chrome:   #7a0a0a;
+  --alert:    #e11b1b;
+  --green:    #3df56e;
+  --green-dim:#1e7a38;
+  --ink:      #cbb6b6;
+  --bright:   #ecdede;
+  --grey:     #9c8080;
+  --grey-dim: #6b5555;
   --mono: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
-  --sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
 }
 
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+html, body { height: 100%; }
 html { background: var(--bg); color-scheme: dark; }
 body {
   background: var(--bg);
   color: var(--ink);
-  font-family: var(--sans);
-  font-size: 15px;
-  line-height: 1.65;
+  font-family: var(--mono);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  min-height: 100%;
+  padding: 40px 24px;
 }
 
 /* CRT scan-lines */
 body::before {
   content: "";
-  position: fixed; inset: 0; z-index: 999; pointer-events: none;
-  background: repeating-linear-gradient(0deg, rgba(255,255,255,.013) 0 1px, transparent 1px 3px);
+  position: fixed; inset: 0; z-index: 0; pointer-events: none;
+  background:
+    repeating-linear-gradient(0deg, rgba(255,255,255,.013) 0 1px, transparent 1px 3px),
+    radial-gradient(ellipse 60% 50% at 50% 0%, rgba(122,10,10,.18), transparent 65%);
 }
 
-h2 { font-family: var(--mono); font-size: 20px; color: var(--green); font-weight: 600; letter-spacing: .02em; text-wrap: balance; }
-h3 { font-family: var(--mono); font-size: 12px; color: var(--amber); font-weight: 600; letter-spacing: .12em; text-transform: uppercase; }
-p  { max-width: 68ch; }
-strong { color: var(--bright); font-weight: 600; }
-a  { color: var(--green); text-decoration: none; }
-a:hover { color: var(--bright); }
-code {
-  font-family: var(--mono); font-size: .84em; color: var(--green);
-  background: rgba(61,245,110,.07); border: 1px solid rgba(61,245,110,.14);
-  padding: 1px 5px; border-radius: 2px; white-space: nowrap;
-}
-
-.wrap { max-width: 1080px; margin-inline: auto; padding-inline: 24px; }
-.eyebrow {
-  font-family: var(--mono); font-size: 10px; letter-spacing: .24em;
-  text-transform: uppercase; color: var(--grey-dim); margin-bottom: 10px;
-}
-
-/* ── nav ── */
-.nav {
-  border-bottom: 1px solid var(--line);
-  background: rgba(6,4,4,.94);
-  backdrop-filter: blur(4px);
-  position: sticky; top: 0; z-index: 100;
-}
-.nav-inner {
-  display: flex; align-items: center; justify-content: space-between;
-  gap: 16px; padding-block: 14px;
-}
-.nav-logo {
-  font-family: var(--mono); font-size: 16px; font-weight: 700;
-  color: var(--alert); letter-spacing: .32em; text-decoration: none;
-}
-.nav-links { display: flex; gap: 22px; align-items: center; }
-.nav-links a {
-  font-family: var(--mono); font-size: 11px; letter-spacing: .1em;
-  text-transform: uppercase; color: var(--grey); transition: color .15s;
-}
-.nav-links a:hover { color: var(--green); }
-.nav-gh {
-  border: 1px solid var(--chrome); color: var(--grey) !important;
-  padding: 6px 14px;
-}
-.nav-gh:hover { border-color: var(--alert); color: var(--alert) !important; }
-
-/* ── hero ── */
-.hero {
-  position: relative; overflow: hidden;
-  padding-block: 80px 68px; border-bottom: 1px solid var(--line);
-}
-.hero::after {
-  content: "";
-  position: absolute; inset: 0; pointer-events: none;
-  background: radial-gradient(ellipse 70% 40% at 50% 0%, rgba(122,10,10,.2), transparent 70%);
-}
-.hero-inner {
+.stage {
   position: relative; z-index: 1;
-  display: flex; flex-direction: column; gap: 30px;
+  display: flex; flex-direction: column; align-items: center;
+  gap: 32px; text-align: center; max-width: 640px; width: 100%;
 }
+
 canvas#logo { display: block; max-width: 100%; height: auto; }
 
-.hero-title {
-  font-family: var(--mono); font-size: clamp(20px, 3.6vw, 34px);
-  color: var(--bright); font-weight: 700; line-height: 1.15;
-  letter-spacing: .02em; text-wrap: balance;
-}
-.hero-desc { font-size: 16px; color: var(--ink); max-width: 60ch; }
-
-.pills { display: flex; flex-wrap: wrap; gap: 8px; }
-.pill {
-  font-family: var(--mono); font-size: 11px; letter-spacing: .05em;
-  padding: 3px 9px; border: 1px solid; border-radius: 2px; white-space: nowrap;
-}
-.pg { color: var(--green); border-color: var(--green-dim); }
-.pr { color: var(--alert); border-color: var(--chrome); }
-.pa { color: var(--amber); border-color: #6a4610; }
-.pd { color: var(--grey);  border-color: var(--grey-dim); }
-
-.ctas { display: flex; flex-wrap: wrap; gap: 12px; }
-.btn {
-  font-family: var(--mono); font-size: 12px; font-weight: 700; letter-spacing: .08em;
-  text-transform: uppercase; padding: 10px 22px; border: 1px solid;
-  text-decoration: none; display: inline-flex; align-items: center; gap: 8px;
-  transition: background .15s, color .15s, border-color .15s;
-}
-.btn-p { background: var(--alert); border-color: var(--alert); color: var(--bright); }
-.btn-p:hover { background: #ff2222; border-color: #ff2222; color: #fff; }
-.btn-g { background: transparent; border-color: var(--chrome); color: var(--grey); }
-.btn-g:hover { border-color: var(--grey); color: var(--bright); }
-
-/* ── sections ── */
-.section { padding-block: 60px; border-bottom: 1px solid var(--line); }
-
-/* ── context ── */
-.ctx-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 44px; align-items: start; margin-top: 24px; }
-.ctx-copy { display: flex; flex-direction: column; gap: 14px; }
-.chat {
-  font-family: var(--mono); font-size: 12.5px; line-height: 1.65;
-  background: #040303; border: 1px solid var(--line); padding: 16px 18px;
-}
-.c-ts   { color: var(--grey-dim); margin-right: 4px; }
-.c-ev   { color: var(--alert); }
-.c-sys  { color: var(--grey-dim); font-style: italic; }
-.c-join { color: var(--amber); font-style: italic; }
-.c-nick { color: var(--bright); font-weight: 700; }
-.c-msg  { color: var(--green); }
-
-/* ── features ── */
-.feat-grid {
-  display: grid; grid-template-columns: repeat(3, 1fr);
-  gap: 1px; background: var(--line);
-  border: 1px solid var(--line); margin-top: 32px;
-}
-.feat {
-  background: var(--panel); padding: 24px 20px;
-  display: flex; flex-direction: column; gap: 10px;
-}
-.feat-id   { font-family: var(--mono); font-size: 16px; color: var(--alert); font-weight: 700; letter-spacing: .06em; }
-.feat-name { font-family: var(--mono); font-size: 12px; font-weight: 700; color: var(--bright); letter-spacing: .06em; text-transform: uppercase; }
-.feat-body { font-size: 13.5px; color: var(--grey); line-height: 1.58; }
-
-/* ── stats ── */
-.stats {
-  display: grid; grid-template-columns: repeat(5, 1fr);
-  border: 1px solid var(--line); margin-top: 32px;
-}
-.stat { padding: 18px 20px; border-right: 1px solid var(--line); }
-.stat:last-child { border-right: none; }
-.stat-k { font-family: var(--mono); font-size: 10px; letter-spacing: .16em; text-transform: uppercase; color: var(--grey-dim); margin-bottom: 5px; }
-.stat-v { font-family: var(--mono); font-size: 28px; color: var(--green); font-variant-numeric: tabular-nums; line-height: 1; }
-.stat-v small { font-size: 13px; color: var(--grey-dim); margin-left: 4px; }
-
-/* ── downloads ── */
-.dl-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; margin-top: 28px; }
-.dl-card { border: 1px solid var(--line); background: var(--panel); padding: 22px 20px; display: flex; flex-direction: column; gap: 14px; }
-.dl-os   { font-family: var(--mono); font-size: 12px; font-weight: 700; color: var(--bright); letter-spacing: .1em; text-transform: uppercase; }
-.dl-files { display: flex; flex-direction: column; gap: 5px; }
-.dl-file {
-  font-family: var(--mono); font-size: 12px; color: var(--grey);
-  padding: 6px 10px; background: var(--panel-2); border: 1px solid var(--line);
-  display: flex; align-items: baseline; gap: 8px;
-}
-.dl-ext { color: var(--green); flex-shrink: 0; }
-.dl-card .btn { margin-top: auto; align-self: flex-start; }
-
-/* ── quickstart ── */
-.qs-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 22px; margin-top: 28px; }
-.qs-block { display: flex; flex-direction: column; gap: 16px; }
-pre {
-  font-family: var(--mono); font-size: 13px; line-height: 1.6;
-  background: #040303; border: 1px solid var(--line);
-  padding: 16px 18px; overflow-x: auto; color: var(--ink);
-}
-pre .c { color: var(--grey-dim); }
-pre .g { color: var(--green); }
-pre .a { color: var(--amber); }
-.pre-lbl {
-  font-family: var(--mono); font-size: 10px; letter-spacing: .18em;
-  text-transform: uppercase; color: var(--grey-dim); margin-bottom: 7px;
+.wordmark {
+  font-size: 11px; letter-spacing: .28em; text-transform: uppercase;
+  color: var(--grey-dim);
 }
 
-/* ── arch table ── */
-.arch-wrap { overflow-x: auto; border: 1px solid var(--line); margin-top: 24px; }
-table.arch { width: 100%; border-collapse: collapse; font-size: 13.5px; min-width: 500px; }
-table.arch th {
-  font-family: var(--mono); font-size: 10px; letter-spacing: .12em; text-transform: uppercase;
-  color: var(--grey-dim); padding: 9px 14px; background: var(--panel-2);
-  border-bottom: 1px solid var(--line); font-weight: 400; text-align: left;
+.tagline {
+  font-size: clamp(18px, 4vw, 26px);
+  font-weight: 700; color: var(--bright);
+  line-height: 1.2; letter-spacing: .02em;
+  text-wrap: balance;
 }
-table.arch td { padding: 10px 14px; border-bottom: 1px solid var(--line); vertical-align: top; }
-table.arch tr:last-child td { border-bottom: none; }
-table.arch tr:hover td { background: rgba(122,10,10,.06); }
-table.arch td:first-child { font-family: var(--mono); color: var(--green); font-size: 13px; white-space: nowrap; }
-.kind { font-family: var(--mono); font-size: 10px; letter-spacing: .1em; text-transform: uppercase; color: var(--grey-dim); }
 
-/* ── footer ── */
-footer {
-  border-top: 1px solid var(--line); padding-block: 32px;
-  display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 16px;
+.desc {
+  font-family: system-ui, -apple-system, sans-serif;
+  font-size: 15px; color: var(--ink); line-height: 1.65;
+  max-width: 52ch; text-wrap: balance;
 }
-.ft-logo { font-family: var(--mono); font-size: 14px; font-weight: 700; color: var(--alert); letter-spacing: .32em; }
-.ft-meta { font-family: var(--mono); font-size: 11px; color: var(--grey-dim); }
-.ft-links { display: flex; gap: 20px; }
-.ft-links a { font-family: var(--mono); font-size: 11px; color: var(--grey); letter-spacing: .06em; }
-.ft-links a:hover { color: var(--green); }
 
-/* ── responsive ── */
-@media (max-width: 780px) {
-  .ctx-grid   { grid-template-columns: 1fr; }
-  .feat-grid  { grid-template-columns: 1fr 1fr; }
-  .stats      { grid-template-columns: repeat(3, 1fr); }
-  .stat:nth-child(3) { border-right: none; }
-  .stat:nth-child(4), .stat:nth-child(5) { border-top: 1px solid var(--line); }
-  .dl-grid    { grid-template-columns: 1fr; }
-  .qs-grid    { grid-template-columns: 1fr; }
-  .hide-sm    { display: none; }
+.paths {
+  display: grid; grid-template-columns: 1fr 1fr;
+  gap: 12px; width: 100%; margin-top: 8px;
 }
-@media (max-width: 520px) {
-  .feat-grid  { grid-template-columns: 1fr; }
-  .stats      { grid-template-columns: 1fr 1fr; }
-  .stat:nth-child(2),
-  .stat:nth-child(4) { border-right: none; }
-  .stat:nth-child(3),
-  .stat:nth-child(5) { border-top: 1px solid var(--line); border-right: 1px solid var(--line); }
+.path {
+  display: flex; flex-direction: column;
+  gap: 8px; padding: 20px 16px;
+  border: 1px solid; text-decoration: none;
+  transition: background .15s, border-color .15s;
+}
+.path-build {
+  background: var(--alert); border-color: var(--alert); color: var(--bright);
+}
+.path-build:hover { background: #ff2222; border-color: #ff2222; }
+.path-explore {
+  background: transparent; border-color: var(--chrome); color: var(--grey);
+}
+.path-explore:hover { border-color: var(--ink); color: var(--bright); }
+.path-label {
+  font-size: 15px; font-weight: 700; letter-spacing: .14em; text-transform: uppercase;
+}
+.path-sub {
+  font-family: system-ui, -apple-system, sans-serif;
+  font-size: 12px; line-height: 1.4; opacity: .8;
+}
+.path-build .path-sub { color: rgba(236,222,222,.7); }
+.path-explore .path-sub { color: var(--grey-dim); }
+
+.footer-note {
+  font-size: 11px; letter-spacing: .1em; color: var(--grey-dim);
+  text-transform: uppercase;
+}
+.footer-note a { color: var(--grey); text-decoration: none; }
+.footer-note a:hover { color: var(--green); }
+
+@media (max-width: 400px) {
+  .paths { grid-template-columns: 1fr; }
 }
 @media (prefers-reduced-motion: reduce) {
-  * { animation: none !important; transition: none !important; }
+  * { animation: none !important; }
 }
 </style>
 </head>
 <body>
 
-<!-- NAV -->
-<nav class="nav">
-  <div class="wrap">
-    <div class="nav-inner">
-      <a href="/" class="nav-logo">KDX</a>
-      <div class="nav-links">
-        <a href="#features" class="hide-sm">Features</a>
-        <a href="#download" class="hide-sm">Download</a>
-        <a href="handoff.html" class="hide-sm">Docs</a>
-        <a href="https://github.com/iamkhayyam/kdx-hotline" class="nav-gh">GitHub ↗</a>
-      </div>
-    </div>
+<div class="stage">
+  <canvas id="logo" width="310" height="136" aria-label="KDX"></canvas>
+
+  <div style="display:flex;flex-direction:column;gap:10px;align-items:center">
+    <p class="wordmark">Hotline revival</p>
+    <p class="tagline">Private chat and file sharing,<br>rebuilt in Rust.</p>
+    <p class="desc">A custom binary protocol over TLS 1.3. Challenge-response auth where the password never leaves your machine. Chat rooms, a virtual file tree, and resumable transfers — both directions.</p>
   </div>
-</nav>
 
-<!-- HERO -->
-<div class="hero">
-  <div class="wrap">
-    <div class="hero-inner">
-      <canvas id="logo" width="310" height="136" aria-label="KDX"></canvas>
-
-      <div style="display:flex;flex-direction:column;gap:12px">
-        <p class="hero-title">A Hotline revival.<br>Rebuilt from scratch in Rust.</p>
-        <p class="hero-desc">Custom binary protocol over TLS 1.3. Challenge-response auth where the password never leaves your machine. Chat rooms, a virtual file tree with drop boxes, and resumable chunked transfers — both directions.</p>
-      </div>
-
-      <div class="pills">
-        <span class="pill pg">Rust</span>
-        <span class="pill pr">TLS 1.3</span>
-        <span class="pill pa">Argon2id</span>
-        <span class="pill pg">Tauri v2</span>
-        <span class="pill pd">macOS · Windows · Linux</span>
-      </div>
-
-      <div class="ctas">
-        <a href="#download" class="btn btn-p">↓ Download</a>
-        <a href="https://github.com/iamkhayyam/kdx-hotline" class="btn btn-g">View Source</a>
-        <a href="handoff.html" class="btn btn-g">Documentation</a>
-      </div>
-    </div>
+  <div class="paths">
+    <a href="kdx-explainer.html#download" class="path path-build">
+      <span class="path-label">Build</span>
+      <span class="path-sub">Download installers or run from source</span>
+    </a>
+    <a href="kdx-explainer.html" class="path path-explore">
+      <span class="path-label">Explore</span>
+      <span class="path-sub">Features, architecture, and how it works</span>
+    </a>
   </div>
-</div>
 
-<!-- CONTEXT -->
-<section class="section" id="about">
-  <div class="wrap">
-    <div class="eyebrow">Background</div>
-    <h2>Remember Hotline?</h2>
-    <div class="ctx-grid">
-      <div class="ctx-copy">
-        <p>In the early 2000s, <strong>KDX</strong> was a peer-to-peer client for private file servers and IRC-style chat, speaking its own tight binary protocol over TCP. You connected to servers by hand, browsed their file trees, and talked to whoever was around. The interface was spare: black window, blood-red chrome, phosphor-green text.</p>
-        <p>This is a ground-up rebuild — same protocol energy, modern stack. Six Rust crates carry everything from the wire codec to the server daemon. The desktop client is a <strong>Tauri v2</strong> app that renders the original aesthetic on a modern webview.</p>
-        <p>It is fully functional: 243 tests, cross-platform packaging via GitHub Actions, and a feature set that covers everything the original KDX did — plus TLS 1.3 and modern cryptography it never had.</p>
-      </div>
-      <div class="chat" aria-label="Sample chat session">
-        <div><span class="c-ts">[09:14:21]</span><span class="c-ev">● connecting to phantom.local:10700…</span></div>
-        <div><span class="c-ts">[09:14:22]</span><span class="c-ev">✓ TLS 1.3 · cert fingerprint pinned</span></div>
-        <div><span class="c-ts">[09:14:22]</span><span class="c-sys">server: Welcome to PHANTOM. Please identify.</span></div>
-        <div><span class="c-ts">[09:14:22]</span><span class="c-ev">✓ logged in as phraq (power)</span></div>
-        <div><span class="c-ts">[09:14:23]</span><span class="c-join">⬡ joined #lobby — 3 users online</span></div>
-        <div>&nbsp;</div>
-        <div><span class="c-ts">[09:14:25]</span><span class="c-nick">&lt;relic&gt;</span> <span class="c-msg">phraq, been a while</span></div>
-        <div><span class="c-ts">[09:14:31]</span><span class="c-nick">&lt;phraq&gt;</span> <span class="c-msg">running on Rust now. TLS and everything.</span></div>
-        <div><span class="c-ts">[09:14:33]</span><span class="c-nick">&lt;relic&gt;</span> <span class="c-msg">wild</span></div>
-        <div><span class="c-ts">[09:14:35]</span><span class="c-join">⬡ gust joined #lobby</span></div>
-        <div>&nbsp;</div>
-        <div><span class="c-ts">[09:14:40]</span><span class="c-sys">» Files: 1,204 items · 47.2 GB available</span></div>
-      </div>
-    </div>
-  </div>
-</section>
-
-<!-- FEATURES -->
-<section class="section" id="features">
-  <div class="wrap">
-    <div class="eyebrow">What's inside</div>
-    <h2>Full stack, no shortcuts</h2>
-    <div class="feat-grid">
-      <div class="feat">
-        <div class="feat-id">PKT</div>
-        <div class="feat-name">Wire Protocol</div>
-        <div class="feat-body">Custom 20-byte framed binary packets with typed message IDs. Full codec, fragmentation, and reassembly — all handwritten in <code>kdx-protocol</code>.</div>
-      </div>
-      <div class="feat">
-        <div class="feat-id">KEY</div>
-        <div class="feat-name">Secure Auth</div>
-        <div class="feat-body">Passwords stored as <strong>Argon2id</strong> hashes. Login is challenge-response: <code>SHA-256(challenge ‖ verifier)</code>. The plaintext never crosses the wire.</div>
-      </div>
-      <div class="feat">
-        <div class="feat-id">#</div>
-        <div class="feat-name">Chat Rooms</div>
-        <div class="feat-body">Multi-room chat with flood protection, emotes, and broadcast messages. Per-room flags, kick and ban, server-wide admin broadcast.</div>
-      </div>
-      <div class="feat">
-        <div class="feat-id">FS</div>
-        <div class="feat-name">Virtual File Tree</div>
-        <div class="feat-body">Server-side file hierarchy with ACL-gated access. Drop boxes let users upload without read access. Alias nodes map one path to another without duplicating bytes.</div>
-      </div>
-      <div class="feat">
-        <div class="feat-id">XFR</div>
-        <div class="feat-name">Resumable Transfers</div>
-        <div class="feat-body">Chunked bidirectional transfers with a per-chunk progress bitmap. Interrupted downloads resume from the last confirmed chunk — no re-downloading from scratch.</div>
-      </div>
-      <div class="feat">
-        <div class="feat-id">REG</div>
-        <div class="feat-name">Tracker Registry</div>
-        <div class="feat-body">Public server directory. Servers announce themselves; clients query to discover available servers without knowing addresses in advance.</div>
-      </div>
-    </div>
-  </div>
-</section>
-
-<!-- STATS -->
-<section class="section">
-  <div class="wrap">
-    <div class="eyebrow">By the numbers</div>
-    <div class="stats">
-      <div class="stat">
-        <div class="stat-k">Tests</div>
-        <div class="stat-v">243 <small>passing</small></div>
-      </div>
-      <div class="stat">
-        <div class="stat-k">Crates</div>
-        <div class="stat-v">6 <small>+ 1 app</small></div>
-      </div>
-      <div class="stat">
-        <div class="stat-k">Platforms</div>
-        <div class="stat-v">3</div>
-      </div>
-      <div class="stat">
-        <div class="stat-k">Transport</div>
-        <div class="stat-v">TLS <small>1.3</small></div>
-      </div>
-      <div class="stat">
-        <div class="stat-k">Storage</div>
-        <div class="stat-v">SQLite</div>
-      </div>
-    </div>
-  </div>
-</section>
-
-<!-- DOWNLOAD -->
-<section class="section" id="download">
-  <div class="wrap">
-    <div class="eyebrow">Get it</div>
-    <h2>Download</h2>
-    <p>Pre-built binaries attach to every GitHub Release. The client runs standalone; the server daemon needs a config file and a data directory.</p>
-    <div class="dl-grid">
-      <div class="dl-card">
-        <div class="dl-os">macOS</div>
-        <div class="dl-files">
-          <div class="dl-file"><span class="dl-ext">.dmg</span> KDX_x.x.x_aarch64.dmg</div>
-          <div class="dl-file"><span class="dl-ext">.zip</span> kdxd-macos.zip</div>
-        </div>
-        <a href="https://github.com/iamkhayyam/kdx-hotline/releases/latest" class="btn btn-p">Latest Release ↗</a>
-      </div>
-      <div class="dl-card">
-        <div class="dl-os">Windows</div>
-        <div class="dl-files">
-          <div class="dl-file"><span class="dl-ext">.exe</span> KDX_x.x.x_x64-setup.exe</div>
-          <div class="dl-file"><span class="dl-ext">.zip</span> kdxd-windows.zip</div>
-        </div>
-        <a href="https://github.com/iamkhayyam/kdx-hotline/releases/latest" class="btn btn-p">Latest Release ↗</a>
-      </div>
-      <div class="dl-card">
-        <div class="dl-os">Linux</div>
-        <div class="dl-files">
-          <div class="dl-file"><span class="dl-ext">.deb</span> kdx_x.x.x_amd64.deb</div>
-          <div class="dl-file"><span class="dl-ext">.AppImage</span> kdx_x.x.x.AppImage</div>
-          <div class="dl-file"><span class="dl-ext">.zip</span> kdxd-linux.zip</div>
-        </div>
-        <a href="https://github.com/iamkhayyam/kdx-hotline/releases/latest" class="btn btn-p">Latest Release ↗</a>
-      </div>
-    </div>
-  </div>
-</section>
-
-<!-- QUICK START -->
-<section class="section" id="quickstart">
-  <div class="wrap">
-    <div class="eyebrow">Run it yourself</div>
-    <h2>Quick start</h2>
-    <div class="qs-grid">
-      <div class="qs-block">
-        <div>
-          <div class="pre-lbl">Server</div>
-<pre><span class="c"># create an account (guest|user|power|admin)</span>
-<span class="g">cargo</span> run -p kdxd -- useradd phraq s3cret power
-
-<span class="c"># start the server (0.0.0.0:10700, self-signed cert)</span>
-<span class="g">cargo</span> run -p kdxd
-
-<span class="c"># or point at a config file</span>
-<span class="g">cargo</span> run -p kdxd -- <span class="a">kdxd.toml</span></pre>
-        </div>
-      </div>
-      <div class="qs-block">
-        <div>
-          <div class="pre-lbl">Client</div>
-<pre><span class="c"># launch the desktop client</span>
-<span class="g">cargo</span> run -p kdx-client</pre>
-        </div>
-        <div>
-          <div class="pre-lbl">Build &amp; test</div>
-<pre><span class="g">cargo</span> build --workspace
-<span class="g">cargo</span> test  --workspace  <span class="c"># no external services needed</span></pre>
-        </div>
-        <div>
-          <div class="pre-lbl">Package (requires target OS)</div>
-<pre><span class="g">cargo</span> install tauri-cli --version <span class="a">'^2'</span>
-<span class="g">cargo</span> tauri build</pre>
-        </div>
-      </div>
-    </div>
-  </div>
-</section>
-
-<!-- ARCHITECTURE -->
-<section class="section" id="architecture">
-  <div class="wrap">
-    <div class="eyebrow">Code layout</div>
-    <h2>Architecture</h2>
-    <p>Seven packages in one Cargo workspace. Each layer depends only on the ones below it; the client app has no compile-time dependency on the server.</p>
-    <div class="arch-wrap">
-      <table class="arch">
-        <thead>
-          <tr><th>Crate</th><th>Kind</th><th>Responsibility</th></tr>
-        </thead>
-        <tbody>
-          <tr>
-            <td>kdx-protocol</td>
-            <td><span class="kind">lib</span></td>
-            <td>Wire format — 20-byte framed packets, codec, fragmentation, typed message IDs</td>
-          </tr>
-          <tr>
-            <td>kdx-crypto</td>
-            <td><span class="kind">lib</span></td>
-            <td>Argon2id password hashing and the challenge-response login handshake</td>
-          </tr>
-          <tr>
-            <td>kdx-storage</td>
-            <td><span class="kind">lib</span></td>
-            <td>SQLite persistence via sqlx — accounts, roles, file metadata, news, tracker entries</td>
-          </tr>
-          <tr>
-            <td>kdx-server-core</td>
-            <td><span class="kind">lib</span></td>
-            <td>Connection state machine, auth, chat rooms, virtual file tree, transfers, IP rules, audit log</td>
-          </tr>
-          <tr>
-            <td>kdx-client-core</td>
-            <td><span class="kind">lib</span></td>
-            <td>Async client library with zero UI deps — TOFU trust store, transfer engines</td>
-          </tr>
-          <tr>
-            <td>kdxd</td>
-            <td><span class="kind">binary</span></td>
-            <td>Server daemon — TLS listener, TOML config file, admin CLI sub-commands</td>
-          </tr>
-          <tr>
-            <td>kdx-client</td>
-            <td><span class="kind">tauri app</span></td>
-            <td>Desktop client — Rust shell + vanilla-JS webview; each feature in its own floating window</td>
-          </tr>
-        </tbody>
-      </table>
-    </div>
-  </div>
-</section>
-
-<!-- FOOTER -->
-<footer class="wrap">
-  <span class="ft-logo">KDX</span>
-  <span class="ft-meta">Open source · MIT license · Built with Rust &amp; Tauri</span>
-  <div class="ft-links">
+  <p class="footer-note">
     <a href="https://github.com/iamkhayyam/kdx-hotline">GitHub</a>
-    <a href="handoff.html">Docs</a>
-    <a href="https://github.com/iamkhayyam/kdx-hotline/releases">Releases</a>
-    <a href="https://github.com/iamkhayyam/kdx-hotline/issues">Issues</a>
-  </div>
-</footer>
+    &nbsp;·&nbsp;
+    <a href="handoff.html">Full docs</a>
+    &nbsp;·&nbsp;
+    MIT license
+  </p>
+</div>
 
 <script>
 (function () {
@@ -549,17 +155,17 @@ footer {
     X: [[1,0,0,0,1],[1,0,0,0,1],[0,1,0,1,0],[0,0,1,0,0],[0,1,0,1,0],[1,0,0,0,1],[1,0,0,0,1]]
   };
   var DOT = 14, GAP = 3, LGAP = 22, PAD = 10;
-  var lw = 5 * DOT + 4 * GAP;   // 82
-  var lh = 7 * DOT + 6 * GAP;   // 116
-  var W  = lw * 3 + LGAP * 2 + PAD * 2; // 310
-  var H  = lh + PAD * 2;                // 136
+  var lw = 5 * DOT + 4 * GAP;
+  var lh = 7 * DOT + 6 * GAP;
+  var W  = lw * 3 + LGAP * 2 + PAD * 2;
+  var H  = lh + PAD * 2;
 
   var canvas = document.getElementById('logo');
   canvas.width  = W;
   canvas.height = H;
   var ctx = canvas.getContext('2d');
 
-  function drawAll(blinkOn) {
+  function draw(blinkOn) {
     ctx.clearRect(0, 0, W, H);
     ['K','D','X'].forEach(function (ch, li) {
       var glyph = GLYPHS[ch];
@@ -570,10 +176,8 @@ footer {
           var x = ox + ci * (DOT + GAP);
           var y = PAD + ri * (DOT + GAP);
           var hot = (ri === 0 && ci === 0) && blinkOn;
-          // glow
           ctx.fillStyle = hot ? 'rgba(225,27,27,.14)' : 'rgba(61,245,110,.12)';
           ctx.fillRect(x - 3, y - 3, DOT + 6, DOT + 6);
-          // pixel
           ctx.fillStyle = hot ? '#e11b1b' : '#3df56e';
           ctx.fillRect(x, y, DOT, DOT);
         });
@@ -581,16 +185,10 @@ footer {
     });
   }
 
-  drawAll(false);
-
-  // subtle corner-pixel flicker — respects prefers-reduced-motion
-  var mq = window.matchMedia('(prefers-reduced-motion: reduce)');
-  if (!mq.matches) {
-    var blink = false;
-    setInterval(function () {
-      blink = !blink;
-      drawAll(blink);
-    }, 1400);
+  draw(false);
+  if (!window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
+    var b = false;
+    setInterval(function () { b = !b; draw(b); }, 1400);
   }
 })();
 </script>
