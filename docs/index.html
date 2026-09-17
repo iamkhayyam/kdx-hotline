@@ -252,8 +252,19 @@ footer {
   .stat:nth-child(3),
   .stat:nth-child(5) { border-top: 1px solid var(--line); border-right: 1px solid var(--line); }
 }
+/* ── chat animation ── */
+.chat-line { opacity: 0; transition: opacity .12s ease; }
+.chat-line.cl-show { opacity: 1; }
+.chat-cursor::after {
+  content: "█";
+  color: var(--green);
+  animation: blink-cur .7s step-end infinite;
+}
+@keyframes blink-cur { 50% { opacity: 0; } }
+
 @media (prefers-reduced-motion: reduce) {
   * { animation: none !important; transition: none !important; }
+  .chat-line { opacity: 1 !important; }
 }
 </style>
 </head>
@@ -314,19 +325,19 @@ footer {
         <p>This is a ground-up rebuild — same protocol energy, modern stack. Six Rust crates carry everything from the wire codec to the server daemon. The desktop client is a <strong>Tauri v2</strong> app that renders the original aesthetic on a modern webview.</p>
         <p>It is fully functional: 243 tests, cross-platform packaging via GitHub Actions, and a feature set that covers everything the original KDX did — plus TLS 1.3 and modern cryptography it never had.</p>
       </div>
-      <div class="chat" aria-label="Sample chat session">
-        <div><span class="c-ts">[09:14:21]</span><span class="c-ev">● connecting to phantom.local:10700…</span></div>
-        <div><span class="c-ts">[09:14:22]</span><span class="c-ev">✓ TLS 1.3 · cert fingerprint pinned</span></div>
-        <div><span class="c-ts">[09:14:22]</span><span class="c-sys">server: Welcome to PHANTOM. Please identify.</span></div>
-        <div><span class="c-ts">[09:14:22]</span><span class="c-ev">✓ logged in as phraq (power)</span></div>
-        <div><span class="c-ts">[09:14:23]</span><span class="c-join">⬡ joined #lobby — 3 users online</span></div>
-        <div>&nbsp;</div>
-        <div><span class="c-ts">[09:14:25]</span><span class="c-nick">&lt;relic&gt;</span> <span class="c-msg">phraq, been a while</span></div>
-        <div><span class="c-ts">[09:14:31]</span><span class="c-nick">&lt;phraq&gt;</span> <span class="c-msg">running on Rust now. TLS and everything.</span></div>
-        <div><span class="c-ts">[09:14:33]</span><span class="c-nick">&lt;relic&gt;</span> <span class="c-msg">wild</span></div>
-        <div><span class="c-ts">[09:14:35]</span><span class="c-join">⬡ gust joined #lobby</span></div>
-        <div>&nbsp;</div>
-        <div><span class="c-ts">[09:14:40]</span><span class="c-sys">» Files: 1,204 items · 47.2 GB available</span></div>
+      <div class="chat" id="chat-demo" aria-label="Sample chat session">
+        <div class="chat-line" data-delay="0"><span class="c-ts">[09:14:21]</span><span class="c-ev">● connecting to phantom.local:10700…</span></div>
+        <div class="chat-line" data-delay="800"><span class="c-ts">[09:14:22]</span><span class="c-ev">✓ TLS 1.3 · cert fingerprint pinned</span></div>
+        <div class="chat-line" data-delay="1000"><span class="c-ts">[09:14:22]</span><span class="c-sys">server: Welcome to PHANTOM. Please identify.</span></div>
+        <div class="chat-line" data-delay="1200"><span class="c-ts">[09:14:22]</span><span class="c-ev">✓ logged in as phraq (power)</span></div>
+        <div class="chat-line" data-delay="1600"><span class="c-ts">[09:14:23]</span><span class="c-join">⬡ joined #lobby — 3 users online</span></div>
+        <div class="chat-line" data-delay="1700">&nbsp;</div>
+        <div class="chat-line" data-delay="3000"><span class="c-ts">[09:14:25]</span><span class="c-nick">&lt;relic&gt;</span> <span class="c-msg">phraq, been a while</span></div>
+        <div class="chat-line" data-delay="4500"><span class="c-ts">[09:14:31]</span><span class="c-nick">&lt;phraq&gt;</span> <span class="c-msg">running on Rust now. TLS and everything.</span></div>
+        <div class="chat-line" data-delay="5100"><span class="c-ts">[09:14:33]</span><span class="c-nick">&lt;relic&gt;</span> <span class="c-msg">wild</span></div>
+        <div class="chat-line" data-delay="5700"><span class="c-ts">[09:14:35]</span><span class="c-join">⬡ gust joined #lobby</span></div>
+        <div class="chat-line" data-delay="5800">&nbsp;</div>
+        <div class="chat-line" data-delay="7200"><span class="c-ts">[09:14:40]</span><span class="c-sys">» Files: 1,204 items · 47.2 GB available</span></div>
       </div>
     </div>
   </div>
@@ -593,6 +604,67 @@ footer {
       drawAll(blink);
     }, 1400);
   }
+})();
+</script>
+
+<script>
+(function () {
+  var chat = document.getElementById('chat-demo');
+  if (!chat) return;
+  var lines = Array.from(chat.querySelectorAll('.chat-line'));
+  var timers = [];
+  var running = false;
+  var loopTimer = null;
+
+  function reset() {
+    timers.forEach(clearTimeout);
+    timers = [];
+    clearTimeout(loopTimer);
+    running = false;
+    lines.forEach(function (l) {
+      l.classList.remove('cl-show', 'chat-cursor');
+    });
+  }
+
+  function play() {
+    if (running) return;
+    running = true;
+    var lastDelay = 0;
+    lines.forEach(function (line, i) {
+      var d = parseInt(line.dataset.delay, 10) || 0;
+      lastDelay = Math.max(lastDelay, d);
+      var t = setTimeout(function () {
+        // remove cursor from previous
+        if (i > 0) lines[i - 1].classList.remove('chat-cursor');
+        line.classList.add('cl-show');
+        // put cursor on last non-blank line
+        if (line.textContent.trim()) line.classList.add('chat-cursor');
+      }, d);
+      timers.push(t);
+    });
+    // remove cursor, then loop after a pause
+    loopTimer = setTimeout(function () {
+      var last = lines[lines.length - 1];
+      last.classList.remove('chat-cursor');
+      loopTimer = setTimeout(function () {
+        reset();
+        play();
+      }, 2800);
+    }, lastDelay + 1200);
+  }
+
+  // trigger when chat scrolls into view
+  var io = new IntersectionObserver(function (entries) {
+    entries.forEach(function (e) {
+      if (e.isIntersecting) {
+        if (!running) play();
+      } else {
+        reset();
+      }
+    });
+  }, { threshold: 0.4 });
+
+  io.observe(chat);
 })();
 </script>
 
