@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>KDX — a server you own</title>
+<title>KDX: a server you own</title>
 <meta name="description" content="KDX is a private, Hotline-style community server you host yourself. Chat, files, people, and a door that locks.">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -26,7 +26,13 @@
     --green-dim: #1a8a3f;
     --amber: #FFBF3D;
     --cream: #E8DDDD;
-    --muted: #7D6E70;
+    /* --muted was 7D6E70 which landed at exactly 4.0:1 against the warm
+       black workspace — right at the AA cliff. Bumped to lift every
+       small-text role (nav items, hints, labels, timestamps, captions)
+       above 4.5:1. --muted-2 was 4A3F41 at 1.96:1 — unreadable even for
+       large text — so it's now reserved for dividers and non-text
+       chrome only; any copy that used it moved up to --muted. */
+    --muted: #9A8A8C;
     --muted-2: #4A3F41;
     --class-guest: #6b6263;
     --class-user: #35FF70;
@@ -37,7 +43,7 @@
   }
 
   * { box-sizing: border-box; }
-  html { scroll-behavior: smooth; }
+  html { scroll-behavior: smooth; overflow-x: hidden; }
   @media (prefers-reduced-motion: reduce) {
     html { scroll-behavior: auto; }
     *, *::before, *::after { animation-duration: 0.001ms !important; transition-duration: 0.001ms !important; }
@@ -99,7 +105,11 @@
   .bb-banner .srv-name { color: var(--green); font-weight: 500; letter-spacing: 0.1em; }
   .bb-banner .srv-meta { color: var(--muted); font-size: 10px; }
   .bb-group-label {
-    color: var(--muted-2);
+    /* Was --muted-2 at 1.96:1 against workspace bg. Group label needs
+       to be readable, even if quietly, so it uses --muted and loses
+       weight through size + letter-spacing + opacity instead. */
+    color: var(--muted);
+    opacity: 0.7;
     font-size: 10px;
     letter-spacing: 0.2em;
     text-transform: uppercase;
@@ -107,18 +117,22 @@
   }
   .bb-item {
     display: flex; align-items: center; gap: 10px;
-    padding: 7px 6px; cursor: pointer;
+    /* 12px vertical padding × 13px font-size × 1.55 line-height ≈ 44px tall.
+       Was 34px — below the WCAG 2.5.5 44×44 touch target floor. */
+    padding: 12px 10px; cursor: pointer;
     color: var(--muted);
     text-decoration: none;
     font-size: 13px;
-    border-left: 2px solid transparent;
-    transition: color 120ms, border-color 120ms, background 120ms;
+    transition: color 120ms, background 120ms;
   }
-  .bb-item:hover { color: var(--cream); background: rgba(255, 24, 33, 0.04); }
+  .bb-item:hover { color: var(--cream); background: rgba(255, 24, 33, 0.05); }
+  /* Active state is carried by the filled green mark, the brighter text
+     color, and the background tint — no side-stripe border (which is an
+     impeccable absolute ban: colored border-left/right > 1px as an
+     accent on list items). */
   .bb-item.active {
     color: var(--cream);
-    border-left-color: var(--chrome);
-    background: rgba(255, 24, 33, 0.06);
+    background: rgba(255, 24, 33, 0.08);
   }
   .bb-item .mark {
     display: inline-block; width: 11px; height: 11px;
@@ -200,6 +214,9 @@
     border-right: 1px solid var(--chrome-dim);
     cursor: default;
   }
+  /* .tb-title is now an <h2> so the document hierarchy reads
+     H1 (hero greeting) → H2 (window titles) → H3 (window sub-sections)
+     instead of the earlier H1 → H3 skip. Styled flat as before. */
   .tb-title {
     flex: 1;
     background: var(--bg);
@@ -207,9 +224,11 @@
     padding: 0 12px;
     display: flex; align-items: center; gap: 10px;
     font-weight: 700;
+    font-family: inherit;
     letter-spacing: 0.14em;
     color: var(--cream);
     font-size: 12px;
+    line-height: 1;
     text-transform: uppercase;
   }
   .tb-menu {
@@ -241,9 +260,16 @@
   .win-body { padding: 32px 36px; }
 
   /* ─── Hero window — CONNECT ─── */
+  /*
+   * Grid-overflow safety: every `1fr` column below gets `minmax(0, 1fr)`
+   * so a child with `white-space: nowrap` (chat lines, cmd strings) or
+   * long tokens (git URLs) can't blow the cell out past its share. The
+   * default `min-content` auto-min was dragging the whole page 540px
+   * wider than the viewport at desktop and 260px wider on mobile.
+   */
   .hero-grid {
     display: grid;
-    grid-template-columns: 1.4fr 1fr;
+    grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr);
     gap: 48px;
     align-items: start;
   }
@@ -375,7 +401,7 @@
   .topicbar .topic-text { color: var(--cream); }
   .chat-layout {
     display: grid;
-    grid-template-columns: 1fr 180px;
+    grid-template-columns: minmax(0, 1fr) 180px;
     gap: 24px;
   }
   .chat-scroll {
@@ -387,10 +413,12 @@
     min-height: 320px;
   }
   .chat-line { color: var(--cream); }
-  .chat-line .ts { color: var(--muted-2); margin-right: 10px; font-size: 12px; }
+  /* Timestamps used --muted-2 at 1.96:1 — fail AA Large. Lifted to
+     --muted (now ~5.5:1 after the token bump). */
+  .chat-line .ts { color: var(--muted); margin-right: 10px; font-size: 12px; }
   .chat-line .nick { color: var(--amber); margin-right: 8px; }
   .chat-line.sys { color: var(--muted); font-style: italic; }
-  .chat-line.sys .ts { color: var(--muted-2); }
+  .chat-line.sys .ts { color: var(--muted); }
   .chat-line.action { color: var(--green); font-style: italic; }
   .chat-userlist {
     background: var(--bg);
@@ -442,7 +470,7 @@
   }
   .files-grid {
     display: grid;
-    grid-template-columns: 1.1fr 1fr;
+    grid-template-columns: minmax(0, 1.1fr) minmax(0, 1fr);
     gap: 32px;
     align-items: start;
   }
@@ -500,7 +528,7 @@
   /* ─── Admin split — user list and server history ─── */
   .split {
     display: grid;
-    grid-template-columns: 1fr 1fr;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
     gap: 56px;
     align-items: start;
   }
@@ -528,7 +556,7 @@
     display: flex; flex-direction: column; gap: 4px;
     line-height: 1.7;
   }
-  .history .ts { color: var(--muted-2); margin-right: 10px; }
+  .history .ts { color: var(--muted); margin-right: 10px; }
   .history .actor { color: var(--amber); margin-right: 6px; }
   .history .act { color: var(--cream); }
   .history .detail { color: var(--muted); }
@@ -536,7 +564,7 @@
   /* ─── Get started window ─── */
   .get-grid {
     display: grid;
-    grid-template-columns: 1fr 1fr 1fr;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
     gap: 24px;
   }
   .get-card {
@@ -574,7 +602,7 @@
   /* ─── Docs window — reaches the interior pages ─── */
   .docs-list {
     display: grid;
-    grid-template-columns: 1fr 1fr;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
     gap: 16px;
   }
   .docs-row {
@@ -693,16 +721,21 @@
     .bb-brand { padding: 0; border-bottom: none; margin: 0 16px 0 0; font-size: 18px; }
     .bb-banner { display: none; }
     .bb-group-label { display: none; }
-    .bb-item { padding: 6px 10px; border-left: none; border-bottom: 2px solid transparent; font-size: 12px; }
-    .bb-item.active { border-bottom-color: var(--chrome); border-left: none; }
+    /* Mobile keeps the ≥44px vertical touch target: 11px padding × 12px
+       font × 1.55 line-height ≈ 44px. */
+    .bb-item { padding: 11px 12px; border-bottom: 2px solid transparent; font-size: 12px; min-height: 44px; }
+    .bb-item.active { border-bottom-color: var(--chrome); }
     .bb-item .mark { display: none; }
     .bb-foot { display: none; }
     .workspace { margin-left: 0; padding: 30px 18px 120px; }
-    .hero-grid, .files-grid, .split { grid-template-columns: 1fr; gap: 24px; }
-    .chat-layout { grid-template-columns: 1fr; }
+    /* Mobile grids: still minmax(0, 1fr) so a nowrap child in a
+       single-column layout (chat lines, cmd blocks) can't push the
+       page wider than the viewport. */
+    .hero-grid, .files-grid, .split { grid-template-columns: minmax(0, 1fr); gap: 24px; }
+    .chat-layout { grid-template-columns: minmax(0, 1fr); }
     .chat-userlist { order: -1; }
-    .get-grid { grid-template-columns: 1fr; }
-    .docs-list { grid-template-columns: 1fr; }
+    .get-grid { grid-template-columns: minmax(0, 1fr); }
+    .docs-list { grid-template-columns: minmax(0, 1fr); }
     .hero-greeting { padding: 24px 20px; }
     .win-body { padding: 20px 18px; }
     .dock { left: 0; padding: 8px 12px; }
@@ -745,7 +778,7 @@
     <section class="win" id="connect" data-title="Connect">
       <div class="titlebar">
         <div class="tb-close" aria-hidden="true">×</div>
-        <div class="tb-title"><span class="tb-menu" aria-hidden="true"></span>Connect</div>
+        <h2 class="tb-title"><span class="tb-menu" aria-hidden="true"></span>Connect</h2>
         <div class="tb-actions">
           <div class="tb-btn" aria-hidden="true">+</div>
           <div class="tb-btn" aria-hidden="true">−</div>
@@ -777,7 +810,7 @@
               <a class="btn" href="#start">Authenticate <span class="arrow">→</span></a>
               <a class="btn ghost" href="#chat">Look around</a>
             </div>
-            <div class="hint">Challenge-response over TLS 1.3. Your password never leaves this machine — the server sends a one-time challenge and gets back only a keyed digest.</div>
+            <div class="hint">Challenge-response over TLS 1.3. Your password never leaves this machine. The server sends a one-time challenge and gets back only a keyed digest.</div>
           </div>
         </div>
       </div>
@@ -787,7 +820,7 @@
     <section class="win" id="chat" data-title="Public Chat">
       <div class="titlebar">
         <div class="tb-close" aria-hidden="true">×</div>
-        <div class="tb-title"><span class="tb-menu" aria-hidden="true"></span>Public Chat</div>
+        <h2 class="tb-title"><span class="tb-menu" aria-hidden="true"></span>Public Chat</h2>
         <div class="tb-actions">
           <div class="tb-btn" aria-hidden="true">+</div>
           <div class="tb-btn" aria-hidden="true">−</div>
@@ -829,7 +862,7 @@
     <section class="win" id="files" data-title="Files">
       <div class="titlebar">
         <div class="tb-close" aria-hidden="true">×</div>
-        <div class="tb-title"><span class="tb-menu" aria-hidden="true"></span>Files</div>
+        <h2 class="tb-title"><span class="tb-menu" aria-hidden="true"></span>Files</h2>
         <div class="tb-actions">
           <div class="tb-btn" aria-hidden="true">+</div>
           <div class="tb-btn" aria-hidden="true">−</div>
@@ -837,7 +870,7 @@
       </div>
 
       <div class="win-body">
-        <div class="pathbar">
+        <div class="pathbar" aria-hidden="true">
           <span class="path">/</span>
           <span class="btn-mini">Up</span>
           <span class="btn-mini">New Folder</span>
@@ -849,20 +882,20 @@
           <table class="files">
             <thead><tr><th>Name</th><th style="text-align:right">Size</th></tr></thead>
             <tbody>
-              <tr><td class="fname"><span class="kind">[DIR]</span>pub</td><td class="fsize">—</td></tr>
-              <tr><td class="fname"><span class="kind">[DIR]</span>archive</td><td class="fsize">—</td></tr>
-              <tr class="drop"><td class="fname"><span class="kind">[DROP]</span>submissions</td><td class="fsize">—</td></tr>
+              <tr><td class="fname"><span class="kind">[DIR]</span>pub</td><td class="fsize"></td></tr>
+              <tr><td class="fname"><span class="kind">[DIR]</span>archive</td><td class="fsize"></td></tr>
+              <tr class="drop"><td class="fname"><span class="kind">[DROP]</span>submissions</td><td class="fsize"></td></tr>
               <tr><td class="fname"><span class="kind">[FILE]</span>readme.txt</td><td class="fsize">2.1 KB</td></tr>
               <tr><td class="fname"><span class="kind">[FILE]</span>mixtape-07.flac</td><td class="fsize">41 MB</td></tr>
-              <tr class="alias"><td class="fname"><span class="kind">[→]</span>scrapbook</td><td class="fsize">—</td></tr>
+              <tr class="alias"><td class="fname"><span class="kind">[→]</span>scrapbook</td><td class="fsize"></td></tr>
               <tr class="alias"><td class="fname"><span class="kind">[→]</span>mixtape-latest.flac</td><td class="fsize">41 MB</td></tr>
             </tbody>
           </table>
 
           <div class="caption">
             <h3>How files work here</h3>
-            <p><span class="k">[DIR]</span> is a folder, <span class="k">[FILE]</span> is a file. A <span class="k">[DROP]</span> box is a folder people can write into but no one can list — the write-only vault for submissions.</p>
-            <p>An <span class="k">[→]</span> alias is a soft pointer. The same bytes appear in two places without duplicating on disk, and the target's own class gate still applies — you can't bypass a stricter folder by aliasing it into a permissive one.</p>
+            <p><span class="k">[DIR]</span> is a folder, <span class="k">[FILE]</span> is a file. A <span class="k">[DROP]</span> box is a folder people can write into but no one can list: the write-only vault for submissions.</p>
+            <p>An <span class="k">[→]</span> alias is a soft pointer. The same bytes appear in two places without duplicating on disk, and the target's own class gate still applies: you can't bypass a stricter folder by aliasing it into a permissive one.</p>
             <p>Access is a class check against the folder, and the folder is the whole fence. No cloud, no API, no third party. The bytes live on your disk.</p>
           </div>
         </div>
@@ -873,7 +906,7 @@
     <section class="win" id="users" data-title="Administration">
       <div class="titlebar">
         <div class="tb-close" aria-hidden="true">×</div>
-        <div class="tb-title"><span class="tb-menu" aria-hidden="true"></span>Administration</div>
+        <h2 class="tb-title"><span class="tb-menu" aria-hidden="true"></span>Administration</h2>
         <div class="tb-actions">
           <div class="tb-btn" aria-hidden="true">+</div>
           <div class="tb-btn" aria-hidden="true">−</div>
@@ -893,7 +926,7 @@
               <div class="row"><span class="class-bar guest"></span><span class="uname">guest</span><span class="uclass">guest</span></div>
             </div>
             <div class="caption" style="margin-top: 20px;">
-              <p>Four base classes, custom roles on top, bans that expire. If someone has to leave, you kick them. If they shouldn't come back, you ban the IP — a CIDR check that runs before TLS so the handshake never happens.</p>
+              <p>Four base classes, custom roles on top, bans that expire. If someone has to leave, you kick them. If they shouldn't come back, you ban the IP: a CIDR check that runs before TLS so the handshake never happens.</p>
             </div>
           </div>
 
@@ -907,11 +940,11 @@
               <div><span class="ts">14:18</span><span class="actor">sysop</span><span class="act">role_assigned</span> <span class="detail">target=phraq, role=moderator</span></div>
               <div><span class="ts">14:22</span><span class="actor">sysop</span><span class="act">kicked</span> <span class="detail">target=spammer_42, reason=links</span></div>
               <div><span class="ts">14:24</span><span class="actor">sysop</span><span class="act">ip_rule_created</span> <span class="detail">deny 5.5.5.0/24</span></div>
-              <div><span class="ts">14:30</span><span class="actor">—</span><span class="act">ip_denied</span> <span class="detail">peer=5.5.5.7, note=links</span></div>
+              <div><span class="ts">14:30</span><span class="actor">system</span><span class="act">ip_denied</span> <span class="detail">peer=5.5.5.7, note=links</span></div>
               <div><span class="ts">14:35</span><span class="actor">sysop</span><span class="act">newsgroup_created</span> <span class="detail">#dev</span></div>
             </div>
             <div class="caption" style="margin-top: 20px;">
-              <p>Every admin action is logged to a persistent audit trail. The log is admin-only and append-only — the receipts you need when something goes sideways.</p>
+              <p>Every admin action is logged to a persistent audit trail. The log is admin-only and append-only: the receipts you need when something goes sideways.</p>
             </div>
           </div>
         </div>
@@ -922,7 +955,7 @@
     <section class="win" id="start" data-title="Get Started">
       <div class="titlebar">
         <div class="tb-close" aria-hidden="true">×</div>
-        <div class="tb-title"><span class="tb-menu" aria-hidden="true"></span>Get Started</div>
+        <h2 class="tb-title"><span class="tb-menu" aria-hidden="true"></span>Get Started</h2>
         <div class="tb-actions">
           <div class="tb-btn" aria-hidden="true">+</div>
           <div class="tb-btn" aria-hidden="true">−</div>
@@ -954,7 +987,7 @@
     <section class="win" id="docs" data-title="Docs">
       <div class="titlebar">
         <div class="tb-close" aria-hidden="true">×</div>
-        <div class="tb-title"><span class="tb-menu" aria-hidden="true"></span>Docs</div>
+        <h2 class="tb-title"><span class="tb-menu" aria-hidden="true"></span>Docs</h2>
         <div class="tb-actions">
           <div class="tb-btn" aria-hidden="true">+</div>
           <div class="tb-btn" aria-hidden="true">−</div>
