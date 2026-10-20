@@ -3,31 +3,1070 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>KDX — Less feed. More place.</title>
-<meta name="description" content="KDX is private community infrastructure for people who want a digital place they can actually control.">
+<title>KDX — a server you own</title>
+<meta name="description" content="KDX is a private, Hotline-style community server you host yourself. Chat, files, people, and a door that locks.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;700&family=IBM+Plex+Sans:wght@400;500&display=swap" rel="stylesheet">
 <style>
-:root{--bg:#070708;--panel:#0d0d0f;--panel2:#111114;--line:#2c1719;--red:#ff1821;--red2:#9d1017;--green:#35ff70;--muted:#938789;--cream:#e8dddd;--yellow:#ffbf3d;--max:1120px}
-*{box-sizing:border-box}html{scroll-behavior:smooth}body{margin:0;background:var(--bg);color:var(--cream);font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,"Liberation Mono",monospace;line-height:1.6}body:before{content:"";position:fixed;inset:0;pointer-events:none;opacity:.08;background:repeating-linear-gradient(0deg,transparent 0 3px,#fff 4px);mix-blend-mode:screen;z-index:10}.wrap{width:min(calc(100% - 40px),var(--max));margin:auto}.nav{height:72px;border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between}.brand{color:var(--red);letter-spacing:.45em;font-weight:900}.navlinks{display:flex;gap:25px;font-size:11px;text-transform:uppercase;letter-spacing:.12em}.nav a{color:var(--muted);text-decoration:none}.nav a:hover{color:var(--green)}.nav .cta{border:1px solid var(--red2);padding:7px 11px;color:var(--cream)}.hero{min-height:710px;display:grid;align-items:center;grid-template-columns:1.02fr .98fr;gap:60px;padding:85px 0 90px}.eyebrow,.kicker{font-size:11px;letter-spacing:.25em;text-transform:uppercase;color:var(--muted)}.eyebrow{color:var(--red);margin-bottom:20px}.hero h1{font-size:clamp(42px,6vw,78px);line-height:1.02;letter-spacing:-.08em;margin:0 0 27px;color:#f2e6e6}.hero h1 span{color:var(--green)}.hero p{font-family:system-ui,sans-serif;font-size:19px;line-height:1.6;color:#b9acad;max-width:620px}.buttons{display:flex;gap:12px;flex-wrap:wrap;margin-top:33px}.btn{display:inline-block;padding:13px 17px;text-decoration:none;font-size:12px;letter-spacing:.1em;text-transform:uppercase;border:1px solid var(--red2);color:var(--cream)}.btn.primary{background:var(--red);border-color:var(--red);color:#160405;font-weight:800}.btn:hover{border-color:var(--green);color:var(--green)}.btn.primary:hover{background:var(--green);border-color:var(--green);color:#031109}.terminal{border:1px solid var(--line);background:linear-gradient(145deg,#120708,#080809);box-shadow:0 0 70px #320b0d55;padding:20px;font-size:12px;color:#cdbfc0}.termbar{display:flex;gap:7px;border-bottom:1px solid var(--line);padding-bottom:13px;margin-bottom:18px}.dot{width:8px;height:8px;border-radius:50%;background:var(--red)}.dot:nth-child(2){background:var(--yellow)}.dot:nth-child(3){background:var(--green)}.terminal pre{white-space:pre-wrap;margin:0;line-height:1.9}.g{color:var(--green)}.r{color:var(--red)}.y{color:var(--yellow)}.dim{color:#726668}.prompt{color:var(--red);margin-top:20px}.section{border-top:1px solid var(--line);padding:90px 0}.section h2{font-size:clamp(28px,4vw,46px);line-height:1.1;letter-spacing:-.06em;margin:12px 0 20px}.section-intro{max-width:700px;font-family:system-ui,sans-serif;color:#afa2a3;font-size:18px}.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:1px;background:var(--line);margin-top:42px;border:1px solid var(--line)}.card{background:var(--panel);padding:28px;min-height:220px}.card h3{color:var(--green);font-size:17px;margin:0 0 15px}.card p{font-family:system-ui,sans-serif;color:#a99c9d;margin:0;font-size:15px}.num{color:var(--red);font-size:12px;letter-spacing:.12em}.split{display:grid;grid-template-columns:1fr 1fr;gap:70px;align-items:center}.quote{font-size:clamp(26px,4vw,49px);line-height:1.12;letter-spacing:-.07em;margin:0;color:#eee1e1}.quote em{color:var(--green);font-style:normal}.list{list-style:none;padding:0;margin:28px 0 0}.list li{border-top:1px solid var(--line);padding:14px 0;color:#b8abad;font-family:system-ui,sans-serif}.list li:before{content:"+";color:var(--green);font-family:monospace;margin-right:12px}.diagram{border:1px solid var(--line);padding:24px;background:var(--panel)}.node{border:1px solid #4a1b1d;background:#110b0c;padding:17px;margin:10px 0;color:var(--green)}.arrow{text-align:center;color:var(--red);font-size:20px}.manifesto{background:radial-gradient(circle at 70% 20%,#3b0b0f 0,#110809 35%,var(--bg) 72%);text-align:center;padding:120px 0}.manifesto h2{max-width:800px;margin:12px auto 24px}.manifesto p{max-width:650px;margin:0 auto;font-family:system-ui,sans-serif;color:#b9acad;font-size:18px}.footer{border-top:1px solid var(--line);padding:35px 0;color:#756869;font-size:11px;display:flex;justify-content:space-between}.green{color:var(--green)}@media(max-width:800px){.navlinks{display:none}.hero,.split{grid-template-columns:1fr;gap:40px;padding:60px 0}.hero{min-height:auto}.grid{grid-template-columns:1fr}.card{min-height:auto}.section{padding:65px 0}.footer{display:block}.footer span{display:block;margin-top:10px}}
+  /*
+   * The desktop is the deck. Palette and chrome are lifted directly from
+   * the real KDX client so this landing reads as a running session, not a
+   * screenshot of one. Only the body + hero copy are rendered at
+   * landing-page scale; chrome stays authentic.
+   */
+  :root {
+    --bg: #0A0A0C;
+    --win: #140B0C;
+    --win-2: #180D0E;
+    --chrome: #FF1821;
+    --chrome-dim: #4A1B1E;
+    --chrome-dimmer: #2A0F11;
+    --green: #35FF70;
+    --green-dim: #1a8a3f;
+    --amber: #FFBF3D;
+    --cream: #E8DDDD;
+    --muted: #7D6E70;
+    --muted-2: #4A3F41;
+    --class-guest: #6b6263;
+    --class-user: #35FF70;
+    --class-power: #FFBF3D;
+    --class-admin: #FF1821;
+    --max: 1180px;
+    --bar-w: 240px;
+  }
+
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  @media (prefers-reduced-motion: reduce) {
+    html { scroll-behavior: auto; }
+    *, *::before, *::after { animation-duration: 0.001ms !important; transition-duration: 0.001ms !important; }
+  }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--cream);
+    font-family: 'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 14px;
+    line-height: 1.55;
+    -webkit-font-smoothing: antialiased;
+    overflow-x: hidden;
+  }
+  /* The workspace has a soft radial glow at the top-right corner so the
+     eye settles on the hero window without a scanline cliché. */
+  body::before {
+    content: '';
+    position: fixed; inset: 0; pointer-events: none; z-index: 0;
+    background:
+      radial-gradient(circle at 72% 8%, rgba(255, 24, 33, 0.08), transparent 55%),
+      radial-gradient(circle at 10% 95%, rgba(53, 255, 112, 0.025), transparent 50%);
+  }
+
+  a { color: var(--green); text-decoration: none; }
+  a:hover { color: var(--amber); }
+  a:focus-visible { outline: 2px solid var(--amber); outline-offset: 2px; }
+  button:focus-visible { outline: 2px solid var(--amber); outline-offset: 2px; }
+
+  /* ─── Button Bar — the sticky left nav, pixel-ported from the real app ─── */
+  .buttonbar {
+    position: fixed; top: 0; left: 0; bottom: 0;
+    width: var(--bar-w);
+    background: var(--bg);
+    border-right: 1px solid var(--chrome-dim);
+    padding: 20px 14px 16px;
+    display: flex; flex-direction: column; gap: 8px;
+    z-index: 20;
+    overflow-y: auto;
+  }
+  .bb-brand {
+    color: var(--chrome);
+    font-weight: 700;
+    letter-spacing: 0.45em;
+    font-size: 20px;
+    padding: 6px 0 18px;
+    border-bottom: 1px dashed var(--chrome-dim);
+    margin-bottom: 10px;
+  }
+  .bb-banner {
+    border: 1px solid var(--chrome-dim);
+    background: linear-gradient(135deg, rgba(255, 24, 33, 0.06), transparent 60%), var(--win);
+    padding: 10px;
+    margin: -2px 0 14px;
+    font-size: 11px;
+    color: var(--muted);
+    display: flex; flex-direction: column; gap: 4px;
+  }
+  .bb-banner .srv-name { color: var(--green); font-weight: 500; letter-spacing: 0.1em; }
+  .bb-banner .srv-meta { color: var(--muted); font-size: 10px; }
+  .bb-group-label {
+    color: var(--muted-2);
+    font-size: 10px;
+    letter-spacing: 0.2em;
+    text-transform: uppercase;
+    margin: 14px 0 4px 6px;
+  }
+  .bb-item {
+    display: flex; align-items: center; gap: 10px;
+    padding: 7px 6px; cursor: pointer;
+    color: var(--muted);
+    text-decoration: none;
+    font-size: 13px;
+    border-left: 2px solid transparent;
+    transition: color 120ms, border-color 120ms, background 120ms;
+  }
+  .bb-item:hover { color: var(--cream); background: rgba(255, 24, 33, 0.04); }
+  .bb-item.active {
+    color: var(--cream);
+    border-left-color: var(--chrome);
+    background: rgba(255, 24, 33, 0.06);
+  }
+  .bb-item .mark {
+    display: inline-block; width: 11px; height: 11px;
+    border: 1px solid var(--chrome-dim);
+    flex-shrink: 0;
+  }
+  .bb-item.active .mark { background: var(--green); border-color: var(--green); box-shadow: 0 0 6px rgba(53, 255, 112, 0.6); }
+  /* The WonderLight — a small LED that pulses when there's a "new" item.
+     Here it indicates the newest doc on the Docs row. */
+  .bb-led {
+    width: 7px; height: 7px; border-radius: 50%;
+    background: var(--amber);
+    margin-left: auto;
+    box-shadow: 0 0 6px rgba(255, 191, 61, 0.9);
+    animation: led 2s ease-in-out infinite;
+  }
+  @keyframes led { 0%, 100% { opacity: 0.3; } 50% { opacity: 1; } }
+
+  .bb-foot {
+    margin-top: auto;
+    padding-top: 12px;
+    border-top: 1px solid var(--chrome-dim);
+    color: var(--muted-2);
+    font-size: 10px;
+    letter-spacing: 0.1em;
+  }
+  .bb-foot .stat { color: var(--muted); }
+
+  /* ─── Workspace — the main scroll area to the right of the Button Bar ─── */
+  .workspace {
+    margin-left: var(--bar-w);
+    padding: 60px 48px 180px;
+    min-height: 100vh;
+    position: relative; z-index: 1;
+  }
+  .flow {
+    width: min(100%, var(--max));
+    margin: 0 auto;
+    display: flex; flex-direction: column; gap: 56px;
+  }
+
+  /* ─── Window — the universal chrome used for every section ─── */
+  .win {
+    background: var(--win);
+    border: 1px solid var(--chrome-dim);
+    box-shadow:
+      0 0 0 1px rgba(255, 24, 33, 0.03),
+      0 24px 60px -24px rgba(255, 24, 33, 0.2),
+      inset 0 0 60px -20px rgba(0, 0, 0, 0.4);
+    position: relative;
+    transition: opacity 400ms ease, transform 400ms ease;
+  }
+  .win.minimized {
+    opacity: 0.35;
+    transform: scale(0.995);
+  }
+
+  /* Titlebar — the hatched red bar with X on the left, title + menu in a
+     solid cutout patch, and +/- on the right. Pixel-accurate to the app. */
+  .titlebar {
+    display: flex; align-items: stretch; height: 32px;
+    background:
+      repeating-linear-gradient(
+        135deg,
+        var(--chrome) 0 2px,
+        transparent 2px 6px
+      ),
+      var(--chrome-dim);
+    border-bottom: 1px solid var(--chrome-dim);
+    position: relative;
+  }
+  .tb-close {
+    width: 32px; height: 32px;
+    background: var(--chrome);
+    display: flex; align-items: center; justify-content: center;
+    color: var(--cream);
+    font-size: 14px;
+    font-weight: 500;
+    border-right: 1px solid var(--chrome-dim);
+    cursor: default;
+  }
+  .tb-title {
+    flex: 1;
+    background: var(--bg);
+    margin: 4px 4px;
+    padding: 0 12px;
+    display: flex; align-items: center; gap: 10px;
+    font-weight: 700;
+    letter-spacing: 0.14em;
+    color: var(--cream);
+    font-size: 12px;
+    text-transform: uppercase;
+  }
+  .tb-menu {
+    width: 20px; height: 20px;
+    background:
+      repeating-linear-gradient(
+        135deg,
+        var(--chrome) 0 2px,
+        transparent 2px 4px
+      ),
+      var(--chrome-dim);
+    flex-shrink: 0;
+    border: 1px solid var(--chrome-dim);
+  }
+  .tb-actions {
+    display: flex; align-items: stretch;
+  }
+  .tb-btn {
+    width: 32px; height: 32px;
+    background: var(--chrome);
+    color: var(--cream);
+    display: flex; align-items: center; justify-content: center;
+    font-size: 16px; font-weight: 700;
+    border-left: 1px solid var(--chrome-dim);
+    cursor: default;
+    line-height: 1;
+  }
+
+  .win-body { padding: 32px 36px; }
+
+  /* ─── Hero window — CONNECT ─── */
+  .hero-grid {
+    display: grid;
+    grid-template-columns: 1.4fr 1fr;
+    gap: 48px;
+    align-items: start;
+  }
+  .hero-greeting {
+    border: 1px solid var(--chrome-dim);
+    background: var(--bg);
+    padding: 36px 32px;
+  }
+  .hero-greeting .label {
+    font-size: 10px;
+    letter-spacing: 0.3em;
+    color: var(--muted);
+    text-transform: uppercase;
+    margin-bottom: 20px;
+    display: flex; align-items: center; gap: 10px;
+  }
+  .hero-greeting .label::before {
+    content: '';
+    width: 7px; height: 7px; border-radius: 50%;
+    background: var(--green);
+    box-shadow: 0 0 8px rgba(53, 255, 112, 0.8);
+  }
+  .hero-greeting h1 {
+    font-family: 'IBM Plex Mono', monospace;
+    font-weight: 700;
+    font-size: clamp(44px, 6vw, 76px);
+    line-height: 0.95;
+    letter-spacing: -0.045em;
+    margin: 0 0 8px;
+    color: var(--cream);
+  }
+  .hero-greeting h1 .dot { color: var(--green); }
+  .hero-greeting h1 .green { color: var(--green); }
+  .hero-greeting p {
+    font-family: 'IBM Plex Sans', system-ui, sans-serif;
+    color: #b8acad;
+    font-size: 17px;
+    line-height: 1.5;
+    max-width: 42ch;
+    margin: 24px 0 0;
+  }
+
+  .form-mock {
+    display: flex; flex-direction: column; gap: 16px;
+  }
+  .fm-row { display: flex; flex-direction: column; gap: 4px; }
+  .fm-label {
+    font-size: 10px;
+    letter-spacing: 0.25em;
+    color: var(--muted);
+    text-transform: uppercase;
+  }
+  .fm-field {
+    border: 1px solid var(--chrome-dim);
+    background: var(--bg);
+    padding: 11px 14px;
+    color: var(--green);
+    font-family: inherit;
+    font-size: 14px;
+    display: flex; align-items: center; gap: 2px;
+  }
+  .fm-field .caret {
+    display: inline-block; width: 8px; height: 15px;
+    background: var(--green);
+    margin-left: 2px;
+    animation: caret 1s step-end infinite;
+  }
+  @keyframes caret { 50% { opacity: 0; } }
+  .fm-field.dim { color: var(--muted); }
+  .fm-field.dim::after { content: '••••••••'; letter-spacing: 2px; color: var(--muted-2); }
+
+  .cta-row {
+    display: flex; gap: 10px; margin-top: 10px; flex-wrap: wrap;
+  }
+  .btn {
+    display: inline-flex; align-items: center; gap: 10px;
+    padding: 14px 20px;
+    background: var(--chrome);
+    color: #140405;
+    border: 1px solid var(--chrome);
+    font-family: inherit;
+    font-weight: 700;
+    font-size: 12px;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    cursor: pointer;
+    text-decoration: none;
+    transition: background 120ms, color 120ms, border-color 120ms, box-shadow 120ms;
+  }
+  .btn:hover {
+    background: var(--green);
+    border-color: var(--green);
+    color: #061308;
+    box-shadow: 0 0 24px rgba(53, 255, 112, 0.35);
+  }
+  .btn.ghost {
+    background: transparent;
+    color: var(--cream);
+    border-color: var(--chrome-dim);
+  }
+  .btn.ghost:hover {
+    background: transparent;
+    color: var(--green);
+    border-color: var(--green);
+    box-shadow: none;
+  }
+  .btn .arrow { font-weight: 500; }
+
+  .hint {
+    font-family: 'IBM Plex Sans', system-ui, sans-serif;
+    color: var(--muted);
+    font-size: 12px;
+    margin-top: 18px;
+  }
+  .hint a { color: var(--muted); border-bottom: 1px dashed var(--muted); }
+
+  /* ─── Chat window — PUBLIC CHAT ─── */
+  .topicbar {
+    background: var(--bg);
+    border: 1px solid var(--chrome-dim);
+    padding: 10px 14px;
+    font-size: 12px;
+    color: var(--muted);
+    margin-bottom: 18px;
+    display: flex; justify-content: space-between; align-items: center;
+    gap: 20px;
+  }
+  .topicbar .topic-label { color: var(--muted-2); letter-spacing: 0.12em; text-transform: uppercase; font-size: 10px; margin-right: 10px; }
+  .topicbar .topic-text { color: var(--cream); }
+  .chat-layout {
+    display: grid;
+    grid-template-columns: 1fr 180px;
+    gap: 24px;
+  }
+  .chat-scroll {
+    background: var(--bg);
+    border: 1px solid var(--chrome-dim);
+    padding: 20px 22px;
+    font-size: 14px;
+    display: flex; flex-direction: column; gap: 8px;
+    min-height: 320px;
+  }
+  .chat-line { color: var(--cream); }
+  .chat-line .ts { color: var(--muted-2); margin-right: 10px; font-size: 12px; }
+  .chat-line .nick { color: var(--amber); margin-right: 8px; }
+  .chat-line.sys { color: var(--muted); font-style: italic; }
+  .chat-line.sys .ts { color: var(--muted-2); }
+  .chat-line.action { color: var(--green); font-style: italic; }
+  .chat-userlist {
+    background: var(--bg);
+    border: 1px solid var(--chrome-dim);
+    padding: 14px;
+    font-size: 12px;
+    display: flex; flex-direction: column; gap: 2px;
+  }
+  .chat-userlist .hdr {
+    font-size: 10px;
+    letter-spacing: 0.2em;
+    color: var(--muted-2);
+    text-transform: uppercase;
+    margin-bottom: 10px;
+    padding-bottom: 8px;
+    border-bottom: 1px dashed var(--chrome-dim);
+  }
+  .chat-userlist .u {
+    display: flex; align-items: center; gap: 8px;
+    padding: 4px 0;
+  }
+  .class-bar {
+    display: inline-block;
+    width: 4px; height: 14px;
+    flex-shrink: 0;
+  }
+  .class-bar.guest { background: var(--class-guest); }
+  .class-bar.user  { background: var(--class-user); }
+  .class-bar.power { background: var(--class-power); }
+  .class-bar.admin { background: var(--class-admin); }
+
+  /* ─── Files window ─── */
+  .pathbar {
+    background: var(--bg);
+    border: 1px solid var(--chrome-dim);
+    padding: 10px 14px;
+    display: flex; align-items: center; gap: 14px;
+    font-size: 12px;
+    margin-bottom: 18px;
+  }
+  .pathbar .path { color: var(--green); }
+  .pathbar .btn-mini {
+    font-size: 10px;
+    letter-spacing: 0.1em;
+    color: var(--muted);
+    border: 1px solid var(--chrome-dim);
+    padding: 3px 8px;
+    text-transform: uppercase;
+  }
+  .files-grid {
+    display: grid;
+    grid-template-columns: 1.1fr 1fr;
+    gap: 32px;
+    align-items: start;
+  }
+  table.files {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 13px;
+    border: 1px solid var(--chrome-dim);
+    background: var(--bg);
+  }
+  table.files th, table.files td {
+    padding: 9px 14px;
+    text-align: left;
+    border-bottom: 1px solid var(--chrome-dimmer);
+  }
+  table.files th {
+    font-size: 10px;
+    letter-spacing: 0.2em;
+    color: var(--muted-2);
+    text-transform: uppercase;
+    font-weight: 400;
+    background: transparent;
+  }
+  table.files td { color: var(--cream); }
+  table.files tr:last-child td { border-bottom: none; }
+  table.files .kind { color: var(--muted); font-size: 11px; margin-right: 10px; }
+  table.files tr.drop td.fname { color: var(--amber); }
+  table.files tr.alias td.fname { color: var(--muted); font-style: italic; }
+  table.files tr.alias td.fname .kind { color: var(--green); font-style: normal; }
+  table.files td.fsize { color: var(--muted); text-align: right; }
+
+  .caption {
+    font-family: 'IBM Plex Sans', system-ui, sans-serif;
+    color: #b8acad;
+    font-size: 15px;
+    line-height: 1.55;
+  }
+  .caption .k {
+    font-family: 'IBM Plex Mono', monospace;
+    color: var(--green);
+    font-size: 14px;
+  }
+  .caption h3 {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 11px;
+    letter-spacing: 0.2em;
+    color: var(--amber);
+    text-transform: uppercase;
+    margin: 0 0 12px;
+    font-weight: 500;
+  }
+  .caption p { margin: 0 0 14px; }
+  .caption p:last-child { margin: 0; }
+
+  /* ─── Admin split — user list and server history ─── */
+  .split {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 56px;
+    align-items: start;
+  }
+  .admin-list {
+    background: var(--bg);
+    border: 1px solid var(--chrome-dim);
+    padding: 16px 18px;
+    display: flex; flex-direction: column; gap: 10px;
+    font-size: 13px;
+  }
+  .admin-list .row {
+    display: grid;
+    grid-template-columns: auto 1fr auto;
+    align-items: center;
+    gap: 12px;
+    padding: 4px 0;
+  }
+  .admin-list .uname { color: var(--cream); }
+  .admin-list .uclass { color: var(--muted); font-size: 11px; letter-spacing: 0.1em; text-transform: uppercase; }
+  .history {
+    background: var(--bg);
+    border: 1px solid var(--chrome-dim);
+    padding: 16px 18px;
+    font-size: 12px;
+    display: flex; flex-direction: column; gap: 4px;
+    line-height: 1.7;
+  }
+  .history .ts { color: var(--muted-2); margin-right: 10px; }
+  .history .actor { color: var(--amber); margin-right: 6px; }
+  .history .act { color: var(--cream); }
+  .history .detail { color: var(--muted); }
+
+  /* ─── Get started window ─── */
+  .get-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr 1fr;
+    gap: 24px;
+  }
+  .get-card {
+    border: 1px solid var(--chrome-dim);
+    background: var(--bg);
+    padding: 22px 20px;
+    display: flex; flex-direction: column; gap: 12px;
+  }
+  .get-card h3 {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 11px;
+    letter-spacing: 0.2em;
+    color: var(--amber);
+    text-transform: uppercase;
+    margin: 0;
+    font-weight: 500;
+  }
+  .get-card .cmd {
+    background: var(--win);
+    border: 1px solid var(--chrome-dimmer);
+    padding: 10px 12px;
+    color: var(--green);
+    font-size: 12px;
+    overflow-x: auto;
+    white-space: nowrap;
+  }
+  .get-card .cmd .prompt { color: var(--chrome); margin-right: 8px; }
+  .get-card p {
+    font-family: 'IBM Plex Sans', system-ui, sans-serif;
+    color: #a99c9d;
+    font-size: 13px;
+    margin: 0;
+  }
+
+  /* ─── Docs window — reaches the interior pages ─── */
+  .docs-list {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 16px;
+  }
+  .docs-row {
+    border: 1px solid var(--chrome-dim);
+    background: var(--bg);
+    padding: 18px 20px;
+    display: flex; flex-direction: column; gap: 6px;
+    color: var(--cream);
+    transition: border-color 120ms, color 120ms, box-shadow 120ms;
+  }
+  .docs-row:hover {
+    border-color: var(--green);
+    color: var(--green);
+    box-shadow: 0 0 24px -8px rgba(53, 255, 112, 0.5);
+  }
+  .docs-row .meta {
+    font-size: 10px;
+    letter-spacing: 0.2em;
+    color: var(--muted);
+    text-transform: uppercase;
+  }
+  .docs-row:hover .meta { color: var(--amber); }
+  .docs-row .title {
+    font-weight: 500;
+    font-size: 15px;
+    letter-spacing: 0.02em;
+  }
+  .docs-row .desc {
+    font-family: 'IBM Plex Sans', system-ui, sans-serif;
+    font-size: 13px;
+    color: var(--muted);
+    margin-top: 4px;
+  }
+  .docs-row:hover .desc { color: #b8acad; }
+
+  /* ─── Dock — the signature piece. Collects minimized windows as you
+         scroll past them. Fixed at the bottom edge. ─── */
+  .dock {
+    position: fixed; left: var(--bar-w); right: 0; bottom: 0;
+    background: var(--bg);
+    border-top: 1px solid var(--chrome-dim);
+    padding: 10px 20px;
+    display: flex; align-items: center; gap: 10px;
+    z-index: 15;
+    min-height: 44px;
+    overflow-x: auto;
+  }
+  .dock-label {
+    font-size: 10px;
+    letter-spacing: 0.22em;
+    color: var(--muted-2);
+    text-transform: uppercase;
+    flex-shrink: 0;
+    margin-right: 6px;
+  }
+  .dock-item {
+    display: inline-flex; align-items: center; gap: 8px;
+    padding: 6px 12px;
+    background: var(--win);
+    border: 1px solid var(--chrome-dim);
+    color: var(--cream);
+    font-size: 11px;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    cursor: pointer;
+    transition: all 120ms;
+    flex-shrink: 0;
+    opacity: 0;
+    transform: translateY(8px);
+    animation: dock-in 300ms ease forwards;
+  }
+  @keyframes dock-in {
+    to { opacity: 1; transform: translateY(0); }
+  }
+  .dock-item:hover {
+    border-color: var(--green);
+    color: var(--green);
+  }
+  .dock-item .dot {
+    width: 7px; height: 7px; background: var(--chrome);
+    display: inline-block;
+  }
+  .dock-item:hover .dot { background: var(--green); }
+  .dock-empty {
+    color: var(--muted-2);
+    font-size: 11px;
+    font-style: italic;
+  }
+
+  /* ─── Footer ─── */
+  .colophon {
+    margin-top: 20px;
+    padding-top: 20px;
+    border-top: 1px dashed var(--chrome-dim);
+    display: flex; justify-content: space-between; gap: 20px;
+    color: var(--muted);
+    font-size: 11px;
+    letter-spacing: 0.1em;
+  }
+  .colophon .k { color: var(--muted-2); }
+
+  /* ─── Responsive ─── */
+  @media (max-width: 900px) {
+    :root { --bar-w: 0px; }
+    .buttonbar {
+      position: static;
+      width: 100%; height: auto; bottom: auto;
+      border-right: none;
+      border-bottom: 1px solid var(--chrome-dim);
+      flex-direction: row;
+      flex-wrap: wrap;
+      align-items: center;
+      padding: 14px 16px;
+      overflow: visible;
+    }
+    .bb-brand { padding: 0; border-bottom: none; margin: 0 16px 0 0; font-size: 18px; }
+    .bb-banner { display: none; }
+    .bb-group-label { display: none; }
+    .bb-item { padding: 6px 10px; border-left: none; border-bottom: 2px solid transparent; font-size: 12px; }
+    .bb-item.active { border-bottom-color: var(--chrome); border-left: none; }
+    .bb-item .mark { display: none; }
+    .bb-foot { display: none; }
+    .workspace { margin-left: 0; padding: 30px 18px 120px; }
+    .hero-grid, .files-grid, .split { grid-template-columns: 1fr; gap: 24px; }
+    .chat-layout { grid-template-columns: 1fr; }
+    .chat-userlist { order: -1; }
+    .get-grid { grid-template-columns: 1fr; }
+    .docs-list { grid-template-columns: 1fr; }
+    .hero-greeting { padding: 24px 20px; }
+    .win-body { padding: 20px 18px; }
+    .dock { left: 0; padding: 8px 12px; }
+    .dock-label { display: none; }
+    .flow { gap: 36px; }
+  }
 </style>
 </head>
 <body>
-<header class="nav"><div class="wrap" style="display:flex;align-items:center;justify-content:space-between;width:100%"><a class="brand" href="#top">KDX</a><nav class="navlinks"><a href="#why">Why</a><a href="#inside">Inside</a><a href="#sovereignty">Sovereignty</a><a href="index.html#download" class="cta">Get started ↗</a></nav></div></header>
-<main id="top">
-<section class="hero wrap"><div><div class="eyebrow">Private community infrastructure</div><h1>Less feed.<br><span>More place.</span></h1><p>KDX brings back the small, intentional internet: a private server for conversation, files, and people who want a digital space they can actually control.</p><div class="buttons"><a class="btn primary" href="#start">Build your server</a><a class="btn" href="#why">See why it matters</a></div></div><div class="terminal"><div class="termbar"><i class="dot"></i><i class="dot"></i><i class="dot"></i></div><pre><span class="dim">[21:58:04]</span> <span class="r">connecting</span> to <span class="g">your-place</span>
-<span class="dim">[21:58:05]</span> <span class="g">✓</span> encrypted channel established
-<span class="dim">[21:58:05]</span> <span class="g">✓</span> identity verified
-<span class="dim">[21:58:06]</span> joined <span class="g">#lobby</span>
 
-<span class="g">[chat]</span> phraq: files are up
-<span class="g">[chat]</span> cid: perfect. grabbing the field notes
-<span class="y">[info]</span> 1 transfer resumed
+<!-- Button Bar — the sticky left-column nav, pattern-ported from the real app -->
+<nav class="buttonbar" aria-label="Primary">
+  <div class="bb-brand">KDX</div>
+  <div class="bb-banner" role="status" aria-live="polite">
+    <span class="srv-name">your-place.kdx</span>
+    <span class="srv-meta">v0.3 · 4 users online · tls 1.3</span>
+  </div>
 
-<span class="prompt">kdx://</span> <span class="g">connected</span></pre></div></section>
-<section class="section" id="why"><div class="wrap"><div class="kicker">The problem</div><h2>The internet got loud.</h2><p class="section-intro">Every tool wants your attention. Every platform wants your data. Every community gets squeezed into the same feed. KDX takes a different path: make a place, give it a front door, and let the people inside decide what matters.</p><div class="grid"><article class="card"><div class="num">01 / FOCUS</div><h3>Conversation with a home</h3><p>Rooms have a purpose. Discussions stay close to the work instead of disappearing into an infinite scroll.</p></article><article class="card"><div class="num">02 / CLARITY</div><h3>Files that belong together</h3><p>Browse a shared file tree, upload resources, and resume interrupted transfers without scattering everything across five services.</p></article><article class="card"><div class="num">03 / CALM</div><h3>No attention machine</h3><p>No public feed, recommendation engine, follower race, or advertising layer required. Connect when you mean to.</p></article></div></div></section>
-<section class="section" id="inside"><div class="wrap split"><div><div class="kicker">The useful stuff</div><h2>Simple on the surface. Serious underneath.</h2><p class="section-intro">KDX keeps the complicated parts below deck so the people using it can simply connect, talk, share, and get on with their work.</p><ul class="list"><li>Private rooms for focused collaboration.</li><li>A browsable server-side file tree.</li><li>Upload-only drop boxes for controlled submissions.</li><li>Chunked transfers that can resume after interruption.</li><li>Accounts and permissions managed by the server.</li></ul></div><div class="diagram"><div class="node">You and your community</div><div class="arrow">↓</div><div class="node">KDX desktop client</div><div class="arrow">↓ encrypted connection</div><div class="node">A server you choose</div><div class="arrow">↓</div><div class="node">Your chat · your files · your rules</div></div></div></section>
-<section class="section" id="sovereignty"><div class="wrap split"><div class="quote">Own the space between the people. <em>Not the platform.</em></div><div><div class="kicker">Digital sovereignty</div><p class="section-intro">A KDX server can live on your hardware, your cloud account, your local network, or somewhere your team controls. You decide who gets in, what they can do, where files live, and how the space is governed.</p><ul class="list"><li>No mandatory SaaS control plane.</li><li>No platform-wide identity required.</li><li>Server-side permissions and local storage.</li><li>Clear responsibility instead of invisible dependency.</li></ul></div></div></section>
-<section class="section"><div class="wrap"><div class="kicker">Made for the real world</div><h2>Small servers. Strong communities.</h2><p class="section-intro">KDX is for groups that need a digital clubhouse, not another public stage.</p><div class="grid"><article class="card"><h3>Field teams</h3><p>Keep reports, manuals, photos, maps, and updates in one controlled place—even when the connection is imperfect.</p></article><article class="card"><h3>Ranches & farms</h3><p>Share work instructions, sensor exports, maintenance files, and operational knowledge with the people who need it.</p></article><article class="card"><h3>Researchers & makers</h3><p>Exchange datasets, protocols, builds, and field notes without giving the whole project to a platform vendor.</p></article></div></div></section>
-<section class="manifesto" id="start"><div class="wrap"><div class="eyebrow">A forgotten idea worth recovering</div><h2>The internet used to feel like a collection of places.</h2><p>A place had an address. A culture. A front door. KDX is a modern rebuild of that feeling—private, intentional, and built for the people inside.</p><div class="buttons" style="justify-content:center"><a class="btn primary" href="index.html#download">Build your server</a><a class="btn" href="handoff.html">Read the docs</a></div></div></section>
+  <a class="bb-item" href="#connect" data-nav="connect"><span class="mark"></span>Connect</a>
+  <a class="bb-item" href="#chat" data-nav="chat"><span class="mark"></span>Public Chat</a>
+  <a class="bb-item" href="#files" data-nav="files"><span class="mark"></span>Files</a>
+  <a class="bb-item" href="#users" data-nav="users"><span class="mark"></span>User List</a>
+  <a class="bb-item" href="#start" data-nav="start"><span class="mark"></span>Get Started</a>
+
+  <div class="bb-group-label">Docs</div>
+  <a class="bb-item" href="handoff-v0.2.html"><span class="mark"></span>Handoff v0.2<span class="bb-led" aria-hidden="true"></span></a>
+  <a class="bb-item" href="handoff.html"><span class="mark"></span>Handoff v0.1</a>
+  <a class="bb-item" href="packaging.html"><span class="mark"></span>Packaging</a>
+  <a class="bb-item" href="ui-concept.html"><span class="mark"></span>UI Concept</a>
+
+  <div class="bb-foot">
+    <span class="stat">[0] [0] [0]</span>
+  </div>
+</nav>
+
+<main class="workspace">
+  <div class="flow">
+
+    <!-- ─── CONNECT — hero ─── -->
+    <section class="win" id="connect" data-title="Connect">
+      <div class="titlebar">
+        <div class="tb-close" aria-hidden="true">×</div>
+        <div class="tb-title"><span class="tb-menu" aria-hidden="true"></span>Connect</div>
+        <div class="tb-actions">
+          <div class="tb-btn" aria-hidden="true">+</div>
+          <div class="tb-btn" aria-hidden="true">−</div>
+        </div>
+      </div>
+
+      <div class="win-body">
+        <div class="hero-grid">
+          <div class="hero-greeting">
+            <div class="label">Server greeting</div>
+            <h1>Less feed<span class="dot">.</span><br><span class="green">More place</span><span class="dot">.</span></h1>
+            <p>KDX is a private community server you host yourself. Chat, files, people, and a door that locks. No feed, no ranking, no one selling ads against your evenings.</p>
+          </div>
+
+          <div class="form-mock" aria-hidden="true">
+            <div class="fm-row">
+              <span class="fm-label">Server</span>
+              <div class="fm-field">your-place.kdx<span class="caret"></span></div>
+            </div>
+            <div class="fm-row">
+              <span class="fm-label">Login</span>
+              <div class="fm-field">guest</div>
+            </div>
+            <div class="fm-row">
+              <span class="fm-label">Password</span>
+              <div class="fm-field dim"></div>
+            </div>
+            <div class="cta-row">
+              <a class="btn" href="#start">Authenticate <span class="arrow">→</span></a>
+              <a class="btn ghost" href="#chat">Look around</a>
+            </div>
+            <div class="hint">Challenge-response over TLS 1.3. Your password never leaves this machine — the server sends a one-time challenge and gets back only a keyed digest.</div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ─── PUBLIC CHAT — the manifesto delivered as sysop messages ─── -->
+    <section class="win" id="chat" data-title="Public Chat">
+      <div class="titlebar">
+        <div class="tb-close" aria-hidden="true">×</div>
+        <div class="tb-title"><span class="tb-menu" aria-hidden="true"></span>Public Chat</div>
+        <div class="tb-actions">
+          <div class="tb-btn" aria-hidden="true">+</div>
+          <div class="tb-btn" aria-hidden="true">−</div>
+        </div>
+      </div>
+
+      <div class="win-body">
+        <div class="topicbar">
+          <div><span class="topic-label">Topic</span><span class="topic-text">a place that doesn't want anything from you · set by sysop · 14:12</span></div>
+          <div style="color: var(--muted);">4 online</div>
+        </div>
+
+        <div class="chat-layout">
+          <div class="chat-scroll">
+            <div class="chat-line sys"><span class="ts">14:08</span>*** phraq joined</div>
+            <div class="chat-line"><span class="ts">14:09</span><span class="nick">&lt;sysop&gt;</span> welcome back</div>
+            <div class="chat-line"><span class="ts">14:11</span><span class="nick">&lt;sysop&gt;</span> everything on this server stays on this server</div>
+            <div class="chat-line"><span class="ts">14:11</span><span class="nick">&lt;sysop&gt;</span> no feed, no ranking, no notifications you didn't ask for</div>
+            <div class="chat-line"><span class="ts">14:12</span><span class="nick">&lt;sysop&gt;</span> just the people you invited and the things you decided to keep</div>
+            <div class="chat-line action"><span class="ts">14:12</span>*** sysop set the topic</div>
+            <div class="chat-line"><span class="ts">14:13</span><span class="nick">&lt;phraq&gt;</span> we used to run bbs's for the same reasons</div>
+            <div class="chat-line"><span class="ts">14:14</span><span class="nick">&lt;phraq&gt;</span> cost was a server, time, and knowing who you let in</div>
+            <div class="chat-line"><span class="ts">14:14</span><span class="nick">&lt;sysop&gt;</span> same costs. same payoff.</div>
+            <div class="chat-line sys"><span class="ts">14:15</span>*** acidburn joined</div>
+            <div class="chat-line"><span class="ts">14:15</span><span class="nick">&lt;acidburn&gt;</span> hey</div>
+          </div>
+          <aside class="chat-userlist">
+            <div class="hdr">Online · 4</div>
+            <div class="u"><span class="class-bar admin"></span>sysop</div>
+            <div class="u"><span class="class-bar power"></span>phraq</div>
+            <div class="u"><span class="class-bar user"></span>acidburn</div>
+            <div class="u"><span class="class-bar guest"></span>guest</div>
+          </aside>
+        </div>
+      </div>
+    </section>
+
+    <!-- ─── FILES — the file tree + a caption on the access model ─── -->
+    <section class="win" id="files" data-title="Files">
+      <div class="titlebar">
+        <div class="tb-close" aria-hidden="true">×</div>
+        <div class="tb-title"><span class="tb-menu" aria-hidden="true"></span>Files</div>
+        <div class="tb-actions">
+          <div class="tb-btn" aria-hidden="true">+</div>
+          <div class="tb-btn" aria-hidden="true">−</div>
+        </div>
+      </div>
+
+      <div class="win-body">
+        <div class="pathbar">
+          <span class="path">/</span>
+          <span class="btn-mini">Up</span>
+          <span class="btn-mini">New Folder</span>
+          <span class="btn-mini">Search</span>
+          <span class="btn-mini">Upload</span>
+        </div>
+
+        <div class="files-grid">
+          <table class="files">
+            <thead><tr><th>Name</th><th style="text-align:right">Size</th></tr></thead>
+            <tbody>
+              <tr><td class="fname"><span class="kind">[DIR]</span>pub</td><td class="fsize">—</td></tr>
+              <tr><td class="fname"><span class="kind">[DIR]</span>archive</td><td class="fsize">—</td></tr>
+              <tr class="drop"><td class="fname"><span class="kind">[DROP]</span>submissions</td><td class="fsize">—</td></tr>
+              <tr><td class="fname"><span class="kind">[FILE]</span>readme.txt</td><td class="fsize">2.1 KB</td></tr>
+              <tr><td class="fname"><span class="kind">[FILE]</span>mixtape-07.flac</td><td class="fsize">41 MB</td></tr>
+              <tr class="alias"><td class="fname"><span class="kind">[→]</span>scrapbook</td><td class="fsize">—</td></tr>
+              <tr class="alias"><td class="fname"><span class="kind">[→]</span>mixtape-latest.flac</td><td class="fsize">41 MB</td></tr>
+            </tbody>
+          </table>
+
+          <div class="caption">
+            <h3>How files work here</h3>
+            <p><span class="k">[DIR]</span> is a folder, <span class="k">[FILE]</span> is a file. A <span class="k">[DROP]</span> box is a folder people can write into but no one can list — the write-only vault for submissions.</p>
+            <p>An <span class="k">[→]</span> alias is a soft pointer. The same bytes appear in two places without duplicating on disk, and the target's own class gate still applies — you can't bypass a stricter folder by aliasing it into a permissive one.</p>
+            <p>Access is a class check against the folder, and the folder is the whole fence. No cloud, no API, no third party. The bytes live on your disk.</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ─── USERS + ADMIN — split-window view ─── -->
+    <section class="win" id="users" data-title="Administration">
+      <div class="titlebar">
+        <div class="tb-close" aria-hidden="true">×</div>
+        <div class="tb-title"><span class="tb-menu" aria-hidden="true"></span>Administration</div>
+        <div class="tb-actions">
+          <div class="tb-btn" aria-hidden="true">+</div>
+          <div class="tb-btn" aria-hidden="true">−</div>
+        </div>
+      </div>
+
+      <div class="win-body">
+        <div class="split">
+          <div>
+            <div class="caption" style="margin-bottom: 16px;">
+              <h3>User List</h3>
+            </div>
+            <div class="admin-list">
+              <div class="row"><span class="class-bar admin"></span><span class="uname">sysop</span><span class="uclass">admin</span></div>
+              <div class="row"><span class="class-bar power"></span><span class="uname">phraq</span><span class="uclass">power user</span></div>
+              <div class="row"><span class="class-bar user"></span><span class="uname">acidburn</span><span class="uclass">user</span></div>
+              <div class="row"><span class="class-bar guest"></span><span class="uname">guest</span><span class="uclass">guest</span></div>
+            </div>
+            <div class="caption" style="margin-top: 20px;">
+              <p>Four base classes, custom roles on top, bans that expire. If someone has to leave, you kick them. If they shouldn't come back, you ban the IP — a CIDR check that runs before TLS so the handshake never happens.</p>
+            </div>
+          </div>
+
+          <div>
+            <div class="caption" style="margin-bottom: 16px;">
+              <h3>Server History</h3>
+            </div>
+            <div class="history">
+              <div><span class="ts">14:08</span><span class="actor">guest</span><span class="act">login</span></div>
+              <div><span class="ts">14:12</span><span class="actor">sysop</span><span class="act">topic_set</span> <span class="detail">lobby</span></div>
+              <div><span class="ts">14:18</span><span class="actor">sysop</span><span class="act">role_assigned</span> <span class="detail">target=phraq, role=moderator</span></div>
+              <div><span class="ts">14:22</span><span class="actor">sysop</span><span class="act">kicked</span> <span class="detail">target=spammer_42, reason=links</span></div>
+              <div><span class="ts">14:24</span><span class="actor">sysop</span><span class="act">ip_rule_created</span> <span class="detail">deny 5.5.5.0/24</span></div>
+              <div><span class="ts">14:30</span><span class="actor">—</span><span class="act">ip_denied</span> <span class="detail">peer=5.5.5.7, note=links</span></div>
+              <div><span class="ts">14:35</span><span class="actor">sysop</span><span class="act">newsgroup_created</span> <span class="detail">#dev</span></div>
+            </div>
+            <div class="caption" style="margin-top: 20px;">
+              <p>Every admin action is logged to a persistent audit trail. The log is admin-only and append-only — the receipts you need when something goes sideways.</p>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ─── GET STARTED ─── -->
+    <section class="win" id="start" data-title="Get Started">
+      <div class="titlebar">
+        <div class="tb-close" aria-hidden="true">×</div>
+        <div class="tb-title"><span class="tb-menu" aria-hidden="true"></span>Get Started</div>
+        <div class="tb-actions">
+          <div class="tb-btn" aria-hidden="true">+</div>
+          <div class="tb-btn" aria-hidden="true">−</div>
+        </div>
+      </div>
+
+      <div class="win-body">
+        <div class="get-grid">
+          <div class="get-card">
+            <h3>Run the server</h3>
+            <div class="cmd"><span class="prompt">$</span>cargo install --git https://github.com/iamkhayyam/kdx-hotline kdxd</div>
+            <p>Rust binary, SQLite under the hood, TLS cert self-generated on first run. One port, one process, your box.</p>
+          </div>
+          <div class="get-card">
+            <h3>Get the client</h3>
+            <div class="cmd"><span class="prompt">$</span>cargo install --git https://github.com/iamkhayyam/kdx-hotline kdx-client</div>
+            <p>Tauri desktop app for macOS, Linux, Windows. Trust-on-first-use certificate pinning. Also runs in a browser against the dist bundle.</p>
+          </div>
+          <div class="get-card">
+            <h3>Read the source</h3>
+            <div class="cmd"><span class="prompt">$</span>git clone https://github.com/iamkhayyam/kdx-hotline</div>
+            <p>Everything is on GitHub. Rust workspace, ~230 tests, clippy clean. Protocol is binary and documented in the handoff docs.</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ─── DOCS — the interior pages ─── -->
+    <section class="win" id="docs" data-title="Docs">
+      <div class="titlebar">
+        <div class="tb-close" aria-hidden="true">×</div>
+        <div class="tb-title"><span class="tb-menu" aria-hidden="true"></span>Docs</div>
+        <div class="tb-actions">
+          <div class="tb-btn" aria-hidden="true">+</div>
+          <div class="tb-btn" aria-hidden="true">−</div>
+        </div>
+      </div>
+
+      <div class="win-body">
+        <div class="docs-list">
+          <a class="docs-row" href="handoff-v0.2.html">
+            <span class="meta">v0.2 · latest</span>
+            <span class="title">Engineering handoff</span>
+            <span class="desc">Current architecture, protocol packet table, actor layout, and the whole feature inventory.</span>
+          </a>
+          <a class="docs-row" href="handoff.html">
+            <span class="meta">v0.1 · historical</span>
+            <span class="title">Engineering handoff (early)</span>
+            <span class="desc">The first-pass handoff from before the deferred items landed. Kept for context.</span>
+          </a>
+          <a class="docs-row" href="packaging.html">
+            <span class="meta">build + distribution</span>
+            <span class="title">Packaging</span>
+            <span class="desc">How to build the server and the Tauri client for each platform, and how to sign and ship.</span>
+          </a>
+          <a class="docs-row" href="ui-concept.html">
+            <span class="meta">design brief</span>
+            <span class="title">UI concept</span>
+            <span class="desc">The window-system brief that this landing is built on. Button Bar, Dock, window chrome anatomy.</span>
+          </a>
+        </div>
+
+        <div class="colophon">
+          <span>A rebuild of Haxial KDX (2001). Written in Rust. Not affiliated with Haxial.</span>
+          <span class="k">kdx-duo.pages.dev</span>
+        </div>
+      </div>
+    </section>
+
+  </div>
 </main>
-<footer class="footer wrap"><span class="brand">KDX</span><span>Private community infrastructure · Less feed. More place.</span><span class="green">YOUR SERVER / YOUR RULES</span></footer>
-</body></html>
+
+<!-- ─── Dock — accumulates minimized windows as you scroll past them ─── -->
+<aside class="dock" id="dock" aria-label="Minimized windows">
+  <span class="dock-label">Dock</span>
+  <span class="dock-empty" id="dock-empty">windows minimize here as you scroll</span>
+</aside>
+
+<script>
+  // The Dock-accumulation choreography. One IntersectionObserver watches
+  // every section window; when a window scrolls above the top of the
+  // viewport, it enters the Dock. When it comes back into view it's
+  // removed. The Button Bar's active-item state is driven by the same
+  // observer so the two stay in sync.
+  const windows = Array.from(document.querySelectorAll('.win[id]'));
+  const navItems = Array.from(document.querySelectorAll('[data-nav]'));
+  const dock = document.getElementById('dock');
+  const dockEmpty = document.getElementById('dock-empty');
+  const prefersReducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+  const minimized = new Set();
+
+  function updateDock() {
+    // Preserve document order so the Dock reads top-to-bottom in the
+    // same sequence the user scrolled past.
+    const items = windows
+      .filter(w => minimized.has(w.id))
+      .map(w => ({ id: w.id, title: w.dataset.title }));
+    dock.querySelectorAll('.dock-item').forEach(el => el.remove());
+    dockEmpty.style.display = items.length ? 'none' : '';
+    for (const it of items) {
+      const el = document.createElement('a');
+      el.className = 'dock-item';
+      el.href = '#' + it.id;
+      el.innerHTML = '<span class="dot" aria-hidden="true"></span>' + it.title;
+      dock.appendChild(el);
+    }
+  }
+
+  function setActive(id) {
+    for (const n of navItems) n.classList.toggle('active', n.dataset.nav === id);
+  }
+
+  // Minimize when a window scrolls above the viewport. Un-minimize when
+  // it re-enters.
+  const minObs = new IntersectionObserver((entries) => {
+    for (const e of entries) {
+      const id = e.target.id;
+      const bottomPastTop = e.boundingClientRect.bottom < 0;
+      if (!e.isIntersecting && bottomPastTop) {
+        minimized.add(id);
+        e.target.classList.add('minimized');
+      } else if (e.isIntersecting) {
+        minimized.delete(id);
+        e.target.classList.remove('minimized');
+      }
+    }
+    updateDock();
+  }, { rootMargin: '0px 0px -40% 0px', threshold: 0 });
+
+  // Separate observer to drive the Button Bar's active state — the one
+  // whose top is highest in the viewport wins.
+  const activeObs = new IntersectionObserver((entries) => {
+    const visible = entries
+      .filter(e => e.isIntersecting)
+      .sort((a, b) => a.boundingClientRect.top - b.boundingClientRect.top);
+    if (visible.length) setActive(visible[0].target.id);
+  }, { rootMargin: '-20% 0px -60% 0px', threshold: 0 });
+
+  for (const w of windows) {
+    minObs.observe(w);
+    activeObs.observe(w);
+  }
+</script>
+
+</body>
+</html>

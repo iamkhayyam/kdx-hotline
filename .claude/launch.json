@@ -2,16 +2,10 @@
   "version": "0.0.1",
   "configurations": [
     {
-      "name": "kdx-client-dist",
+      "name": "kdx-docs",
       "runtimeExecutable": "python3",
-      "runtimeArgs": ["-m", "http.server", "5177", "--directory", "apps/kdx-client/dist"],
-      "port": 5177
-    },
-    {
-      "name": "docs-static",
-      "runtimeExecutable": "python3",
-      "runtimeArgs": ["-m", "http.server", "8934", "--directory", "docs"],
-      "port": 8934
+      "runtimeArgs": ["-m", "http.server", "8765", "--directory", "docs"],
+      "port": 8765
     }
   ]
 }
