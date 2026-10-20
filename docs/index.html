@@ -3,776 +3,1102 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>KDX Hotline</title>
-<meta name="description" content="A ground-up Rust rebuild of KDX — Hotline-style TCP chat and file sharing. Custom binary protocol over TLS 1.3, Argon2id auth, resumable transfers, virtual file trees. Runs on macOS, Windows, and Linux.">
-<meta property="og:title" content="KDX Hotline">
-<meta property="og:description" content="A Hotline revival, rebuilt from scratch in Rust.">
-<meta property="og:type" content="website">
+<title>KDX: a server you own</title>
+<meta name="description" content="KDX is a private, Hotline-style community server you host yourself. Chat, files, people, and a door that locks.">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600;700&display=swap">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;700&family=IBM+Plex+Sans:wght@400;500&display=swap" rel="stylesheet">
 <style>
-:root {
-  --bg:        #060404;
-  --panel:     #0d0808;
-  --panel-2:   #110a0a;
-  --line:      #2a1414;
-  --chrome:    #7a0a0a;
-  --alert:     #e11b1b;
-  --green:     #3df56e;
-  --green-dim: #1e7a38;
-  --amber:     #ffb020;
-  --ink:       #cbb6b6;
-  --bright:    #ecdede;
-  --grey:      #9c8080;
-  --grey-dim:  #6b5555;
-  --mono: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
-  --sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
-}
+  /*
+   * The desktop is the deck. Palette and chrome are lifted directly from
+   * the real KDX client so this landing reads as a running session, not a
+   * screenshot of one. Only the body + hero copy are rendered at
+   * landing-page scale; chrome stays authentic.
+   */
+  :root {
+    --bg: #0A0A0C;
+    --win: #140B0C;
+    --win-2: #180D0E;
+    --chrome: #FF1821;
+    --chrome-dim: #4A1B1E;
+    --chrome-dimmer: #2A0F11;
+    --green: #35FF70;
+    --green-dim: #1a8a3f;
+    --amber: #FFBF3D;
+    --cream: #E8DDDD;
+    /* --muted was 7D6E70 which landed at exactly 4.0:1 against the warm
+       black workspace — right at the AA cliff. Bumped to lift every
+       small-text role (nav items, hints, labels, timestamps, captions)
+       above 4.5:1. --muted-2 was 4A3F41 at 1.96:1 — unreadable even for
+       large text — so it's now reserved for dividers and non-text
+       chrome only; any copy that used it moved up to --muted. */
+    --muted: #9A8A8C;
+    --muted-2: #4A3F41;
+    --class-guest: #6b6263;
+    --class-user: #35FF70;
+    --class-power: #FFBF3D;
+    --class-admin: #FF1821;
+    --max: 1180px;
+    --bar-w: 240px;
+  }
 
-*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-html { background: var(--bg); color-scheme: dark; }
-body {
-  background: var(--bg);
-  color: var(--ink);
-  font-family: var(--sans);
-  font-size: 15px;
-  line-height: 1.65;
-}
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; overflow-x: hidden; }
+  @media (prefers-reduced-motion: reduce) {
+    html { scroll-behavior: auto; }
+    *, *::before, *::after { animation-duration: 0.001ms !important; transition-duration: 0.001ms !important; }
+  }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--cream);
+    font-family: 'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 14px;
+    line-height: 1.55;
+    -webkit-font-smoothing: antialiased;
+    overflow-x: hidden;
+  }
+  /* The workspace has a soft radial glow at the top-right corner so the
+     eye settles on the hero window without a scanline cliché. */
+  body::before {
+    content: '';
+    position: fixed; inset: 0; pointer-events: none; z-index: 0;
+    background:
+      radial-gradient(circle at 72% 8%, rgba(255, 24, 33, 0.08), transparent 55%),
+      radial-gradient(circle at 10% 95%, rgba(53, 255, 112, 0.025), transparent 50%);
+  }
 
-/* CRT scan-lines */
-body::before {
-  content: "";
-  position: fixed; inset: 0; z-index: 999; pointer-events: none;
-  background: repeating-linear-gradient(0deg, rgba(255,255,255,.013) 0 1px, transparent 1px 3px);
-}
+  a { color: var(--green); text-decoration: none; }
+  a:hover { color: var(--amber); }
+  a:focus-visible { outline: 2px solid var(--amber); outline-offset: 2px; }
+  button:focus-visible { outline: 2px solid var(--amber); outline-offset: 2px; }
 
-h2 { font-family: var(--mono); font-size: 20px; color: var(--green); font-weight: 600; letter-spacing: .02em; text-wrap: balance; }
-h3 { font-family: var(--mono); font-size: 12px; color: var(--amber); font-weight: 600; letter-spacing: .12em; text-transform: uppercase; }
-p  { max-width: 68ch; }
-strong { color: var(--bright); font-weight: 600; }
-a  { color: var(--green); text-decoration: none; }
-a:hover { color: var(--bright); }
-code {
-  font-family: var(--mono); font-size: .84em; color: var(--green);
-  background: rgba(61,245,110,.07); border: 1px solid rgba(61,245,110,.14);
-  padding: 1px 5px; border-radius: 2px; white-space: nowrap;
-}
+  /* ─── Button Bar — the sticky left nav, pixel-ported from the real app ─── */
+  .buttonbar {
+    position: fixed; top: 0; left: 0; bottom: 0;
+    width: var(--bar-w);
+    background: var(--bg);
+    border-right: 1px solid var(--chrome-dim);
+    padding: 20px 14px 16px;
+    display: flex; flex-direction: column; gap: 8px;
+    z-index: 20;
+    overflow-y: auto;
+  }
+  .bb-brand {
+    color: var(--chrome);
+    font-weight: 700;
+    letter-spacing: 0.45em;
+    font-size: 20px;
+    padding: 6px 0 18px;
+    border-bottom: 1px dashed var(--chrome-dim);
+    margin-bottom: 10px;
+  }
+  .bb-banner {
+    border: 1px solid var(--chrome-dim);
+    background: linear-gradient(135deg, rgba(255, 24, 33, 0.06), transparent 60%), var(--win);
+    padding: 10px;
+    margin: -2px 0 14px;
+    font-size: 11px;
+    color: var(--muted);
+    display: flex; flex-direction: column; gap: 4px;
+  }
+  .bb-banner .srv-name { color: var(--green); font-weight: 500; letter-spacing: 0.1em; }
+  .bb-banner .srv-meta { color: var(--muted); font-size: 10px; }
+  .bb-group-label {
+    /* Was --muted-2 at 1.96:1 against workspace bg. Group label needs
+       to be readable, even if quietly, so it uses --muted and loses
+       weight through size + letter-spacing + opacity instead. */
+    color: var(--muted);
+    opacity: 0.7;
+    font-size: 10px;
+    letter-spacing: 0.2em;
+    text-transform: uppercase;
+    margin: 14px 0 4px 6px;
+  }
+  .bb-item {
+    display: flex; align-items: center; gap: 10px;
+    /* 12px vertical padding × 13px font-size × 1.55 line-height ≈ 44px tall.
+       Was 34px — below the WCAG 2.5.5 44×44 touch target floor. */
+    padding: 12px 10px; cursor: pointer;
+    color: var(--muted);
+    text-decoration: none;
+    font-size: 13px;
+    transition: color 120ms, background 120ms;
+  }
+  .bb-item:hover { color: var(--cream); background: rgba(255, 24, 33, 0.05); }
+  /* Active state is carried by the filled green mark, the brighter text
+     color, and the background tint — no side-stripe border (which is an
+     impeccable absolute ban: colored border-left/right > 1px as an
+     accent on list items). */
+  .bb-item.active {
+    color: var(--cream);
+    background: rgba(255, 24, 33, 0.08);
+  }
+  .bb-item .mark {
+    display: inline-block; width: 11px; height: 11px;
+    border: 1px solid var(--chrome-dim);
+    flex-shrink: 0;
+  }
+  .bb-item.active .mark { background: var(--green); border-color: var(--green); box-shadow: 0 0 6px rgba(53, 255, 112, 0.6); }
+  /* The WonderLight — a small LED that pulses when there's a "new" item.
+     Here it indicates the newest doc on the Docs row. */
+  .bb-led {
+    width: 7px; height: 7px; border-radius: 50%;
+    background: var(--amber);
+    margin-left: auto;
+    box-shadow: 0 0 6px rgba(255, 191, 61, 0.9);
+    animation: led 2s ease-in-out infinite;
+  }
+  @keyframes led { 0%, 100% { opacity: 0.3; } 50% { opacity: 1; } }
 
-.wrap { max-width: 1080px; margin-inline: auto; padding-inline: 24px; }
-.eyebrow {
-  font-family: var(--mono); font-size: 10px; letter-spacing: .24em;
-  text-transform: uppercase; color: var(--grey-dim); margin-bottom: 10px;
-}
+  .bb-foot {
+    margin-top: auto;
+    padding-top: 12px;
+    border-top: 1px solid var(--chrome-dim);
+    color: var(--muted-2);
+    font-size: 10px;
+    letter-spacing: 0.1em;
+  }
+  .bb-foot .stat { color: var(--muted); }
 
-/* ── nav ── */
-.nav {
-  border-bottom: 1px solid var(--line);
-  background: rgba(6,4,4,.94);
-  backdrop-filter: blur(4px);
-  position: sticky; top: 0; z-index: 100;
-}
-.nav-inner {
-  display: flex; align-items: center; justify-content: space-between;
-  gap: 16px; padding-block: 14px;
-}
-.nav-logo {
-  font-family: var(--mono); font-size: 16px; font-weight: 700;
-  color: var(--alert); letter-spacing: .32em; text-decoration: none;
-}
-.nav-links { display: flex; gap: 22px; align-items: center; }
-.nav-links a {
-  font-family: var(--mono); font-size: 11px; letter-spacing: .1em;
-  text-transform: uppercase; color: var(--grey); transition: color .15s;
-}
-.nav-links a:hover { color: var(--green); }
-.nav-gh {
-  border: 1px solid var(--chrome); color: var(--grey) !important;
-  padding: 6px 14px;
-}
-.nav-gh:hover { border-color: var(--alert); color: var(--alert) !important; }
+  /* ─── Workspace — the main scroll area to the right of the Button Bar ─── */
+  .workspace {
+    margin-left: var(--bar-w);
+    padding: 60px 48px 180px;
+    min-height: 100vh;
+    position: relative; z-index: 1;
+  }
+  .flow {
+    width: min(100%, var(--max));
+    margin: 0 auto;
+    display: flex; flex-direction: column; gap: 56px;
+  }
 
-/* ── hero ── */
-.hero {
-  position: relative; overflow: hidden;
-  padding-block: 80px 68px; border-bottom: 1px solid var(--line);
-}
-.hero::after {
-  content: "";
-  position: absolute; inset: 0; pointer-events: none;
-  background: radial-gradient(ellipse 70% 40% at 50% 0%, rgba(122,10,10,.2), transparent 70%);
-}
-.hero-inner {
-  position: relative; z-index: 1;
-  display: flex; flex-direction: column; gap: 30px;
-}
-canvas#logo { display: block; max-width: 100%; height: auto; }
+  /* ─── Window — the universal chrome used for every section ─── */
+  .win {
+    background: var(--win);
+    border: 1px solid var(--chrome-dim);
+    box-shadow:
+      0 0 0 1px rgba(255, 24, 33, 0.03),
+      0 24px 60px -24px rgba(255, 24, 33, 0.2),
+      inset 0 0 60px -20px rgba(0, 0, 0, 0.4);
+    position: relative;
+    transition: opacity 400ms ease, transform 400ms ease;
+  }
+  .win.minimized {
+    opacity: 0.35;
+    transform: scale(0.995);
+  }
 
-.hero-title {
-  font-family: var(--mono); font-size: clamp(20px, 3.6vw, 34px);
-  color: var(--bright); font-weight: 700; line-height: 1.15;
-  letter-spacing: .02em; text-wrap: balance;
-}
-.hero-desc { font-size: 16px; color: var(--ink); max-width: 60ch; }
+  /* Titlebar — the hatched red bar with X on the left, title + menu in a
+     solid cutout patch, and +/- on the right. Pixel-accurate to the app. */
+  .titlebar {
+    display: flex; align-items: stretch; height: 32px;
+    background:
+      repeating-linear-gradient(
+        135deg,
+        var(--chrome) 0 2px,
+        transparent 2px 6px
+      ),
+      var(--chrome-dim);
+    border-bottom: 1px solid var(--chrome-dim);
+    position: relative;
+  }
+  .tb-close {
+    width: 32px; height: 32px;
+    background: var(--chrome);
+    display: flex; align-items: center; justify-content: center;
+    color: var(--cream);
+    font-size: 14px;
+    font-weight: 500;
+    border-right: 1px solid var(--chrome-dim);
+    cursor: default;
+  }
+  /* .tb-title is now an <h2> so the document hierarchy reads
+     H1 (hero greeting) → H2 (window titles) → H3 (window sub-sections)
+     instead of the earlier H1 → H3 skip. Styled flat as before. */
+  .tb-title {
+    flex: 1;
+    background: var(--bg);
+    margin: 4px 4px;
+    padding: 0 12px;
+    display: flex; align-items: center; gap: 10px;
+    font-weight: 700;
+    font-family: inherit;
+    letter-spacing: 0.14em;
+    color: var(--cream);
+    font-size: 12px;
+    line-height: 1;
+    text-transform: uppercase;
+  }
+  .tb-menu {
+    width: 20px; height: 20px;
+    background:
+      repeating-linear-gradient(
+        135deg,
+        var(--chrome) 0 2px,
+        transparent 2px 4px
+      ),
+      var(--chrome-dim);
+    flex-shrink: 0;
+    border: 1px solid var(--chrome-dim);
+  }
+  .tb-actions {
+    display: flex; align-items: stretch;
+  }
+  .tb-btn {
+    width: 32px; height: 32px;
+    background: var(--chrome);
+    color: var(--cream);
+    display: flex; align-items: center; justify-content: center;
+    font-size: 16px; font-weight: 700;
+    border-left: 1px solid var(--chrome-dim);
+    cursor: default;
+    line-height: 1;
+  }
 
-.pills { display: flex; flex-wrap: wrap; gap: 8px; }
-.pill {
-  font-family: var(--mono); font-size: 11px; letter-spacing: .05em;
-  padding: 3px 9px; border: 1px solid; border-radius: 2px; white-space: nowrap;
-}
-.pg { color: var(--green); border-color: var(--green-dim); }
-.pr { color: var(--alert); border-color: var(--chrome); }
-.pa { color: var(--amber); border-color: #6a4610; }
-.pd { color: var(--grey);  border-color: var(--grey-dim); }
+  .win-body { padding: 32px 36px; }
 
-.ctas { display: flex; flex-wrap: wrap; gap: 12px; }
-.btn {
-  font-family: var(--mono); font-size: 12px; font-weight: 700; letter-spacing: .08em;
-  text-transform: uppercase; padding: 10px 22px; border: 1px solid;
-  text-decoration: none; display: inline-flex; align-items: center; gap: 8px;
-  transition: background .15s, color .15s, border-color .15s;
-}
-.btn-p { background: var(--alert); border-color: var(--alert); color: var(--bright); }
-.btn-p:hover { background: #ff2222; border-color: #ff2222; color: #fff; }
-.btn-g { background: transparent; border-color: var(--chrome); color: var(--grey); }
-.btn-g:hover { border-color: var(--grey); color: var(--bright); }
+  /* ─── Hero window — CONNECT ─── */
+  /*
+   * Grid-overflow safety: every `1fr` column below gets `minmax(0, 1fr)`
+   * so a child with `white-space: nowrap` (chat lines, cmd strings) or
+   * long tokens (git URLs) can't blow the cell out past its share. The
+   * default `min-content` auto-min was dragging the whole page 540px
+   * wider than the viewport at desktop and 260px wider on mobile.
+   */
+  .hero-grid {
+    display: grid;
+    grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr);
+    gap: 48px;
+    align-items: start;
+  }
+  .hero-greeting {
+    border: 1px solid var(--chrome-dim);
+    background: var(--bg);
+    padding: 36px 32px;
+  }
+  .hero-greeting .label {
+    font-size: 10px;
+    letter-spacing: 0.3em;
+    color: var(--muted);
+    text-transform: uppercase;
+    margin-bottom: 20px;
+    display: flex; align-items: center; gap: 10px;
+  }
+  .hero-greeting .label::before {
+    content: '';
+    width: 7px; height: 7px; border-radius: 50%;
+    background: var(--green);
+    box-shadow: 0 0 8px rgba(53, 255, 112, 0.8);
+  }
+  .hero-greeting h1 {
+    font-family: 'IBM Plex Mono', monospace;
+    font-weight: 700;
+    font-size: clamp(44px, 6vw, 76px);
+    line-height: 0.95;
+    letter-spacing: -0.045em;
+    margin: 0 0 8px;
+    color: var(--cream);
+  }
+  .hero-greeting h1 .dot { color: var(--green); }
+  .hero-greeting h1 .green { color: var(--green); }
+  .hero-greeting p {
+    font-family: 'IBM Plex Sans', system-ui, sans-serif;
+    color: #b8acad;
+    font-size: 17px;
+    line-height: 1.5;
+    max-width: 42ch;
+    margin: 24px 0 0;
+  }
 
-/* ── sections ── */
-.section { padding-block: 60px; border-bottom: 1px solid var(--line); }
+  .form-mock {
+    display: flex; flex-direction: column; gap: 16px;
+  }
+  .fm-row { display: flex; flex-direction: column; gap: 4px; }
+  .fm-label {
+    font-size: 10px;
+    letter-spacing: 0.25em;
+    color: var(--muted);
+    text-transform: uppercase;
+  }
+  .fm-field {
+    border: 1px solid var(--chrome-dim);
+    background: var(--bg);
+    padding: 11px 14px;
+    color: var(--green);
+    font-family: inherit;
+    font-size: 14px;
+    display: flex; align-items: center; gap: 2px;
+  }
+  .fm-field .caret {
+    display: inline-block; width: 8px; height: 15px;
+    background: var(--green);
+    margin-left: 2px;
+    animation: caret 1s step-end infinite;
+  }
+  @keyframes caret { 50% { opacity: 0; } }
+  .fm-field.dim { color: var(--muted); }
+  .fm-field.dim::after { content: '••••••••'; letter-spacing: 2px; color: var(--muted-2); }
 
-/* ── context ── */
-.ctx-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 44px; align-items: start; margin-top: 24px; }
-.ctx-copy { display: flex; flex-direction: column; gap: 14px; }
-.chat {
-  font-family: var(--mono); font-size: 12.5px; line-height: 1.65;
-  background: #040303; border: 1px solid var(--line); padding: 16px 18px;
-}
-.c-ts   { color: var(--grey-dim); margin-right: 4px; }
-.c-ev   { color: var(--alert); }
-.c-sys  { color: var(--grey-dim); font-style: italic; }
-.c-join { color: var(--amber); font-style: italic; }
-.c-nick { color: var(--bright); font-weight: 700; }
-.c-msg  { color: var(--green); }
+  .cta-row {
+    display: flex; gap: 10px; margin-top: 10px; flex-wrap: wrap;
+  }
+  .btn {
+    display: inline-flex; align-items: center; gap: 10px;
+    padding: 14px 20px;
+    background: var(--chrome);
+    color: #140405;
+    border: 1px solid var(--chrome);
+    font-family: inherit;
+    font-weight: 700;
+    font-size: 12px;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    cursor: pointer;
+    text-decoration: none;
+    transition: background 120ms, color 120ms, border-color 120ms, box-shadow 120ms;
+  }
+  .btn:hover {
+    background: var(--green);
+    border-color: var(--green);
+    color: #061308;
+    box-shadow: 0 0 24px rgba(53, 255, 112, 0.35);
+  }
+  .btn.ghost {
+    background: transparent;
+    color: var(--cream);
+    border-color: var(--chrome-dim);
+  }
+  .btn.ghost:hover {
+    background: transparent;
+    color: var(--green);
+    border-color: var(--green);
+    box-shadow: none;
+  }
+  .btn .arrow { font-weight: 500; }
 
-/* ── features ── */
-.feat-grid {
-  display: grid; grid-template-columns: repeat(3, 1fr);
-  gap: 1px; background: var(--line);
-  border: 1px solid var(--line); margin-top: 32px;
-}
-.feat {
-  background: var(--panel); padding: 24px 20px;
-  display: flex; flex-direction: column; gap: 10px;
-}
-.feat-id   { font-family: var(--mono); font-size: 16px; color: var(--alert); font-weight: 700; letter-spacing: .06em; }
-.feat-name { font-family: var(--mono); font-size: 12px; font-weight: 700; color: var(--bright); letter-spacing: .06em; text-transform: uppercase; }
-.feat-body { font-size: 13.5px; color: var(--grey); line-height: 1.58; }
+  .hint {
+    font-family: 'IBM Plex Sans', system-ui, sans-serif;
+    color: var(--muted);
+    font-size: 12px;
+    margin-top: 18px;
+  }
+  .hint a { color: var(--muted); border-bottom: 1px dashed var(--muted); }
 
-/* ── stats ── */
-.stats {
-  display: grid; grid-template-columns: repeat(5, 1fr);
-  border: 1px solid var(--line); margin-top: 32px;
-}
-.stat { padding: 18px 20px; border-right: 1px solid var(--line); }
-.stat:last-child { border-right: none; }
-.stat-k { font-family: var(--mono); font-size: 10px; letter-spacing: .16em; text-transform: uppercase; color: var(--grey-dim); margin-bottom: 5px; }
-.stat-v { font-family: var(--mono); font-size: 28px; color: var(--green); font-variant-numeric: tabular-nums; line-height: 1; }
-.stat-v small { font-size: 13px; color: var(--grey-dim); margin-left: 4px; }
+  /* ─── Chat window — PUBLIC CHAT ─── */
+  .topicbar {
+    background: var(--bg);
+    border: 1px solid var(--chrome-dim);
+    padding: 10px 14px;
+    font-size: 12px;
+    color: var(--muted);
+    margin-bottom: 18px;
+    display: flex; justify-content: space-between; align-items: center;
+    gap: 20px;
+  }
+  .topicbar .topic-label { color: var(--muted-2); letter-spacing: 0.12em; text-transform: uppercase; font-size: 10px; margin-right: 10px; }
+  .topicbar .topic-text { color: var(--cream); }
+  .chat-layout {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 180px;
+    gap: 24px;
+  }
+  .chat-scroll {
+    background: var(--bg);
+    border: 1px solid var(--chrome-dim);
+    padding: 20px 22px;
+    font-size: 14px;
+    display: flex; flex-direction: column; gap: 8px;
+    min-height: 320px;
+  }
+  .chat-line { color: var(--cream); }
+  /* Timestamps used --muted-2 at 1.96:1 — fail AA Large. Lifted to
+     --muted (now ~5.5:1 after the token bump). */
+  .chat-line .ts { color: var(--muted); margin-right: 10px; font-size: 12px; }
+  .chat-line .nick { color: var(--amber); margin-right: 8px; }
+  .chat-line.sys { color: var(--muted); font-style: italic; }
+  .chat-line.sys .ts { color: var(--muted); }
+  .chat-line.action { color: var(--green); font-style: italic; }
+  .chat-userlist {
+    background: var(--bg);
+    border: 1px solid var(--chrome-dim);
+    padding: 14px;
+    font-size: 12px;
+    display: flex; flex-direction: column; gap: 2px;
+  }
+  .chat-userlist .hdr {
+    font-size: 10px;
+    letter-spacing: 0.2em;
+    color: var(--muted-2);
+    text-transform: uppercase;
+    margin-bottom: 10px;
+    padding-bottom: 8px;
+    border-bottom: 1px dashed var(--chrome-dim);
+  }
+  .chat-userlist .u {
+    display: flex; align-items: center; gap: 8px;
+    padding: 4px 0;
+  }
+  .class-bar {
+    display: inline-block;
+    width: 4px; height: 14px;
+    flex-shrink: 0;
+  }
+  .class-bar.guest { background: var(--class-guest); }
+  .class-bar.user  { background: var(--class-user); }
+  .class-bar.power { background: var(--class-power); }
+  .class-bar.admin { background: var(--class-admin); }
 
-/* ── downloads ── */
-.dl-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; margin-top: 28px; }
-.dl-card { border: 1px solid var(--line); background: var(--panel); padding: 22px 20px; display: flex; flex-direction: column; gap: 14px; }
-.dl-os   { font-family: var(--mono); font-size: 12px; font-weight: 700; color: var(--bright); letter-spacing: .1em; text-transform: uppercase; }
-.dl-files { display: flex; flex-direction: column; gap: 5px; }
-.dl-file {
-  font-family: var(--mono); font-size: 12px; color: var(--grey);
-  padding: 6px 10px; background: var(--panel-2); border: 1px solid var(--line);
-  display: flex; align-items: baseline; gap: 8px;
-}
-.dl-ext { color: var(--green); flex-shrink: 0; }
-.dl-card .btn { margin-top: auto; align-self: flex-start; }
+  /* ─── Files window ─── */
+  .pathbar {
+    background: var(--bg);
+    border: 1px solid var(--chrome-dim);
+    padding: 10px 14px;
+    display: flex; align-items: center; gap: 14px;
+    font-size: 12px;
+    margin-bottom: 18px;
+  }
+  .pathbar .path { color: var(--green); }
+  .pathbar .btn-mini {
+    font-size: 10px;
+    letter-spacing: 0.1em;
+    color: var(--muted);
+    border: 1px solid var(--chrome-dim);
+    padding: 3px 8px;
+    text-transform: uppercase;
+  }
+  .files-grid {
+    display: grid;
+    grid-template-columns: minmax(0, 1.1fr) minmax(0, 1fr);
+    gap: 32px;
+    align-items: start;
+  }
+  table.files {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 13px;
+    border: 1px solid var(--chrome-dim);
+    background: var(--bg);
+  }
+  table.files th, table.files td {
+    padding: 9px 14px;
+    text-align: left;
+    border-bottom: 1px solid var(--chrome-dimmer);
+  }
+  table.files th {
+    font-size: 10px;
+    letter-spacing: 0.2em;
+    color: var(--muted-2);
+    text-transform: uppercase;
+    font-weight: 400;
+    background: transparent;
+  }
+  table.files td { color: var(--cream); }
+  table.files tr:last-child td { border-bottom: none; }
+  table.files .kind { color: var(--muted); font-size: 11px; margin-right: 10px; }
+  table.files tr.drop td.fname { color: var(--amber); }
+  table.files tr.alias td.fname { color: var(--muted); font-style: italic; }
+  table.files tr.alias td.fname .kind { color: var(--green); font-style: normal; }
+  table.files td.fsize { color: var(--muted); text-align: right; }
 
-/* ── quickstart ── */
-.qs-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 22px; margin-top: 28px; }
-.qs-block { display: flex; flex-direction: column; gap: 16px; }
-pre {
-  font-family: var(--mono); font-size: 13px; line-height: 1.6;
-  background: #040303; border: 1px solid var(--line);
-  padding: 16px 18px; overflow-x: auto; color: var(--ink);
-}
-pre .c { color: var(--grey-dim); }
-pre .g { color: var(--green); }
-pre .a { color: var(--amber); }
-.pre-lbl {
-  font-family: var(--mono); font-size: 10px; letter-spacing: .18em;
-  text-transform: uppercase; color: var(--grey-dim); margin-bottom: 7px;
-}
+  .caption {
+    font-family: 'IBM Plex Sans', system-ui, sans-serif;
+    color: #b8acad;
+    font-size: 15px;
+    line-height: 1.55;
+  }
+  .caption .k {
+    font-family: 'IBM Plex Mono', monospace;
+    color: var(--green);
+    font-size: 14px;
+  }
+  .caption h3 {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 11px;
+    letter-spacing: 0.2em;
+    color: var(--amber);
+    text-transform: uppercase;
+    margin: 0 0 12px;
+    font-weight: 500;
+  }
+  .caption p { margin: 0 0 14px; }
+  .caption p:last-child { margin: 0; }
 
-/* ── arch table ── */
-.arch-wrap { overflow-x: auto; border: 1px solid var(--line); margin-top: 24px; }
-table.arch { width: 100%; border-collapse: collapse; font-size: 13.5px; min-width: 500px; }
-table.arch th {
-  font-family: var(--mono); font-size: 10px; letter-spacing: .12em; text-transform: uppercase;
-  color: var(--grey-dim); padding: 9px 14px; background: var(--panel-2);
-  border-bottom: 1px solid var(--line); font-weight: 400; text-align: left;
-}
-table.arch td { padding: 10px 14px; border-bottom: 1px solid var(--line); vertical-align: top; }
-table.arch tr:last-child td { border-bottom: none; }
-table.arch tr:hover td { background: rgba(122,10,10,.06); }
-table.arch td:first-child { font-family: var(--mono); color: var(--green); font-size: 13px; white-space: nowrap; }
-.kind { font-family: var(--mono); font-size: 10px; letter-spacing: .1em; text-transform: uppercase; color: var(--grey-dim); }
+  /* ─── Admin split — user list and server history ─── */
+  .split {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    gap: 56px;
+    align-items: start;
+  }
+  .admin-list {
+    background: var(--bg);
+    border: 1px solid var(--chrome-dim);
+    padding: 16px 18px;
+    display: flex; flex-direction: column; gap: 10px;
+    font-size: 13px;
+  }
+  .admin-list .row {
+    display: grid;
+    grid-template-columns: auto 1fr auto;
+    align-items: center;
+    gap: 12px;
+    padding: 4px 0;
+  }
+  .admin-list .uname { color: var(--cream); }
+  .admin-list .uclass { color: var(--muted); font-size: 11px; letter-spacing: 0.1em; text-transform: uppercase; }
+  .history {
+    background: var(--bg);
+    border: 1px solid var(--chrome-dim);
+    padding: 16px 18px;
+    font-size: 12px;
+    display: flex; flex-direction: column; gap: 4px;
+    line-height: 1.7;
+  }
+  .history .ts { color: var(--muted); margin-right: 10px; }
+  .history .actor { color: var(--amber); margin-right: 6px; }
+  .history .act { color: var(--cream); }
+  .history .detail { color: var(--muted); }
 
-/* ── footer ── */
-footer {
-  border-top: 1px solid var(--line); padding-block: 32px;
-  display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 16px;
-}
-.ft-logo { font-family: var(--mono); font-size: 14px; font-weight: 700; color: var(--alert); letter-spacing: .32em; }
-.ft-meta { font-family: var(--mono); font-size: 11px; color: var(--grey-dim); }
-.ft-links { display: flex; gap: 20px; }
-.ft-links a { font-family: var(--mono); font-size: 11px; color: var(--grey); letter-spacing: .06em; }
-.ft-links a:hover { color: var(--green); }
+  /* ─── Get started window ─── */
+  .get-grid {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 24px;
+  }
+  .get-card {
+    border: 1px solid var(--chrome-dim);
+    background: var(--bg);
+    padding: 22px 20px;
+    display: flex; flex-direction: column; gap: 12px;
+  }
+  .get-card h3 {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 11px;
+    letter-spacing: 0.2em;
+    color: var(--amber);
+    text-transform: uppercase;
+    margin: 0;
+    font-weight: 500;
+  }
+  .get-card .cmd {
+    background: var(--win);
+    border: 1px solid var(--chrome-dimmer);
+    padding: 10px 12px;
+    color: var(--green);
+    font-size: 12px;
+    overflow-x: auto;
+    white-space: nowrap;
+  }
+  .get-card .cmd .prompt { color: var(--chrome); margin-right: 8px; }
+  .get-card p {
+    font-family: 'IBM Plex Sans', system-ui, sans-serif;
+    color: #a99c9d;
+    font-size: 13px;
+    margin: 0;
+  }
 
-/* ── responsive ── */
-@media (max-width: 780px) {
-  .ctx-grid   { grid-template-columns: 1fr; }
-  .feat-grid  { grid-template-columns: 1fr 1fr; }
-  .stats      { grid-template-columns: repeat(3, 1fr); }
-  .stat:nth-child(3) { border-right: none; }
-  .stat:nth-child(4), .stat:nth-child(5) { border-top: 1px solid var(--line); }
-  .dl-grid    { grid-template-columns: 1fr; }
-  .qs-grid    { grid-template-columns: 1fr; }
-  .hide-sm    { display: none; }
-}
-@media (max-width: 520px) {
-  .feat-grid  { grid-template-columns: 1fr; }
-  .stats      { grid-template-columns: 1fr 1fr; }
-  .stat:nth-child(2),
-  .stat:nth-child(4) { border-right: none; }
-  .stat:nth-child(3),
-  .stat:nth-child(5) { border-top: 1px solid var(--line); border-right: 1px solid var(--line); }
-}
-/* ── chat animation ── */
-.chat-line { opacity: 0; transition: opacity .12s ease; }
-.chat-line.cl-show { opacity: 1; }
-.chat-cursor::after {
-  content: "█";
-  color: var(--green);
-  animation: blink-cur .7s step-end infinite;
-}
-@keyframes blink-cur { 50% { opacity: 0; } }
+  /* ─── Docs window — reaches the interior pages ─── */
+  .docs-list {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 16px;
+  }
+  .docs-row {
+    border: 1px solid var(--chrome-dim);
+    background: var(--bg);
+    padding: 18px 20px;
+    display: flex; flex-direction: column; gap: 6px;
+    color: var(--cream);
+    transition: border-color 120ms, color 120ms, box-shadow 120ms;
+  }
+  .docs-row:hover {
+    border-color: var(--green);
+    color: var(--green);
+    box-shadow: 0 0 24px -8px rgba(53, 255, 112, 0.5);
+  }
+  .docs-row .meta {
+    font-size: 10px;
+    letter-spacing: 0.2em;
+    color: var(--muted);
+    text-transform: uppercase;
+  }
+  .docs-row:hover .meta { color: var(--amber); }
+  .docs-row .title {
+    font-weight: 500;
+    font-size: 15px;
+    letter-spacing: 0.02em;
+  }
+  .docs-row .desc {
+    font-family: 'IBM Plex Sans', system-ui, sans-serif;
+    font-size: 13px;
+    color: var(--muted);
+    margin-top: 4px;
+  }
+  .docs-row:hover .desc { color: #b8acad; }
 
-@media (prefers-reduced-motion: reduce) {
-  * { animation: none !important; transition: none !important; }
-  .chat-line { opacity: 1 !important; }
-}
+  /* ─── Dock — the signature piece. Collects minimized windows as you
+         scroll past them. Fixed at the bottom edge. ─── */
+  .dock {
+    position: fixed; left: var(--bar-w); right: 0; bottom: 0;
+    background: var(--bg);
+    border-top: 1px solid var(--chrome-dim);
+    padding: 10px 20px;
+    display: flex; align-items: center; gap: 10px;
+    z-index: 15;
+    min-height: 44px;
+    overflow-x: auto;
+  }
+  .dock-label {
+    font-size: 10px;
+    letter-spacing: 0.22em;
+    color: var(--muted-2);
+    text-transform: uppercase;
+    flex-shrink: 0;
+    margin-right: 6px;
+  }
+  .dock-item {
+    display: inline-flex; align-items: center; gap: 8px;
+    padding: 6px 12px;
+    background: var(--win);
+    border: 1px solid var(--chrome-dim);
+    color: var(--cream);
+    font-size: 11px;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    cursor: pointer;
+    transition: all 120ms;
+    flex-shrink: 0;
+    opacity: 0;
+    transform: translateY(8px);
+    animation: dock-in 300ms ease forwards;
+  }
+  @keyframes dock-in {
+    to { opacity: 1; transform: translateY(0); }
+  }
+  .dock-item:hover {
+    border-color: var(--green);
+    color: var(--green);
+  }
+  .dock-item .dot {
+    width: 7px; height: 7px; background: var(--chrome);
+    display: inline-block;
+  }
+  .dock-item:hover .dot { background: var(--green); }
+  .dock-empty {
+    color: var(--muted-2);
+    font-size: 11px;
+    font-style: italic;
+  }
+
+  /* ─── Footer ─── */
+  .colophon {
+    margin-top: 20px;
+    padding-top: 20px;
+    border-top: 1px dashed var(--chrome-dim);
+    display: flex; justify-content: space-between; gap: 20px;
+    color: var(--muted);
+    font-size: 11px;
+    letter-spacing: 0.1em;
+  }
+  .colophon .k { color: var(--muted-2); }
+
+  /* ─── Responsive ─── */
+  @media (max-width: 900px) {
+    :root { --bar-w: 0px; }
+    .buttonbar {
+      position: static;
+      width: 100%; height: auto; bottom: auto;
+      border-right: none;
+      border-bottom: 1px solid var(--chrome-dim);
+      flex-direction: row;
+      flex-wrap: wrap;
+      align-items: center;
+      padding: 14px 16px;
+      overflow: visible;
+    }
+    .bb-brand { padding: 0; border-bottom: none; margin: 0 16px 0 0; font-size: 18px; }
+    .bb-banner { display: none; }
+    .bb-group-label { display: none; }
+    /* Mobile keeps the ≥44px vertical touch target: 11px padding × 12px
+       font × 1.55 line-height ≈ 44px. */
+    .bb-item { padding: 11px 12px; border-bottom: 2px solid transparent; font-size: 12px; min-height: 44px; }
+    .bb-item.active { border-bottom-color: var(--chrome); }
+    .bb-item .mark { display: none; }
+    .bb-foot { display: none; }
+    .workspace { margin-left: 0; padding: 30px 18px 120px; }
+    /* Mobile grids: still minmax(0, 1fr) so a nowrap child in a
+       single-column layout (chat lines, cmd blocks) can't push the
+       page wider than the viewport. */
+    .hero-grid, .files-grid, .split { grid-template-columns: minmax(0, 1fr); gap: 24px; }
+    .chat-layout { grid-template-columns: minmax(0, 1fr); }
+    .chat-userlist { order: -1; }
+    .get-grid { grid-template-columns: minmax(0, 1fr); }
+    .docs-list { grid-template-columns: minmax(0, 1fr); }
+    .hero-greeting { padding: 24px 20px; }
+    .win-body { padding: 20px 18px; }
+    .dock { left: 0; padding: 8px 12px; }
+    .dock-label { display: none; }
+    .flow { gap: 36px; }
+  }
 </style>
 </head>
 <body>
 
-<!-- NAV -->
-<nav class="nav">
-  <div class="wrap">
-    <div class="nav-inner">
-      <a href="/" class="nav-logo">KDX</a>
-      <div class="nav-links">
-        <a href="kdx-explainer.html" class="hide-sm">Overview</a>
-        <a href="#features" class="hide-sm">Features</a>
-        <a href="#download" class="hide-sm">Download</a>
-        <a href="handoff.html" class="hide-sm">Docs</a>
-        <a href="https://github.com/iamkhayyam/kdx-hotline" class="nav-gh">GitHub ↗</a>
-      </div>
-    </div>
+<!-- Button Bar — the sticky left-column nav, pattern-ported from the real app -->
+<nav class="buttonbar" aria-label="Primary">
+  <div class="bb-brand">KDX</div>
+  <div class="bb-banner" role="status" aria-live="polite">
+    <span class="srv-name">your-place.kdx</span>
+    <span class="srv-meta">v0.3 · 4 users online · tls 1.3</span>
+  </div>
+
+  <a class="bb-item" href="#connect" data-nav="connect"><span class="mark"></span>Connect</a>
+  <a class="bb-item" href="#chat" data-nav="chat"><span class="mark"></span>Public Chat</a>
+  <a class="bb-item" href="#files" data-nav="files"><span class="mark"></span>Files</a>
+  <a class="bb-item" href="#users" data-nav="users"><span class="mark"></span>User List</a>
+  <a class="bb-item" href="#start" data-nav="start"><span class="mark"></span>Get Started</a>
+
+  <div class="bb-group-label">Docs</div>
+  <a class="bb-item" href="handoff-v0.2.html"><span class="mark"></span>Handoff v0.2<span class="bb-led" aria-hidden="true"></span></a>
+  <a class="bb-item" href="handoff.html"><span class="mark"></span>Handoff v0.1</a>
+  <a class="bb-item" href="packaging.html"><span class="mark"></span>Packaging</a>
+  <a class="bb-item" href="ui-concept.html"><span class="mark"></span>UI Concept</a>
+
+  <div class="bb-foot">
+    <span class="stat">[0] [0] [0]</span>
   </div>
 </nav>
 
-<!-- HERO -->
-<div class="hero">
-  <div class="wrap">
-    <div class="hero-inner">
-      <canvas id="logo" width="310" height="136" aria-label="KDX"></canvas>
+<main class="workspace">
+  <div class="flow">
 
-      <div style="display:flex;flex-direction:column;gap:12px">
-        <p class="hero-title">A Hotline revival.<br>Rebuilt from scratch in Rust.</p>
-        <p class="hero-desc">Custom binary protocol over TLS 1.3. Challenge-response auth where the password never leaves your machine. Chat rooms, a virtual file tree with drop boxes, and resumable chunked transfers — both directions.</p>
-      </div>
-
-      <div class="pills">
-        <span class="pill pg">Rust</span>
-        <span class="pill pr">TLS 1.3</span>
-        <span class="pill pa">Argon2id</span>
-        <span class="pill pg">Tauri v2</span>
-        <span class="pill pd">macOS · Windows · Linux</span>
-      </div>
-
-      <div class="ctas">
-        <a href="#download" class="btn btn-p">↓ Download</a>
-        <a href="https://github.com/iamkhayyam/kdx-hotline" class="btn btn-g">View Source</a>
-        <a href="handoff.html" class="btn btn-g">Documentation</a>
-      </div>
-    </div>
-  </div>
-</div>
-
-<!-- CONTEXT -->
-<section class="section" id="about">
-  <div class="wrap">
-    <div class="eyebrow">Background</div>
-    <h2>Remember Hotline?</h2>
-    <div class="ctx-grid">
-      <div class="ctx-copy">
-        <p>In the early 2000s, <strong>KDX</strong> was a peer-to-peer client for private file servers and IRC-style chat, speaking its own tight binary protocol over TCP. You connected to servers by hand, browsed their file trees, and talked to whoever was around. The interface was spare: black window, blood-red chrome, phosphor-green text.</p>
-        <p>This is a ground-up rebuild — same protocol energy, modern stack. Six Rust crates carry everything from the wire codec to the server daemon. The desktop client is a <strong>Tauri v2</strong> app that renders the original aesthetic on a modern webview.</p>
-        <p>It is fully functional: 243 tests, cross-platform packaging via GitHub Actions, and a feature set that covers everything the original KDX did — plus TLS 1.3 and modern cryptography it never had.</p>
-      </div>
-      <div class="chat" id="chat-demo" aria-label="Sample chat session">
-        <div class="chat-line" data-delay="0"><span class="c-ts">[09:14:21]</span><span class="c-ev">● connecting to phantom.local:10700…</span></div>
-        <div class="chat-line" data-delay="800"><span class="c-ts">[09:14:22]</span><span class="c-ev">✓ TLS 1.3 · cert fingerprint pinned</span></div>
-        <div class="chat-line" data-delay="1000"><span class="c-ts">[09:14:22]</span><span class="c-sys">server: Welcome to PHANTOM. Please identify.</span></div>
-        <div class="chat-line" data-delay="1200"><span class="c-ts">[09:14:22]</span><span class="c-ev">✓ logged in as phraq (power)</span></div>
-        <div class="chat-line" data-delay="1600"><span class="c-ts">[09:14:23]</span><span class="c-join">⬡ joined #lobby — 3 users online</span></div>
-        <div class="chat-line" data-delay="1700">&nbsp;</div>
-        <div class="chat-line" data-delay="3000"><span class="c-ts">[09:14:25]</span><span class="c-nick">&lt;relic&gt;</span> <span class="c-msg">phraq, been a while</span></div>
-        <div class="chat-line" data-delay="4500"><span class="c-ts">[09:14:31]</span><span class="c-nick">&lt;phraq&gt;</span> <span class="c-msg">running on Rust now. TLS and everything.</span></div>
-        <div class="chat-line" data-delay="5100"><span class="c-ts">[09:14:33]</span><span class="c-nick">&lt;relic&gt;</span> <span class="c-msg">wild</span></div>
-        <div class="chat-line" data-delay="5700"><span class="c-ts">[09:14:35]</span><span class="c-join">⬡ gust joined #lobby</span></div>
-        <div class="chat-line" data-delay="5800">&nbsp;</div>
-        <div class="chat-line" data-delay="7200"><span class="c-ts">[09:14:40]</span><span class="c-sys">» Files: 1,204 items · 47.2 GB available</span></div>
-      </div>
-    </div>
-  </div>
-</section>
-
-<!-- FEATURES -->
-<section class="section" id="features">
-  <div class="wrap">
-    <div class="eyebrow">What's inside</div>
-    <h2>Full stack, no shortcuts</h2>
-    <div class="feat-grid">
-      <div class="feat">
-        <div class="feat-id">PKT</div>
-        <div class="feat-name">Wire Protocol</div>
-        <div class="feat-body">Custom 20-byte framed binary packets with typed message IDs. Full codec, fragmentation, and reassembly — all handwritten in <code>kdx-protocol</code>.</div>
-      </div>
-      <div class="feat">
-        <div class="feat-id">KEY</div>
-        <div class="feat-name">Secure Auth</div>
-        <div class="feat-body">Passwords stored as <strong>Argon2id</strong> hashes. Login is challenge-response: <code>SHA-256(challenge ‖ verifier)</code>. The plaintext never crosses the wire.</div>
-      </div>
-      <div class="feat">
-        <div class="feat-id">#</div>
-        <div class="feat-name">Chat Rooms</div>
-        <div class="feat-body">Multi-room chat with flood protection, emotes, and broadcast messages. Per-room flags, kick and ban, server-wide admin broadcast.</div>
-      </div>
-      <div class="feat">
-        <div class="feat-id">FS</div>
-        <div class="feat-name">Virtual File Tree</div>
-        <div class="feat-body">Server-side file hierarchy with ACL-gated access. Drop boxes let users upload without read access. Alias nodes map one path to another without duplicating bytes.</div>
-      </div>
-      <div class="feat">
-        <div class="feat-id">XFR</div>
-        <div class="feat-name">Resumable Transfers</div>
-        <div class="feat-body">Chunked bidirectional transfers with a per-chunk progress bitmap. Interrupted downloads resume from the last confirmed chunk — no re-downloading from scratch.</div>
-      </div>
-      <div class="feat">
-        <div class="feat-id">REG</div>
-        <div class="feat-name">Tracker Registry</div>
-        <div class="feat-body">Public server directory. Servers announce themselves; clients query to discover available servers without knowing addresses in advance.</div>
-      </div>
-    </div>
-  </div>
-</section>
-
-<!-- STATS -->
-<section class="section">
-  <div class="wrap">
-    <div class="eyebrow">By the numbers</div>
-    <div class="stats">
-      <div class="stat">
-        <div class="stat-k">Tests</div>
-        <div class="stat-v">243 <small>passing</small></div>
-      </div>
-      <div class="stat">
-        <div class="stat-k">Crates</div>
-        <div class="stat-v">6 <small>+ 1 app</small></div>
-      </div>
-      <div class="stat">
-        <div class="stat-k">Platforms</div>
-        <div class="stat-v">3</div>
-      </div>
-      <div class="stat">
-        <div class="stat-k">Transport</div>
-        <div class="stat-v">TLS <small>1.3</small></div>
-      </div>
-      <div class="stat">
-        <div class="stat-k">Storage</div>
-        <div class="stat-v">SQLite</div>
-      </div>
-    </div>
-  </div>
-</section>
-
-<!-- DOWNLOAD -->
-<section class="section" id="download">
-  <div class="wrap">
-    <div class="eyebrow">Get it</div>
-    <h2>Download</h2>
-    <p>Pre-built binaries attach to every GitHub Release. The client runs standalone; the server daemon needs a config file and a data directory.</p>
-    <div class="dl-grid">
-      <div class="dl-card">
-        <div class="dl-os">macOS</div>
-        <div class="dl-files">
-          <div class="dl-file"><span class="dl-ext">.dmg</span> KDX_x.x.x_aarch64.dmg</div>
-          <div class="dl-file"><span class="dl-ext">.zip</span> kdxd-macos.zip</div>
-        </div>
-        <a href="https://github.com/iamkhayyam/kdx-hotline/releases/latest" class="btn btn-p">Latest Release ↗</a>
-      </div>
-      <div class="dl-card">
-        <div class="dl-os">Windows</div>
-        <div class="dl-files">
-          <div class="dl-file"><span class="dl-ext">.exe</span> KDX_x.x.x_x64-setup.exe</div>
-          <div class="dl-file"><span class="dl-ext">.zip</span> kdxd-windows.zip</div>
-        </div>
-        <a href="https://github.com/iamkhayyam/kdx-hotline/releases/latest" class="btn btn-p">Latest Release ↗</a>
-      </div>
-      <div class="dl-card">
-        <div class="dl-os">Linux</div>
-        <div class="dl-files">
-          <div class="dl-file"><span class="dl-ext">.deb</span> kdx_x.x.x_amd64.deb</div>
-          <div class="dl-file"><span class="dl-ext">.AppImage</span> kdx_x.x.x.AppImage</div>
-          <div class="dl-file"><span class="dl-ext">.zip</span> kdxd-linux.zip</div>
-        </div>
-        <a href="https://github.com/iamkhayyam/kdx-hotline/releases/latest" class="btn btn-p">Latest Release ↗</a>
-      </div>
-    </div>
-  </div>
-</section>
-
-<!-- QUICK START -->
-<section class="section" id="quickstart">
-  <div class="wrap">
-    <div class="eyebrow">Run it yourself</div>
-    <h2>Quick start</h2>
-    <div class="qs-grid">
-      <div class="qs-block">
-        <div>
-          <div class="pre-lbl">Server</div>
-<pre><span class="c"># create an account (guest|user|power|admin)</span>
-<span class="g">cargo</span> run -p kdxd -- useradd phraq s3cret power
-
-<span class="c"># start the server (0.0.0.0:10700, self-signed cert)</span>
-<span class="g">cargo</span> run -p kdxd
-
-<span class="c"># or point at a config file</span>
-<span class="g">cargo</span> run -p kdxd -- <span class="a">kdxd.toml</span></pre>
+    <!-- ─── CONNECT — hero ─── -->
+    <section class="win" id="connect" data-title="Connect">
+      <div class="titlebar">
+        <div class="tb-close" aria-hidden="true">×</div>
+        <h2 class="tb-title"><span class="tb-menu" aria-hidden="true"></span>Connect</h2>
+        <div class="tb-actions">
+          <div class="tb-btn" aria-hidden="true">+</div>
+          <div class="tb-btn" aria-hidden="true">−</div>
         </div>
       </div>
-      <div class="qs-block">
-        <div>
-          <div class="pre-lbl">Client</div>
-<pre><span class="c"># launch the desktop client</span>
-<span class="g">cargo</span> run -p kdx-client</pre>
-        </div>
-        <div>
-          <div class="pre-lbl">Build &amp; test</div>
-<pre><span class="g">cargo</span> build --workspace
-<span class="g">cargo</span> test  --workspace  <span class="c"># no external services needed</span></pre>
-        </div>
-        <div>
-          <div class="pre-lbl">Package (requires target OS)</div>
-<pre><span class="g">cargo</span> install tauri-cli --version <span class="a">'^2'</span>
-<span class="g">cargo</span> tauri build</pre>
+
+      <div class="win-body">
+        <div class="hero-grid">
+          <div class="hero-greeting">
+            <div class="label">Server greeting</div>
+            <h1>Less feed<span class="dot">.</span><br><span class="green">More place</span><span class="dot">.</span></h1>
+            <p>KDX is a private community server you host yourself. Chat, files, people, and a door that locks. No feed, no ranking, no one selling ads against your evenings.</p>
+          </div>
+
+          <div class="form-mock" aria-hidden="true">
+            <div class="fm-row">
+              <span class="fm-label">Server</span>
+              <div class="fm-field">your-place.kdx<span class="caret"></span></div>
+            </div>
+            <div class="fm-row">
+              <span class="fm-label">Login</span>
+              <div class="fm-field">guest</div>
+            </div>
+            <div class="fm-row">
+              <span class="fm-label">Password</span>
+              <div class="fm-field dim"></div>
+            </div>
+            <div class="cta-row">
+              <a class="btn" href="#start">Authenticate <span class="arrow">→</span></a>
+              <a class="btn ghost" href="#chat">Look around</a>
+            </div>
+            <div class="hint">Challenge-response over TLS 1.3. Your password never leaves this machine. The server sends a one-time challenge and gets back only a keyed digest.</div>
+          </div>
         </div>
       </div>
-    </div>
-  </div>
-</section>
+    </section>
 
-<!-- ARCHITECTURE -->
-<section class="section" id="architecture">
-  <div class="wrap">
-    <div class="eyebrow">Code layout</div>
-    <h2>Architecture</h2>
-    <p>Seven packages in one Cargo workspace. Each layer depends only on the ones below it; the client app has no compile-time dependency on the server.</p>
-    <div class="arch-wrap">
-      <table class="arch">
-        <thead>
-          <tr><th>Crate</th><th>Kind</th><th>Responsibility</th></tr>
-        </thead>
-        <tbody>
-          <tr>
-            <td>kdx-protocol</td>
-            <td><span class="kind">lib</span></td>
-            <td>Wire format — 20-byte framed packets, codec, fragmentation, typed message IDs</td>
-          </tr>
-          <tr>
-            <td>kdx-crypto</td>
-            <td><span class="kind">lib</span></td>
-            <td>Argon2id password hashing and the challenge-response login handshake</td>
-          </tr>
-          <tr>
-            <td>kdx-storage</td>
-            <td><span class="kind">lib</span></td>
-            <td>SQLite persistence via sqlx — accounts, roles, file metadata, news, tracker entries</td>
-          </tr>
-          <tr>
-            <td>kdx-server-core</td>
-            <td><span class="kind">lib</span></td>
-            <td>Connection state machine, auth, chat rooms, virtual file tree, transfers, IP rules, audit log</td>
-          </tr>
-          <tr>
-            <td>kdx-client-core</td>
-            <td><span class="kind">lib</span></td>
-            <td>Async client library with zero UI deps — TOFU trust store, transfer engines</td>
-          </tr>
-          <tr>
-            <td>kdxd</td>
-            <td><span class="kind">binary</span></td>
-            <td>Server daemon — TLS listener, TOML config file, admin CLI sub-commands</td>
-          </tr>
-          <tr>
-            <td>kdx-client</td>
-            <td><span class="kind">tauri app</span></td>
-            <td>Desktop client — Rust shell + vanilla-JS webview; each feature in its own floating window</td>
-          </tr>
-        </tbody>
-      </table>
-    </div>
-  </div>
-</section>
+    <!-- ─── PUBLIC CHAT — the manifesto delivered as sysop messages ─── -->
+    <section class="win" id="chat" data-title="Public Chat">
+      <div class="titlebar">
+        <div class="tb-close" aria-hidden="true">×</div>
+        <h2 class="tb-title"><span class="tb-menu" aria-hidden="true"></span>Public Chat</h2>
+        <div class="tb-actions">
+          <div class="tb-btn" aria-hidden="true">+</div>
+          <div class="tb-btn" aria-hidden="true">−</div>
+        </div>
+      </div>
 
-<!-- FOOTER -->
-<footer class="wrap">
-  <span class="ft-logo">KDX</span>
-  <span class="ft-meta">Open source · MIT license · Built with Rust &amp; Tauri</span>
-  <div class="ft-links">
-    <a href="https://github.com/iamkhayyam/kdx-hotline">GitHub</a>
-    <a href="handoff.html">Docs</a>
-    <a href="https://github.com/iamkhayyam/kdx-hotline/releases">Releases</a>
-    <a href="https://github.com/iamkhayyam/kdx-hotline/issues">Issues</a>
+      <div class="win-body">
+        <div class="topicbar">
+          <div><span class="topic-label">Topic</span><span class="topic-text">a place that doesn't want anything from you · set by sysop · 14:12</span></div>
+          <div style="color: var(--muted);">4 online</div>
+        </div>
+
+        <div class="chat-layout">
+          <div class="chat-scroll">
+            <div class="chat-line sys"><span class="ts">14:08</span>*** phraq joined</div>
+            <div class="chat-line"><span class="ts">14:09</span><span class="nick">&lt;sysop&gt;</span> welcome back</div>
+            <div class="chat-line"><span class="ts">14:11</span><span class="nick">&lt;sysop&gt;</span> everything on this server stays on this server</div>
+            <div class="chat-line"><span class="ts">14:11</span><span class="nick">&lt;sysop&gt;</span> no feed, no ranking, no notifications you didn't ask for</div>
+            <div class="chat-line"><span class="ts">14:12</span><span class="nick">&lt;sysop&gt;</span> just the people you invited and the things you decided to keep</div>
+            <div class="chat-line action"><span class="ts">14:12</span>*** sysop set the topic</div>
+            <div class="chat-line"><span class="ts">14:13</span><span class="nick">&lt;phraq&gt;</span> we used to run bbs's for the same reasons</div>
+            <div class="chat-line"><span class="ts">14:14</span><span class="nick">&lt;phraq&gt;</span> cost was a server, time, and knowing who you let in</div>
+            <div class="chat-line"><span class="ts">14:14</span><span class="nick">&lt;sysop&gt;</span> same costs. same payoff.</div>
+            <div class="chat-line sys"><span class="ts">14:15</span>*** acidburn joined</div>
+            <div class="chat-line"><span class="ts">14:15</span><span class="nick">&lt;acidburn&gt;</span> hey</div>
+          </div>
+          <aside class="chat-userlist">
+            <div class="hdr">Online · 4</div>
+            <div class="u"><span class="class-bar admin"></span>sysop</div>
+            <div class="u"><span class="class-bar power"></span>phraq</div>
+            <div class="u"><span class="class-bar user"></span>acidburn</div>
+            <div class="u"><span class="class-bar guest"></span>guest</div>
+          </aside>
+        </div>
+      </div>
+    </section>
+
+    <!-- ─── FILES — the file tree + a caption on the access model ─── -->
+    <section class="win" id="files" data-title="Files">
+      <div class="titlebar">
+        <div class="tb-close" aria-hidden="true">×</div>
+        <h2 class="tb-title"><span class="tb-menu" aria-hidden="true"></span>Files</h2>
+        <div class="tb-actions">
+          <div class="tb-btn" aria-hidden="true">+</div>
+          <div class="tb-btn" aria-hidden="true">−</div>
+        </div>
+      </div>
+
+      <div class="win-body">
+        <div class="pathbar" aria-hidden="true">
+          <span class="path">/</span>
+          <span class="btn-mini">Up</span>
+          <span class="btn-mini">New Folder</span>
+          <span class="btn-mini">Search</span>
+          <span class="btn-mini">Upload</span>
+        </div>
+
+        <div class="files-grid">
+          <table class="files">
+            <thead><tr><th>Name</th><th style="text-align:right">Size</th></tr></thead>
+            <tbody>
+              <tr><td class="fname"><span class="kind">[DIR]</span>pub</td><td class="fsize"></td></tr>
+              <tr><td class="fname"><span class="kind">[DIR]</span>archive</td><td class="fsize"></td></tr>
+              <tr class="drop"><td class="fname"><span class="kind">[DROP]</span>submissions</td><td class="fsize"></td></tr>
+              <tr><td class="fname"><span class="kind">[FILE]</span>readme.txt</td><td class="fsize">2.1 KB</td></tr>
+              <tr><td class="fname"><span class="kind">[FILE]</span>mixtape-07.flac</td><td class="fsize">41 MB</td></tr>
+              <tr class="alias"><td class="fname"><span class="kind">[→]</span>scrapbook</td><td class="fsize"></td></tr>
+              <tr class="alias"><td class="fname"><span class="kind">[→]</span>mixtape-latest.flac</td><td class="fsize">41 MB</td></tr>
+            </tbody>
+          </table>
+
+          <div class="caption">
+            <h3>How files work here</h3>
+            <p><span class="k">[DIR]</span> is a folder, <span class="k">[FILE]</span> is a file. A <span class="k">[DROP]</span> box is a folder people can write into but no one can list: the write-only vault for submissions.</p>
+            <p>An <span class="k">[→]</span> alias is a soft pointer. The same bytes appear in two places without duplicating on disk, and the target's own class gate still applies: you can't bypass a stricter folder by aliasing it into a permissive one.</p>
+            <p>Access is a class check against the folder, and the folder is the whole fence. No cloud, no API, no third party. The bytes live on your disk.</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ─── USERS + ADMIN — split-window view ─── -->
+    <section class="win" id="users" data-title="Administration">
+      <div class="titlebar">
+        <div class="tb-close" aria-hidden="true">×</div>
+        <h2 class="tb-title"><span class="tb-menu" aria-hidden="true"></span>Administration</h2>
+        <div class="tb-actions">
+          <div class="tb-btn" aria-hidden="true">+</div>
+          <div class="tb-btn" aria-hidden="true">−</div>
+        </div>
+      </div>
+
+      <div class="win-body">
+        <div class="split">
+          <div>
+            <div class="caption" style="margin-bottom: 16px;">
+              <h3>User List</h3>
+            </div>
+            <div class="admin-list">
+              <div class="row"><span class="class-bar admin"></span><span class="uname">sysop</span><span class="uclass">admin</span></div>
+              <div class="row"><span class="class-bar power"></span><span class="uname">phraq</span><span class="uclass">power user</span></div>
+              <div class="row"><span class="class-bar user"></span><span class="uname">acidburn</span><span class="uclass">user</span></div>
+              <div class="row"><span class="class-bar guest"></span><span class="uname">guest</span><span class="uclass">guest</span></div>
+            </div>
+            <div class="caption" style="margin-top: 20px;">
+              <p>Four base classes, custom roles on top, bans that expire. If someone has to leave, you kick them. If they shouldn't come back, you ban the IP: a CIDR check that runs before TLS so the handshake never happens.</p>
+            </div>
+          </div>
+
+          <div>
+            <div class="caption" style="margin-bottom: 16px;">
+              <h3>Server History</h3>
+            </div>
+            <div class="history">
+              <div><span class="ts">14:08</span><span class="actor">guest</span><span class="act">login</span></div>
+              <div><span class="ts">14:12</span><span class="actor">sysop</span><span class="act">topic_set</span> <span class="detail">lobby</span></div>
+              <div><span class="ts">14:18</span><span class="actor">sysop</span><span class="act">role_assigned</span> <span class="detail">target=phraq, role=moderator</span></div>
+              <div><span class="ts">14:22</span><span class="actor">sysop</span><span class="act">kicked</span> <span class="detail">target=spammer_42, reason=links</span></div>
+              <div><span class="ts">14:24</span><span class="actor">sysop</span><span class="act">ip_rule_created</span> <span class="detail">deny 5.5.5.0/24</span></div>
+              <div><span class="ts">14:30</span><span class="actor">system</span><span class="act">ip_denied</span> <span class="detail">peer=5.5.5.7, note=links</span></div>
+              <div><span class="ts">14:35</span><span class="actor">sysop</span><span class="act">newsgroup_created</span> <span class="detail">#dev</span></div>
+            </div>
+            <div class="caption" style="margin-top: 20px;">
+              <p>Every admin action is logged to a persistent audit trail. The log is admin-only and append-only: the receipts you need when something goes sideways.</p>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ─── GET STARTED ─── -->
+    <section class="win" id="start" data-title="Get Started">
+      <div class="titlebar">
+        <div class="tb-close" aria-hidden="true">×</div>
+        <h2 class="tb-title"><span class="tb-menu" aria-hidden="true"></span>Get Started</h2>
+        <div class="tb-actions">
+          <div class="tb-btn" aria-hidden="true">+</div>
+          <div class="tb-btn" aria-hidden="true">−</div>
+        </div>
+      </div>
+
+      <div class="win-body">
+        <div class="get-grid">
+          <div class="get-card">
+            <h3>Run the server</h3>
+            <div class="cmd"><span class="prompt">$</span>cargo install --git https://github.com/iamkhayyam/kdx-hotline kdxd</div>
+            <p>Rust binary, SQLite under the hood, TLS cert self-generated on first run. One port, one process, your box.</p>
+          </div>
+          <div class="get-card">
+            <h3>Get the client</h3>
+            <div class="cmd"><span class="prompt">$</span>cargo install --git https://github.com/iamkhayyam/kdx-hotline kdx-client</div>
+            <p>Tauri desktop app for macOS, Linux, Windows. Trust-on-first-use certificate pinning. Also runs in a browser against the dist bundle.</p>
+          </div>
+          <div class="get-card">
+            <h3>Read the source</h3>
+            <div class="cmd"><span class="prompt">$</span>git clone https://github.com/iamkhayyam/kdx-hotline</div>
+            <p>Everything is on GitHub. Rust workspace, ~230 tests, clippy clean. Protocol is binary and documented in the handoff docs.</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ─── DOCS — the interior pages ─── -->
+    <section class="win" id="docs" data-title="Docs">
+      <div class="titlebar">
+        <div class="tb-close" aria-hidden="true">×</div>
+        <h2 class="tb-title"><span class="tb-menu" aria-hidden="true"></span>Docs</h2>
+        <div class="tb-actions">
+          <div class="tb-btn" aria-hidden="true">+</div>
+          <div class="tb-btn" aria-hidden="true">−</div>
+        </div>
+      </div>
+
+      <div class="win-body">
+        <div class="docs-list">
+          <a class="docs-row" href="handoff-v0.2.html">
+            <span class="meta">v0.2 · latest</span>
+            <span class="title">Engineering handoff</span>
+            <span class="desc">Current architecture, protocol packet table, actor layout, and the whole feature inventory.</span>
+          </a>
+          <a class="docs-row" href="handoff.html">
+            <span class="meta">v0.1 · historical</span>
+            <span class="title">Engineering handoff (early)</span>
+            <span class="desc">The first-pass handoff from before the deferred items landed. Kept for context.</span>
+          </a>
+          <a class="docs-row" href="packaging.html">
+            <span class="meta">build + distribution</span>
+            <span class="title">Packaging</span>
+            <span class="desc">How to build the server and the Tauri client for each platform, and how to sign and ship.</span>
+          </a>
+          <a class="docs-row" href="ui-concept.html">
+            <span class="meta">design brief</span>
+            <span class="title">UI concept</span>
+            <span class="desc">The window-system brief that this landing is built on. Button Bar, Dock, window chrome anatomy.</span>
+          </a>
+        </div>
+
+        <div class="colophon">
+          <span>A rebuild of Haxial KDX (2001). Written in Rust. Not affiliated with Haxial.</span>
+          <span class="k">kdx-duo.pages.dev</span>
+        </div>
+      </div>
+    </section>
+
   </div>
-</footer>
+</main>
+
+<!-- ─── Dock — accumulates minimized windows as you scroll past them ─── -->
+<aside class="dock" id="dock" aria-label="Minimized windows">
+  <span class="dock-label">Dock</span>
+  <span class="dock-empty" id="dock-empty">windows minimize here as you scroll</span>
+</aside>
 
 <script>
-(function () {
-  var GLYPHS = {
-    K: [[1,0,0,0,1],[1,0,0,1,0],[1,0,1,0,0],[1,1,0,0,0],[1,0,1,0,0],[1,0,0,1,0],[1,0,0,0,1]],
-    D: [[1,1,1,0,0],[1,0,0,1,0],[1,0,0,0,1],[1,0,0,0,1],[1,0,0,0,1],[1,0,0,1,0],[1,1,1,0,0]],
-    X: [[1,0,0,0,1],[1,0,0,0,1],[0,1,0,1,0],[0,0,1,0,0],[0,1,0,1,0],[1,0,0,0,1],[1,0,0,0,1]]
-  };
-  var DOT = 14, GAP = 3, LGAP = 22, PAD = 10;
-  var lw = 5 * DOT + 4 * GAP;   // 82
-  var lh = 7 * DOT + 6 * GAP;   // 116
-  var W  = lw * 3 + LGAP * 2 + PAD * 2; // 310
-  var H  = lh + PAD * 2;                // 136
+  // The Dock-accumulation choreography. One IntersectionObserver watches
+  // every section window; when a window scrolls above the top of the
+  // viewport, it enters the Dock. When it comes back into view it's
+  // removed. The Button Bar's active-item state is driven by the same
+  // observer so the two stay in sync.
+  const windows = Array.from(document.querySelectorAll('.win[id]'));
+  const navItems = Array.from(document.querySelectorAll('[data-nav]'));
+  const dock = document.getElementById('dock');
+  const dockEmpty = document.getElementById('dock-empty');
+  const prefersReducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 
-  var canvas = document.getElementById('logo');
-  canvas.width  = W;
-  canvas.height = H;
-  var ctx = canvas.getContext('2d');
+  const minimized = new Set();
 
-  function drawAll(blinkOn) {
-    ctx.clearRect(0, 0, W, H);
-    ['K','D','X'].forEach(function (ch, li) {
-      var glyph = GLYPHS[ch];
-      var ox = PAD + li * (lw + LGAP);
-      glyph.forEach(function (row, ri) {
-        row.forEach(function (on, ci) {
-          if (!on) return;
-          var x = ox + ci * (DOT + GAP);
-          var y = PAD + ri * (DOT + GAP);
-          var hot = (ri === 0 && ci === 0) && blinkOn;
-          // glow
-          ctx.fillStyle = hot ? 'rgba(225,27,27,.14)' : 'rgba(61,245,110,.12)';
-          ctx.fillRect(x - 3, y - 3, DOT + 6, DOT + 6);
-          // pixel
-          ctx.fillStyle = hot ? '#e11b1b' : '#3df56e';
-          ctx.fillRect(x, y, DOT, DOT);
-        });
-      });
-    });
-  }
-
-  drawAll(false);
-
-  // subtle corner-pixel flicker — respects prefers-reduced-motion
-  var mq = window.matchMedia('(prefers-reduced-motion: reduce)');
-  if (!mq.matches) {
-    var blink = false;
-    setInterval(function () {
-      blink = !blink;
-      drawAll(blink);
-    }, 1400);
-  }
-})();
-</script>
-
-<script>
-(function () {
-  var chat = document.getElementById('chat-demo');
-  if (!chat) return;
-  var lines = Array.from(chat.querySelectorAll('.chat-line'));
-  var allTimers = [];
-  var running = false;
-  var loopTimer = null;
-
-  // Snapshot original HTML for each line so we can reset cleanly
-  var origHTML = lines.map(function (l) { return l.innerHTML; });
-
-  function addTimer(fn, delay) {
-    var t = setTimeout(fn, delay);
-    allTimers.push(t);
-    return t;
-  }
-
-  function reset() {
-    allTimers.forEach(clearTimeout);
-    allTimers = [];
-    clearTimeout(loopTimer);
-    running = false;
-    lines.forEach(function (l, i) {
-      l.innerHTML = origHTML[i];
-      l.classList.remove('cl-show', 'chat-cursor');
-    });
-  }
-
-  // Type out a line's non-timestamp content character by character.
-  // Calls done() when finished.
-  function typeOut(line, done) {
-    // Collect segments from original HTML already parsed in DOM
-    var segments = [];
-    line.childNodes.forEach(function (node) {
-      if (node.nodeType === 3) {           // bare text node (e.g. space between nick and msg)
-        var t = node.textContent;
-        if (t) segments.push({ cls: null, text: t });
-      } else if (node.nodeName === 'SPAN') {
-        segments.push({ cls: node.className, text: node.textContent });
-      }
-    });
-
-    if (!segments.length) { line.classList.add('cl-show'); done && done(); return; }
-
-    // Determine per-character speed based on content type
-    var hasMsg = segments.some(function (s) { return s.cls === 'c-msg'; });
-    var charMs = hasMsg ? 52 : 22;   // chat: ~52ms/char; system: ~22ms/char
-
-    // Wipe and show shell
-    line.innerHTML = '';
-    line.classList.add('cl-show');
-
-    // Show timestamp instantly (first segment if c-ts)
-    var si = 0;
-    if (segments[0] && segments[0].cls === 'c-ts') {
-      var ts = document.createElement('span');
-      ts.className = 'c-ts';
-      ts.textContent = segments[0].text;
-      line.appendChild(ts);
-      si = 1;
+  function updateDock() {
+    // Preserve document order so the Dock reads top-to-bottom in the
+    // same sequence the user scrolled past.
+    const items = windows
+      .filter(w => minimized.has(w.id))
+      .map(w => ({ id: w.id, title: w.dataset.title }));
+    dock.querySelectorAll('.dock-item').forEach(el => el.remove());
+    dockEmpty.style.display = items.length ? 'none' : '';
+    for (const it of items) {
+      const el = document.createElement('a');
+      el.className = 'dock-item';
+      el.href = '#' + it.id;
+      el.innerHTML = '<span class="dot" aria-hidden="true"></span>' + it.title;
+      dock.appendChild(el);
     }
-
-    // Flatten remaining into {cls, ch} pairs
-    var chars = [];
-    for (var i = si; i < segments.length; i++) {
-      var seg = segments[i];
-      seg.text.split('').forEach(function (ch) {
-        chars.push({ cls: seg.cls, ch: ch });
-      });
-    }
-
-    var idx = 0;
-    var curSpan = null;
-    var curCls = '__none__';
-
-    function tick() {
-      if (idx >= chars.length) { done && done(); return; }
-      var item = chars[idx++];
-      if (item.cls !== curCls) {
-        curCls = item.cls;
-        if (item.cls === null) {
-          curSpan = null;   // will use text node
-        } else {
-          curSpan = document.createElement('span');
-          curSpan.className = item.cls;
-          line.appendChild(curSpan);
-        }
-      }
-      if (curSpan) {
-        curSpan.textContent += item.ch;
-      } else {
-        line.appendChild(document.createTextNode(item.ch));
-        curSpan = null; curCls = null;  // reset so next char gets fresh node
-      }
-      addTimer(tick, charMs);
-    }
-
-    addTimer(tick, 0);
   }
 
-  // Pre-compute type duration from original HTML (before DOM is wiped during animation)
-  var lineDurations = lines.map(function (l) {
-    var tmp = document.createElement('div');
-    tmp.innerHTML = origHTML[l.dataset ? Array.from(chat.querySelectorAll('.chat-line')).indexOf(l) : 0] || origHTML[lines.indexOf(l)];
-    var text = tmp.textContent.replace(/\[\d+:\d+:\d+\]/, '');
-    var hasMsg = !!tmp.querySelector('.c-msg');
-    return text.length * (hasMsg ? 52 : 22);
-  });
-
-  function play() {
-    if (running) return;
-    running = true;
-
-    var cursor = null;
-    var wallclock = 0;
-
-    lines.forEach(function (line, i) {
-      var startAt = parseInt(line.dataset.delay, 10) || 0;
-      wallclock = Math.max(wallclock, startAt);
-
-      (function (startDelay, lineEl, lineIdx) {
-        addTimer(function () {
-          // Remove cursor from previous line
-          if (cursor) cursor.classList.remove('chat-cursor');
-
-          // Blank / nbsp lines: just show
-          if (!lineEl.textContent.trim()) {
-            lineEl.classList.add('cl-show');
-            cursor = null;
-            return;
-          }
-
-          // Put cursor on this line while typing
-          lineEl.classList.add('chat-cursor');
-          cursor = lineEl;
-
-          typeOut(lineEl, function () {
-            // cursor stays until next line takes over; on the last line, remove after pause
-            if (lineIdx === lines.length - 1) {
-              addTimer(function () {
-                lineEl.classList.remove('chat-cursor');
-                // loop
-                loopTimer = setTimeout(function () {
-                  reset();
-                  play();
-                }, 2200);
-              }, 900);
-            }
-          });
-        }, startDelay);
-      })(wallclock, line, i);
-
-      wallclock += lineDurations[i] + 80;
-    });
+  function setActive(id) {
+    for (const n of navItems) n.classList.toggle('active', n.dataset.nav === id);
   }
 
-  var io = new IntersectionObserver(function (entries) {
-    entries.forEach(function (e) {
-      if (e.isIntersecting) { if (!running) play(); }
-      else                  { reset(); }
-    });
-  }, { threshold: 0.35 });
+  // Minimize when a window scrolls above the viewport. Un-minimize when
+  // it re-enters.
+  const minObs = new IntersectionObserver((entries) => {
+    for (const e of entries) {
+      const id = e.target.id;
+      const bottomPastTop = e.boundingClientRect.bottom < 0;
+      if (!e.isIntersecting && bottomPastTop) {
+        minimized.add(id);
+        e.target.classList.add('minimized');
+      } else if (e.isIntersecting) {
+        minimized.delete(id);
+        e.target.classList.remove('minimized');
+      }
+    }
+    updateDock();
+  }, { rootMargin: '0px 0px -40% 0px', threshold: 0 });
 
-  io.observe(chat);
-})();
+  // Separate observer to drive the Button Bar's active state — the one
+  // whose top is highest in the viewport wins.
+  const activeObs = new IntersectionObserver((entries) => {
+    const visible = entries
+      .filter(e => e.isIntersecting)
+      .sort((a, b) => a.boundingClientRect.top - b.boundingClientRect.top);
+    if (visible.length) setActive(visible[0].target.id);
+  }, { rootMargin: '-20% 0px -60% 0px', threshold: 0 });
+
+  for (const w of windows) {
+    minObs.observe(w);
+    activeObs.observe(w);
+  }
 </script>
 
 </body>

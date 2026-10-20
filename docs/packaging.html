@@ -97,6 +97,46 @@
 </style>
 </head>
 <body>
+<!-- Home affordance: fixed-position back-to-landing pill. Self-contained
+     styles under a .kdx-home scope so none of the host page's existing
+     tokens can collide. Mono fallback stack avoids a Google Fonts round
+     trip on these interior docs. 44px min-height for touch targets. -->
+<style>
+  .kdx-home {
+    position: fixed;
+    top: 14px; right: 14px;
+    z-index: 10000;
+    display: inline-flex;
+    align-items: center;
+    gap: 10px;
+    min-height: 44px;
+    padding: 0 16px;
+    background: rgba(10, 4, 5, 0.92);
+    border: 1px solid #4a1b1e;
+    color: #e8dddd;
+    font: 700 11px/1 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+    text-decoration: none;
+    transition: color 120ms, border-color 120ms;
+  }
+  .kdx-home:hover, .kdx-home:focus-visible {
+    color: #35ff70;
+    border-color: #35ff70;
+  }
+  .kdx-home:focus-visible {
+    outline: 2px solid #ffbf3d;
+    outline-offset: 2px;
+  }
+  .kdx-home .arrow { font-size: 15px; letter-spacing: 0; line-height: 1; }
+  @media (max-width: 600px) {
+    .kdx-home { top: 10px; right: 10px; padding: 0 12px; }
+  }
+</style>
+<a class="kdx-home" href="index.html" aria-label="Back to KDX home">
+  <span class="arrow" aria-hidden="true">←</span><span>KDX</span>
+</a>
+
 <div class="page">
 
   <p class="doc-sub">
