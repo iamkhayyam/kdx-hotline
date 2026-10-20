@@ -1,0 +1,28 @@
+<!--
+  Sovereign KDX favicon. Distills the real KDX titlebar signature into a
+  single 32-pixel mark: the diagonal red/black hatched chrome, plus the
+  solid-cutout "title patch" that holds a tiny green server-online LED.
+  Reads crisply at tab size (16px), on dock icons (32px), and when scaled
+  up for OS Share sheets. Monochrome-safe (strips alone read as the mark).
+-->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" shape-rendering="crispEdges">
+  <!-- Window body background, matches the landing's warm-black. -->
+  <rect width="32" height="32" fill="#140B0C"/>
+
+  <!-- Hatched red stripes at 135°, drawn as rotated rects so each edge
+       lands on a pixel boundary (no AA mush at small sizes). -->
+  <g transform="translate(16 16) rotate(45)">
+    <rect x="-32" y="-20" width="64" height="4" fill="#FF1821"/>
+    <rect x="-32" y="-10" width="64" height="4" fill="#FF1821"/>
+    <rect x="-32" y="0"   width="64" height="4" fill="#FF1821"/>
+    <rect x="-32" y="10"  width="64" height="4" fill="#FF1821"/>
+    <rect x="-32" y="20"  width="64" height="4" fill="#FF1821"/>
+  </g>
+
+  <!-- The "title cutout" patch — the solid dark bar that holds the window
+       title in a real KDX chrome bar. Here it holds a tiny LED pip. -->
+  <rect x="4" y="13" width="24" height="6" fill="#0A0A0C"/>
+
+  <!-- WonderLight LED — the authentic green server-online indicator. -->
+  <circle cx="16" cy="16" r="2" fill="#35FF70"/>
+</svg>
