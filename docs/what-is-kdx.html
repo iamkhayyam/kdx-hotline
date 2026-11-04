@@ -1,0 +1,819 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>What is KDX? — Sovereign KDX</title>
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<link rel="icon" href="favicon.ico" sizes="32x32 16x16">
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
+<meta name="description" content="KDX is a private community server you host yourself — chat, files, and controlled access. The place that belongs to you, not to a platform.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;700&family=IBM+Plex+Sans:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #0A0A0C;
+    --win: #140B0C;
+    --win-2: #180D0E;
+    --chrome: #FF1821;
+    --chrome-dim: #4A1B1E;
+    --chrome-dimmer: #2A0F11;
+    --green: #35FF70;
+    --green-dim: #1a8a3f;
+    --amber: #FFBF3D;
+    --cream: #E8DDDD;
+    --muted: #9A8A8C;
+    --muted-2: #4A3F41;
+    --class-guest: #6b6263;
+    --class-user: #35FF70;
+    --class-power: #FFBF3D;
+    --class-admin: #FF1821;
+    --max: 1180px;
+    --bar-w: 240px;
+  }
+
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; overflow-x: hidden; }
+  @media (prefers-reduced-motion: reduce) {
+    html { scroll-behavior: auto; }
+    *, *::before, *::after { animation-duration: 0.001ms !important; transition-duration: 0.001ms !important; }
+  }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--cream);
+    font-family: 'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 14px;
+    line-height: 1.55;
+    -webkit-font-smoothing: antialiased;
+    overflow-x: hidden;
+  }
+  body::before {
+    content: '';
+    position: fixed; inset: 0; pointer-events: none; z-index: 0;
+    background:
+      radial-gradient(circle at 72% 8%, rgba(255, 24, 33, 0.08), transparent 55%),
+      radial-gradient(circle at 10% 95%, rgba(53, 255, 112, 0.025), transparent 50%);
+  }
+
+  a { color: var(--green); text-decoration: none; }
+  a:hover { color: var(--amber); }
+  a:focus-visible { outline: 2px solid var(--amber); outline-offset: 2px; }
+  button:focus-visible { outline: 2px solid var(--amber); outline-offset: 2px; }
+
+  /* ─── Button Bar ─── */
+  .buttonbar {
+    position: fixed; top: 0; left: 0; bottom: 0;
+    width: var(--bar-w);
+    background: var(--bg);
+    border-right: 1px solid var(--chrome-dim);
+    padding: 20px 14px 16px;
+    display: flex; flex-direction: column; gap: 8px;
+    z-index: 20;
+    overflow-y: auto;
+  }
+  .bb-brand {
+    display: flex; flex-direction: column; gap: 2px;
+    padding: 6px 0 18px;
+    border-bottom: 1px dashed var(--chrome-dim);
+    margin-bottom: 10px;
+    text-decoration: none;
+  }
+  .bb-brand .tier {
+    color: var(--chrome-dim);
+    font-size: 9px;
+    font-weight: 500;
+    letter-spacing: 0.4em;
+    text-transform: uppercase;
+    filter: brightness(1.8);
+  }
+  .bb-brand .mark {
+    color: var(--chrome);
+    font-weight: 700;
+    letter-spacing: 0.45em;
+    font-size: 20px;
+    line-height: 1;
+  }
+  .bb-group-label {
+    color: var(--muted);
+    opacity: 0.7;
+    font-size: 10px;
+    letter-spacing: 0.2em;
+    text-transform: uppercase;
+    margin: 14px 0 4px 6px;
+  }
+  .bb-item {
+    display: flex; align-items: center; gap: 10px;
+    padding: 12px 10px;
+    color: var(--muted);
+    font-size: 13px;
+    border-left: 2px solid transparent;
+    transition: color 80ms, border-color 80ms;
+    min-height: 44px;
+  }
+  .bb-item .mark { color: var(--chrome-dim); font-size: 10px; width: 14px; flex-shrink: 0; }
+  .bb-item:hover { color: var(--cream); }
+  .bb-item:hover .mark { color: var(--chrome); }
+  .bb-item.active { color: var(--cream); border-left-color: var(--chrome); }
+  .bb-item.active .mark { color: var(--chrome); }
+  .bb-item.this-page { color: var(--amber); }
+  .bb-item.this-page .mark { color: var(--amber); }
+  .bb-foot {
+    margin-top: auto;
+    padding-top: 20px;
+    border-top: 1px dashed var(--chrome-dimmer);
+    color: var(--muted-2);
+    font-size: 10px;
+    letter-spacing: 0.15em;
+  }
+
+  /* ─── Workspace ─── */
+  .workspace {
+    margin-left: var(--bar-w);
+    padding: 40px 40px 120px;
+    max-width: calc(var(--max) + var(--bar-w));
+    position: relative; z-index: 1;
+  }
+  .flow { display: flex; flex-direction: column; gap: 48px; }
+
+  /* ─── Window chrome ─── */
+  .win {
+    background: var(--win);
+    border: 1px solid var(--chrome-dim);
+    position: relative;
+    transition: opacity 200ms;
+  }
+  .win.minimized { opacity: 0; pointer-events: none; height: 0; overflow: hidden; margin: 0; }
+  .titlebar {
+    display: flex; align-items: center; gap: 10px;
+    padding: 8px 14px;
+    border-bottom: 1px solid var(--chrome-dim);
+    background: var(--win-2);
+  }
+  .tb-close {
+    color: var(--chrome-dim); font-size: 13px; cursor: default;
+    width: 18px; text-align: center; flex-shrink: 0;
+  }
+  .tb-title {
+    flex: 1; font-size: 12px; font-weight: 500;
+    letter-spacing: 0.15em; text-transform: uppercase;
+    color: var(--chrome); margin: 0;
+  }
+  .tb-menu { margin-right: 6px; color: var(--chrome-dim); font-size: 10px; }
+  .tb-actions { display: flex; gap: 6px; }
+  .tb-btn { color: var(--chrome-dim); font-size: 12px; cursor: default; }
+  .win-body { padding: 28px 32px; }
+
+  /* ─── Typography ─── */
+  h1 { font-size: 36px; font-weight: 700; line-height: 1.1; margin: 0 0 16px; letter-spacing: -0.01em; }
+  h2 { font-size: 13px; font-weight: 500; letter-spacing: 0.15em; text-transform: uppercase; margin: 0; }
+  h3 { font-size: 14px; font-weight: 500; color: var(--green); margin: 0 0 10px; letter-spacing: 0.05em; }
+  p { margin: 0 0 12px; color: var(--cream); }
+  p:last-child { margin-bottom: 0; }
+  .label {
+    font-size: 10px; letter-spacing: 0.2em; text-transform: uppercase;
+    color: var(--muted); margin-bottom: 8px;
+  }
+  .green { color: var(--green); }
+  .amber { color: var(--amber); }
+  .dot { color: var(--chrome); }
+  strong { color: var(--amber); font-weight: 500; }
+  .k { color: var(--green); font-weight: 500; }
+
+  /* ─── Hero ─── */
+  .hero-layout {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 40px;
+    align-items: start;
+  }
+  .hero-copy h1 { font-size: 42px; }
+  .hero-copy p { font-size: 15px; line-height: 1.65; color: var(--muted); }
+  .hero-copy p strong { color: var(--cream); }
+  .hero-nav {
+    display: flex; flex-direction: column; gap: 2px;
+    border: 1px solid var(--chrome-dim);
+    background: var(--win-2);
+    padding: 16px;
+  }
+  .hero-nav .hn-label {
+    font-size: 10px; letter-spacing: 0.2em; text-transform: uppercase;
+    color: var(--muted); margin-bottom: 10px; padding-bottom: 10px;
+    border-bottom: 1px dashed var(--chrome-dimmer);
+  }
+  .hero-nav a {
+    display: flex; align-items: center; gap: 10px;
+    padding: 8px 6px;
+    color: var(--muted); font-size: 13px;
+    border-left: 2px solid transparent;
+    transition: color 80ms, border-color 80ms;
+  }
+  .hero-nav a .dot-sm {
+    width: 5px; height: 5px; background: var(--chrome-dim);
+    display: inline-block; flex-shrink: 0;
+    transition: background 80ms;
+  }
+  .hero-nav a:hover { color: var(--cream); }
+  .hero-nav a:hover .dot-sm { background: var(--green); }
+  .hero-nav a.active { color: var(--amber); border-left-color: var(--amber); }
+  .hero-nav a.active .dot-sm { background: var(--amber); }
+
+  /* ─── Problem section ─── */
+  .problem-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 32px;
+  }
+  .problem-card {
+    border: 1px solid var(--chrome-dim);
+    background: var(--win-2);
+    padding: 20px;
+  }
+  .problem-card .pc-label {
+    font-size: 9px; letter-spacing: 0.25em; text-transform: uppercase;
+    color: var(--chrome); margin-bottom: 10px;
+  }
+  .problem-card h3 { color: var(--cream); margin-bottom: 8px; font-size: 15px; }
+  .problem-card p { color: var(--muted); font-size: 13px; line-height: 1.6; }
+
+  /* ─── Chat as storytelling ─── */
+  .chat-scroll {
+    display: flex; flex-direction: column; gap: 2px;
+    font-size: 13px; line-height: 1.6;
+  }
+  .chat-line { display: flex; gap: 10px; }
+  .chat-line .ts { color: var(--muted); flex-shrink: 0; min-width: 38px; }
+  .chat-line .nick { color: var(--green); flex-shrink: 0; }
+  .chat-line .nick.admin { color: var(--chrome); }
+  .chat-line.sys { color: var(--muted); font-style: italic; }
+
+  /* ─── Feature grid ─── */
+  .feature-grid {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 20px;
+  }
+  .feat {
+    border: 1px solid var(--chrome-dim);
+    background: var(--win-2);
+    padding: 18px;
+  }
+  .feat .feat-label {
+    font-size: 9px; letter-spacing: 0.25em; text-transform: uppercase;
+    color: var(--muted); margin-bottom: 8px;
+  }
+  .feat h3 { color: var(--green); margin-bottom: 8px; font-size: 13px; }
+  .feat p { color: var(--muted); font-size: 12px; line-height: 1.6; margin: 0; }
+  .feat .feat-example {
+    margin-top: 10px; padding-top: 10px;
+    border-top: 1px dashed var(--chrome-dimmer);
+    font-size: 11px; color: var(--muted); font-style: italic;
+  }
+
+  /* ─── Access model diagram ─── */
+  .access-layout { display: grid; grid-template-columns: 1fr 1fr; gap: 32px; align-items: start; }
+  .class-table {
+    display: flex; flex-direction: column; gap: 2px;
+    border: 1px solid var(--chrome-dim);
+    background: var(--win-2);
+  }
+  .class-row {
+    display: grid;
+    grid-template-columns: 4px 1fr;
+    gap: 12px;
+    align-items: center;
+    padding: 10px 14px;
+    border-bottom: 1px solid var(--chrome-dimmer);
+  }
+  .class-row:last-child { border-bottom: none; }
+  .class-bar { height: 100%; min-height: 20px; }
+  .class-bar.admin { background: var(--class-admin); }
+  .class-bar.power { background: var(--class-power); }
+  .class-bar.user { background: var(--class-user); }
+  .class-bar.guest { background: var(--class-guest); }
+  .class-name { font-size: 13px; color: var(--cream); }
+  .class-desc { font-size: 11px; color: var(--muted); }
+
+  /* ─── Audience cards ─── */
+  .audience-grid {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 20px;
+  }
+  .aud-card {
+    border: 1px solid var(--chrome-dim);
+    background: var(--win-2);
+    padding: 20px;
+  }
+  .aud-card .aud-label {
+    font-size: 9px; letter-spacing: 0.25em; text-transform: uppercase;
+    color: var(--muted); margin-bottom: 10px;
+  }
+  .aud-card h3 { color: var(--amber); margin-bottom: 10px; font-size: 14px; }
+  .aud-card p { color: var(--muted); font-size: 13px; line-height: 1.6; margin: 0; }
+
+  /* ─── CTA row ─── */
+  .cta-row { display: flex; gap: 12px; margin-top: 24px; flex-wrap: wrap; }
+  .btn {
+    display: inline-flex; align-items: center; gap: 6px;
+    padding: 10px 20px;
+    background: var(--chrome); color: #fff;
+    font-family: inherit; font-size: 12px; font-weight: 500;
+    letter-spacing: 0.1em; text-transform: uppercase;
+    border: 1px solid var(--chrome); text-decoration: none;
+    transition: background 80ms, border-color 80ms;
+  }
+  .btn:hover { background: #c01018; color: #fff; border-color: #c01018; }
+  .btn.ghost {
+    background: transparent; color: var(--cream);
+    border-color: var(--chrome-dim);
+  }
+  .btn.ghost:hover { border-color: var(--muted); color: var(--amber); }
+  .btn .arrow { opacity: 0.7; }
+
+  /* ─── Cmd block ─── */
+  .cmd {
+    background: var(--bg);
+    border: 1px solid var(--chrome-dim);
+    padding: 10px 14px;
+    font-size: 12px;
+    color: var(--green);
+    margin: 10px 0;
+    overflow-x: auto;
+  }
+  .cmd .prompt { color: var(--muted); margin-right: 6px; }
+
+  /* ─── Colophon ─── */
+  .colophon {
+    margin-top: 20px;
+    padding-top: 20px;
+    border-top: 1px dashed var(--chrome-dim);
+    display: flex; justify-content: space-between; gap: 20px;
+    color: var(--muted);
+    font-size: 11px;
+    letter-spacing: 0.1em;
+  }
+  .colophon .k { color: var(--muted-2); }
+
+  /* ─── Dock ─── */
+  .dock {
+    position: fixed; bottom: 0; left: var(--bar-w); right: 0;
+    background: rgba(10, 10, 12, 0.92);
+    border-top: 1px solid var(--chrome-dim);
+    backdrop-filter: blur(8px);
+    padding: 8px 20px;
+    display: flex; align-items: center; gap: 10px;
+    z-index: 10;
+    font-size: 11px;
+  }
+  .dock-label { color: var(--muted-2); letter-spacing: 0.15em; text-transform: uppercase; font-size: 9px; flex-shrink: 0; }
+  .dock-item {
+    display: inline-flex; align-items: center; gap: 6px;
+    padding: 4px 10px;
+    border: 1px solid var(--chrome-dim);
+    color: var(--muted);
+    font-size: 11px;
+    cursor: pointer;
+    text-decoration: none;
+    transition: all 120ms;
+    flex-shrink: 0;
+    opacity: 0;
+    transform: translateY(8px);
+    animation: dock-in 300ms ease forwards;
+  }
+  @keyframes dock-in { to { opacity: 1; transform: translateY(0); } }
+  .dock-item:hover { border-color: var(--green); color: var(--green); }
+  .dock-item .dot { width: 7px; height: 7px; background: var(--chrome); display: inline-block; }
+  .dock-item:hover .dot { background: var(--green); }
+  .dock-empty { color: var(--muted-2); font-size: 11px; font-style: italic; }
+
+  /* ─── Responsive ─── */
+  @media (max-width: 900px) {
+    :root { --bar-w: 0px; }
+    .buttonbar {
+      position: static;
+      width: 100%; height: auto; bottom: auto;
+      border-right: none;
+      border-bottom: 1px solid var(--chrome-dim);
+      flex-direction: row;
+      flex-wrap: wrap;
+      align-items: center;
+      padding: 14px 16px;
+      overflow: visible;
+    }
+    .bb-brand { padding: 0; border-bottom: none; margin: 0 16px 0 0; flex-direction: row; align-items: baseline; gap: 8px; }
+    .bb-brand .tier { font-size: 8px; letter-spacing: 0.3em; }
+    .bb-brand .mark { font-size: 18px; }
+    .bb-group-label { display: none; }
+    .bb-item { padding: 11px 12px; border-left: none; border-bottom: 2px solid transparent; font-size: 12px; min-height: 44px; }
+    .bb-item.active { border-bottom-color: var(--chrome); }
+    .bb-item .mark { display: none; }
+    .bb-foot { display: none; }
+    .workspace { margin-left: 0; padding: 30px 18px 120px; }
+    .hero-layout { grid-template-columns: minmax(0, 1fr); gap: 24px; }
+    .problem-grid { grid-template-columns: minmax(0, 1fr); }
+    .feature-grid { grid-template-columns: minmax(0, 1fr); }
+    .access-layout { grid-template-columns: minmax(0, 1fr); }
+    .audience-grid { grid-template-columns: minmax(0, 1fr); }
+    .hero-copy h1 { font-size: 30px; }
+    .win-body { padding: 20px 18px; }
+    .dock { left: 0; padding: 8px 12px; }
+    .dock-label { display: none; }
+    .flow { gap: 36px; }
+  }
+</style>
+</head>
+<body>
+
+<nav class="buttonbar" aria-label="Primary">
+  <a class="bb-brand" href="kdx-explainer.html" aria-label="Sovereign KDX, Knowledge Dissemination Exchange">
+    <span class="tier">Sovereign</span>
+    <span class="mark">KDX</span>
+  </a>
+
+  <a class="bb-item" href="kdx-explainer.html"><span class="mark">↩</span>Overview</a>
+  <a class="bb-item" href="index.html"><span class="mark">⌘</span>Technical</a>
+
+  <div class="bb-group-label">On this page</div>
+  <a class="bb-item" href="#problem" data-nav="problem"><span class="mark"></span>The problem</a>
+  <a class="bb-item" href="#what" data-nav="what"><span class="mark"></span>What it is</a>
+  <a class="bb-item" href="#features" data-nav="features"><span class="mark"></span>What you can do</a>
+  <a class="bb-item" href="#who" data-nav="who"><span class="mark"></span>Who it's for</a>
+  <a class="bb-item" href="#start" data-nav="start"><span class="mark"></span>Get started</a>
+
+  <div class="bb-group-label">Docs</div>
+  <a class="bb-item this-page" href="what-is-kdx.html"><span class="mark">→</span>What is KDX</a>
+  <a class="bb-item" href="handoff-v0.2.html"><span class="mark"></span>Handoff v0.2</a>
+  <a class="bb-item" href="handoff.html"><span class="mark"></span>Handoff v0.1</a>
+  <a class="bb-item" href="packaging.html"><span class="mark"></span>Packaging</a>
+  <a class="bb-item" href="ui-concept.html"><span class="mark"></span>UI Concept</a>
+
+  <div class="bb-foot">
+    <span class="stat">[0] [0] [0]</span>
+  </div>
+</nav>
+
+<main class="workspace">
+  <div class="flow">
+
+    <!-- ─── HERO ─── -->
+    <section class="win" id="problem" data-title="What is KDX?">
+      <div class="titlebar">
+        <div class="tb-close" aria-hidden="true">×</div>
+        <h2 class="tb-title"><span class="tb-menu" aria-hidden="true"></span>What is KDX?</h2>
+        <div class="tb-actions">
+          <div class="tb-btn" aria-hidden="true">+</div>
+          <div class="tb-btn" aria-hidden="true">−</div>
+        </div>
+      </div>
+
+      <div class="win-body">
+        <div class="hero-layout">
+          <div class="hero-copy">
+            <div class="label">Server greeting</div>
+            <h1>Your community<span class="dot">.</span><br><span class="green">Your server</span><span class="dot">.</span></h1>
+            <p>Every online community exists somewhere. For most, that somewhere is a platform — Discord, Slack, Reddit, Facebook. The platform owns the place. It sets the rules. It logs the traffic. It can close the door.</p>
+            <p><strong>KDX is a server you host yourself.</strong> Chat, file sharing, and controlled access — the core of a community space — running on your hardware, under your rules, with no third party in the middle.</p>
+          </div>
+
+          <div class="hero-nav" role="navigation" aria-label="Page sections">
+            <div class="hn-label">On this page</div>
+            <a href="#problem"><span class="dot-sm" aria-hidden="true"></span>Why platforms aren't enough</a>
+            <a href="#what"><span class="dot-sm" aria-hidden="true"></span>What KDX actually is</a>
+            <a href="#features"><span class="dot-sm" aria-hidden="true"></span>Concrete things you can do</a>
+            <a href="#who"><span class="dot-sm" aria-hidden="true"></span>Who it's for</a>
+            <a href="#start"><span class="dot-sm" aria-hidden="true"></span>Get started</a>
+          </div>
+        </div>
+
+        <div class="problem-grid" style="margin-top: 32px;">
+          <div class="problem-card">
+            <div class="pc-label">The platform problem</div>
+            <h3>You're renting someone else's space</h3>
+            <p>Platforms survive by turning your community into an audience. Feeds surface what keeps people watching. Notifications arrive at the platform's discretion. Your history is theirs. When the platform changes its terms, folds, or decides your community is a liability, your place is gone.</p>
+          </div>
+          <div class="problem-card">
+            <div class="pc-label">What's missing</div>
+            <h3>A server you actually control</h3>
+            <p>The BBS era had this right. The sysop owned the box. The community was a list of people the sysop let in. No algorithm, no ads, no notifications the sysop didn't set. What was missing was modern security, easy deployment, and a client that doesn't feel like 1998. KDX is that.</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ─── WHAT IT IS ─── -->
+    <section class="win" id="what" data-title="What KDX Is">
+      <div class="titlebar">
+        <div class="tb-close" aria-hidden="true">×</div>
+        <h2 class="tb-title"><span class="tb-menu" aria-hidden="true"></span>What KDX Is</h2>
+        <div class="tb-actions">
+          <div class="tb-btn" aria-hidden="true">+</div>
+          <div class="tb-btn" aria-hidden="true">−</div>
+        </div>
+      </div>
+
+      <div class="win-body">
+        <div class="access-layout">
+          <div>
+            <p><strong>KDX is a client/server system</strong> for small private communities. You run a server daemon on a machine you control. People connect with the KDX client and get a chat window, a file browser, and a user list — the anatomy of a place, not a feed.</p>
+
+            <p>It's a Rust rebuild of <strong>Haxial KDX</strong>, a 2001-era server that ran underground music scenes, zine circles, and software crews through the late dial-up era. The design is proven. The implementation is modern: TLS 1.3, Argon2id password hashing, challenge-response authentication, SQLite persistence.</p>
+
+            <p>The server is a single binary. It generates its own TLS certificate on first run, opens one port, and starts listening. The client is a Tauri desktop app for macOS, Linux, and Windows. Trust-on-first-use certificate pinning so the client locks to your server and nobody can intercept the connection.</p>
+
+            <div class="cta-row">
+              <a class="btn" href="#start">Get started <span class="arrow">→</span></a>
+              <a class="btn ghost" href="index.html">Technical details →</a>
+            </div>
+          </div>
+
+          <div>
+            <div class="label" style="margin-bottom: 12px;">What connects to what</div>
+            <div class="chat-scroll" style="border: 1px solid var(--chrome-dim); background: var(--win-2); padding: 16px; gap: 4px;">
+              <div class="chat-line sys"><span class="ts">00:00</span>*** server started on :5503, cert generated</div>
+              <div class="chat-line sys"><span class="ts">00:01</span>*** phraq connected from 203.0.113.42</div>
+              <div class="chat-line"><span class="ts">00:01</span><span class="nick">&lt;phraq&gt;</span> trust-on-first-use: certificate pinned</div>
+              <div class="chat-line sys"><span class="ts">00:02</span>*** acidburn connected from 198.51.100.7</div>
+              <div class="chat-line"><span class="ts">00:03</span><span class="nick admin">&lt;sysop&gt;</span> welcome — you're on the guest list</div>
+              <div class="chat-line"><span class="ts">00:03</span><span class="nick admin">&lt;sysop&gt;</span> files are in /pub, chat is here</div>
+              <div class="chat-line"><span class="ts">00:04</span><span class="nick">&lt;acidburn&gt;</span> clean. no notifications, no feed</div>
+              <div class="chat-line"><span class="ts">00:04</span><span class="nick admin">&lt;sysop&gt;</span> that's the point</div>
+            </div>
+            <p style="font-size: 12px; color: var(--muted); margin-top: 10px;">TLS 1.3 end to end. No relay, no cloud, no third party. The sysop's machine is the server. That's the whole topology.</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ─── FEATURES ─── -->
+    <section class="win" id="features" data-title="What You Can Do">
+      <div class="titlebar">
+        <div class="tb-close" aria-hidden="true">×</div>
+        <h2 class="tb-title"><span class="tb-menu" aria-hidden="true"></span>What You Can Do</h2>
+        <div class="tb-actions">
+          <div class="tb-btn" aria-hidden="true">+</div>
+          <div class="tb-btn" aria-hidden="true">−</div>
+        </div>
+      </div>
+
+      <div class="win-body">
+        <p style="color: var(--muted); margin-bottom: 24px;">Everything here is running against a real server you own. No feed, no algorithm, no notifications you didn't configure.</p>
+
+        <div class="feature-grid">
+          <div class="feat">
+            <div class="feat-label">Chat</div>
+            <h3>Public rooms + private messages</h3>
+            <p>Live group chat with timestamps and a topic line set by any moderator. Private messages between users. All activity is scoped to the server — no cross-server indexing.</p>
+            <div class="feat-example">Every room has a topic. The sysop sets one; power users can too.</div>
+          </div>
+
+          <div class="feat">
+            <div class="feat-label">Files</div>
+            <h3>Hierarchical file tree</h3>
+            <p>Browse, upload, and download files organised in folders. Access is per-folder: a folder's class gate determines who can list and read it. Aliases let the same file appear in multiple places without duplicating bytes.</p>
+            <div class="feat-example">Alias <span class="k">mixtape-latest.flac</span> → the actual file. The gate still applies.</div>
+          </div>
+
+          <div class="feat">
+            <div class="feat-label">Drop Boxes</div>
+            <h3>Write-only submission vaults</h3>
+            <p>A Drop folder accepts uploads from any class but lets no one list what's inside. The sysop sees the contents; contributors can't see each other's submissions. Anonymous review, no peeking.</p>
+            <div class="feat-example">Set up <span class="k">[DROP] submissions/</span> for demos, zines, or mixtapes.</div>
+          </div>
+
+          <div class="feat">
+            <div class="feat-label">Access Control</div>
+            <h3>Four user classes, custom roles</h3>
+            <p>Guest, User, Power User, Admin — each with a different access envelope. Custom roles layer on top. Assign them per-person, upgrade or downgrade at any time.</p>
+            <div class="feat-example">Move phraq from user → power user: one command in the admin panel.</div>
+          </div>
+
+          <div class="feat">
+            <div class="feat-label">Moderation</div>
+            <h3>Kick and IP-level bans</h3>
+            <p>Kick anyone from the current session. Ban an IP or CIDR range; the check runs before the TLS handshake completes, so a banned host gets a connection refused, not a login failure.</p>
+            <div class="feat-example"><span class="k">deny 5.5.5.0/24</span> — an entire range blocked at the network level.</div>
+          </div>
+
+          <div class="feat">
+            <div class="feat-label">Audit Log</div>
+            <h3>Append-only admin history</h3>
+            <p>Every admin action — role changes, topic sets, kicks, bans, newsgroup creation — is written to a persistent log. Admin-only, append-only. The receipts are always there.</p>
+            <div class="feat-example">Who banned who, when, and why. Logged and kept.</div>
+          </div>
+
+          <div class="feat">
+            <div class="feat-label">Channels</div>
+            <h3>Multiple chat rooms (newsgroups)</h3>
+            <p>Create named channels for different topics: <span class="k">#dev</span>, <span class="k">#releases</span>, <span class="k">#offtopic</span>. Each has its own topic and history. Users join the ones they care about.</p>
+            <div class="feat-example">Spin up <span class="k">#dev</span> for code and keep the lobby for social.</div>
+          </div>
+
+          <div class="feat">
+            <div class="feat-label">Auth</div>
+            <h3>Challenge-response, no plaintext</h3>
+            <p>Passwords never travel over the wire. The server sends a one-time challenge; the client responds with a keyed digest. Argon2id on the server side. Your password never leaves your machine.</p>
+            <div class="feat-example">Even if someone intercepts the handshake, they get a digest that expires immediately.</div>
+          </div>
+
+          <div class="feat">
+            <div class="feat-label">News</div>
+            <h3>Server-side news board</h3>
+            <p>Post persistent announcements that persist across sessions. New users see the latest bulletin when they connect. Good for rules, events, or anything that should outlast the chat scroll.</p>
+            <div class="feat-example">Post release notes, maintenance windows, or the house rules.</div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ─── WHO IT'S FOR ─── -->
+    <section class="win" id="who" data-title="Who It's For">
+      <div class="titlebar">
+        <div class="tb-close" aria-hidden="true">×</div>
+        <h2 class="tb-title"><span class="tb-menu" aria-hidden="true"></span>Who It's For</h2>
+        <div class="tb-actions">
+          <div class="tb-btn" aria-hidden="true">+</div>
+          <div class="tb-btn" aria-hidden="true">−</div>
+        </div>
+      </div>
+
+      <div class="win-body">
+        <div class="access-layout" style="margin-bottom: 32px;">
+          <div>
+            <p>KDX is for communities where the people know each other — or at least know who invited them. It scales from two people sharing files to a few hundred regulars in a named space. It doesn't scale to public, anonymous, indexed, or algorithmic. That's not a limitation; that's the design.</p>
+            <p>The sysop is the person who runs it. They set the rules, control the door, and bear the costs: a server, some bandwidth, and the time it takes to know who's inside. If you're not willing to do that, a platform is the right choice.</p>
+            <p>If you are — if the value of a place that belongs entirely to your community is worth the overhead — KDX is built for you.</p>
+          </div>
+
+          <div>
+            <div class="label" style="margin-bottom: 12px;">User class ladder</div>
+            <div class="class-table">
+              <div class="class-row">
+                <div class="class-bar admin"></div>
+                <div>
+                  <div class="class-name">Admin / Sysop</div>
+                  <div class="class-desc">Full access. Runs the server. Sets every rule.</div>
+                </div>
+              </div>
+              <div class="class-row">
+                <div class="class-bar power"></div>
+                <div>
+                  <div class="class-name">Power User</div>
+                  <div class="class-desc">Can set topics, moderate chat, manage lower users.</div>
+                </div>
+              </div>
+              <div class="class-row">
+                <div class="class-bar user"></div>
+                <div>
+                  <div class="class-name">User</div>
+                  <div class="class-desc">Full member. Reads everything they're allowed to see, uploads to drop boxes, chats.</div>
+                </div>
+              </div>
+              <div class="class-row">
+                <div class="class-bar guest"></div>
+                <div>
+                  <div class="class-name">Guest</div>
+                  <div class="class-desc">Read-only or limited access. Useful for newcomers before you've decided to admit them fully.</div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="audience-grid">
+          <div class="aud-card">
+            <div class="aud-label">Audience type</div>
+            <h3>The sysop</h3>
+            <p>Someone who wants to run a server for people they know. Could be a friend group, a creative collective, a small team. You want the place to be yours: your hardware, your rules, no third party making decisions about your community's future.</p>
+          </div>
+          <div class="aud-card">
+            <div class="aud-label">Audience type</div>
+            <h3>Creative communities</h3>
+            <p>Music scenes, zine circles, art collectives, writing groups. You have work to share, conversations to have, and a roster of people you've chosen to include. You want a file tree where your archives stay safe and a chat where the history is yours.</p>
+          </div>
+          <div class="aud-card">
+            <div class="aud-label">Audience type</div>
+            <h3>Small teams with a trust relationship</h3>
+            <p>Not every team collaboration belongs in a corporate chat app. If the people you work with are people you've chosen, and you don't need a vendor to manage your compliance, a server you control is a credible alternative.</p>
+          </div>
+          <div class="aud-card">
+            <div class="aud-label">Audience type</div>
+            <h3>Communities tired of platforms</h3>
+            <p>Your Discord server got banned, your Slack free tier expired, your subreddit was quarantined. You've been evicted before. You know what it costs to build something on rented infrastructure. KDX is what you run when you're done renting.</p>
+          </div>
+        </div>
+
+        <div style="margin-top: 24px; padding: 20px; border: 1px solid var(--chrome-dim); background: var(--win-2);">
+          <p style="color: var(--muted); margin: 0; font-size: 13px;"><strong>Not a fit:</strong> If you need discoverability, public indexing, anonymous users at scale, or push notifications to people who didn't install a client — KDX isn't designed for that. It's designed for the opposite.</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- ─── GET STARTED ─── -->
+    <section class="win" id="start" data-title="Get Started">
+      <div class="titlebar">
+        <div class="tb-close" aria-hidden="true">×</div>
+        <h2 class="tb-title"><span class="tb-menu" aria-hidden="true"></span>Get Started</h2>
+        <div class="tb-actions">
+          <div class="tb-btn" aria-hidden="true">+</div>
+          <div class="tb-btn" aria-hidden="true">−</div>
+        </div>
+      </div>
+
+      <div class="win-body">
+        <div class="problem-grid">
+          <div>
+            <h3>Run the server</h3>
+            <div class="cmd"><span class="prompt">$</span>cargo install --git https://github.com/iamkhayyam/kdx-hotline kdxd</div>
+            <p style="font-size: 13px; color: var(--muted);">One binary. Generates its own TLS cert on first run. Opens one port. No configuration required to get started.</p>
+          </div>
+          <div>
+            <h3>Get the client</h3>
+            <div class="cmd"><span class="prompt">$</span>cargo install --git https://github.com/iamkhayyam/kdx-hotline kdx-client</div>
+            <p style="font-size: 13px; color: var(--muted);">Tauri desktop app: macOS, Linux, Windows. Connect to the server address. Trust-on-first-use certificate pinning locks the client to your server.</p>
+          </div>
+        </div>
+
+        <div style="margin-top: 24px; padding: 16px; border: 1px solid var(--green-dim); background: rgba(53, 255, 112, 0.04);">
+          <p style="font-size: 13px; color: var(--muted); margin: 0;"><span class="k">First-run checklist:</span> start kdxd, note the address and port, open the client, enter the address, accept the certificate fingerprint, log in as sysop with the password you set during install. That's the whole setup.</p>
+        </div>
+
+        <div class="cta-row">
+          <a class="btn" href="index.html">Technical reference <span class="arrow">→</span></a>
+          <a class="btn ghost" href="handoff-v0.2.html">Engineering handoff →</a>
+          <a class="btn ghost" href="handoff.html">Operator manual →</a>
+        </div>
+
+        <div class="colophon">
+          <span>Sovereign KDX · Knowledge Dissemination Exchange. A Rust rebuild of Haxial KDX (2001), not affiliated with Haxial.</span>
+          <span class="k">sovereignkdx.com</span>
+        </div>
+      </div>
+    </section>
+
+  </div>
+</main>
+
+<aside class="dock" id="dock" aria-label="Minimized windows">
+  <span class="dock-label">Dock</span>
+  <span class="dock-empty" id="dock-empty">windows minimize here as you scroll</span>
+</aside>
+
+<script>
+  const windows = Array.from(document.querySelectorAll('.win[id]'));
+  const navItems = Array.from(document.querySelectorAll('[data-nav]'));
+  const dock = document.getElementById('dock');
+  const dockEmpty = document.getElementById('dock-empty');
+
+  const minimized = new Set();
+
+  function updateDock() {
+    const items = windows
+      .filter(w => minimized.has(w.id))
+      .map(w => ({ id: w.id, title: w.dataset.title }));
+    dock.querySelectorAll('.dock-item').forEach(el => el.remove());
+    dockEmpty.style.display = items.length ? 'none' : '';
+    for (const it of items) {
+      const el = document.createElement('a');
+      el.className = 'dock-item';
+      el.href = '#' + it.id;
+      el.innerHTML = '<span class="dot" aria-hidden="true"></span>' + it.title;
+      dock.appendChild(el);
+    }
+  }
+
+  function setActive(id) {
+    for (const n of navItems) n.classList.toggle('active', n.dataset.nav === id);
+  }
+
+  const minObs = new IntersectionObserver((entries) => {
+    for (const e of entries) {
+      const id = e.target.id;
+      const bottomPastTop = e.boundingClientRect.bottom < 0;
+      if (!e.isIntersecting && bottomPastTop) {
+        minimized.add(id);
+        e.target.classList.add('minimized');
+      } else if (e.isIntersecting) {
+        minimized.delete(id);
+        e.target.classList.remove('minimized');
+      }
+    }
+    updateDock();
+  }, { rootMargin: '0px 0px -40% 0px', threshold: 0 });
+
+  const activeObs = new IntersectionObserver((entries) => {
+    const visible = entries
+      .filter(e => e.isIntersecting)
+      .sort((a, b) => a.boundingClientRect.top - b.boundingClientRect.top);
+    if (visible.length) setActive(visible[0].target.id);
+  }, { rootMargin: '-20% 0px -60% 0px', threshold: 0 });
+
+  for (const w of windows) {
+    minObs.observe(w);
+    activeObs.observe(w);
+  }
+</script>
+
+</body>
+</html>
