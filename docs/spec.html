@@ -180,12 +180,48 @@
 
   footer.doc { padding: 30px 44px 60px; color: var(--grey-dim); font-family: var(--mono); font-size: 11px; border-top: 1px solid var(--line); }
 
+  /* ── sequence diagram ─────────────────────────────────────── */
+  .seq-diagram { margin: 18px 0; font-family: var(--mono); }
+  .seq-headers { display: grid; grid-template-columns: 1fr 220px 1fr; border: 1px solid var(--line); border-bottom: 2px solid var(--chrome-dim); }
+  .seq-headers .seq-h { padding: 8px 14px; background: var(--panel-2); font-size: 10px; letter-spacing: .2em; text-transform: uppercase; color: var(--grey-dim); }
+  .seq-headers .seq-h.mid { border-left: 1px solid var(--line); border-right: 1px solid var(--line); text-align: center; }
+  .seq-headers .seq-h:last-child { text-align: right; }
+  .seq-step { display: grid; grid-template-columns: 1fr 220px 1fr; border-left: 1px solid var(--line); border-right: 1px solid var(--line); border-bottom: 1px solid var(--line); min-height: 72px; }
+  .seq-note { padding: 12px 14px; font-size: 11.5px; color: var(--grey); line-height: 1.55; display: flex; flex-direction: column; justify-content: center; }
+  .seq-note.left { text-align: right; border-right: 1px dashed #2a1414; }
+  .seq-note.right { border-left: 1px dashed #2a1414; }
+  .seq-note em { color: var(--amber); font-style: normal; font-size: 9.5px; letter-spacing: .14em; text-transform: uppercase; display: block; margin-bottom: 2px; font-weight: 600; }
+  .seq-mid { display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 12px 10px; gap: 3px; }
+  .seq-mid .msg-name { color: var(--green); font-weight: 700; font-size: 12px; white-space: nowrap; }
+  .seq-mid .msg-opcode { color: var(--grey-dim); font-size: 10px; }
+  .seq-mid .msg-fields { color: var(--grey); font-size: 10px; text-align: center; line-height: 1.5; }
+  .seq-arrow-r { width: 100%; height: 1px; background: var(--chrome-dim); position: relative; margin: 5px 0; }
+  .seq-arrow-r::after { content: "▶"; position: absolute; right: -2px; top: -8px; color: var(--chrome); font-size: 10px; }
+  .seq-arrow-l { width: 100%; height: 1px; background: var(--green-dim); position: relative; margin: 5px 0; }
+  .seq-arrow-l::before { content: "◀"; position: absolute; left: -2px; top: -8px; color: var(--green-dim); font-size: 10px; }
+
+  /* ── PHC anatomy strip ────────────────────────────────────── */
+  .phc-strip { display: flex; flex-wrap: wrap; gap: 0; border: 1px solid var(--line); font-family: var(--mono); font-size: 11px; margin: 14px 0; }
+  .phc-seg { flex: 0 0 auto; padding: 9px 12px; border-right: 1px solid var(--line); }
+  .phc-seg:last-child { border-right: none; flex: 1 1 auto; }
+  .phc-seg .phc-val { color: var(--green); display: block; font-size: 12.5px; white-space: nowrap; }
+  .phc-seg .phc-lbl { color: var(--grey-dim); font-size: 9.5px; letter-spacing: .12em; text-transform: uppercase; display: block; margin-top: 2px; }
+
+  /* ── security guarantees ──────────────────────────────────── */
+  .sec-guarantees { display: grid; grid-template-columns: 1fr 1fr; gap: 1px; background: var(--line); border: 1px solid var(--line); margin: 16px 0; }
+  .sec-g { background: var(--panel); padding: 16px 18px; }
+  .sec-g .g-tag { font-family: var(--mono); font-size: 9px; letter-spacing: .22em; color: var(--amber); border: 1px solid #4a2a00; display: inline-block; padding: 2px 7px; margin-bottom: 8px; }
+  .sec-g .g-title { color: var(--ink-bright); font-family: var(--mono); font-size: 13px; font-weight: 600; display: block; margin-bottom: 6px; }
+  .sec-g .g-desc { font-size: 12.5px; color: var(--grey); line-height: 1.6; }
+
   @media (max-width: 820px) {
     .wrap { grid-template-columns: 1fr; }
     nav.toc { position: static; height: auto; border-right: none; border-bottom: 1px solid var(--line); }
     nav.toc a { display: inline-block; }
     main { padding: 20px 20px 90px; }
     .grid2 { grid-template-columns: 1fr; }
+    .seq-diagram { overflow-x: auto; }
+    .sec-guarantees { grid-template-columns: 1fr; }
   }
 </style>
 
@@ -457,47 +493,76 @@
     <section id="auth">
       <div class="eyebrow">Security</div>
       <h2>Authentication</h2>
-      <p>KDX uses a four-message <strong>challenge-response handshake</strong>. The server stores only an <strong>Argon2id</strong> PHC string; the plaintext password never crosses the wire, not even inside TLS. Each login uses a fresh random challenge, so replaying a captured transcript is useless.</p>
+      <p>KDX uses a four-message <strong>challenge-response handshake</strong>. The server stores only an <strong>Argon2id</strong> PHC string; the plaintext password never crosses the wire, not even inside TLS. Each login issues a fresh 32-byte random challenge from <code>OsRng</code>, so replaying a captured transcript is useless.</p>
 
-      <h3>Four-message handshake</h3>
-      <div class="layer">message flow →</div>
-      <div class="flow">
-        <div class="node"><span class="t">AuthRequest</span><span class="s">client → server<br>0x10 · username</span></div>
-        <div class="arw">→</div>
-        <div class="node"><span class="t">AuthChallenge</span><span class="s">server → client<br>0x11 · challenge + KDF params</span></div>
-        <div class="arw">→</div>
-        <div class="node"><span class="t">AuthResponse</span><span class="s">client → server<br>0x12 · H(challenge ‖ verifier)</span></div>
-        <div class="arw">→</div>
-        <div class="node"><span class="t">AuthResult</span><span class="s">server → client<br>0x13 · success + session_id + class</span></div>
+      <h3>Handshake sequence</h3>
+      <div class="seq-diagram">
+        <div class="seq-headers">
+          <div class="seq-h">CLIENT</div>
+          <div class="seq-h mid">wire</div>
+          <div class="seq-h">SERVER</div>
+        </div>
+        <div class="seq-step">
+          <div class="seq-note left"></div>
+          <div class="seq-mid">
+            <div class="msg-name">AuthRequest</div>
+            <div class="msg-opcode">0x10</div>
+            <div class="seq-arrow-r"></div>
+            <div class="msg-fields">username</div>
+          </div>
+          <div class="seq-note right"><em>server</em>lookup account<br>extract PHC → salt + params</div>
+        </div>
+        <div class="seq-step">
+          <div class="seq-note left"><em>client</em>receive challenge + KDF params</div>
+          <div class="seq-mid">
+            <div class="msg-name">AuthChallenge</div>
+            <div class="msg-opcode">0x11</div>
+            <div class="seq-arrow-l"></div>
+            <div class="msg-fields">challenge[32] · m_cost · t_cost<br>p_cost · salt</div>
+          </div>
+          <div class="seq-note right"><em>server</em>OsRng.fill_bytes(32)</div>
+        </div>
+        <div class="seq-step">
+          <div class="seq-note left"><em>client</em>verifier = Argon2id(pw, salt, params)<br>response = SHA-256(challenge ‖ verifier)</div>
+          <div class="seq-mid">
+            <div class="msg-name">AuthResponse</div>
+            <div class="msg-opcode">0x12</div>
+            <div class="seq-arrow-r"></div>
+            <div class="msg-fields">response[32]</div>
+          </div>
+          <div class="seq-note right"><em>server</em>expected = SHA-256(challenge ‖ stored_verifier)<br>ok = constant_time_eq(expected, response)</div>
+        </div>
+        <div class="seq-step">
+          <div class="seq-note left"><em>client</em>store session_id · proceed as class</div>
+          <div class="seq-mid">
+            <div class="msg-name">AuthResult</div>
+            <div class="msg-opcode">0x13</div>
+            <div class="seq-arrow-l"></div>
+            <div class="msg-fields">success · session_id[16] · class · message</div>
+          </div>
+          <div class="seq-note right"></div>
+        </div>
       </div>
 
-      <h3>Payload schemas</h3>
-      <div class="tbl-wrap">
-        <table>
-          <thead><tr><th>Message</th><th>Direction</th><th>Fields</th></tr></thead>
-          <tbody>
-            <tr>
-              <td><code>AuthRequest</code> 0x10</td>
-              <td>client → server</td>
-              <td><code>username</code> (u16-length-prefixed UTF-8 string)</td>
-            </tr>
-            <tr>
-              <td><code>AuthChallenge</code> 0x11</td>
-              <td>server → client</td>
-              <td><code>challenge</code> 32 bytes (OS random) &nbsp;·&nbsp; <code>m_cost</code> u32 &nbsp;·&nbsp; <code>t_cost</code> u32 &nbsp;·&nbsp; <code>p_cost</code> u32 &nbsp;·&nbsp; <code>salt</code> (u16-prefixed bytes from stored PHC)</td>
-            </tr>
-            <tr>
-              <td><code>AuthResponse</code> 0x12</td>
-              <td>client → server</td>
-              <td><code>response</code> 32 bytes (SHA-256 output)</td>
-            </tr>
-            <tr>
-              <td><code>AuthResult</code> 0x13</td>
-              <td>server → client</td>
-              <td><code>success</code> u8 &nbsp;·&nbsp; <code>session_id</code> 16 bytes &nbsp;·&nbsp; <code>class</code> u8 &nbsp;·&nbsp; <code>message</code> (u16-prefixed UTF-8)</td>
-            </tr>
-          </tbody>
-        </table>
+      <h3>Argon2id parameters</h3>
+      <div class="stats">
+        <div class="cell"><div class="k">m_cost</div><div class="v">19456 <small>KiB</small></div></div>
+        <div class="cell"><div class="k">t_cost</div><div class="v">2 <small>passes</small></div></div>
+        <div class="cell"><div class="k">p_cost</div><div class="v">1 <small>thread</small></div></div>
+        <div class="cell"><div class="k">out_len</div><div class="v">32 <small>bytes</small></div></div>
+        <div class="cell"><div class="k">challenge</div><div class="v">32 <small>bytes</small></div></div>
+        <div class="cell"><div class="k">session_id</div><div class="v">16 <small>bytes</small></div></div>
+      </div>
+      <p>Parameters meet <strong>OWASP Argon2id minimum</strong> recommendations (19&thinsp;MiB memory, 2 iterations). Shipped to the client inside <code>AuthChallenge</code> so it can reproduce the exact hash stored on the server — no second round-trip needed.</p>
+
+      <h3>Stored credential format</h3>
+      <p>The server stores one <strong>PHC string</strong> per account — no separate password column, no separate salt column. Everything needed to verify a future login is encoded inside a single opaque token.</p>
+      <div class="phc-strip">
+        <div class="phc-seg"><span class="phc-val">$argon2id</span><span class="phc-lbl">algorithm</span></div>
+        <div class="phc-seg"><span class="phc-val">$v=19</span><span class="phc-lbl">version</span></div>
+        <div class="phc-seg"><span class="phc-val">$m=19456,t=2,p=1</span><span class="phc-lbl">kdf params</span></div>
+        <div class="phc-seg"><span class="phc-val">$&lt;base64-salt&gt;</span><span class="phc-lbl">salt</span></div>
+        <div class="phc-seg"><span class="phc-val">$&lt;base64-hash&gt;</span><span class="phc-lbl">verifier</span></div>
       </div>
 
       <h3>Response derivation</h3>
@@ -505,14 +570,33 @@
 <span class="g">verifier</span>  = Argon2id(password, salt, m_cost, t_cost, p_cost, out_len=32)
 <span class="g">response</span>  = SHA-256(challenge <span class="a">||</span> verifier)        <span class="c">// 32 bytes</span>
 
-<span class="c">// Server (from stored PHC string):</span>
-<span class="g">verifier</span>  = extract hash bytes from PHC            <span class="c">// already stored, no re-derivation</span>
+<span class="c">// Server (never re-derives — reads verifier bytes from stored PHC):</span>
+<span class="g">verifier</span>  = extract hash bytes from PHC
 <span class="g">expected</span>  = SHA-256(challenge <span class="a">||</span> verifier)
 <span class="g">ok</span>        = constant_time_eq(expected, response)   <span class="c">// subtle::ConstantTimeEq</span></pre>
 
-      <div class="note green">
-        <span class="lbl">What the server never sees</span>
-        The server stores only the Argon2id PHC string (hash + salt + params in one opaque token). The challenge-response design means: (1) the password bytes never cross the wire; (2) the server never reconstructs the password from the verifier; (3) a compromised session key does not expose the password.
+      <h3>Security guarantees</h3>
+      <div class="sec-guarantees">
+        <div class="sec-g">
+          <div class="g-tag">NO-PW</div>
+          <span class="g-title">Password never on wire</span>
+          <span class="g-desc">Not in plaintext, not inside TLS. The client sends only <code>SHA-256(challenge&thinsp;‖&thinsp;verifier)</code> — this output cannot be reversed to recover the password or the Argon2id verifier.</span>
+        </div>
+        <div class="sec-g">
+          <div class="g-tag">FRESH</div>
+          <span class="g-title">Replay resistance</span>
+          <span class="g-desc">Every login issues a new 32-byte challenge from <code>OsRng</code>. A captured <code>AuthResponse</code> is worthless against any subsequent challenge — the response is bound to a single session by construction.</span>
+        </div>
+        <div class="sec-g">
+          <div class="g-tag">CT-EQ</div>
+          <span class="g-title">Timing-attack resistance</span>
+          <span class="g-desc">The final comparison uses <code>subtle::ConstantTimeEq</code>. Verification time is identical whether the response is correct or wrong, closing side-channel inference on the stored verifier.</span>
+        </div>
+        <div class="sec-g">
+          <div class="g-tag">LOCAL</div>
+          <span class="g-title">Credential isolation</span>
+          <span class="g-desc">No shared identity provider. Each KDX server holds its own PHC strings in local SQLite. A breach of one server does not expose credentials on any other server.</span>
+        </div>
       </div>
 
       <h3>Account classes</h3>
