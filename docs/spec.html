@@ -1,0 +1,813 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>KDX — Technical Specification</title>
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<link rel="icon" href="favicon.ico" sizes="32x32 16x16">
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
+<style>html,body{margin:0;background:#060404}</style>
+</head>
+<body>
+<!-- Home affordance: fixed-position back-to-landing pill. Same scope and
+     tokens as handoff.html — zero collision risk. -->
+<style>
+  .kdx-home {
+    position: fixed;
+    top: 14px; right: 14px;
+    z-index: 10000;
+    display: inline-flex;
+    align-items: center;
+    gap: 10px;
+    min-height: 44px;
+    padding: 0 16px;
+    background: rgba(10, 4, 5, 0.92);
+    border: 1px solid #4a1b1e;
+    color: #e8dddd;
+    font: 700 11px/1 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+    text-decoration: none;
+    transition: color 120ms, border-color 120ms;
+  }
+  .kdx-home:hover, .kdx-home:focus-visible {
+    color: #35ff70;
+    border-color: #35ff70;
+  }
+  .kdx-home:focus-visible {
+    outline: 2px solid #ffbf3d;
+    outline-offset: 2px;
+  }
+  .kdx-home .arrow { font-size: 15px; letter-spacing: 0; line-height: 1; }
+  @media (max-width: 600px) {
+    .kdx-home { top: 10px; right: 10px; padding: 0 12px; }
+  }
+</style>
+<a class="kdx-home" href="index.html" aria-label="Back to Sovereign KDX home">
+  <span class="arrow" aria-hidden="true">←</span><span>KDX</span>
+</a>
+
+<style>
+  :root {
+    --bg: #060404;
+    --panel: #0d0808;
+    --panel-2: #110a0a;
+    --line: #2a1414;
+    --chrome: #7a0a0a;
+    --chrome-dim: #4a0808;
+    --alert: #e11b1b;
+    --green: #3df56e;
+    --green-dim: #1e7a38;
+    --amber: #ffb020;
+    --ink: #cbb6b6;
+    --ink-bright: #ecdede;
+    --grey: #9c8080;
+    --grey-dim: #6b5555;
+    --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
+    --sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  .kdx-doc {
+    background: var(--bg);
+    color: var(--ink);
+    font-family: var(--sans);
+    font-size: 15px;
+    line-height: 1.62;
+    min-height: 100vh;
+    position: relative;
+  }
+  .kdx-doc::before {
+    content: "";
+    position: fixed; inset: 0;
+    background:
+      repeating-linear-gradient(0deg, rgba(255,255,255,.012) 0 1px, transparent 1px 3px),
+      radial-gradient(ellipse at 50% 0%, rgba(122,10,10,.13), transparent 60%);
+    pointer-events: none; z-index: 0;
+  }
+  .wrap { position: relative; z-index: 1; display: grid; grid-template-columns: 250px 1fr; gap: 0; max-width: 1180px; margin: 0 auto; }
+
+  /* ---- sidebar ---- */
+  nav.toc {
+    position: sticky; top: 0; align-self: start; height: 100vh;
+    padding: 26px 18px 40px; border-right: 1px solid var(--line);
+    overflow-y: auto;
+  }
+  nav.toc .logo { color: var(--alert); font-family: var(--mono); font-weight: 700; letter-spacing: .3em; font-size: 20px; }
+  nav.toc .sub { color: var(--grey-dim); font-family: var(--mono); font-size: 10px; letter-spacing: .18em; text-transform: uppercase; margin-top: 4px; margin-bottom: 22px; }
+  nav.toc a { display: block; color: var(--grey); text-decoration: none; font-size: 13px; padding: 4px 10px; border-left: 2px solid transparent; margin: 1px 0; }
+  nav.toc a:hover { color: var(--green); }
+  nav.toc a.active { color: var(--green); border-left-color: var(--alert); background: rgba(122,10,10,.12); }
+  nav.toc .grp { color: var(--grey-dim); font-family: var(--mono); font-size: 9px; letter-spacing: .2em; text-transform: uppercase; margin: 18px 0 6px 10px; }
+
+  /* ---- content ---- */
+  main { padding: 26px 44px 120px; min-width: 0; }
+  section { scroll-margin-top: 18px; padding: 30px 0; border-bottom: 1px solid var(--line); }
+  section:last-child { border-bottom: none; }
+  .eyebrow { color: var(--grey-dim); font-family: var(--mono); font-size: 11px; letter-spacing: .22em; text-transform: uppercase; }
+  h1 { font-family: var(--mono); font-size: 30px; letter-spacing: .04em; color: var(--ink-bright); margin: 4px 0 10px; text-wrap: balance; }
+  h2 { font-family: var(--mono); font-size: 21px; color: var(--green); margin: 2px 0 8px; letter-spacing: .02em; text-wrap: balance; }
+  h3 { font-family: var(--mono); font-size: 14px; color: var(--amber); letter-spacing: .06em; text-transform: uppercase; margin: 22px 0 8px; }
+  p { margin: 10px 0; max-width: 70ch; }
+  a.inline { color: var(--green); }
+  strong { color: var(--ink-bright); font-weight: 600; }
+  code { font-family: var(--mono); font-size: .86em; color: var(--green); background: rgba(61,245,110,.07); border: 1px solid rgba(61,245,110,.14); padding: 1px 5px; border-radius: 3px; white-space: nowrap; }
+  .lead { font-size: 17px; color: var(--ink-bright); max-width: 68ch; }
+
+  /* pills */
+  .pill { display: inline-block; font-family: var(--mono); font-size: 11px; letter-spacing: .05em; padding: 2px 8px; border-radius: 2px; border: 1px solid; white-space: nowrap; }
+  .pill.green { color: var(--green); border-color: var(--green-dim); }
+  .pill.red { color: var(--alert); border-color: var(--chrome); }
+  .pill.amber { color: var(--amber); border-color: #6b4a10; }
+  .pill.grey { color: var(--grey); border-color: var(--grey-dim); }
+
+  /* stat row */
+  .stats { display: flex; flex-wrap: wrap; gap: 0; border: 1px solid var(--line); margin: 18px 0; }
+  .stats .cell { flex: 1 1 120px; padding: 12px 16px; border-right: 1px solid var(--line); }
+  .stats .cell:last-child { border-right: none; }
+  .stats .k { font-family: var(--mono); font-size: 10px; letter-spacing: .14em; text-transform: uppercase; color: var(--grey-dim); }
+  .stats .v { font-family: var(--mono); font-size: 22px; color: var(--green); font-variant-numeric: tabular-nums; }
+  .stats .v small { font-size: 12px; color: var(--grey); }
+
+  /* tables */
+  .tbl-wrap { overflow-x: auto; margin: 14px 0; border: 1px solid var(--line); }
+  table { width: 100%; border-collapse: collapse; font-size: 13.5px; min-width: 560px; }
+  th { text-align: left; font-family: var(--mono); font-size: 10px; letter-spacing: .12em; text-transform: uppercase; color: var(--grey-dim); padding: 9px 12px; background: var(--panel-2); border-bottom: 1px solid var(--line); font-weight: 400; }
+  td { padding: 9px 12px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  tr:last-child td { border-bottom: none; }
+  tbody tr:hover td { background: rgba(122,10,10,.07); }
+  td.mono { font-family: var(--mono); }
+  td code { font-family: var(--mono); }
+  td .cmd { color: var(--green); font-family: var(--mono); font-weight: 600; }
+  td .ev { color: var(--amber); font-family: var(--mono); }
+
+  /* cards / callouts */
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin: 16px 0; }
+  .card { border: 1px solid var(--line); background: var(--panel); padding: 16px 18px; }
+  .card h3 { margin-top: 0; }
+  .note { border-left: 3px solid var(--chrome); background: rgba(122,10,10,.08); padding: 12px 16px; margin: 16px 0; }
+  .note.green { border-left-color: var(--green-dim); background: rgba(61,245,110,.06); }
+  .note.amber { border-left-color: var(--amber); background: rgba(255,176,32,.06); }
+  .note .lbl { font-family: var(--mono); font-size: 10px; letter-spacing: .16em; text-transform: uppercase; color: var(--amber); display: block; margin-bottom: 3px; }
+
+  /* code block */
+  pre { font-family: var(--mono); font-size: 13px; line-height: 1.5; background: #040303; border: 1px solid var(--line); padding: 14px 16px; overflow-x: auto; margin: 14px 0; color: var(--ink); }
+  pre .c { color: var(--grey-dim); }
+  pre .g { color: var(--green); }
+  pre .a { color: var(--amber); }
+
+  ul.clean { list-style: none; padding-left: 0; margin: 10px 0; }
+  ul.clean li { padding: 4px 0 4px 20px; position: relative; max-width: 70ch; }
+  ul.clean li::before { content: "▪"; color: var(--chrome); position: absolute; left: 4px; font-size: 11px; top: 7px; }
+
+  /* flow diagram */
+  .flow { display: flex; flex-wrap: wrap; align-items: stretch; gap: 0; margin: 18px 0; font-family: var(--mono); font-size: 12px; }
+  .flow .node { flex: 1 1 130px; border: 1px solid var(--line); background: var(--panel); padding: 12px; text-align: center; }
+  .flow .node .t { color: var(--green); font-weight: 600; }
+  .flow .node .s { color: var(--grey-dim); font-size: 10px; display: block; margin-top: 3px; }
+  .flow .arw { display: flex; align-items: center; color: var(--chrome); padding: 0 6px; font-size: 18px; }
+  .layer { color: var(--grey-dim); font-family: var(--mono); font-size: 10px; letter-spacing: .16em; text-transform: uppercase; margin: 4px 0; }
+
+  /* byte-layout diagram */
+  .bytelayout { display: grid; gap: 0; border: 1px solid var(--line); font-family: var(--mono); font-size: 11px; margin: 14px 0; }
+  .bytelayout .row { display: flex; border-bottom: 1px solid var(--line); }
+  .bytelayout .row:last-child { border-bottom: none; }
+  .bytelayout .off { width: 42px; padding: 7px 10px; color: var(--grey-dim); background: var(--panel-2); border-right: 1px solid var(--line); flex-shrink: 0; }
+  .bytelayout .fld { flex: 1; padding: 7px 10px; color: var(--ink-bright); border-right: 1px solid var(--line); }
+  .bytelayout .fld:last-child { border-right: none; }
+  .bytelayout .fld .nm { color: var(--green); }
+  .bytelayout .fld .sz { color: var(--grey-dim); font-size: 10px; }
+
+  footer.doc { padding: 30px 44px 60px; color: var(--grey-dim); font-family: var(--mono); font-size: 11px; border-top: 1px solid var(--line); }
+
+  @media (max-width: 820px) {
+    .wrap { grid-template-columns: 1fr; }
+    nav.toc { position: static; height: auto; border-right: none; border-bottom: 1px solid var(--line); }
+    nav.toc a { display: inline-block; }
+    main { padding: 20px 20px 90px; }
+    .grid2 { grid-template-columns: 1fr; }
+  }
+</style>
+
+<div class="kdx-doc">
+<div class="wrap">
+
+  <nav class="toc">
+    <div class="logo">KDX</div>
+    <div class="sub">Technical Spec</div>
+    <div class="grp">Intro</div>
+    <a href="#overview">Overview</a>
+    <div class="grp">Protocol</div>
+    <a href="#framing">Wire framing</a>
+    <a href="#types">Packet types</a>
+    <a href="#flags">Flags &amp; fragmentation</a>
+    <div class="grp">Security</div>
+    <a href="#tls">Transport / TLS</a>
+    <a href="#auth">Authentication</a>
+    <div class="grp">Features</div>
+    <a href="#chat">Chat</a>
+    <a href="#files">File system</a>
+    <a href="#transfers">Transfers</a>
+    <div class="grp">Infrastructure</div>
+    <a href="#tracker">Tracker / registry</a>
+    <a href="#privacy">Privacy posture</a>
+  </nav>
+
+  <main>
+
+    <!-- ═══════════════════════════════════════════════════════ OVERVIEW -->
+    <section id="overview">
+      <div class="eyebrow">Specification · v1</div>
+      <h1>KDX Technical Specification</h1>
+      <p class="lead">Precise definitions for the KDX wire protocol, security model, authentication flow, file-system semantics, transfer engine, and infrastructure posture. All values are sourced directly from the implementation; this document and the code are authoritative together.</p>
+
+      <div class="stats">
+        <div class="cell"><div class="k">Header</div><div class="v">20 <small>bytes</small></div></div>
+        <div class="cell"><div class="k">Packet types</div><div class="v">76</div></div>
+        <div class="cell"><div class="k">Auth rounds</div><div class="v">4 <small>messages</small></div></div>
+        <div class="cell"><div class="k">Chunk size</div><div class="v">32 <small>KiB default</small></div></div>
+        <div class="cell"><div class="k">Node kinds</div><div class="v">5</div></div>
+      </div>
+
+      <div class="note green">
+        <span class="lbl">Single implementation</span>
+        The client and server link the same <code>kdx-protocol</code> and <code>kdx-crypto</code> crates, so the wire format has one canonical implementation shared by both sides. There is no separate client codec that could drift.
+      </div>
+    </section>
+
+    <!-- ═══════════════════════════════════════════════════════ FRAMING -->
+    <section id="framing">
+      <div class="eyebrow">Protocol</div>
+      <h2>Wire framing</h2>
+      <p>Every KDX message starts with a fixed 20-byte header followed by a variable-length payload whose size is given by the header's <code>length</code> field. All multi-byte integers are big-endian. The header is self-contained: a reader can parse or skip any packet without prior context.</p>
+
+      <h3>Header layout</h3>
+      <div class="bytelayout">
+        <div class="row">
+          <div class="off">0–3</div>
+          <div class="fld"><span class="nm">magic</span> <span class="sz">4 bytes</span><br>Fixed sentinel <code>KDX\0</code> (0x4B 0x44 0x58 0x00). Connection-fatal if absent.</div>
+        </div>
+        <div class="row">
+          <div class="off">4</div>
+          <div class="fld"><span class="nm">version</span> <span class="sz">1 byte</span><br>Protocol version. Current value: <code>1</code>. Mismatches are connection-fatal.</div>
+        </div>
+        <div class="row">
+          <div class="off">5</div>
+          <div class="fld"><span class="nm">type</span> <span class="sz">1 byte</span><br>Packet opcode — one of 76 defined values. See <a class="inline" href="#types">Packet types</a>.</div>
+        </div>
+        <div class="row">
+          <div class="off">6–7</div>
+          <div class="fld"><span class="nm">flags</span> <span class="sz">2 bytes</span><br>Bitfield of behavioral modifiers. See <a class="inline" href="#flags">Flags</a>.</div>
+        </div>
+        <div class="row">
+          <div class="off">8–11</div>
+          <div class="fld"><span class="nm">sequence</span> <span class="sz">4 bytes u32</span><br>Monotonically increasing per-connection counter. Used for fragmentation ordering and ACK correlation.</div>
+        </div>
+        <div class="row">
+          <div class="off">12–15</div>
+          <div class="fld"><span class="nm">length</span> <span class="sz">4 bytes u32</span><br>Byte length of the payload that follows the header.</div>
+        </div>
+        <div class="row">
+          <div class="off">16–17</div>
+          <div class="fld"><span class="nm">reserved</span> <span class="sz">2 bytes</span><br>Must be zero. Reserved for future use.</div>
+        </div>
+        <div class="row">
+          <div class="off">18–19</div>
+          <div class="fld"><span class="nm">checksum</span> <span class="sz">2 bytes</span><br>CRC32C of the preceding 18 bytes, folded to 16 bits by XOR-ing the two halves: <code>(crc32c &gt;&gt; 16) ^ (crc32c &amp; 0xFFFF)</code>. Framing-corruption guard only — integrity and authenticity are provided by TLS.</div>
+        </div>
+      </div>
+
+      <div class="note">
+        <span class="lbl">Checksum is not a security control</span>
+        The header checksum detects framing corruption (bit-flips, truncation, stream desync) so the codec can close the connection immediately rather than misinterpreting a garbage opcode or length. All confidentiality and integrity guarantees are provided by TLS 1.3.
+      </div>
+
+      <h3>Wire representation</h3>
+      <pre><span class="c">// Offset  Size  Field</span>
+<span class="g">KDX\0</span>       <span class="c">// 0–3    4    magic</span>
+<span class="a">01</span>          <span class="c">// 4      1    version = 1</span>
+<span class="a">30</span>          <span class="c">// 5      1    type = 0x30 (ChatMessage)</span>
+<span class="a">00 08</span>       <span class="c">// 6–7    2    flags = REQUIRES_ACK</span>
+<span class="a">00 00 00 2A</span> <span class="c">// 8–11   4    sequence = 42</span>
+<span class="a">00 00 00 0D</span> <span class="c">// 12–15  4    length = 13 bytes of payload</span>
+<span class="a">00 00</span>       <span class="c">// 16–17  2    reserved</span>
+<span class="a">XX XX</span>       <span class="c">// 18–19  2    CRC32C(bytes 0–17) folded to 16 bits</span>
+<span class="c">// ... 13 bytes of payload follow</span></pre>
+    </section>
+
+    <!-- ═══════════════════════════════════════════════════════ TYPES -->
+    <section id="types">
+      <div class="eyebrow">Protocol</div>
+      <h2>Packet types</h2>
+      <p>Opcodes occupy a single byte (0x00–0xFF). The 76 defined values are grouped into functional ranges. Unknown opcodes are connection-fatal.</p>
+
+      <div class="tbl-wrap">
+        <table>
+          <thead>
+            <tr><th>Range</th><th>Group</th><th>Opcodes</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td class="mono">0x01–0x0F</td>
+              <td>Connection management</td>
+              <td><code>HandshakeInit</code> 0x01 &nbsp;·&nbsp; <code>HandshakeResp</code> 0x02 &nbsp;·&nbsp; <code>Ping</code> 0x03 &nbsp;·&nbsp; <code>Pong</code> 0x04 &nbsp;·&nbsp; <code>Disconnect</code> 0x0F</td>
+            </tr>
+            <tr>
+              <td class="mono">0x10–0x13</td>
+              <td>Authentication</td>
+              <td><code>AuthRequest</code> 0x10 &nbsp;·&nbsp; <code>AuthChallenge</code> 0x11 &nbsp;·&nbsp; <code>AuthResponse</code> 0x12 &nbsp;·&nbsp; <code>AuthResult</code> 0x13</td>
+            </tr>
+            <tr>
+              <td class="mono">0x20–0x2E</td>
+              <td>File operations</td>
+              <td><code>FileListRequest/Response</code> 0x20–0x21 &nbsp;·&nbsp; <code>FileTransferStart/Data/End</code> 0x22–0x24 &nbsp;·&nbsp; <code>FileCreateFolder</code> 0x25 &nbsp;·&nbsp; <code>FileDelete</code> 0x26 &nbsp;·&nbsp; <code>FileGenerateCatalog/FileCatalogGenerated</code> 0x27–0x28 &nbsp;·&nbsp; <code>FileSearchRequest/Response</code> 0x29–0x2A &nbsp;·&nbsp; <code>FileMove</code> 0x2B &nbsp;·&nbsp; <code>FileAlias</code> 0x2C &nbsp;·&nbsp; <code>FileInfoRequest/Response</code> 0x2D–0x2E</td>
+            </tr>
+            <tr>
+              <td class="mono">0x30–0x3A</td>
+              <td>Chat &amp; presence</td>
+              <td><code>ChatMessage</code> 0x30 &nbsp;·&nbsp; <code>ChatJoin/Leave</code> 0x31–0x32 &nbsp;·&nbsp; <code>ChatUserList</code> 0x33 &nbsp;·&nbsp; <code>ChatTopicSet</code> 0x34 &nbsp;·&nbsp; <code>PresenceListRequest/Response</code> 0x35–0x36 &nbsp;·&nbsp; <code>PresenceChange</code> 0x37 &nbsp;·&nbsp; <code>UserInfoRequest/Response</code> 0x38–0x39 &nbsp;·&nbsp; <code>SetIdentity</code> 0x3A</td>
+            </tr>
+            <tr>
+              <td class="mono">0x40–0x42</td>
+              <td>Private messages &amp; admin</td>
+              <td><code>PrivateSend</code> 0x40 &nbsp;·&nbsp; <code>PrivateMessage</code> 0x41 &nbsp;·&nbsp; <code>AdminDisconnect</code> 0x42</td>
+            </tr>
+            <tr>
+              <td class="mono">0x50–0x5C</td>
+              <td>Roles &amp; accounts</td>
+              <td><code>RoleListRequest/Response</code> 0x50–0x51 &nbsp;·&nbsp; <code>RoleCreate/Update/Delete</code> 0x52–0x54 &nbsp;·&nbsp; <code>RoleAssign/Unassign</code> 0x55–0x56 &nbsp;·&nbsp; <code>AccountRolesRequest/Response</code> 0x57–0x58 &nbsp;·&nbsp; <code>AccountCreate/Update</code> 0x59–0x5A &nbsp;·&nbsp; <code>AccountListRequest/Response</code> 0x5B–0x5C</td>
+            </tr>
+            <tr>
+              <td class="mono">0x60–0x66</td>
+              <td>News</td>
+              <td><code>NewsgroupListRequest/Response</code> 0x60–0x61 &nbsp;·&nbsp; <code>NewsThreadListRequest/Response</code> 0x62–0x63 &nbsp;·&nbsp; <code>NewsPostCreate/Delete</code> 0x64–0x65 &nbsp;·&nbsp; <code>NewsgroupCreate</code> 0x66</td>
+            </tr>
+            <tr>
+              <td class="mono">0x70–0x81</td>
+              <td>Infrastructure</td>
+              <td><code>TrackerListRequest/Response</code> 0x70–0x71 &nbsp;·&nbsp; <code>ServerSettingsRequest/Response/Update</code> 0x72–0x74 &nbsp;·&nbsp; <code>AdminBroadcast</code> 0x75 &nbsp;·&nbsp; <code>AdminShutdown</code> 0x76 &nbsp;·&nbsp; <code>ChatInvite/Invited</code> 0x77–0x78 &nbsp;·&nbsp; <code>HistoryListRequest/Response</code> 0x79–0x7A &nbsp;·&nbsp; <code>IpRuleListRequest/Response</code> 0x7B–0x7C &nbsp;·&nbsp; <code>IpRuleCreate/Delete</code> 0x7D–0x7E &nbsp;·&nbsp; <code>ConnectionListRequest/Response</code> 0x7F–0x80 &nbsp;·&nbsp; <code>ChatRoomFlags</code> 0x81</td>
+            </tr>
+            <tr>
+              <td class="mono">0xF0–0xF2</td>
+              <td>System</td>
+              <td><code>Error</code> 0xF0 &nbsp;·&nbsp; <code>Warning</code> 0xF1 &nbsp;·&nbsp; <code>Info</code> 0xF2</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- ═══════════════════════════════════════════════════════ FLAGS -->
+    <section id="flags">
+      <div class="eyebrow">Protocol</div>
+      <h2>Flags &amp; fragmentation</h2>
+
+      <h3>Flag bits (16-bit field)</h3>
+      <div class="tbl-wrap">
+        <table>
+          <thead><tr><th>Bit</th><th>Name</th><th>Meaning</th></tr></thead>
+          <tbody>
+            <tr><td class="mono">1</td><td><code>COMPRESSED</code></td><td>Payload is compressed (reserved; not yet used).</td></tr>
+            <tr><td class="mono">3</td><td><code>REQUIRES_ACK</code></td><td>Receiver must send an acknowledgment for this sequence number.</td></tr>
+            <tr><td class="mono">4</td><td><code>TRANSFER_START</code></td><td>This packet opens a new transfer session.</td></tr>
+            <tr><td class="mono">5</td><td><code>TRANSFER_END</code></td><td>This packet closes the transfer session normally.</td></tr>
+            <tr><td class="mono">6</td><td><code>TRANSFER_ABORT</code></td><td>Transfer is cancelled by the sender.</td></tr>
+            <tr><td class="mono">7</td><td><code>TRANSFER_RESUME</code></td><td>Resume request; payload carries the confirmed-chunk bitmap.</td></tr>
+            <tr><td class="mono">8–9</td><td><code>PRIORITY_BIT0/1</code></td><td>Two-bit priority field: 0=Low, 1=Normal, 2=High, 3=Critical. Use <code>PacketFlags::priority()</code> rather than testing bits directly.</td></tr>
+            <tr><td class="mono">12</td><td><code>FRAGMENTED</code></td><td>This packet is part of a multi-frame logical message.</td></tr>
+            <tr><td class="mono">13</td><td><code>MORE_FRAGMENTS</code></td><td>More frames follow in this fragment group (all but the last fragment set this).</td></tr>
+            <tr><td class="mono">14</td><td><code>SYSTEM_MESSAGE</code></td><td>Server-originated system notification (not user-generated content).</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="note amber">
+        <span class="lbl">Bits 0 and 2 reserved</span>
+        Bits 0 and 2 (formerly ENCRYPTED / SIGNED in legacy drafts) are reserved and must be zero. Encryption and signing are delegated entirely to TLS — per-packet equivalents would be redundant.
+      </div>
+
+      <h3>Fragmentation protocol</h3>
+      <p>When a logical payload exceeds the negotiated maximum frame size, the codec splits it across consecutive frames sharing the same packet type. All fragment frames set <code>FRAGMENTED</code>; every frame except the last additionally sets <code>MORE_FRAGMENTS</code>. The terminal fragment clears <code>MORE_FRAGMENTS</code>, signaling end-of-group to the reassembler.</p>
+
+      <ul class="clean">
+        <li>Fragments share <strong>consecutive sequence numbers</strong>, consumed from the connection's monotonic counter.</li>
+        <li>The connection is TCP/TLS (ordered delivery), so only <strong>one fragment group can be open at a time</strong>. An unfragmented frame or a new group while one is open is a connection-fatal protocol error.</li>
+        <li>Out-of-order fragments (<code>FragmentOutOfOrder</code>) and interleaved unfragmented frames (<code>FragmentInterleaved</code>) are connection-fatal.</li>
+        <li>A configurable <code>max_total</code> cap bounds reassembled payload size. Exceeding it is connection-fatal (<code>ReassemblyTooLarge</code>).</li>
+        <li>The reassembler can be <code>abort()</code>-ed on timeout, leaving the connection ready to accept a fresh packet.</li>
+      </ul>
+
+      <div class="layer">fragment group example →</div>
+      <div class="flow">
+        <div class="node"><span class="t">Frame 0</span><span class="s">FRAGMENTED | MORE_FRAGMENTS<br>seq=N</span></div>
+        <div class="arw">→</div>
+        <div class="node"><span class="t">Frame 1</span><span class="s">FRAGMENTED | MORE_FRAGMENTS<br>seq=N+1</span></div>
+        <div class="arw">→</div>
+        <div class="node"><span class="t">Frame 2</span><span class="s">FRAGMENTED (terminal)<br>seq=N+2</span></div>
+        <div class="arw">→</div>
+        <div class="node"><span class="t">Reassembled</span><span class="s">full logical payload<br>flags stripped</span></div>
+      </div>
+    </section>
+
+    <!-- ═══════════════════════════════════════════════════════ TLS -->
+    <section id="tls">
+      <div class="eyebrow">Security</div>
+      <h2>Transport security</h2>
+      <p>All KDX traffic runs over TLS 1.3 (provided by <code>rustls</code>). Servers generate a <strong>self-signed certificate</strong> at first run; there is no certificate authority hierarchy and no requirement to purchase a certificate from a third party.</p>
+
+      <h3>Trust-on-first-use (TOFU)</h3>
+      <p>Because self-signed certificates cannot be validated against a CA, the client uses SSH-style TOFU pinning:</p>
+
+      <ul class="clean">
+        <li>On first connection to a <code>host:port</code>, the client records the server's certificate fingerprint in <code>known_hosts.toml</code>.</li>
+        <li>On subsequent connections, the client requires the same fingerprint. A changed fingerprint triggers a loud warning and aborts the handshake.</li>
+        <li>Fingerprints are stored as <code>sha256:&lt;base64&gt;</code> (SHA-256 of the DER-encoded leaf certificate).</li>
+        <li>The <code>known_hosts.toml</code> file lives in the client's data directory and uses a minimal <code>"host:port" = "sha256:…"</code> line format.</li>
+      </ul>
+
+      <div class="note">
+        <span class="lbl">Fingerprint scope</span>
+        The fingerprint is per <code>host:port</code> pair. Connecting to the same server on a different port is treated as a distinct entry. Re-pinning replaces the stored fingerprint.
+      </div>
+
+      <h3>TLS 1.3 enforcement</h3>
+      <p>The <code>rustls</code> configuration explicitly negotiates TLS 1.3 only. TLS 1.2 is not offered by the server and not accepted by the client. The <code>TofuVerifier</code> custom <code>ServerCertVerifier</code> implementation handles both signature verification paths for completeness, but the TLS 1.2 path is unreachable in a standard deployment.</p>
+
+      <div class="grid2">
+        <div class="card">
+          <h3>Server side</h3>
+          <ul class="clean">
+            <li>Generates self-signed cert + key at first run</li>
+            <li>Presents leaf cert in TLS handshake</li>
+            <li>No CA involvement; no OCSP stapling</li>
+          </ul>
+        </div>
+        <div class="card">
+          <h3>Client side</h3>
+          <ul class="clean">
+            <li>Loads or creates <code>known_hosts.toml</code></li>
+            <li>Checks fingerprint; fails fast on mismatch</li>
+            <li>Records unseen fingerprint for user confirmation</li>
+          </ul>
+        </div>
+      </div>
+    </section>
+
+    <!-- ═══════════════════════════════════════════════════════ AUTH -->
+    <section id="auth">
+      <div class="eyebrow">Security</div>
+      <h2>Authentication</h2>
+      <p>KDX uses a four-message <strong>challenge-response handshake</strong>. The server stores only an <strong>Argon2id</strong> PHC string; the plaintext password never crosses the wire, not even inside TLS. Each login uses a fresh random challenge, so replaying a captured transcript is useless.</p>
+
+      <h3>Four-message handshake</h3>
+      <div class="layer">message flow →</div>
+      <div class="flow">
+        <div class="node"><span class="t">AuthRequest</span><span class="s">client → server<br>0x10 · username</span></div>
+        <div class="arw">→</div>
+        <div class="node"><span class="t">AuthChallenge</span><span class="s">server → client<br>0x11 · challenge + KDF params</span></div>
+        <div class="arw">→</div>
+        <div class="node"><span class="t">AuthResponse</span><span class="s">client → server<br>0x12 · H(challenge ‖ verifier)</span></div>
+        <div class="arw">→</div>
+        <div class="node"><span class="t">AuthResult</span><span class="s">server → client<br>0x13 · success + session_id + class</span></div>
+      </div>
+
+      <h3>Payload schemas</h3>
+      <div class="tbl-wrap">
+        <table>
+          <thead><tr><th>Message</th><th>Direction</th><th>Fields</th></tr></thead>
+          <tbody>
+            <tr>
+              <td><code>AuthRequest</code> 0x10</td>
+              <td>client → server</td>
+              <td><code>username</code> (u16-length-prefixed UTF-8 string)</td>
+            </tr>
+            <tr>
+              <td><code>AuthChallenge</code> 0x11</td>
+              <td>server → client</td>
+              <td><code>challenge</code> 32 bytes (OS random) &nbsp;·&nbsp; <code>m_cost</code> u32 &nbsp;·&nbsp; <code>t_cost</code> u32 &nbsp;·&nbsp; <code>p_cost</code> u32 &nbsp;·&nbsp; <code>salt</code> (u16-prefixed bytes from stored PHC)</td>
+            </tr>
+            <tr>
+              <td><code>AuthResponse</code> 0x12</td>
+              <td>client → server</td>
+              <td><code>response</code> 32 bytes (SHA-256 output)</td>
+            </tr>
+            <tr>
+              <td><code>AuthResult</code> 0x13</td>
+              <td>server → client</td>
+              <td><code>success</code> u8 &nbsp;·&nbsp; <code>session_id</code> 16 bytes &nbsp;·&nbsp; <code>class</code> u8 &nbsp;·&nbsp; <code>message</code> (u16-prefixed UTF-8)</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3>Response derivation</h3>
+      <pre><span class="c">// Client:</span>
+<span class="g">verifier</span>  = Argon2id(password, salt, m_cost, t_cost, p_cost, out_len=32)
+<span class="g">response</span>  = SHA-256(challenge <span class="a">||</span> verifier)        <span class="c">// 32 bytes</span>
+
+<span class="c">// Server (from stored PHC string):</span>
+<span class="g">verifier</span>  = extract hash bytes from PHC            <span class="c">// already stored, no re-derivation</span>
+<span class="g">expected</span>  = SHA-256(challenge <span class="a">||</span> verifier)
+<span class="g">ok</span>        = constant_time_eq(expected, response)   <span class="c">// subtle::ConstantTimeEq</span></pre>
+
+      <div class="note green">
+        <span class="lbl">What the server never sees</span>
+        The server stores only the Argon2id PHC string (hash + salt + params in one opaque token). The challenge-response design means: (1) the password bytes never cross the wire; (2) the server never reconstructs the password from the verifier; (3) a compromised session key does not expose the password.
+      </div>
+
+      <h3>Account classes</h3>
+      <div class="tbl-wrap">
+        <table>
+          <thead><tr><th>Value</th><th>Class</th><th>Default capabilities</th></tr></thead>
+          <tbody>
+            <tr><td class="mono">0</td><td><span class="pill grey">Guest</span></td><td>Read-only access to public rooms and <code>min_class_read=0</code> file nodes.</td></tr>
+            <tr><td class="mono">1</td><td><span class="pill green">User</span></td><td>Chat, file download/upload to permitted nodes, private messages.</td></tr>
+            <tr><td class="mono">2</td><td><span class="pill amber">Power User</span></td><td>Elevated write access; file operations on <code>min_class_write≤2</code> nodes.</td></tr>
+            <tr><td class="mono">3</td><td><span class="pill red">Admin</span></td><td>Full server control: kick/ban, IP rules, server settings, shutdown, broadcast.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- ═══════════════════════════════════════════════════════ CHAT -->
+    <section id="chat">
+      <div class="eyebrow">Features</div>
+      <h2>Chat</h2>
+      <p>KDX supports one or more named rooms. Users join a room with <code>ChatJoin</code> (0x31) and leave with <code>ChatLeave</code> (0x32). The server maintains the per-room user list, distributes messages, and enforces flood protection.</p>
+
+      <h3>Message flow</h3>
+      <ul class="clean">
+        <li><strong>ChatMessage (0x30)</strong> — user-originated line. The server echoes it to all room members except the sender, prepending the sender's nick and timestamp.</li>
+        <li><strong>ChatTopicSet (0x34)</strong> — sets or clears the room topic. Requires <code>CHAT_SET_TOPIC</code> permission.</li>
+        <li><strong>ChatUserList (0x33)</strong> — server push on join: the full current member list for the room.</li>
+        <li><strong>ChatRoomFlags (0x81)</strong> — per-room flag update. Sent by the server when flags change; can also be requested by an authorized client.</li>
+        <li><strong>SetIdentity (0x3A)</strong> — client updates its own nick or status without leaving and rejoining.</li>
+      </ul>
+
+      <h3>Presence</h3>
+      <ul class="clean">
+        <li><strong>PresenceListRequest/Response (0x35–0x36)</strong> — fetch the full server-wide user list.</li>
+        <li><strong>PresenceChange (0x37)</strong> — server push when any user's status (away, idle, etc.) changes.</li>
+        <li><strong>UserInfoRequest/Response (0x38–0x39)</strong> — fetch the profile of a specific connected user.</li>
+      </ul>
+
+      <h3>Private messages</h3>
+      <ul class="clean">
+        <li><strong>PrivateSend (0x40)</strong> — client sends a PM to a named user. The server routes it.</li>
+        <li><strong>PrivateMessage (0x41)</strong> — server delivers the PM to the recipient.</li>
+        <li><strong>ChatInvite/Invited (0x77–0x78)</strong> — invite to and notification of a private chat session. These opcodes live outside the 0x30–0x3F chat block because that range filled before the feature was added.</li>
+      </ul>
+
+      <h3>Moderation &amp; administration</h3>
+      <div class="tbl-wrap">
+        <table>
+          <thead><tr><th>Opcode</th><th>Name</th><th>Required class</th><th>Effect</th></tr></thead>
+          <tbody>
+            <tr><td class="mono">0x42</td><td><code>AdminDisconnect</code></td><td><span class="pill red">Admin</span></td><td>Forcibly disconnects a user. May set a ban flag.</td></tr>
+            <tr><td class="mono">0x75</td><td><code>AdminBroadcast</code></td><td><span class="pill red">Admin</span></td><td>Server-wide announcement delivered to all connected users.</td></tr>
+            <tr><td class="mono">0x76</td><td><code>AdminShutdown</code></td><td><span class="pill red">Admin</span></td><td>Initiates a graceful server shutdown.</td></tr>
+            <tr><td class="mono">0x7B–0x7E</td><td><code>IpRule*</code></td><td><span class="pill red">Admin</span></td><td>Allow/deny rules applied at the TCP accept layer before authentication.</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3>Flood protection</h3>
+      <p>The server tracks message rate per connection. A client sending more than the configured threshold of messages in a sliding window is throttled (messages dropped or delayed) rather than immediately disconnected. Persistent abuse triggers an administrative action via <code>AdminDisconnect</code>.</p>
+    </section>
+
+    <!-- ═══════════════════════════════════════════════════════ FILES -->
+    <section id="files">
+      <div class="eyebrow">Features</div>
+      <h2>File system</h2>
+      <p>KDX presents a <strong>virtual file tree</strong> rooted at a fixed <code>root</code> node. The tree is stored in SQLite (<code>file_nodes</code> table). Every node has a kind, two ACL fields (<code>min_class_read</code> and <code>min_class_write</code>), and an optional owner. The server enforces ACLs before any operation; there is no way to bypass them from the wire.</p>
+
+      <h3>Node kinds</h3>
+      <div class="tbl-wrap">
+        <table>
+          <thead><tr><th>Kind</th><th>Name</th><th>Semantics</th></tr></thead>
+          <tbody>
+            <tr>
+              <td class="mono">0</td>
+              <td><span class="pill grey">Directory</span></td>
+              <td>Standard folder. Readable and listable by users with <code>class ≥ min_class_read</code>. No associated storage path.</td>
+            </tr>
+            <tr>
+              <td class="mono">1</td>
+              <td><span class="pill green">File</span></td>
+              <td>A concrete file with <code>storage_path</code>, <code>size</code>, and <code>sha256</code>. Download requires <code>class ≥ min_class_read</code>.</td>
+            </tr>
+            <tr>
+              <td class="mono">2</td>
+              <td><span class="pill amber">Drop Box</span></td>
+              <td>Upload-only to everyone. The designated <code>owner</code> (and admins) may read and delete inside. All other users can upload but not list or download.</td>
+            </tr>
+            <tr>
+              <td class="mono">3</td>
+              <td><span class="pill amber">Upload Folder</span></td>
+              <td>Like a drop box but readable by users with the requisite class. Useful for community contribution areas where uploads should be visible after submission.</td>
+            </tr>
+            <tr>
+              <td class="mono">4</td>
+              <td><span class="pill grey">Alias</span></td>
+              <td>A symbolic link to another node (<code>target_id</code>). The target's size and storage are resolved at request time. If the target is deleted, the alias row is set to <code>target_id = NULL</code> (FK <code>ON DELETE SET NULL</code>), and resolution returns "not found" rather than silently disappearing from the tree.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3>ACL enforcement</h3>
+      <p>Each node carries two integer thresholds:</p>
+      <ul class="clean">
+        <li><strong><code>min_class_read</code></strong> — minimum account class required to list or download.</li>
+        <li><strong><code>min_class_write</code></strong> — minimum account class required to upload, create, rename, or delete.</li>
+      </ul>
+      <p>Default for new files: <code>min_class_read=0</code> (guests can read), <code>min_class_write=2</code> (power users can write). The server enforces these on every request; clients receive an <code>Error</code> (0xF0) if they attempt an operation their class does not permit.</p>
+
+      <h3>File operations</h3>
+      <div class="tbl-wrap">
+        <table>
+          <thead><tr><th>Opcode</th><th>Name</th><th>Notes</th></tr></thead>
+          <tbody>
+            <tr><td class="mono">0x20–0x21</td><td><code>FileListRequest/Response</code></td><td>List the children of a directory node.</td></tr>
+            <tr><td class="mono">0x22–0x24</td><td><code>FileTransferStart/Data/End</code></td><td>Open, stream, and close a transfer session. See <a class="inline" href="#transfers">Transfers</a>.</td></tr>
+            <tr><td class="mono">0x25</td><td><code>FileCreateFolder</code></td><td>Create a dir, drop box, or upload folder. Requires <code>class ≥ min_class_write</code> on the parent.</td></tr>
+            <tr><td class="mono">0x26</td><td><code>FileDelete</code></td><td>Delete a node. Admins can delete anything; others need <code>min_class_write</code> on the parent.</td></tr>
+            <tr><td class="mono">0x27–0x28</td><td><code>FileGenerateCatalog / FileCatalogGenerated</code></td><td>Server-side catalog generation (async). Server pushes <code>FileCatalogGenerated</code> when complete.</td></tr>
+            <tr><td class="mono">0x29–0x2A</td><td><code>FileSearchRequest/Response</code></td><td>Name-pattern search across the accessible subtree.</td></tr>
+            <tr><td class="mono">0x2B</td><td><code>FileMove</code></td><td>Move a node to a different parent.</td></tr>
+            <tr><td class="mono">0x2C</td><td><code>FileAlias</code></td><td>Create an alias node pointing to an existing non-alias node.</td></tr>
+            <tr><td class="mono">0x2D–0x2E</td><td><code>FileInfoRequest/Response</code></td><td>Fetch metadata (size, SHA-256, kind, ACLs) for a single node.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- ═══════════════════════════════════════════════════════ TRANSFERS -->
+    <section id="transfers">
+      <div class="eyebrow">Features</div>
+      <h2>Transfers</h2>
+      <p>KDX transfers are <strong>bidirectional</strong> (both upload and download use the same engine) and <strong>resumable</strong>. Files are split into fixed-size chunks; both sides maintain a per-chunk progress bitmap. An interrupted transfer can resume from the last confirmed chunk on reconnect.</p>
+
+      <div class="stats">
+        <div class="cell"><div class="k">Default chunk</div><div class="v">32 <small>KiB</small></div></div>
+        <div class="cell"><div class="k">Bitmap type</div><div class="v"><small>BitVec&lt;u8,Lsb0&gt;</small></div></div>
+        <div class="cell"><div class="k">Sidecar ext</div><div class="v"><small>.kdxpart</small></div></div>
+        <div class="cell"><div class="k">Transfer ID</div><div class="v"><small>128-bit UUID</small></div></div>
+      </div>
+
+      <h3>Chunk math</h3>
+      <ul class="clean">
+        <li><code>total_chunks = ceil(size / chunk_size)</code> — zero for empty files.</li>
+        <li>All chunks except the last are exactly <code>chunk_size</code> bytes. The last chunk is <code>size % chunk_size</code> bytes, or <code>chunk_size</code> if size is exactly divisible.</li>
+        <li>The default chunk size is 32 KiB (32,768 bytes) for both client and server.</li>
+      </ul>
+
+      <h3>Protocol opcodes</h3>
+      <div class="tbl-wrap">
+        <table>
+          <thead><tr><th>Opcode</th><th>Name</th><th>Notes</th></tr></thead>
+          <tbody>
+            <tr><td class="mono">0x22</td><td><code>FileTransferStart</code></td><td>Opens a transfer. Carries file node ID, direction, chunk size, and total size. <code>TRANSFER_START</code> flag set. For a resume, also carries <code>TRANSFER_RESUME</code> and the confirmed-chunk bitmap from the sidecar.</td></tr>
+            <tr><td class="mono">0x23</td><td><code>FileTransferData</code></td><td>One chunk of payload data. Carries chunk index and bytes. <code>FRAGMENTED</code> may be set if the chunk exceeds max frame size.</td></tr>
+            <tr><td class="mono">0x24</td><td><code>FileTransferEnd</code></td><td>Normal close. <code>TRANSFER_END</code> flag set. Both sides reconcile the final bitmap.</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3>Progress bitmap</h3>
+      <p>Each side maintains a <code>BitVec&lt;u8, Lsb0&gt;</code> with one bit per chunk — set when that chunk is confirmed received. The bitmap travels in resume requests so the sender can skip already-confirmed chunks. Serialized to bytes (LSB-first bit order) for the sidecar and wire.</p>
+
+      <h3>Resume sidecar (.kdxpart)</h3>
+      <p>When a download is interrupted, the client writes a <code>.kdxpart</code> file next to the partial download (e.g. <code>report.pdf.kdxpart</code>). On the next attempt, the client reads this sidecar, validates that the transfer parameters match, and resumes from the first unconfirmed chunk.</p>
+
+      <pre><span class="c"># .kdxpart line format (key=value, one field per line)</span>
+<span class="g">id</span>=550e8400-e29b-41d4-a716-446655440000   <span class="c"># UUID of the transfer session</span>
+<span class="g">size</span>=10485760                             <span class="c"># total file size in bytes</span>
+<span class="g">chunk_size</span>=32768                          <span class="c"># negotiated chunk size</span>
+<span class="g">sha256</span>=&lt;base64&gt;                           <span class="c"># expected SHA-256 of completed file</span>
+<span class="g">bitmap</span>=&lt;base64&gt;                           <span class="c"># confirmed-chunk bitmap (bytes, base64)</span></pre>
+
+      <div class="note green">
+        <span class="lbl">Integrity on resume</span>
+        The sidecar carries the expected SHA-256 of the whole file. After a resumed download completes, the client verifies the hash before removing the sidecar. A mismatch indicates corruption; the sidecar is preserved so the transfer can retry.
+      </div>
+
+      <h3>Upload path</h3>
+      <p>Uploads follow the same opcode sequence in reverse: the client sends <code>FileTransferStart</code> targeting a writable node, streams <code>FileTransferData</code> chunks, and closes with <code>FileTransferEnd</code>. The server writes each chunk to a staging path and atomically renames on completion, then inserts the resulting file node row (kind=1) with the confirmed size and SHA-256.</p>
+    </section>
+
+    <!-- ═══════════════════════════════════════════════════════ TRACKER -->
+    <section id="tracker">
+      <div class="eyebrow">Infrastructure</div>
+      <h2>Tracker / registry</h2>
+      <p>The KDX tracker is an optional directory service. Servers announce themselves; clients query the tracker to discover servers without prior knowledge of host/port.</p>
+
+      <h3>Opcodes</h3>
+      <div class="tbl-wrap">
+        <table>
+          <thead><tr><th>Opcode</th><th>Name</th><th>Direction</th><th>Notes</th></tr></thead>
+          <tbody>
+            <tr>
+              <td class="mono">0x70</td>
+              <td><code>TrackerListRequest</code></td>
+              <td>client → tracker</td>
+              <td>Requests the current list of registered servers. No payload required.</td>
+            </tr>
+            <tr>
+              <td class="mono">0x71</td>
+              <td><code>TrackerListResponse</code></td>
+              <td>tracker → client</td>
+              <td>Returns the registry: for each server, host, port, name, description, and current user count.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3>Server announcement</h3>
+      <p>A server configured with a tracker URL sends a registration beacon at startup and periodically thereafter. The beacon includes the server's public hostname, port, display name, and description. The tracker maintains the list and culls stale entries that have not renewed within a configurable TTL.</p>
+
+      <div class="note">
+        <span class="lbl">Tracker is optional</span>
+        A KDX server operates fully without any tracker. Direct connections by host:port are always supported. The tracker exists to aid discovery, not to gate operation.
+      </div>
+    </section>
+
+    <!-- ═══════════════════════════════════════════════════════ PRIVACY -->
+    <section id="privacy">
+      <div class="eyebrow">Infrastructure</div>
+      <h2>Privacy posture</h2>
+      <p>KDX is designed so that the operator — not a SaaS provider, not a platform — controls all data about their users. This is a structural property of the architecture, not a policy claim.</p>
+
+      <div class="grid2">
+        <div class="card">
+          <h3>No SaaS control plane</h3>
+          <p>There is no central KDX authority. No account creation on a third-party service, no license activation, no telemetry endpoint. The server binary is self-contained.</p>
+        </div>
+        <div class="card">
+          <h3>No platform identity</h3>
+          <p>Users authenticate with a username and password stored in the server's own SQLite database, hashed with Argon2id. There is no OAuth, no "sign in with X", no token from an external identity provider.</p>
+        </div>
+        <div class="card">
+          <h3>Server-side permissions</h3>
+          <p>Access control is enforced on the server. The file ACL model (<code>min_class_read</code>, <code>min_class_write</code>) and IP allow/deny rules are evaluated at the connection layer before any data is served. There is no client-side permission boundary that could be bypassed.</p>
+        </div>
+        <div class="card">
+          <h3>Local storage</h3>
+          <p>All server state lives in a single SQLite file: accounts, roles, file tree, chat history, bans, IP rules. The operator owns this file, can back it up, and can delete it. No data is written to any external service.</p>
+        </div>
+      </div>
+
+      <h3>Operator data responsibility</h3>
+      <p>Because all data is local, the operator is the sole custodian of user information:</p>
+      <ul class="clean">
+        <li>Password hashes (Argon2id PHC strings) are stored only on the server's filesystem.</li>
+        <li>Chat history is stored in <code>history</code> and <code>news</code> tables — the operator decides the retention policy.</li>
+        <li>File uploads live on the server's storage. There is no CDN, no object store, no offsite mirror unless the operator sets one up.</li>
+        <li>IP ban records and connection logs are local. No IP is submitted to any external threat-intelligence service.</li>
+      </ul>
+
+      <div class="note green">
+        <span class="lbl">What "sovereign" means in practice</span>
+        A Sovereign KDX server can run on a machine with no outbound internet access at all, as long as clients can reach it. The only optional network calls are tracker announcements and certificate rotation (self-signed, so no CA round trip). Everything else is peer-to-peer between client and server.
+      </div>
+
+      <h3>What KDX does not do</h3>
+      <ul class="clean">
+        <li>Does not phone home on startup, shutdown, or any user action.</li>
+        <li>Does not send crash reports or usage statistics to any party.</li>
+        <li>Does not require a valid DNS name or a public IP — works on a LAN or Tailnet.</li>
+        <li>Does not store or transmit cleartext passwords at any point.</li>
+        <li>Does not maintain session tokens in any external store — the 16-byte session ID exists only in server RAM for the lifetime of the connection.</li>
+      </ul>
+    </section>
+
+  </main>
+</div><!-- .wrap -->
+
+<footer class="doc">
+  Sovereign KDX · Technical Specification &nbsp;·&nbsp; Rust workspace: kdx-protocol · kdx-crypto · kdx-storage · kdx-server-core · kdx-client-core · kdxd + Tauri app
+</footer>
+</div><!-- .kdx-doc -->
+
+<script>
+  // Scroll-spy the table of contents.
+  (function () {
+    var links = Array.prototype.slice.call(document.querySelectorAll("nav.toc a"));
+    var map = {};
+    links.forEach(function (a) { map[a.getAttribute("href").slice(1)] = a; });
+    var sections = Array.prototype.slice.call(document.querySelectorAll("main section"));
+    if (!("IntersectionObserver" in window)) return;
+    var obs = new IntersectionObserver(function (entries) {
+      entries.forEach(function (e) {
+        if (e.isIntersecting) {
+          links.forEach(function (l) { l.classList.remove("active"); });
+          var a = map[e.target.id];
+          if (a) a.classList.add("active");
+        }
+      });
+    }, { rootMargin: "-10% 0px -80% 0px", threshold: 0 });
+    sections.forEach(function (s) { obs.observe(s); });
+  })();
+</script>
+</body>
+</html>
