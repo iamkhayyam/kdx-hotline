@@ -513,24 +513,24 @@
           <div class="seq-note right"><em>server</em>lookup account<br>extract PHC → salt + params</div>
         </div>
         <div class="seq-step">
-          <div class="seq-note left"><em>client</em>receive challenge + KDF params</div>
+          <div class="seq-note left"><em>client</em>derive response from<br>password + challenge</div>
           <div class="seq-mid">
             <div class="msg-name">AuthChallenge</div>
             <div class="msg-opcode">0x11</div>
             <div class="seq-arrow-l"></div>
-            <div class="msg-fields">challenge[32] · m_cost · t_cost<br>p_cost · salt</div>
+            <div class="msg-fields">challenge[32] + KDF parameters + salt</div>
           </div>
-          <div class="seq-note right"><em>server</em>OsRng.fill_bytes(32)</div>
+          <div class="seq-note right"><em>server</em>generate fresh challenge</div>
         </div>
         <div class="seq-step">
-          <div class="seq-note left"><em>client</em>verifier = Argon2id(pw, salt, params)<br>response = SHA-256(challenge ‖ verifier)</div>
+          <div class="seq-note left"></div>
           <div class="seq-mid">
             <div class="msg-name">AuthResponse</div>
             <div class="msg-opcode">0x12</div>
             <div class="seq-arrow-r"></div>
             <div class="msg-fields">response[32]</div>
           </div>
-          <div class="seq-note right"><em>server</em>expected = SHA-256(challenge ‖ stored_verifier)<br>ok = constant_time_eq(expected, response)</div>
+          <div class="seq-note right"><em>server</em>verify response</div>
         </div>
         <div class="seq-step">
           <div class="seq-note left"><em>client</em>store session_id · proceed as class</div>
@@ -544,43 +544,12 @@
         </div>
       </div>
 
-      <h3>Argon2id parameters</h3>
-      <div class="stats">
-        <div class="cell"><div class="k">m_cost</div><div class="v">19456 <small>KiB</small></div></div>
-        <div class="cell"><div class="k">t_cost</div><div class="v">2 <small>passes</small></div></div>
-        <div class="cell"><div class="k">p_cost</div><div class="v">1 <small>thread</small></div></div>
-        <div class="cell"><div class="k">out_len</div><div class="v">32 <small>bytes</small></div></div>
-        <div class="cell"><div class="k">challenge</div><div class="v">32 <small>bytes</small></div></div>
-        <div class="cell"><div class="k">session_id</div><div class="v">16 <small>bytes</small></div></div>
-      </div>
-      <p>Parameters meet <strong>OWASP Argon2id minimum</strong> recommendations (19&thinsp;MiB memory, 2 iterations). Shipped to the client inside <code>AuthChallenge</code> so it can reproduce the exact hash stored on the server — no second round-trip needed.</p>
-
-      <h3>Stored credential format</h3>
-      <p>The server stores one <strong>PHC string</strong> per account — no separate password column, no separate salt column. Everything needed to verify a future login is encoded inside a single opaque token.</p>
-      <div class="phc-strip">
-        <div class="phc-seg"><span class="phc-val">$argon2id</span><span class="phc-lbl">algorithm</span></div>
-        <div class="phc-seg"><span class="phc-val">$v=19</span><span class="phc-lbl">version</span></div>
-        <div class="phc-seg"><span class="phc-val">$m=19456,t=2,p=1</span><span class="phc-lbl">kdf params</span></div>
-        <div class="phc-seg"><span class="phc-val">$&lt;base64-salt&gt;</span><span class="phc-lbl">salt</span></div>
-        <div class="phc-seg"><span class="phc-val">$&lt;base64-hash&gt;</span><span class="phc-lbl">verifier</span></div>
-      </div>
-
-      <h3>Response derivation</h3>
-      <pre><span class="c">// Client:</span>
-<span class="g">verifier</span>  = Argon2id(password, salt, m_cost, t_cost, p_cost, out_len=32)
-<span class="g">response</span>  = SHA-256(challenge <span class="a">||</span> verifier)        <span class="c">// 32 bytes</span>
-
-<span class="c">// Server (never re-derives — reads verifier bytes from stored PHC):</span>
-<span class="g">verifier</span>  = extract hash bytes from PHC
-<span class="g">expected</span>  = SHA-256(challenge <span class="a">||</span> verifier)
-<span class="g">ok</span>        = constant_time_eq(expected, response)   <span class="c">// subtle::ConstantTimeEq</span></pre>
-
       <h3>Security guarantees</h3>
       <div class="sec-guarantees">
         <div class="sec-g">
           <div class="g-tag">NO-PW</div>
           <span class="g-title">Password never on wire</span>
-          <span class="g-desc">Not in plaintext, not inside TLS. The client sends only <code>SHA-256(challenge&thinsp;‖&thinsp;verifier)</code> — this output cannot be reversed to recover the password or the Argon2id verifier.</span>
+          <span class="g-desc">Not in plaintext, not inside TLS. The client sends a cryptographic response derived from the password — not the password itself, not in any recoverable form.</span>
         </div>
         <div class="sec-g">
           <div class="g-tag">FRESH</div>
