@@ -9,6 +9,7 @@ pub mod connection;
 pub mod files;
 pub mod history;
 pub mod ip_rules;
+pub mod limits;
 pub mod news;
 pub mod presence;
 pub mod settings;
