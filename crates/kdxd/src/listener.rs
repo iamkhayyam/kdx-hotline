@@ -149,6 +149,15 @@ pub async fn serve(config: Config) -> Result<Server, ServeError> {
     let ip_rules = IpRuleManager::load(pool.clone())
         .await
         .map_err(|e| ServeError::Init(e.to_string()))?;
+    // Config gives the defaults; settings an admin saved earlier override them.
+    let settings = ServerSettings::load(
+        pool.clone(),
+        config.server_name.clone(),
+        config.server_description.clone(),
+        config.max_users,
+    )
+    .await
+    .map_err(|e| ServeError::Init(e.to_string()))?;
     let listener = TcpListener::bind(config.bind).await?;
     let local_addr = listener.local_addr()?;
 
@@ -163,11 +172,7 @@ pub async fn serve(config: Config) -> Result<Server, ServeError> {
         transfers,
         presence: Presence::spawn(),
         tracker: Tracker::spawn(DEFAULT_TTL),
-        settings: ServerSettings::new(
-            config.server_name.clone(),
-            config.server_description.clone(),
-            config.max_users,
-        ),
+        settings,
         bind_port: local_addr.port(),
         shutdown: Arc::new(Notify::new()),
     });

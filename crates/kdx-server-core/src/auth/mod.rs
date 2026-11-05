@@ -1,5 +1,6 @@
 pub mod classes;
 pub mod manager;
+pub mod policy;
 pub mod roles;
 
 pub use classes::{effective_privileges, BaseClass, Privileges};
