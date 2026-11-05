@@ -649,6 +649,27 @@ impl FileTree {
         }
         state.nodes.insert(node.id.clone(), node);
     }
+
+    /// The current `/`-separated path of node `id` (`"/"` for the root), or
+    /// `None` if it is no longer in the tree. Lets a resumed upload re-check
+    /// its destination folder (stored by id) through `prepare_upload`.
+    pub async fn path_of(&self, id: &str) -> Option<String> {
+        let state = self.state.read().await;
+        let mut node = state.nodes.get(id)?;
+        let mut segments = Vec::new();
+        while let Some(parent_id) = &node.parent_id {
+            if segments.len() > state.nodes.len() {
+                return None; // cycle: fail closed
+            }
+            segments.push(node.name.as_str());
+            node = state.nodes.get(parent_id)?;
+        }
+        if node.id != ROOT_ID {
+            return None; // detached from the root
+        }
+        segments.reverse();
+        Some(format!("/{}", segments.join("/")))
+    }
 }
 
 /// Post-order walk of a subtree: pushes every descendant id (deepest first,

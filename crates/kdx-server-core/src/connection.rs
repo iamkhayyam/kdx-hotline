@@ -883,7 +883,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                             .await?;
                             self.stream_download(&mut stream).await?;
                         }
-                        Err(e) => self.send_error(&e.to_string()).await?,
+                        Err(e) => {
+                            if e.is_internal() {
+                                warn!(error = %e, "download could not start");
+                            }
+                            self.send_error(&e.client_message()).await?;
+                        }
                     }
                 }
                 PacketType::FileTransferStart => {
@@ -895,6 +900,21 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                     }
                     if upload.is_some() {
                         self.send_error("a transfer is already active").await?;
+                        continue;
+                    }
+                    if let Err(message) = crate::limits::check_len(
+                        "path",
+                        &request.path,
+                        crate::limits::MAX_PATH_LEN,
+                    )
+                    .and_then(|()| {
+                        crate::limits::check_len(
+                            "file name",
+                            &request.name,
+                            crate::limits::MAX_FILE_NAME_LEN,
+                        )
+                    }) {
+                        self.send_error(&message).await?;
                         continue;
                     }
                     let result = self
@@ -913,7 +933,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                         .await;
                     match result {
                         Ok((active, accept)) => {
-                            upload = Some(active);
+                            let transfer_id = accept.transfer_id;
                             let msg = TransferAccept {
                                 transfer_id: accept.transfer_id,
                                 chunk_size: accept.chunk_size,
@@ -928,8 +948,45 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                                 msg.encode(),
                             )
                             .await?;
+                            if !active.is_complete() {
+                                upload = Some(active);
+                                continue;
+                            }
+                            // Nothing left for the client to send (an empty
+                            // file, or a resume of an upload whose chunks
+                            // all arrived): verify and file it now.
+                            let (status, message) =
+                                match self.ctx.transfers.finish(&self.ctx.tree, active).await {
+                                    Ok(()) => (TRANSFER_VERIFIED, "verified".to_string()),
+                                    Err(TransferError::FileHashMismatch) => {
+                                        (TRANSFER_HASH_MISMATCH, "file hash mismatch".to_string())
+                                    }
+                                    Err(e) => {
+                                        warn!(error = %e, "upload could not be filed");
+                                        (
+                                            kdx_protocol::messages::TRANSFER_ABORTED,
+                                            format!("upload not filed: {}", e.client_message()),
+                                        )
+                                    }
+                                };
+                            let end = TransferEnd {
+                                transfer_id,
+                                status,
+                                message,
+                            };
+                            self.send(
+                                PacketType::FileTransferEnd,
+                                PacketFlags::TRANSFER_END,
+                                end.encode(),
+                            )
+                            .await?;
                         }
-                        Err(e) => self.send_error(&e.to_string()).await?,
+                        Err(e) => {
+                            if e.is_internal() {
+                                warn!(error = %e, "upload could not start");
+                            }
+                            self.send_error(&e.client_message()).await?;
+                        }
                     }
                 }
                 PacketType::FileTransferData => {
@@ -958,7 +1015,16 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                                     Err(TransferError::FileHashMismatch) => {
                                         (TRANSFER_HASH_MISMATCH, "file hash mismatch".to_string())
                                     }
-                                    Err(e) => return Err(ConnectionError::Transfer(e)),
+                                    // Name taken / folder gone meanwhile, or
+                                    // a server failure: the upload has been
+                                    // discarded; tell the client, stay up.
+                                    Err(e) => {
+                                        warn!(error = %e, "upload could not be filed");
+                                        (
+                                            kdx_protocol::messages::TRANSFER_ABORTED,
+                                            format!("upload not filed: {}", e.client_message()),
+                                        )
+                                    }
                                 };
                             let end = TransferEnd {
                                 transfer_id,
@@ -973,13 +1039,47 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                             .await?;
                         }
                         // Recoverable per-chunk problems: report, let the
-                        // client resend. Anything else is connection-fatal.
+                        // client resend.
                         Err(
                             e @ (TransferError::ChunkHashMismatch
                             | TransferError::BadChunkIndex
                             | TransferError::BadChunkLength),
                         ) => self.send_error(&e.to_string()).await?,
-                        Err(e) => return Err(ConnectionError::Transfer(e)),
+                        // A server-side failure (disk, database): end this
+                        // attempt but keep the upload resumable.
+                        Err(e) => {
+                            warn!(error = %e, "upload chunk could not be stored");
+                            let failed = upload.take().expect("active upload present");
+                            let transfer_id = *failed.id().as_bytes();
+                            self.ctx.transfers.release(failed).await;
+                            let end = TransferEnd {
+                                transfer_id,
+                                status: kdx_protocol::messages::TRANSFER_ABORTED,
+                                message: "upload interrupted by a server error; resume later"
+                                    .into(),
+                            };
+                            self.send(
+                                PacketType::FileTransferEnd,
+                                PacketFlags::TRANSFER_END,
+                                end.encode(),
+                            )
+                            .await?;
+                        }
+                    }
+                }
+                PacketType::FileTransferEnd => {
+                    // The client is abandoning (or pausing) its upload: free
+                    // the slot, keep the partial state for a later resume.
+                    let end = TransferEnd::decode(&frame.payload)?;
+                    match upload.take() {
+                        Some(active) if end.transfer_id == *active.id().as_bytes() => {
+                            debug!(status = end.status, "client ended its upload early");
+                            self.ctx.transfers.release(active).await;
+                        }
+                        other => {
+                            upload = other;
+                            self.send_error("no matching active transfer").await?;
+                        }
                     }
                 }
                 PacketType::RoleListRequest => {

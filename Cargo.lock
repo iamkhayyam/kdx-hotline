@@ -1961,6 +1961,7 @@ dependencies = [
  "kdx-crypto",
  "kdx-protocol",
  "kdx-storage",
+ "libc",
  "rand",
  "sha2",
  "tempfile",
