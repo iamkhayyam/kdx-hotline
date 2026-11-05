@@ -9,6 +9,7 @@ import { inTauri, getCurrentWindow } from "./bridge.js";
 import { isRegistered, isOpen, toggle } from "./wm.js";
 import { esc } from "./html.js";
 import { activeTransferCount } from "./store.js";
+import { canUseWindow } from "./privileges.js";
 
 // Order mirrors the real KDX client's left strip.
 const FEATURES = [
@@ -127,7 +128,6 @@ export function buildButtonBar(mount, handlers) {
 
   function update(state) {
     const connected = state.connection === "online";
-    const isAdmin = state.session && state.session.class === 3;
 
     serverName.textContent = connected && state.server
       ? state.server.host
@@ -140,7 +140,8 @@ export function buildButtonBar(mount, handlers) {
       let enabled = true;
       if (f.win && !isRegistered(f.win)) enabled = false; // not built yet
       if (f.requires === "connected" && !connected) enabled = false;
-      if (f.requires === "admin" && !(connected && isAdmin)) enabled = false;
+      // Files needs FILE_LIST; Administration any admin privilege.
+      if (f.win && connected && !canUseWindow(state.session, f.win)) enabled = false;
       if (f.id === "connect") enabled = true; // always reachable
       if (f.id === "exit") enabled = true;
       btn.disabled = !enabled;

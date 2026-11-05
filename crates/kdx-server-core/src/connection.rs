@@ -416,10 +416,17 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                                 }
                                 continue;
                             };
+                            // The client gates its UI on these privileges. A
+                            // login-time snapshot is enough: a change to this
+                            // account's class or effective privileges kicks
+                            // the session (auth::policy, and
+                            // stale_login_reason for one racing this login),
+                            // so they hold for as long as it lives.
                             let result = AuthResult {
                                 success: true,
                                 session_id: *session.id.as_bytes(),
                                 class: session.class as u8,
+                                privileges: session.privileges.bits(),
                                 message: format!("welcome, {}", session.username),
                                 server_signature: verified.server_signature,
                             };
@@ -495,12 +502,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
         }
     }
 
-    /// Send a failed `AuthResult` (no session, no server signature).
+    /// Send a failed `AuthResult`: session id, class, privileges and server
+    /// signature all zero.
     async fn send_auth_failure(&mut self, message: String) -> Result<(), ConnectionError> {
         let result = AuthResult {
             success: false,
             session_id: [0u8; 16],
             class: 0,
+            privileges: 0,
             message,
             server_signature: [0u8; 32],
         };
@@ -3665,6 +3674,76 @@ mod tests {
         assert!(ctx.auth.validate(session_id).is_none());
     }
 
+    /// A refused login reveals nothing about the account: no session, class,
+    /// privileges or signature.
+    fn assert_refused(result: &AuthResult) {
+        assert!(!result.success, "{}", result.message);
+        assert_eq!(result.session_id, [0u8; 16]);
+        assert_eq!(result.class, 0);
+        assert_eq!(result.privileges, 0);
+        assert_eq!(result.server_signature, [0u8; 32]);
+    }
+
+    #[tokio::test]
+    async fn auth_result_carries_the_effective_privileges() {
+        let (ctx, _dir) = test_ctx().await;
+        // A User-class account with an account grant, a role grant, and
+        // account revokes of a class default and of a role bit.
+        let granted = Privileges::USER_KICK;
+        let revoked = Privileges::FILE_UPLOAD | Privileges::USER_BAN;
+        ctx.auth
+            .create_account(
+                "deputy",
+                "s3cret",
+                1,
+                granted.bits() as i64,
+                revoked.bits() as i64,
+            )
+            .await
+            .unwrap();
+        let role = ctx
+            .roles
+            .create("Host", Privileges::CHAT_SET_TOPIC | Privileges::USER_BAN, 1, None)
+            .await
+            .unwrap();
+        let id = ctx.auth.account_id("deputy").await.unwrap().unwrap();
+        ctx.roles.assign(&id, role.id).await.unwrap();
+
+        let (client, server) = tokio::io::duplex(4096);
+        let conn = tokio::spawn(Connection::new(server, ctx.clone()).run());
+        let mut client = client_framed(client);
+        let mut seq = 0;
+        do_handshake(&mut client, &mut seq).await;
+
+        // Failures first: nothing leaks before the proof checks out.
+        assert_refused(&do_login(&mut client, &mut seq, "deputy", "wrong").await);
+
+        let result = do_login(&mut client, &mut seq, "deputy", "s3cret").await;
+        assert!(result.success, "{}", result.message);
+        assert_eq!(result.class, 1);
+        // User defaults, minus the revoked upload; plus the account's kick
+        // and the role's topic; the role's ban is revoked on the account.
+        let expected = Privileges::CHAT_SEND
+            | Privileges::CHAT_PRIVATE
+            | Privileges::FILE_LIST
+            | Privileges::FILE_DOWNLOAD
+            | Privileges::USER_KICK
+            | Privileges::CHAT_SET_TOPIC;
+        assert_eq!(result.privileges, expected.bits());
+        // Exactly what the server itself enforces for this session.
+        let session = ctx
+            .auth
+            .validate(uuid::Uuid::from_bytes(result.session_id))
+            .unwrap();
+        assert_eq!(result.privileges, session.privileges.bits());
+
+        client
+            .send(client_frame(PacketType::Disconnect, bump(&mut seq), Bytes::new()))
+            .await
+            .unwrap();
+        conn.await.unwrap().unwrap();
+    }
+
     #[tokio::test]
     async fn wrong_password_then_retry_succeeds() {
         let (ctx, _dir) = test_ctx().await;
@@ -3675,9 +3754,10 @@ mod tests {
 
         do_handshake(&mut client, &mut seq).await;
         let first = do_login(&mut client, &mut seq, "phraq", "wrong").await;
-        assert!(!first.success);
+        assert_refused(&first);
         let second = do_login(&mut client, &mut seq, "phraq", "s3cret").await;
         assert!(second.success);
+        assert_eq!(second.privileges, BaseClass::PowerUser.privileges().bits());
 
         client
             .send(client_frame(PacketType::Disconnect, bump(&mut seq), Bytes::new()))
@@ -3797,7 +3877,7 @@ mod tests {
             let frame = send_auth_request(&mut client, &mut seq, &huge).await;
             assert_eq!(frame.header.packet_type, PacketType::AuthResult);
             let result = AuthResult::decode(&frame.payload).unwrap();
-            assert!(!result.success);
+            assert_refused(&result);
         }
         assert!(matches!(
             conn.await.unwrap().unwrap_err(),
@@ -3833,7 +3913,8 @@ mod tests {
         do_handshake(&mut client, &mut seq).await;
         for _ in 0..MAX_AUTH_ATTEMPTS {
             let result = do_login(&mut client, &mut seq, "phraq", "s3cret").await;
-            assert!(!result.success);
+            // The right password, but a banned account learns nothing more.
+            assert_refused(&result);
             assert!(
                 result.message.starts_with("banned until"),
                 "{}",
@@ -3888,7 +3969,7 @@ mod tests {
         let frame = send_auth_request(&mut client, &mut seq, "phraq").await;
         assert_eq!(frame.header.packet_type, PacketType::AuthResult);
         let refused = AuthResult::decode(&frame.payload).unwrap();
-        assert!(!refused.success);
+        assert_refused(&refused);
         assert!(
             refused.message.contains("too many failed login attempts"),
             "{}",
@@ -4032,11 +4113,12 @@ mod tests {
         let mut seq2 = 0;
         do_handshake(&mut client2, &mut seq2).await;
         let full = do_login(&mut client2, &mut seq2, "plain", "s3cret").await;
-        assert!(!full.success);
+        assert_refused(&full);
         assert_eq!(full.message, "server is full");
         // ...but an admin still gets in.
         let admin = do_login(&mut client2, &mut seq2, "sysop", "s3cret").await;
         assert!(admin.success, "{}", admin.message);
+        assert_eq!(admin.privileges, Privileges::all().bits());
         assert_eq!(ctx.auth.live_session_count(), 2);
 
         for (mut client, mut seq, conn) in [(client1, seq1, conn1), (client2, seq2, conn2)] {

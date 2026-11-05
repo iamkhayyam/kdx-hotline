@@ -257,16 +257,18 @@ pub async fn get_session(state: State<'_, AppState>) -> CmdResult<Option<Session
     }))
 }
 
-/// Log in. With an empty `password` and a `bookmark_id`, the bookmark's
-/// password is read from the OS credential store here — it never travels
-/// through the webview — and only if it was saved for this server and login.
+/// Log in; resolves to who is now logged in (username, class and effective
+/// privileges — what `get_session` reports from then on). With an empty
+/// `password` and a `bookmark_id`, the bookmark's password is read from the
+/// OS credential store here — it never travels through the webview — and
+/// only if it was saved for this server and login.
 #[tauri::command]
 pub async fn login(
     state: State<'_, AppState>,
     username: String,
     password: String,
     bookmark_id: Option<String>,
-) -> CmdResult<u8> {
+) -> CmdResult<SessionUser> {
     let (handle, gen, host, port) = {
         let conn = state.conn.lock().await;
         let c = conn.as_ref().ok_or_else(|| CmdError::msg("not connected"))?;
@@ -286,15 +288,13 @@ pub async fn login(
         _ => password,
     };
     let session = handle.login(&username, &password).await.map_err(CmdError::msg)?;
+    let user = SessionUser::new(username, &session);
     if let Some(c) = state.conn.lock().await.as_mut() {
         if c.generation == gen {
-            c.user = Some(SessionUser {
-                username,
-                class: session.class,
-            });
+            c.user = Some(user.clone());
         }
     }
-    Ok(session.class)
+    Ok(user)
 }
 
 /// Save a bookmark's password in the OS credential store. Returns `false`
@@ -971,6 +971,39 @@ mod tests {
         assert!(text.contains("connection ended"), "{text}");
         let text = message(transfer_error(ClientError::Transfer("cancelled".into())));
         assert_eq!(text, "transfer failed: cancelled");
+    }
+
+    /// `login` resolves to, and `get_session` reports, the session's
+    /// effective privileges next to its class — the shape the webview's
+    /// session.js / connect.js read.
+    #[test]
+    fn the_session_carries_privileges_to_the_webview() {
+        let session = kdx_client_core::Session {
+            session_id: [7; 16],
+            class: 1,
+            privileges: 0x0001_000B,
+        };
+        let user = SessionUser::new("deputy".into(), &session);
+        assert_eq!(
+            serde_json::to_value(&user).unwrap(),
+            serde_json::json!({ "username": "deputy", "class": 1, "privileges": 0x0001_000B })
+        );
+        let dto = SessionDto {
+            gen: 3,
+            host: "kdx.example".into(),
+            port: 10700,
+            user: Some(user),
+        };
+        let json = serde_json::to_value(&dto).unwrap();
+        assert_eq!(json["user"]["privileges"], 0x0001_000B);
+        assert_eq!(json["user"]["class"], 1);
+        // Every bit a u32 can carry survives (JSON numbers, not i32).
+        let every_bit = kdx_client_core::Session {
+            privileges: u32::MAX,
+            ..session
+        };
+        let all = SessionUser::new("sysop".into(), &every_bit);
+        assert_eq!(serde_json::to_value(&all).unwrap()["privileges"], u32::MAX);
     }
 
     fn pending(previous: Option<&str>) -> PendingTrust {

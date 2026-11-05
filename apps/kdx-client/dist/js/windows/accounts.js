@@ -11,24 +11,9 @@ import { invoke } from "../bridge.js";
 import { esc, num, errorText } from "../html.js";
 import { askConfirm, confirmThen } from "../confirm.js";
 import { newPasswordProblem } from "../passwords.js";
+import { PRIVILEGES } from "../privileges.js";
 
 const CLASS_NAME = ["guest", "user", "power user", "admin"];
-
-const PRIVILEGES = [
-  { bit: 1 << 0, label: "Chat: send" },
-  { bit: 1 << 1, label: "Chat: private message" },
-  { bit: 1 << 2, label: "Chat: create room" },
-  { bit: 1 << 3, label: "Chat: set topic" },
-  { bit: 1 << 4, label: "Files: list" },
-  { bit: 1 << 5, label: "Files: download" },
-  { bit: 1 << 6, label: "Files: upload" },
-  { bit: 1 << 7, label: "Files: delete" },
-  { bit: 1 << 8, label: "Files: manage tree" },
-  { bit: 1 << 16, label: "Users: kick" },
-  { bit: 1 << 17, label: "Users: ban" },
-  { bit: 1 << 18, label: "Users: manage accounts/roles" },
-  { bit: 1 << 19, label: "Server: config/shutdown" },
-];
 
 export function buildAccounts() {
   const body = document.createElement("div");

@@ -1,9 +1,12 @@
 // User List — the server-wide roster (distinct from a chat room's member
-// list). Class color bars per row, type-to-filter, right-click "Get Info".
+// list). Class color bars per row, type-to-filter, right-click "Get Info"
+// plus the verbs the session's privileges allow (privileges.js).
 
 import { invoke, deliver } from "../bridge.js";
 import { showMenu } from "../menu.js";
+import { getState } from "../store.js";
 import { esc, num, errorText } from "../html.js";
+import { peerActions } from "../privileges.js";
 
 const CLASS_NAME = ["guest", "user", "power user", "admin"];
 
@@ -51,14 +54,21 @@ export function buildUserList() {
       row.addEventListener("click", () => deliver("userinfo", "show", { user: u.username }));
       row.addEventListener("contextmenu", (e) => {
         e.preventDefault();
-        const items = [
-          { label: "Send Message", fn: () => deliver("messages", "open-with", { user: u.username }) },
-          { label: "Get Info", fn: () => deliver("userinfo", "show", { user: u.username }) },
-        ];
+        // Only the verbs this session holds the privilege for.
+        const may = peerActions(getState().session);
+        const items = [];
+        if (may.message) {
+          items.push({ label: "Send Message", fn: () => deliver("messages", "open-with", { user: u.username }) });
+        }
+        items.push({ label: "Get Info", fn: () => deliver("userinfo", "show", { user: u.username }) });
         // The Chat window sends the invite, so it can follow the inviter
         // into the private room the server creates.
-        items.push({ label: "Invite to Chat…", fn: () => deliver("chat", "invite", { user: u.username }) });
-        items.push({ label: "Disconnect…", fn: () => deliver("admin", "open-disconnect", { user: u.username }) });
+        if (may.invite) {
+          items.push({ label: "Invite to Chat…", fn: () => deliver("chat", "invite", { user: u.username }) });
+        }
+        if (may.disconnect) {
+          items.push({ label: "Disconnect…", fn: () => deliver("admin", "open-disconnect", { user: u.username }) });
+        }
         showMenu(e.clientX, e.clientY, items);
       });
       listEl.appendChild(row);

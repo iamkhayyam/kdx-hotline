@@ -23,6 +23,10 @@ use crate::handle::{ClientHandle, Command, Password, Session};
 
 const BINDING: [u8; 32] = [0x5A; 32];
 
+/// Privilege bits the scripted server reports on a successful login: low
+/// and high bits set, so a dropped or truncated field shows.
+const RESULT_PRIVILEGES: u32 = 0x000A_01CF;
+
 type ServerSide = Framed<DuplexStream, KdxCodec>;
 
 struct Harness {
@@ -88,6 +92,7 @@ impl Harness {
             success,
             session_id: if success { [9u8; 16] } else { [0u8; 16] },
             class: if success { 2 } else { 0 },
+            privileges: if success { RESULT_PRIVILEGES } else { 0 },
             message: message.into(),
             server_signature,
         };
@@ -142,6 +147,9 @@ async fn login_succeeds_against_an_honest_server() {
 
     let session = finish(login).await.unwrap();
     assert_eq!(session.class, 2);
+    // The privileges come through exactly as the server sent them.
+    assert_eq!(session.privileges, RESULT_PRIVILEGES);
+    assert_eq!(session.session_id, [9u8; 16]);
 }
 
 /// P-3: a second login on a logged-in connection is refused locally. It

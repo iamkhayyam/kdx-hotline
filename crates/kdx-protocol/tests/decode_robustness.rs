@@ -453,6 +453,7 @@ fn cases() -> Vec<(&'static str, Vec<Bytes>, Probe)> {
                 let mut b = vec![1u8];
                 b.extend_from_slice(&[3u8; 16]);
                 b.push(2);
+                b.extend_from_slice(&0x000C_01FFu32.to_be_bytes()); // privileges
                 b.extend_from_slice(&[0, 2, b'h', b'i']);
                 b.extend_from_slice(&[7u8; 32]); // server_signature (v2)
                 Bytes::from(b)

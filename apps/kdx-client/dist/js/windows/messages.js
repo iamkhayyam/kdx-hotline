@@ -4,11 +4,18 @@
 //
 // Bounded (convos.js) and incremental: a PM appends one row/line instead of
 // rebuilding the window, so a flood can't freeze it.
+//
+// Anyone can receive messages; sending needs CHAT_PRIVATE, so without it the
+// input stays disabled (privileges.js).
 
 import { invoke, emitUi } from "../bridge.js";
-import { getState } from "../store.js";
+import { getState, subscribe } from "../store.js";
 import { errorText } from "../html.js";
 import { createConversations, MAX_LINES } from "../convos.js";
+import { can, CHAT_PRIVATE } from "../privileges.js";
+
+const ENTRY_HINT = "private message…";
+const NO_PM_HINT = "you can't send private messages (needs CHAT_PRIVATE)";
 
 export function buildMessages() {
   const body = document.createElement("div");
@@ -20,7 +27,7 @@ export function buildMessages() {
       <div class="msg-scroll" id="msg-scroll"></div>
       <div class="chat-input">
         <span class="prompt">&gt;</span>
-        <input id="msg-entry" placeholder="private message…" autocomplete="off" disabled />
+        <input id="msg-entry" autocomplete="off" disabled />
       </div>
     </div>`;
 
@@ -39,6 +46,17 @@ export function buildMessages() {
     const s = getState().session;
     return s && s.username;
   }
+
+  /** The input is live with a conversation open, unless the session can't
+   * send private messages. (Not logged in, a send says "not connected".) */
+  function syncEntry() {
+    const s = getState().session;
+    const mayPm = !s || can(s, CHAT_PRIVATE);
+    entry.disabled = !active || !mayPm;
+    entry.placeholder = mayPm ? ENTRY_HINT : NO_PM_HINT;
+  }
+  syncEntry();
+  subscribe(syncEntry);
 
   function syncLed() {
     const n = convos.unreadCount();
@@ -118,7 +136,7 @@ export function buildMessages() {
     dropRows(convos.ensure(user, user).evicted);
     convos.markRead(user);
     withEl.textContent = "conversation with " + user;
-    entry.disabled = false;
+    syncEntry();
     if (previous && previous !== user) paintRow(previous);
     paintRow(user);
     renderThread();

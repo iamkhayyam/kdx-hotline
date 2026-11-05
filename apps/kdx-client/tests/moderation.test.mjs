@@ -1,10 +1,14 @@
-// Moderation UI logic (dist/js/moderation.js): who is offered Unban and the
-// newsgroup admin controls, and the client-side checks before a request.
+// Moderation UI logic (dist/js/moderation.js): who is offered Unban, the
+// newsgroup admin controls, posting and post deletion, and the client-side
+// checks before a request.
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { ALL, USER_ADMIN, USER_BAN, USER_KICK } from "../dist/js/privileges.js";
 import {
   ADMIN_CLASS,
   canManageNewsgroups,
+  canPostTo,
+  canDeletePost,
   canLiftBan,
   banRemaining,
   filterBans,
@@ -40,11 +44,38 @@ test("unban is offered by the same rule the server applies", () => {
   assert.equal(canLiftBan(mod, ban("x", "0")), false);
 });
 
-test("newsgroup admin controls follow the Admin class", () => {
-  assert.equal(canManageNewsgroups({ username: "sysop", class: 3 }), true);
-  assert.equal(canManageNewsgroups({ username: "helpdesk", class: 2 }), false);
+// These used to follow the Admin class (the login result had no privileges);
+// now they follow USER_ADMIN, the privilege the server checks, whatever the
+// class: a delegated helpdesk gets them, an Admin with it revoked doesn't.
+test("newsgroup admin controls follow USER_ADMIN, not the class", () => {
+  assert.equal(canManageNewsgroups({ username: "sysop", class: 3, privileges: ALL }), true);
+  assert.equal(canManageNewsgroups({ username: "helpdesk", class: 2, privileges: USER_ADMIN }), true);
+  assert.equal(canManageNewsgroups({ username: "muzzled", class: 3, privileges: ALL & ~USER_ADMIN }), false);
+  assert.equal(canManageNewsgroups({ username: "mod", class: 2, privileges: USER_KICK | USER_BAN }), false);
+  // A session without privileges (none known) never gets them.
+  assert.equal(canManageNewsgroups({ username: "sysop", class: 3 }), false);
   assert.equal(canManageNewsgroups(null), false);
   assert.equal(canManageNewsgroups(undefined), false);
+});
+
+test("posting is offered where the class reaches the group's post class", () => {
+  const group = { id: "g", name: "general", min_read_class: 0, min_post_class: 1 };
+  assert.equal(canPostTo({ username: "u", class: 1, privileges: 0 }, group), true);
+  assert.equal(canPostTo({ username: "u", class: 3, privileges: 0 }, group), true);
+  assert.equal(canPostTo({ username: "g", class: 0, privileges: ALL }, group), false, "a class rule, not a privilege");
+  assert.equal(canPostTo({ username: "u", class: 1 }, null), false, "no group open");
+  assert.equal(canPostTo(null, group), false);
+  assert.equal(canPostTo({ username: "u", class: "1" }, group), false);
+});
+
+test("a post's Delete is for its author or USER_ADMIN", () => {
+  const post = { id: "p", author: "alice", subject: "hi" };
+  assert.equal(canDeletePost({ username: "alice", class: 1, privileges: 0 }, post), true);
+  assert.equal(canDeletePost({ username: "bob", class: 1, privileges: 0 }, post), false);
+  assert.equal(canDeletePost({ username: "bob", class: 2, privileges: USER_ADMIN }, post), true);
+  assert.equal(canDeletePost({ username: "bob", class: 3, privileges: ALL & ~USER_ADMIN }, post), false);
+  assert.equal(canDeletePost({ class: 1, privileges: 0 }, { id: "p" }), false, "no author, no name");
+  assert.equal(canDeletePost(null, post), false);
 });
 
 test("time left on a ban is short and never negative", () => {

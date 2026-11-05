@@ -4,13 +4,15 @@
 // threads and replies. Creating, editing and deleting newsgroups and deleting
 // others' posts are server-enforced on USER_ADMIN (edit/delete also need read
 // access to the group); posting is gated by the group's post class. The
-// newsgroup Edit/Delete controls are only shown to admins (moderation.js).
+// controls follow the same rules (moderation.js): newsgroup New/Edit/Delete
+// only for USER_ADMIN, New Message/Reply only where the class may post, and
+// Delete on your own posts or, with USER_ADMIN, anyone's.
 
 import { invoke } from "../bridge.js";
 import { getState, subscribe } from "../store.js";
 import { esc, num, errorText } from "../html.js";
 import { askConfirm, confirmThen } from "../confirm.js";
-import { canManageNewsgroups, newsgroupFormError } from "../moderation.js";
+import { canManageNewsgroups, canPostTo, canDeletePost, newsgroupFormError } from "../moderation.js";
 
 const CLASS_NAME = ["guest", "user", "power user", "admin"];
 
@@ -21,7 +23,7 @@ export function buildNews() {
     <div class="news-groups">
       <div class="news-hdr">Newsgroups</div>
       <div class="news-group-list" id="news-groups"></div>
-      <button class="mini" id="news-newgroup">New Newsgroup…</button>
+      <button class="mini hidden" id="news-newgroup">New Newsgroup…</button>
       <div class="news-group-admin hidden" id="news-group-admin">
         <button class="mini" id="news-editgroup" disabled>Edit…</button>
         <button class="mini danger" id="news-delgroup" disabled>Delete…</button>
@@ -93,11 +95,16 @@ export function buildNews() {
     }
   }
 
-  /** Newsgroup Edit/Delete: shown to admins, live while a group is open. */
+  /** Newsgroup New/Edit/Delete: shown to USER_ADMIN, Edit/Delete live while
+   * a group is open. New Message: live in a group the session may post to. */
   function updateAdminControls() {
-    groupAdmin.classList.toggle("hidden", !canManageNewsgroups(getState().session));
+    const session = getState().session;
+    const admin = canManageNewsgroups(session);
+    groupAdmin.classList.toggle("hidden", !admin);
+    $("#news-newgroup").classList.toggle("hidden", !admin);
     $("#news-editgroup").disabled = !group;
     $("#news-delgroup").disabled = !group;
+    $("#news-compose").disabled = !canPostTo(session, group);
   }
 
   /** After the group list changed: follow the open group's new name, or
@@ -118,7 +125,7 @@ export function buildNews() {
     posts = [];
     selected = null;
     titleEl.textContent = "select a newsgroup";
-    $("#news-compose").disabled = true;
+    $("#news-compose").disabled = true; // no group, nothing to post to
     threadsEl.innerHTML = "";
     readingEl.innerHTML = "";
     composer.classList.add("hidden");
@@ -150,7 +157,6 @@ export function buildNews() {
     group = groups.find((g) => g.id === id) || null;
     if (!group) return;
     titleEl.textContent = group.name;
-    $("#news-compose").disabled = false;
     selected = null;
     readingEl.innerHTML = "";
     composer.classList.add("hidden");
@@ -205,7 +211,9 @@ export function buildNews() {
   function selectPost(post) {
     selected = post;
     renderThreads();
-    const mine = getState().session && getState().session.username === post.author;
+    const session = getState().session;
+    const reply = canPostTo(session, group);
+    const del = canDeletePost(session, post);
     readingEl.innerHTML = `
       <div class="news-read-head">
         <span class="news-read-subj">${esc(post.subject)}</span>
@@ -213,12 +221,13 @@ export function buildNews() {
       </div>
       <div class="news-read-body">${esc(post.body)}</div>
       <div class="news-read-actions">
-        <button class="mini" id="news-reply">Reply</button>
-        ${mine ? '<button class="mini danger" id="news-delete">Delete</button>' : ""}
+        ${reply ? '<button class="mini" id="news-reply">Reply</button>' : ""}
+        ${del ? '<button class="mini danger" id="news-delete">Delete</button>' : ""}
       </div>`;
-    readingEl.querySelector("#news-reply").addEventListener("click", () => openComposer(post));
-    const del = readingEl.querySelector("#news-delete");
-    if (del) del.addEventListener("click", () => deletePost(post));
+    const replyBtn = readingEl.querySelector("#news-reply");
+    if (replyBtn) replyBtn.addEventListener("click", () => openComposer(post));
+    const delBtn = readingEl.querySelector("#news-delete");
+    if (delBtn) delBtn.addEventListener("click", () => deletePost(post));
   }
 
   function openComposer(parent) {

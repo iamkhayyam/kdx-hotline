@@ -20,7 +20,15 @@ use crate::event::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Session {
     pub session_id: [u8; 16],
+    /// The account's base class (0 guest, 1 user, 2 power user, 3 admin).
     pub class: u8,
+    /// The session's effective privilege bits, as the server computed them
+    /// at login (the server's `Privileges` bitflags: class defaults, plus
+    /// role and account grants, minus account revokes). Fit for deciding
+    /// what to offer the user; the server still checks every request. They
+    /// stay accurate for the connection's lifetime: the server disconnects
+    /// a session whose class or effective privileges change.
+    pub privileges: u32,
 }
 
 /// A login password on its way to the connection actor: wiped from memory

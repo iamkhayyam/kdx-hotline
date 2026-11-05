@@ -3,6 +3,7 @@ import { getState, update } from "../store.js";
 import { showMenu } from "../menu.js";
 import { esc, errorText } from "../html.js";
 import { inCurrentRoom, shouldAdoptRoom, createJoinTracker, INVITE_ADOPT_MS } from "../rooms.js";
+import { chatRefusal, peerActions } from "../privileges.js";
 
 const CHAT_ACTION = 1 << 0;
 const CHAT_SYSTEM = 1 << 1;
@@ -31,14 +32,15 @@ function savedRoom(gen) {
 // one never wipes the other.
 const identity = { name: "", description: "" };
 
-// Slash-command help, shown by /help. Both `/` and `\` prefixes are accepted.
+// Slash-command help, shown by /help: only the commands the session holds
+// the privilege for (privileges.js). Both `/` and `\` prefixes are accepted.
 const SLASH_HELP = [
-  "/me <action> — pose an action (also \\me)",
-  "/away [reason] · /back · /afk — announce your status",
-  "/topic <text> — set the room topic",
-  "/roomflags <min-class 0-3> <on|off> — set join gate + interview mode",
-  "/clear — clear this transcript",
-  "/help — this list",
+  { cmd: "me", text: "/me <action> — pose an action (also \\me)" },
+  { cmd: "away", text: "/away [reason] · /back · /afk — announce your status" },
+  { cmd: "topic", text: "/topic <text> — set the room topic" },
+  { cmd: "roomflags", text: "/roomflags <min-class 0-3> <on|off> — set join gate + interview mode" },
+  { cmd: "clear", text: "/clear — clear this transcript" },
+  { cmd: "help", text: "/help — this list" },
 ];
 
 /** opts.onUserCount(n): the room on screen now has `n` members. */
@@ -218,13 +220,28 @@ export function buildChat(opts = {}) {
   // everything else is an ordinary chat message.
   async function handleInput(raw) {
     const room = getState().room;
+    // Refuse here what the server would for a missing privilege, with why.
+    // (Not logged in, the server's own "not connected" says it better.)
+    const session = getState().session;
+    const where = { lobby: room === DEFAULT_ROOM };
+    const refusal = (c) => (session ? chatRefusal(session, c, where) : null);
     if (!/^[/\\]/.test(raw)) {
+      const refused = refusal("");
+      if (refused) {
+        lineText("err", `! ${refused}`);
+        return;
+      }
       await invoke("send_chat", { room, flags: 0, text: raw });
       return;
     }
     const space = raw.indexOf(" ");
     const cmd = (space === -1 ? raw.slice(1) : raw.slice(1, space)).toLowerCase();
     const rest = space === -1 ? "" : raw.slice(space + 1);
+    const refused = refusal(cmd);
+    if (refused) {
+      lineText("err", `! /${cmd}: ${refused}`);
+      return;
+    }
     switch (cmd) {
       case "me":
         if (rest.trim()) await invoke("send_chat", { room, flags: CHAT_ACTION, text: rest });
@@ -275,7 +292,9 @@ export function buildChat(opts = {}) {
         scroll.textContent = "";
         break;
       case "help":
-        for (const h of SLASH_HELP) lineText("sys", `*** ${h}`);
+        for (const h of SLASH_HELP) {
+          if (!refusal(h.cmd)) lineText("sys", `*** ${h.text}`);
+        }
         break;
       case "name":
       case "n":
@@ -307,12 +326,13 @@ export function buildChat(opts = {}) {
       // primary action surface, mirroring the global User List.
       d.addEventListener("contextmenu", (e) => {
         e.preventDefault();
+        const may = peerActions(getState().session);
         const items = [];
-        if (u !== me) {
+        if (u !== me && may.message) {
           items.push({ label: "Send Message", fn: () => deliver("messages", "open-with", { user: u }) });
         }
         items.push({ label: "Get Info", fn: () => deliver("userinfo", "show", { user: u }) });
-        if (u !== me) {
+        if (u !== me && may.invite) {
           items.push({ label: "Invite to Chat…", fn: () => invite(u) });
         }
         if (items.length) showMenu(e.clientX, e.clientY, items);

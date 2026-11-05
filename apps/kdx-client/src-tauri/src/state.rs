@@ -1,6 +1,6 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use kdx_client_core::ClientHandle;
+use kdx_client_core::{ClientHandle, Session};
 use serde::Serialize;
 use tauri::async_runtime::JoinHandle;
 use tokio::sync::Mutex;
@@ -41,10 +41,27 @@ pub struct Conn {
     pub user: Option<SessionUser>,
 }
 
-#[derive(Clone, Serialize)]
+/// Who is logged in on a connection, as the webview sees it (`login`'s
+/// result and `get_session`'s `user`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct SessionUser {
     pub username: String,
     pub class: u8,
+    /// Effective privilege bits from the login result. The webview gates its
+    /// controls on them (dist/js/privileges.js); the server still checks
+    /// every request. Accurate for the connection's lifetime: the server
+    /// disconnects a session whose privileges change.
+    pub privileges: u32,
+}
+
+impl SessionUser {
+    pub fn new(username: String, session: &Session) -> Self {
+        Self {
+            username,
+            class: session.class,
+            privileges: session.privileges,
+        }
+    }
 }
 
 /// An untrusted certificate the user may choose to pin.

@@ -1,29 +1,18 @@
-// Administration — SysOp-defined custom roles (Discord-style): named,
-// colorable privilege bundles a SysOp can create and assign to accounts on
-// top of their base class. Viewing the list is open to any connected user;
-// mutations are server-enforced on USER_ADMIN and simply error otherwise.
+// Administration — the moderation hub. SysOp-defined custom roles
+// (Discord-style): named, colorable privilege bundles a SysOp can create and
+// assign to accounts on top of their base class; the Disconnect User panel;
+// and buttons to the other admin windows. Each tool is shown only to a
+// session holding the privilege the server checks for it (privileges.js):
+// roles (listing and changes) USER_ADMIN, disconnect USER_KICK, a ban with
+// it USER_BAN too, and each window its own. The server enforces all of it.
 
 import { invoke } from "../bridge.js";
 import { open } from "../wm.js";
+import { getState, subscribe } from "../store.js";
 import { esc, num, safeColor, errorText } from "../html.js";
+import { PRIVILEGES, adminTools, privilegesOf } from "../privileges.js";
 
 const DEFAULT_SWATCH = "#6b5555";
-
-const PRIVILEGES = [
-  { bit: 1 << 0, name: "CHAT_SEND", label: "Chat: send" },
-  { bit: 1 << 1, name: "CHAT_PRIVATE", label: "Chat: private message" },
-  { bit: 1 << 2, name: "CHAT_CREATE_ROOM", label: "Chat: create room" },
-  { bit: 1 << 3, name: "CHAT_SET_TOPIC", label: "Chat: set topic" },
-  { bit: 1 << 4, name: "FILE_LIST", label: "Files: list" },
-  { bit: 1 << 5, name: "FILE_DOWNLOAD", label: "Files: download" },
-  { bit: 1 << 6, name: "FILE_UPLOAD", label: "Files: upload" },
-  { bit: 1 << 7, name: "FILE_DELETE", label: "Files: delete" },
-  { bit: 1 << 8, name: "FILE_MANAGE_TREE", label: "Files: manage tree" },
-  { bit: 1 << 16, name: "USER_KICK", label: "Users: kick" },
-  { bit: 1 << 17, name: "USER_BAN", label: "Users: ban" },
-  { bit: 1 << 18, name: "USER_ADMIN", label: "Users: manage accounts/roles" },
-  { bit: 1 << 19, name: "SERVER_ADMIN", label: "Server: config/shutdown" },
-];
 
 export function buildRoles() {
   const body = document.createElement("div");
@@ -54,7 +43,7 @@ export function buildRoles() {
         <button type="button" class="btn" id="rl-cancel">Cancel</button>
       </div>
     </form>
-    <div class="rl-assign">
+    <div class="rl-assign" id="rl-roles-panel">
       <div class="rl-assign-head">Roles</div>
       <div class="rl-assign-row">
         <input id="rl-username" placeholder="username" spellcheck="false" />
@@ -65,14 +54,14 @@ export function buildRoles() {
       </div>
       <div class="rl-assign-result" id="rl-assign-result"></div>
     </div>
-    <div class="rl-kick">
+    <div class="rl-kick" id="rl-kick-panel">
       <div class="rl-assign-head">Disconnect User</div>
       <div class="rl-assign-row">
         <input id="rl-kick-user" placeholder="username" spellcheck="false" />
         <input id="rl-kick-reason" class="rl-kick-reason" placeholder="reason (optional)" spellcheck="false" />
       </div>
       <div class="rl-assign-row">
-        <label class="rl-kick-ban">Ban
+        <label class="rl-kick-ban" id="rl-kick-ban-field">Ban
           <select id="rl-kick-ban">
             <option value="0">no ban (kick only)</option>
             <option value="300">5 minutes</option>
@@ -102,7 +91,27 @@ export function buildRoles() {
     (p) => `<label class="rl-priv"><input type="checkbox" data-bit="${num(p.bit)}" />${esc(p.label)}</label>`
   ).join("");
 
+  /** Show `text` in the role list's place. */
+  function listNote(text) {
+    const empty = document.createElement("div");
+    empty.className = "empty";
+    empty.textContent = text;
+    listEl.replaceChildren(empty);
+  }
+
   async function refresh() {
+    // Listing roles needs USER_ADMIN too: without it, don't ask.
+    const session = getState().session;
+    if (!session) {
+      roles = [];
+      listNote("not connected");
+      return;
+    }
+    if (!adminTools(session).roles) {
+      roles = [];
+      listNote("managing roles needs the USER_ADMIN privilege");
+      return;
+    }
     listEl.innerHTML = '<div class="empty">loading…</div>';
     try {
       roles = await invoke("list_roles");
@@ -110,10 +119,7 @@ export function buildRoles() {
       render();
     } catch (err) {
       // Server error text: shown as text, never parsed as markup.
-      const empty = document.createElement("div");
-      empty.className = "empty";
-      empty.textContent = errorText(err);
-      listEl.replaceChildren(empty);
+      listNote(errorText(err));
     }
   }
 
@@ -248,7 +254,7 @@ export function buildRoles() {
     const username = $("#rl-kick-user").value.trim();
     if (!username) return;
     const reason = $("#rl-kick-reason").value.trim();
-    const banSecs = parseInt($("#rl-kick-ban").value, 10) || 0;
+    const banSecs = adminTools(getState().session).ban ? parseInt($("#rl-kick-ban").value, 10) || 0 : 0;
     // The server acks over the event channel (server_info / server_error);
     // this just reflects that the request was sent.
     try {
@@ -268,6 +274,39 @@ export function buildRoles() {
     kickResult.textContent = "";
     $("#rl-kick-user").scrollIntoView({ block: "nearest" });
   }
+
+  // Show each tool only to a session holding its privilege; re-laid out
+  // (and the role list re-fetched) when the session arrives or changes.
+  let gatedFor; // the privilege bits (or null: no session) last laid out for
+  function applyGates() {
+    const session = getState().session;
+    const key = session ? privilegesOf(session) : null;
+    if (key === gatedFor) return;
+    const first = gatedFor === undefined;
+    gatedFor = key;
+    const tools = adminTools(session);
+    const shown = [
+      ["#rl-accounts", tools.accounts],
+      ["#rl-server", tools.server],
+      ["#rl-history", tools.history],
+      ["#rl-iprules", tools.iprules],
+      ["#rl-connections", tools.connections],
+      ["#rl-bans", tools.bans],
+      ["#rl-filter", tools.roles],
+      ["#rl-new", tools.roles],
+      ["#rl-refresh", tools.roles],
+      ["#rl-roles-panel", tools.roles],
+      ["#rl-kick-panel", tools.kick],
+      ["#rl-kick-ban-field", tools.ban],
+    ];
+    for (const [sel, on] of shown) $(sel).classList.toggle("hidden", !on);
+    if (!tools.ban) $("#rl-kick-ban").value = "0";
+    if (!tools.roles && !editor.classList.contains("hidden")) closeEditor();
+    // The window's mount does the first fetch.
+    if (!first) refresh();
+  }
+  applyGates();
+  subscribe(applyGates);
 
   return { body, refresh, openDisconnect };
 }
