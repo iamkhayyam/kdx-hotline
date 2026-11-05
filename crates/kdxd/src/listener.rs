@@ -15,7 +15,7 @@ use kdx_server_core::news::NewsManager;
 use kdx_server_core::presence::unix_now;
 use kdx_server_core::settings::ServerSettings;
 use kdx_server_core::tracker::{ServerEntry, Tracker, DEFAULT_TTL};
-use kdx_server_core::transfer::{TransferConfig, TransferManager};
+use kdx_server_core::transfer::{TransferConfig, TransferLimits, TransferManager};
 use kdx_server_core::{Connection, Presence, ServerCtx};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::ServerConfig as TlsServerConfig;
@@ -133,12 +133,16 @@ pub async fn serve(config: Config) -> Result<Server, ServeError> {
     let tree = FileTree::load(pool.clone())
         .await
         .map_err(|e| ServeError::Init(e.to_string()))?;
-    let transfers = TransferManager::new(
+    let transfers = TransferManager::with_limits(
         pool.clone(),
         TransferConfig {
             files_root: config.files_root.clone(),
             max_upload_bytes_per_sec: config.max_upload_bytes_per_sec,
             max_download_bytes_per_sec: config.max_download_bytes_per_sec,
+        },
+        TransferLimits {
+            orphan_retention: config.orphan_retention(),
+            ..TransferLimits::default()
         },
     )
     .await

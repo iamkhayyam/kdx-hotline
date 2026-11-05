@@ -15,7 +15,7 @@
 //! `limits::MAX_PATH_LEN`, so even a deep chain persisted by an older build
 //! can't overflow the stack.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use kdx_storage::file_tree::{self, FileNodeRow, ROOT_ID};
@@ -119,6 +119,89 @@ pub struct CatalogEntry {
     pub kind: NodeKind,
     pub size: u64,
     pub min_read_class: BaseClass,
+}
+
+/// Where an upload is headed, as settled by [`FileTree::prepare_upload`].
+#[derive(Debug, Clone)]
+pub struct UploadDest {
+    /// The folder the file goes into.
+    pub parent: Node,
+    /// The uploader may not list `parent` (a drop box they neither own nor
+    /// administer, or a folder whose read class is above theirs), so the
+    /// upload must not tell them which names are taken there: it never
+    /// fails with [`TreeError::Exists`] and is stored under the first free
+    /// variant of the requested name instead (see [`free_name`]).
+    pub blind: bool,
+    /// The longest name an entry of `parent` may have (the name cap, or
+    /// less when the folder's path leaves less room). Variants are trimmed
+    /// to fit it.
+    pub name_budget: usize,
+}
+
+/// Room for a name a blind upload needs in its folder: enough for any
+/// variant (a ` (n)` counter of up to 20 digits, an extension of up to
+/// [`MAX_EXTENSION_LEN`] bytes and at least one character of the stem). A
+/// blind upload into a folder whose path leaves less is refused whatever
+/// the name, so the refusal says nothing about which names are taken.
+pub(crate) const MIN_VARIANT_BUDGET: usize = 48;
+
+/// Longest tail (`.` included) [`free_name`] keeps after the counter as an
+/// extension: `report (2).pdf`. Longer tails are part of the stem.
+const MAX_EXTENSION_LEN: usize = 16;
+
+/// The first name, in a fixed order, that `taken` reports free: `name`
+/// itself, then `stem (2).ext`, `stem (3).ext`, … (a name that already ends
+/// in a counter, `stem (k).ext`, goes on from `k + 1`). A variant longer
+/// than `budget` bytes keeps its counter and extension and loses the end of
+/// its stem, so every candidate is distinct and passes [`validate_name`]
+/// given a valid `name` and a `budget` of at least `name.len()` and
+/// [`MIN_VARIANT_BUDGET`]. `None` only if no variant fits `budget`.
+pub(crate) fn free_name(name: &str, budget: usize, taken: impl Fn(&str) -> bool) -> Option<String> {
+    if !taken(name) {
+        return Some(name.to_owned());
+    }
+    let (stem, mut n, ext) = split_variant(name);
+    loop {
+        n = n.checked_add(1)?;
+        let suffix = format!(" ({n})");
+        let room = budget.checked_sub(suffix.len() + ext.len())?;
+        let stem = limits::truncate_utf8(stem, room);
+        if stem.is_empty() {
+            return None;
+        }
+        let candidate = format!("{stem}{suffix}{ext}");
+        if !taken(&candidate) {
+            debug_assert!(validate_name(&candidate).is_ok(), "{candidate:?}");
+            return Some(candidate);
+        }
+    }
+}
+
+/// Split `name` into (stem, counter, extension) for [`free_name`]:
+/// `"report (3).pdf"` → `("report", 3, ".pdf")`, `"notes"` → `("notes", 1,
+/// "")`. A leading dot (`.profile`) or a tail longer than
+/// [`MAX_EXTENSION_LEN`] is no extension; a counter is 1–9 digits without a
+/// leading zero.
+fn split_variant(name: &str) -> (&str, u64, &str) {
+    let (stem, ext) = match name.rfind('.') {
+        Some(dot) if dot > 0 && dot + 1 < name.len() && name.len() - dot <= MAX_EXTENSION_LEN => {
+            name.split_at(dot)
+        }
+        _ => (name, ""),
+    };
+    let counter = stem.strip_suffix(')').and_then(|body| {
+        let open = body.rfind(" (")?;
+        let digits = &body[open + 2..];
+        let plausible = open > 0
+            && (1..=9).contains(&digits.len())
+            && !digits.starts_with('0')
+            && digits.bytes().all(|b| b.is_ascii_digit());
+        plausible.then(|| (&stem[..open], digits.parse::<u64>().ok()))
+    });
+    match counter {
+        Some((base, Some(k))) => (base, k, ext),
+        _ => (stem, 1, ext),
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -406,29 +489,28 @@ impl FileTree {
         Ok(entries)
     }
 
-    /// Validate an upload destination and return the parent node. Enforces
+    /// Validate an upload destination and say where the file goes. Enforces
     /// the name rules, inherited ACLs on the way to the folder, its write
     /// ACL, the depth/path caps and name collisions. Uploading into a drop
     /// box is allowed (that's what it's for); into anything *under* one is
     /// owner/admin-only.
+    ///
+    /// A taken name is refused with [`TreeError::Exists`] only when the
+    /// uploader can list the folder. Otherwise (a drop box they don't own,
+    /// say) the answer must be the same whether or not the name is taken —
+    /// anything else lets them probe the folder's contents — so the upload
+    /// is accepted as [`UploadDest::blind`] and its caller stores it under a
+    /// free variant of the name.
     pub async fn prepare_upload(
         &self,
         path: &str,
         name: &str,
         session: &Session,
-    ) -> Result<Node, TreeError> {
+    ) -> Result<UploadDest, TreeError> {
         validate_name(name)?;
         let state = self.state.read().await;
         let node = state.resolve_as(path, session)?;
-        if !node.kind.is_folder() {
-            return Err(TreeError::NotAFolder);
-        }
-        state.check_place_into(node, session, false)?;
-        state.check_room(node, 0, 1 + name.len())?;
-        if state.name_taken(&node.id, name) {
-            return Err(TreeError::Exists);
-        }
-        Ok(node.clone())
+        state.upload_dest(node, name, session)
     }
 
     /// [`prepare_upload`](Self::prepare_upload) for a destination folder
@@ -442,29 +524,39 @@ impl FileTree {
         parent_id: &str,
         name: &str,
         session: &Session,
-    ) -> Result<Node, TreeError> {
+    ) -> Result<UploadDest, TreeError> {
         validate_name(name)?;
         let state = self.state.read().await;
         let node = state.nodes.get(parent_id).ok_or(TreeError::NotFound)?;
-        if !node.kind.is_folder() {
-            return Err(TreeError::NotAFolder);
-        }
         // The same gates `resolve_as` + `check_place_into` apply to a path:
         // every folder above must be readable (this also fails closed with
         // `NotFound` when the folder is detached), and it must be writable.
-        state.check_place_into(node, session, false)?;
-        state.check_room(node, 0, 1 + name.len())?;
-        if state.name_taken(&node.id, name) {
-            return Err(TreeError::Exists);
-        }
-        Ok(node.clone())
+        state.upload_dest(node, name, session)
     }
 
-    /// The entry named `name` directly inside folder `parent_id`, if any.
-    /// Applies no ACL (server-internal).
-    pub(crate) async fn child(&self, parent_id: &str, name: &str) -> Option<Node> {
+    /// Run `f` with a test for "is this name taken in folder `parent_id`",
+    /// while no entry can be added to the tree (the read lock is held for
+    /// the duration, so `f` must not block). Lets an upload pick a free
+    /// name and reserve it in one step.
+    pub(crate) async fn with_entry_names<R>(
+        &self,
+        parent_id: &str,
+        f: impl FnOnce(&dyn Fn(&str) -> bool) -> R,
+    ) -> R {
         let state = self.state.read().await;
-        let found = state.child_nodes(parent_id).find(|n| n.name == name).cloned();
+        let names: HashSet<&str> = state.child_nodes(parent_id).map(|n| n.name.as_str()).collect();
+        f(&|name: &str| names.contains(name))
+    }
+
+    /// The first entry directly inside folder `parent_id` that `matches`,
+    /// if any. Applies no ACL (server-internal).
+    pub(crate) async fn find_child(
+        &self,
+        parent_id: &str,
+        matches: impl Fn(&Node) -> bool,
+    ) -> Option<Node> {
+        let state = self.state.read().await;
+        let found = state.child_nodes(parent_id).find(|n| matches(n)).cloned();
         found
     }
 
@@ -648,17 +740,64 @@ impl FileTree {
         sha256: &[u8],
         storage_path: &str,
     ) -> Result<Node, TreeError> {
+        self.file_entry(parent_id, name, size, sha256, storage_path, None)
+            .await
+    }
+
+    /// [`add_file`](Self::add_file) for a blind upload (see
+    /// [`UploadDest::blind`]): if `name` has been taken meanwhile, the file
+    /// is filed under the first free variant of it (see [`free_name`]),
+    /// passing over names `reserved` reports other uploads are headed for,
+    /// rather than failing with `Exists`. The returned node carries the
+    /// name it was filed under. `reserved` runs under the tree's write lock
+    /// and must not block.
+    pub(crate) async fn add_file_renaming(
+        &self,
+        parent_id: &str,
+        name: &str,
+        size: u64,
+        sha256: &[u8],
+        storage_path: &str,
+        reserved: &(dyn Fn(&str) -> bool + Sync),
+    ) -> Result<Node, TreeError> {
+        self.file_entry(parent_id, name, size, sha256, storage_path, Some(reserved))
+            .await
+    }
+
+    async fn file_entry(
+        &self,
+        parent_id: &str,
+        name: &str,
+        size: u64,
+        sha256: &[u8],
+        storage_path: &str,
+        rename_if_taken: Option<&(dyn Fn(&str) -> bool + Sync)>,
+    ) -> Result<Node, TreeError> {
         validate_name(name)?;
         let mut state = self.state.write().await;
         let parent = state.nodes.get(parent_id).ok_or(TreeError::NotFound)?;
         if !parent.kind.is_folder() {
             return Err(TreeError::NotAFolder);
         }
-        if state.name_taken(parent_id, name) {
-            return Err(TreeError::Exists);
-        }
+        let name = match rename_if_taken {
+            _ if !state.name_taken(parent_id, name) => name.to_owned(),
+            None => return Err(TreeError::Exists),
+            Some(reserved) => {
+                // Never less room than the upload was accepted with, even
+                // if its folder has moved somewhere deeper since: a refusal
+                // here would tell the uploader the name was taken.
+                let budget = state
+                    .name_budget(parent)?
+                    .max(name.len())
+                    .max(MIN_VARIANT_BUDGET);
+                let names: HashSet<&str> =
+                    state.child_nodes(parent_id).map(|n| n.name.as_str()).collect();
+                free_name(name, budget, |c| names.contains(c) || reserved(c))
+                    .ok_or(TreeError::InvalidPath("path is too long"))?
+            }
+        };
         let row =
-            file_tree::create_file(&self.pool, parent_id, name, size as i64, sha256, storage_path)
+            file_tree::create_file(&self.pool, parent_id, &name, size as i64, sha256, storage_path)
                 .await
                 .map_err(map_write_err)?;
         let node = node_from_row(row)?;
@@ -1001,6 +1140,44 @@ impl TreeState {
 
     fn name_taken(&self, parent_id: &str, name: &str) -> bool {
         self.child_nodes(parent_id).any(|n| n.name == name)
+    }
+
+    /// The checks behind [`FileTree::prepare_upload`] for folder `node`.
+    fn upload_dest(&self, node: &Node, name: &str, s: &Session) -> Result<UploadDest, TreeError> {
+        if !node.kind.is_folder() {
+            return Err(TreeError::NotAFolder);
+        }
+        self.check_place_into(node, s, false)?;
+        self.check_room(node, 0, 1 + name.len())?;
+        let name_budget = self.name_budget(node)?;
+        // `check_place_into` passed, so every folder above is readable:
+        // whether the uploader may see what's in the folder is its own rule.
+        let blind = check_read_node(node, s).is_err();
+        if blind {
+            // Depends on the folder's path alone, never on its contents.
+            if name_budget < MIN_VARIANT_BUDGET {
+                return Err(TreeError::InvalidPath("path is too long"));
+            }
+        } else if self.name_taken(&node.id, name) {
+            return Err(TreeError::Exists);
+        }
+        Ok(UploadDest {
+            parent: node.clone(),
+            blind,
+            name_budget,
+        })
+    }
+
+    /// The longest name an entry of `folder` may have: the name cap, or
+    /// what's left of the path cap below `folder`.
+    fn name_budget(&self, folder: &Node) -> Result<usize, TreeError> {
+        let path_len: usize = self
+            .ancestry(folder)?
+            .iter()
+            .filter(|n| n.parent_id.is_some())
+            .map(|n| 1 + n.name.len())
+            .sum();
+        Ok(limits::MAX_FILE_NAME_LEN.min(limits::MAX_PATH_LEN.saturating_sub(path_len + 1)))
     }
 
     /// `start`, its parent, …, the root — walked iteratively and bounded by
@@ -2262,7 +2439,8 @@ mod tests {
         let parent = tree
             .prepare_upload("/pub", "up.bin", &sess(BaseClass::User))
             .await
-            .unwrap();
+            .unwrap()
+            .parent;
         // Same name filed meanwhile → Exists.
         tree.add_file(&parent.id, "up.bin", 1, &[0u8; 32], "/tmp/1").await.unwrap();
         assert!(matches!(
@@ -2302,11 +2480,11 @@ mod tests {
             .unwrap();
         let b = tree.resolve("/a/b").await.unwrap();
         let user = sess(BaseClass::User);
-        assert_eq!(tree.prepare_upload_into(&b.id, "x.bin", &user).await.unwrap().id, b.id);
+        assert_eq!(tree.prepare_upload_into(&b.id, "x.bin", &user).await.unwrap().parent.id, b.id);
 
         // An ancestor moved: same folder, still a valid destination.
         tree.move_node("/a", "/c", &admin()).await.unwrap();
-        assert_eq!(tree.prepare_upload_into(&b.id, "x.bin", &user).await.unwrap().id, b.id);
+        assert_eq!(tree.prepare_upload_into(&b.id, "x.bin", &user).await.unwrap().parent.id, b.id);
 
         // The rules of `prepare_upload`, as for the folder's path.
         tree.add_file(&b.id, "taken.bin", 1, &[0u8; 32], "/tmp/t").await.unwrap();
@@ -2367,5 +2545,163 @@ mod tests {
         assert_eq!(seen[0].size, 0);
         let seen = tree.list("/pub", &admin()).await.unwrap();
         assert_eq!(seen[0].size, 1);
+    }
+
+    // ---- drop-box name oracle (round 3, G3) ---------------------------------
+
+    fn free(name: &str, taken: &[&str]) -> String {
+        free_name(name, limits::MAX_FILE_NAME_LEN, |c| taken.contains(&c)).unwrap()
+    }
+
+    #[test]
+    fn free_name_counts_up_from_the_requested_name() {
+        assert_eq!(free("report.pdf", &[]), "report.pdf");
+        assert_eq!(free("report.pdf", &["report.pdf"]), "report (2).pdf");
+        assert_eq!(free("report.pdf", &["report.pdf", "report (2).pdf"]), "report (3).pdf");
+        // A name that already carries a counter goes on from it.
+        assert_eq!(free("report (3).pdf", &["report (3).pdf"]), "report (4).pdf");
+        assert_eq!(free("notes", &["notes"]), "notes (2)");
+        assert_eq!(free(".profile", &[".profile"]), ".profile (2)");
+        assert_eq!(free("a.tar.gz", &["a.tar.gz"]), "a.tar (2).gz");
+        assert_eq!(free("v1.", &["v1."]), "v1. (2)");
+        // Not counters: a leading zero, too many digits, no stem.
+        assert_eq!(free("x (0)", &["x (0)"]), "x (0) (2)");
+        assert_eq!(free("x (0123456789)", &["x (0123456789)"]), "x (0123456789) (2)");
+        // A long tail is no extension.
+        let long_tail = "a.this-is-no-extension";
+        assert_eq!(free(long_tail, &[long_tail]), "a.this-is-no-extension (2)");
+    }
+
+    #[test]
+    fn free_name_variants_fit_the_budget_stay_valid_and_never_repeat() {
+        let cases = [
+            ("n".repeat(limits::MAX_FILE_NAME_LEN), limits::MAX_FILE_NAME_LEN),
+            (format!("{}.txt", "é".repeat(120)), 244),
+            (format!("{}.verylongext", "w".repeat(40)), MIN_VARIANT_BUDGET.max(52)),
+            ("a".to_string(), MIN_VARIANT_BUDGET),
+            (format!("{} (7).bin", "z".repeat(30)), MIN_VARIANT_BUDGET),
+        ];
+        for (name, budget) in cases {
+            validate_name(&name).unwrap();
+            assert!(name.len() <= budget, "{name}");
+            let mut taken: HashSet<String> = HashSet::from([name.clone()]);
+            for _ in 0..300 {
+                let next = free_name(&name, budget, |c| taken.contains(c)).unwrap();
+                assert!(next.len() <= budget, "{next:?} over {budget}");
+                validate_name(&next).unwrap_or_else(|e| panic!("{next:?}: {e}"));
+                assert!(taken.insert(next.clone()), "{next:?} repeated");
+            }
+        }
+        // The stem gives way, the counter and extension stay.
+        let name = format!("{}.pdf", "r".repeat(251));
+        let next = free_name(&name, 255, |c| c == name).unwrap();
+        assert_eq!(next, format!("{} (2).pdf", "r".repeat(247)));
+        // Too little room for any variant.
+        assert!(free_name("abc", 5, |_| true).is_none());
+    }
+
+    #[tokio::test]
+    async fn blind_upload_into_a_drop_box_never_reports_a_taken_name() {
+        let (tree, _dir) = tree().await;
+        drop_box_with_file(&tree).await; // /drop (owner bob) holds a.txt
+        let alice = named(BaseClass::User, "alice");
+        for name in ["a.txt", "fresh.txt"] {
+            let dest = tree.prepare_upload("/drop", name, &alice).await.unwrap();
+            assert!(dest.blind, "{name}");
+            assert_eq!(dest.parent.name, "drop");
+            assert_eq!(dest.name_budget, limits::MAX_FILE_NAME_LEN);
+        }
+        let drop = tree.resolve("/drop").await.unwrap();
+        assert!(tree.prepare_upload_into(&drop.id, "a.txt", &alice).await.unwrap().blind);
+        // The owner and admins can list the box: they keep the explicit answer.
+        let bob = named(BaseClass::User, "bob");
+        for session in [&bob, &admin()] {
+            assert!(matches!(
+                tree.prepare_upload("/drop", "a.txt", session).await,
+                Err(TreeError::Exists)
+            ));
+            assert!(!tree.prepare_upload("/drop", "fresh.txt", session).await.unwrap().blind);
+        }
+        // A `[db]` folder is a drop box too.
+        tree.create_folder("/", "in [db]", NodeKind::Directory, BaseClass::Guest, BaseClass::User, Some("bob"), &admin())
+            .await
+            .unwrap();
+        let inbox = tree.resolve("/in [db]").await.unwrap();
+        tree.add_file(&inbox.id, "b.txt", 1, &[0u8; 32], "/tmp/none").await.unwrap();
+        assert!(tree.prepare_upload("/in [db]", "b.txt", &alice).await.unwrap().blind);
+        // So is any folder the uploader may write to but not list.
+        tree.create_folder("/", "slot", NodeKind::Directory, BaseClass::Admin, BaseClass::User, None, &admin())
+            .await
+            .unwrap();
+        let slot = tree.resolve("/slot").await.unwrap();
+        tree.add_file(&slot.id, "c.txt", 1, &[0u8; 32], "/tmp/none").await.unwrap();
+        assert!(tree.prepare_upload("/slot", "c.txt", &alice).await.unwrap().blind);
+        // A folder the uploader can list still says the name is taken.
+        tree.create_folder("/", "pub", NodeKind::Directory, BaseClass::Guest, BaseClass::User, None, &admin())
+            .await
+            .unwrap();
+        let public = tree.resolve("/pub").await.unwrap();
+        tree.add_file(&public.id, "d.txt", 1, &[0u8; 32], "/tmp/none").await.unwrap();
+        assert!(matches!(
+            tree.prepare_upload("/pub", "d.txt", &alice).await,
+            Err(TreeError::Exists)
+        ));
+    }
+
+    // A blind upload needs room for a variant: whether it gets it depends
+    // on the folder's path alone, so the refusal can't reveal a name.
+    #[tokio::test]
+    async fn blind_upload_room_depends_on_the_folder_path_only() {
+        let (tree, _dir) = tree().await;
+        let mut path = String::new();
+        for _ in 0..15 {
+            let name = "d".repeat(limits::MAX_FILE_NAME_LEN);
+            let parent = if path.is_empty() { "/".to_string() } else { path.clone() };
+            tree.create_folder(&parent, &name, NodeKind::Directory, BaseClass::Guest, BaseClass::User, None, &admin())
+                .await
+                .unwrap();
+            path = format!("{path}/{name}");
+        }
+        let boxname = "b".repeat(210);
+        tree.create_folder(&path, &boxname, NodeKind::DropBox, BaseClass::Guest, BaseClass::User, Some("bob"), &admin())
+            .await
+            .unwrap();
+        let path = format!("{path}/{boxname}");
+        let dest = tree.prepare_upload(&path, "x", &named(BaseClass::User, "bob")).await.unwrap();
+        assert!(dest.name_budget < MIN_VARIANT_BUDGET, "{}", dest.name_budget);
+        tree.add_file(&dest.parent.id, "x", 1, &[0u8; 32], "/tmp/none").await.unwrap();
+
+        let alice = named(BaseClass::User, "alice");
+        let taken = tree.prepare_upload(&path, "x", &alice).await.unwrap_err();
+        let free = tree.prepare_upload(&path, "y", &alice).await.unwrap_err();
+        assert!(matches!(taken, TreeError::InvalidPath(_)), "{taken}");
+        assert_eq!(taken.to_string(), free.to_string());
+    }
+
+    #[tokio::test]
+    async fn add_file_renaming_files_under_a_free_unreserved_variant() {
+        let (tree, _dir) = tree().await;
+        drop_box_with_file(&tree).await;
+        let drop = tree.resolve("/drop").await.unwrap();
+        let reserved = |name: &str| name == "a (2).txt";
+        let node = tree
+            .add_file_renaming(&drop.id, "a.txt", 1, &[0u8; 32], "/tmp/1", &reserved)
+            .await
+            .unwrap();
+        assert_eq!(node.name, "a (3).txt");
+        // A free name is used as it is, even if "reserved" (that's the
+        // caller's own reservation).
+        let node = tree
+            .add_file_renaming(&drop.id, "a (2).txt", 1, &[0u8; 32], "/tmp/2", &reserved)
+            .await
+            .unwrap();
+        assert_eq!(node.name, "a (2).txt");
+        let names: Vec<_> = tree.list("/drop", &admin()).await.unwrap().into_iter().map(|e| e.name).collect();
+        assert_eq!(names, ["a (2).txt", "a (3).txt", "a.txt"]);
+        // The plain variant still refuses.
+        assert!(matches!(
+            tree.add_file(&drop.id, "a.txt", 1, &[0u8; 32], "/tmp/3").await,
+            Err(TreeError::Exists)
+        ));
     }
 }
