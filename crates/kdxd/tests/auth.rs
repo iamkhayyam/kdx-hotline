@@ -317,20 +317,33 @@ async fn repeated_failures_from_one_address_are_throttled() {
         refused.message
     );
 
-    // The failures were audited (on detached tasks) with the peer address.
+    // The failures were audited (through the detached history writer) with
+    // the peer address. The writer merges identical events that land in one
+    // batch into a single row whose detail ends in " (xN)" — and these three
+    // are identical (same actor, same connection's peer) — so count events,
+    // not rows: how many rows they became depends on batching timing.
+    fn events_in(detail: &str) -> usize {
+        detail
+            .rsplit_once(" (x")
+            .and_then(|(_, tail)| tail.strip_suffix(')'))
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(1)
+    }
     let mut failed = Vec::new();
+    let mut events = 0;
     for _ in 0..200 {
         let history = server.ctx.history.recent(50).await.unwrap();
         failed = history
             .into_iter()
             .filter(|e| e.action == "login_failed")
             .collect();
-        if failed.len() >= 3 {
+        events = failed.iter().map(|e| events_in(&e.detail)).sum::<usize>();
+        if events >= 3 {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
-    assert_eq!(failed.len(), 3);
+    assert_eq!(events, 3, "{failed:?}");
     assert!(
         failed.iter().all(|e| e.detail.contains("127.0.0.1")),
         "{failed:?}"
