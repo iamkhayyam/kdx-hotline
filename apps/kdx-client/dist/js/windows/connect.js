@@ -118,16 +118,19 @@ export function buildConnect() {
   async function finishLogin(gen, host, port, username, password) {
     setStatus("authenticating…");
     const useSaved = !password && bookmarkId;
-    const klass = await invoke("login", {
+    // { username, class, privileges }: the effective privilege bits the
+    // server computed at login, which every window gates its controls on.
+    const user = await invoke("login", {
       username,
       password,
       bookmarkId: useSaved ? bookmarkId : null,
     });
+    const session = { username, class: user.class, privileges: user.privileges };
     try {
       localStorage.setItem("kdx.lastServer", JSON.stringify({ host, port, username }));
     } catch (_) {}
-    update({ connection: "online", session: { class: klass, username }, server: { host, port } });
-    setStatus(`logged in as ${username} (${CLASSES[klass] || "?"})`, "ok");
+    update({ connection: "online", session, server: { host, port } });
+    setStatus(`logged in as ${username} (${CLASSES[session.class] || "?"})`, "ok");
     try {
       await invoke("join_room", { room: getState().room });
     } catch (err) {
@@ -136,7 +139,7 @@ export function buildConnect() {
     }
     // Tell every other window who we are (they keep their own store), and
     // let the launcher open the chat window + snapshot the roster.
-    emitUi("*", "session", { gen, session: { username, class: klass }, server: { host, port } });
+    emitUi("*", "session", { gen, session, server: { host, port } });
     emitUi("main", "login-success");
   }
 

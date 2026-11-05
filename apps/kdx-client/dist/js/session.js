@@ -5,7 +5,9 @@
 import { invoke, noteGeneration } from "./bridge.js";
 import { update } from "./store.js";
 
-/** Apply a "session" broadcast: { gen, session: {username, class}, server }. */
+/** Apply a "session" broadcast: { gen, session: {username, class,
+ * privileges}, server }. `privileges` is the login result's effective bit
+ * set (see privileges.js). */
 export function applySession(msg) {
   noteGeneration(msg.gen);
   update({ connection: "online", session: msg.session, server: msg.server });
@@ -24,7 +26,11 @@ export async function hydrateSession() {
   const patch = { server: { host: s.host, port: s.port } };
   if (s.user) {
     patch.connection = "online";
-    patch.session = { username: s.user.username, class: s.user.class };
+    patch.session = {
+      username: s.user.username,
+      class: s.user.class,
+      privileges: s.user.privileges,
+    };
   }
   update(patch);
   return s;

@@ -36,18 +36,28 @@ pub struct AuthResponse {
 }
 
 /// Server → client: outcome. On success carries the session id, the
-/// account's base class (0 guest, 1 user, 2 power user, 3 admin) and the
-/// `ServerSignature` (`HMAC(ServerKey, AuthMessage)`) the client must verify
-/// before trusting the login. On failure the signature is all zeros. A
-/// failure may also be sent directly in reply to `AuthRequest` (throttled,
-/// server full, invalid username) without a challenge round.
+/// account's base class (0 guest, 1 user, 2 power user, 3 admin), the
+/// session's effective privilege bits (class defaults, plus role and
+/// account grants, minus account revokes — the server's `Privileges`
+/// bitflags) and the `ServerSignature` (`HMAC(ServerKey, AuthMessage)`) the
+/// client must verify before trusting the login. On failure the session id,
+/// class, privileges and signature are all zero. A failure may also be sent
+/// directly in reply to `AuthRequest` (throttled, server full, invalid
+/// username) without a challenge round.
 ///
-/// Wire: `success:u8 session_id[16] class:u8 message:str server_signature[32]`.
+/// The privileges are a login-time snapshot. They stay accurate for the
+/// session's lifetime because the server disconnects the live sessions of
+/// an account whose class or effective privileges change (through its
+/// overrides, its roles, or a role's privileges); they must log in again.
+///
+/// Wire: `success:u8 session_id[16] class:u8 privileges:u32 message:str
+/// server_signature[32]`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthResult {
     pub success: bool,
     pub session_id: [u8; 16],
     pub class: u8,
+    pub privileges: u32,
     pub message: String,
     pub server_signature: [u8; 32],
 }
@@ -166,23 +176,25 @@ impl AuthResponse {
 
 impl AuthResult {
     pub fn encode(&self) -> Bytes {
-        let mut buf = BytesMut::with_capacity(1 + 16 + 1 + 2 + self.message.len() + 32);
+        let mut buf = BytesMut::with_capacity(1 + 16 + 1 + 4 + 2 + self.message.len() + 32);
         buf.put_u8(self.success as u8);
         buf.put_slice(&self.session_id);
         buf.put_u8(self.class);
+        buf.put_u32(self.privileges);
         put_str(&mut buf, &self.message);
         buf.put_slice(&self.server_signature);
         buf.freeze()
     }
 
     pub fn decode(mut payload: &[u8]) -> Result<Self, ProtocolError> {
-        if payload.remaining() < 1 + 16 + 1 + 2 {
+        if payload.remaining() < 1 + 16 + 1 + 4 + 2 {
             return Err(ProtocolError::MalformedPayload("AuthResult"));
         }
         let success = payload.get_u8() != 0;
         let mut session_id = [0u8; 16];
         payload.copy_to_slice(&mut session_id);
         let class = payload.get_u8();
+        let privileges = payload.get_u32();
         let message = get_str(&mut payload, "AuthResult")?;
         if payload.remaining() != 32 {
             return Err(ProtocolError::MalformedPayload("AuthResult"));
@@ -193,6 +205,7 @@ impl AuthResult {
             success,
             session_id,
             class,
+            privileges,
             message,
             server_signature,
         })
@@ -324,10 +337,36 @@ mod tests {
             success: true,
             session_id: [3u8; 16],
             class: 2,
+            // High and low bits both survive (u32, big-endian).
+            privileges: 0x8008_0101,
             message: "welcome back".into(),
             server_signature: [5u8; 32],
         };
         assert_eq!(AuthResult::decode(&msg.encode()).unwrap(), msg);
+    }
+
+    #[test]
+    fn result_layout_puts_privileges_after_class() {
+        let msg = AuthResult {
+            success: true,
+            session_id: [3u8; 16],
+            class: 2,
+            privileges: 0x000C_01FF,
+            message: "hi".into(),
+            server_signature: [5u8; 32],
+        };
+        let bytes = msg.encode();
+        let mut expected = vec![1u8];
+        expected.extend_from_slice(&[3u8; 16]);
+        expected.push(2);
+        expected.extend_from_slice(&[0x00, 0x0C, 0x01, 0xFF]);
+        expected.extend_from_slice(&[0, 2, b'h', b'i']);
+        expected.extend_from_slice(&[5u8; 32]);
+        assert_eq!(&bytes[..], &expected[..]);
+        // Every strict prefix is refused (privileges included).
+        for len in 0..bytes.len() {
+            assert!(AuthResult::decode(&bytes[..len]).is_err(), "prefix of {len} bytes");
+        }
     }
 
     #[test]
@@ -336,6 +375,7 @@ mod tests {
             success: false,
             session_id: [0u8; 16],
             class: 0,
+            privileges: 0,
             message: "invalid credentials".into(),
             server_signature: [0u8; 32],
         };

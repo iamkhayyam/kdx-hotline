@@ -49,6 +49,60 @@ async fn connect_login_returns_class() {
     ts.stop();
 }
 
+/// The session carries the effective privileges the server computed at
+/// login: class defaults, plus role and account grants, minus account
+/// revokes (bit values: kdx_server_core::auth::Privileges).
+#[tokio::test]
+async fn login_returns_effective_privileges() {
+    const CHAT_SEND: u32 = 1 << 0;
+    const CHAT_PRIVATE: u32 = 1 << 1;
+    const CHAT_SET_TOPIC: u32 = 1 << 3;
+    const FILE_LIST: u32 = 1 << 4;
+    const FILE_DOWNLOAD: u32 = 1 << 5;
+    const FILE_UPLOAD: u32 = 1 << 6;
+    const USER_KICK: u32 = 1 << 16;
+    const USER_BAN: u32 = 1 << 17;
+
+    let ts = TestServer::start().await;
+    ts.seed_account("sysop", "pw", 3).await;
+    // A User with an account grant (kick), a role (topic + ban), and
+    // account revokes of a class default (upload) and of the role's ban.
+    let pool = kdx_storage::connect(&ts.db_path).await.unwrap();
+    let credential = kdx_crypto::hash_password("pw").unwrap();
+    let deputy = kdx_storage::accounts::create(
+        &pool,
+        "deputy",
+        &credential,
+        1,
+        USER_KICK as i64,
+        (FILE_UPLOAD | USER_BAN) as i64,
+    )
+    .await
+    .unwrap();
+    let role = kdx_storage::roles::create(&pool, "Host", (CHAT_SET_TOPIC | USER_BAN) as i64, 1, None)
+        .await
+        .unwrap();
+    kdx_storage::roles::assign(&pool, &deputy.id, &role.id).await.unwrap();
+
+    let (client, mut events, _dd) = ts.connect_client().await;
+    next_event(&mut events).await; // Connected
+    let session = client.login("deputy", "pw").await.unwrap();
+    assert_eq!(session.class, 1);
+    assert_eq!(
+        session.privileges,
+        CHAT_SEND | CHAT_PRIVATE | FILE_LIST | FILE_DOWNLOAD | USER_KICK | CHAT_SET_TOPIC
+    );
+    client.disconnect().await;
+
+    // An Admin holds every defined privilege (bits 0–8 and 16–19).
+    let (admin, mut events, _dd2) = ts.connect_client().await;
+    next_event(&mut events).await;
+    let session = admin.login("sysop", "pw").await.unwrap();
+    assert_eq!(session.privileges, 0x000F_01FF);
+    admin.disconnect().await;
+    ts.stop();
+}
+
 #[tokio::test]
 async fn wrong_password_then_retry() {
     let ts = TestServer::start().await;

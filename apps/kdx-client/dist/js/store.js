@@ -4,7 +4,7 @@
 const state = {
   connection: "offline", // offline | connecting | online
   server: null, // { host, port }
-  session: null, // { class }
+  session: null, // { username, class, privileges } — see privileges.js
   room: "lobby",
   users: [], // current room's roster (chat window's user-list pane)
   presenceCount: 0, // server-wide online count (Button Bar footer)

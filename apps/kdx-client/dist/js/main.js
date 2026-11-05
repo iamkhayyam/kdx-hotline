@@ -30,6 +30,7 @@ import { applySettings, loadSettings } from "./windows/settings.js";
 import { createDeliveryQueue } from "./delivery.js";
 import { applySession, hydrateSession } from "./session.js";
 import { migrateAddressBook } from "./windows/addressbook.js";
+import { canUseWindow } from "./privileges.js";
 
 const desktop = document.getElementById("desktop");
 
@@ -77,7 +78,11 @@ function mountLauncher() {
   // disappear until it's restored here (or via F1 / Cmd+H).
   const hidden = new Set(); // labels currently hidden (but alive)
   function openWindowsMenu(at) {
-    const items = FEATURES.map((f) => {
+    // Logged in, a window this session has no privilege for isn't offered
+    // (one already open still is, to hide or show it).
+    const session = getState().session;
+    const offered = FEATURES.filter((f) => isOpen(f.id) || !session || canUseWindow(session, f.id));
+    const items = offered.map((f) => {
       const exists = isOpen(f.id);
       const visible = exists && !hidden.has(f.id);
       return {

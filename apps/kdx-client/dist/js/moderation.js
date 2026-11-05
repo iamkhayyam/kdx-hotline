@@ -1,7 +1,9 @@
 // Pure helpers behind the moderation UI: the Bans window and the News
-// window's newsgroup Edit/Delete controls. No DOM, no Tauri — unit-tested
-// in tests/moderation.test.mjs. The server enforces every rule here; these
+// window's newsgroup and post controls. No DOM, no Tauri — unit-tested in
+// tests/moderation.test.mjs. The server enforces every rule here; these
 // only decide what the UI offers.
+
+import { can, USER_ADMIN } from "./privileges.js";
 
 /** Base class of an Admin (0 guest, 1 user, 2 power user, 3 admin). */
 export const ADMIN_CLASS = 3;
@@ -10,15 +12,29 @@ export const ADMIN_CLASS = 3;
 export const MAX_NEWSGROUP_NAME_BYTES = 64;
 export const MAX_NEWSGROUP_DESCRIPTION_BYTES = 1024;
 
-/**
- * Whether to show newsgroup admin controls (Edit / Delete) to `session`.
- * The login result carries only the account's class, not its privileges,
- * so USER_ADMIN is approximated by the Admin class (which holds it unless
- * revoked). A delegated USER_ADMIN below Admin doesn't get the controls;
- * the server checks the real privilege either way.
- */
+/** Whether to offer creating, editing and deleting newsgroups: USER_ADMIN,
+ * the privilege the server checks (edits and deletes also need read access
+ * to the group, which any group the session lists has). */
 export function canManageNewsgroups(session) {
-  return !!session && session.class === ADMIN_CLASS;
+  return can(session, USER_ADMIN);
+}
+
+/** Whether to offer posting to `group`: the session's class must reach the
+ * group's post class (the server's check; it's class-based, not a
+ * privilege). */
+export function canPostTo(session, group) {
+  if (!session || !group) return false;
+  const mine = session.class;
+  return Number.isInteger(mine) && Number.isInteger(group.min_post_class) && mine >= group.min_post_class;
+}
+
+/** Whether to offer deleting `post`: its author may (until others reply —
+ * the server says so then), and USER_ADMIN may delete anyone's post in a
+ * group it can read. */
+export function canDeletePost(session, post) {
+  if (!session || !post) return false;
+  const mine = typeof session.username === "string" && session.username === post.author;
+  return mine || can(session, USER_ADMIN);
 }
 
 /**

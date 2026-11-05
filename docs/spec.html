@@ -539,14 +539,14 @@
           <div class="seq-note right"><em>server</em>ClientKey = proof ⊕ HMAC(StoredKey, AuthMessage)<br>ok = ct_eq(SHA-256(ClientKey), StoredKey)<br>then ban check · max_users</div>
         </div>
         <div class="seq-step">
-          <div class="seq-note left"><em>client</em>ct_eq(server_signature, expected)<br>mismatch → fail + disconnect<br>else store session_id · class</div>
+          <div class="seq-note left"><em>client</em>ct_eq(server_signature, expected)<br>mismatch → fail + disconnect<br>else store session_id · class · privileges</div>
           <div class="seq-mid">
             <div class="msg-name">AuthResult</div>
             <div class="msg-opcode">0x13</div>
             <div class="seq-arrow-l"></div>
-            <div class="msg-fields">success · session_id[16] · class<br>message · server_signature[32]</div>
+            <div class="msg-fields">success · session_id[16] · class<br>privileges · message · server_signature[32]</div>
           </div>
-          <div class="seq-note right"><em>server</em>server_signature =<br>HMAC(ServerKey, AuthMessage)<br>(all zeros on failure)</div>
+          <div class="seq-note right"><em>server</em>server_signature =<br>HMAC(ServerKey, AuthMessage)<br>privileges = effective set<br>(all zeros on failure)</div>
         </div>
       </div>
 
@@ -559,7 +559,7 @@
             <tr><td class="mono">0x10</td><td><code>AuthRequest</code></td><td class="mono">username:str</td><td>Usernames over 64 bytes are refused without a challenge.</td></tr>
             <tr><td class="mono">0x11</td><td><code>AuthChallenge</code></td><td class="mono">challenge[32] m_cost:u32 t_cost:u32 p_cost:u32 salt_len:u16 salt</td><td>Exactly <code>46 + salt_len</code> bytes. Wire order puts the parameters before the salt; <code>AuthMessage</code> puts the salt first.</td></tr>
             <tr><td class="mono">0x12</td><td><code>AuthResponse</code></td><td class="mono">proof[32]</td><td>Exactly 32 bytes: the <code>ClientProof</code>.</td></tr>
-            <tr><td class="mono">0x13</td><td><code>AuthResult</code></td><td class="mono">success:u8 session_id[16] class:u8 message:str server_signature[32]</td><td>Exactly 32 bytes follow <code>message</code>. On failure <code>session_id</code>, <code>class</code> and <code>server_signature</code> are zero. A failure may also answer <code>AuthRequest</code> directly (throttled, over-long username).</td></tr>
+            <tr><td class="mono">0x13</td><td><code>AuthResult</code></td><td class="mono">success:u8 session_id[16] class:u8 privileges:u32 message:str server_signature[32]</td><td><code>privileges</code> is the session's effective privilege set (<a class="inline" href="#privileges">below</a>). Exactly 32 bytes follow <code>message</code>. On failure <code>session_id</code>, <code>class</code>, <code>privileges</code> and <code>server_signature</code> are zero. A failure may also answer <code>AuthRequest</code> directly (throttled, over-long username).</td></tr>
           </tbody>
         </table>
       </div>
@@ -800,6 +800,30 @@
           </tbody>
         </table>
       </div>
+
+      <h3 id="privileges">Effective privileges</h3>
+      <p>What a session may do is a 32-bit privilege set, computed at login: <code>(class defaults | role privileges | account grants) − account revokes</code>, where the roles are every custom role assigned to the account (a revoke beats any grant). <code>AuthResult</code> sends it to the client, which uses it only to decide which controls to offer; the server checks the privilege on every request. The set is a login-time snapshot, and stays exact for the session's lifetime: a change that alters an account's class or effective privileges — through its overrides, its roles, or the privileges of a role it holds — disconnects its live sessions (<code>your privileges changed — please reconnect</code>), a login in flight included, and the next login carries the new set. Undefined bits are never set.</p>
+      <div class="tbl-wrap">
+        <table>
+          <thead><tr><th>Bit</th><th>Value</th><th>Privilege</th><th>Gates</th><th>Class default</th></tr></thead>
+          <tbody>
+            <tr><td class="mono">0</td><td class="mono">0x00001</td><td><code>CHAT_SEND</code></td><td>Chat messages and actions</td><td>Guest</td></tr>
+            <tr><td class="mono">1</td><td class="mono">0x00002</td><td><code>CHAT_PRIVATE</code></td><td>Private messages, private-chat invites</td><td>User</td></tr>
+            <tr><td class="mono">2</td><td class="mono">0x00004</td><td><code>CHAT_CREATE_ROOM</code></td><td>Joining a public room that doesn't exist yet (creating it)</td><td>Power User</td></tr>
+            <tr><td class="mono">3</td><td class="mono">0x00008</td><td><code>CHAT_SET_TOPIC</code></td><td>Room topic and room flags (the lobby's flags also need <code>SERVER_ADMIN</code>); speaking in interview mode</td><td>Power User</td></tr>
+            <tr><td class="mono">4</td><td class="mono">0x00010</td><td><code>FILE_LIST</code></td><td>Folder listings, file info, catalog search</td><td>Guest</td></tr>
+            <tr><td class="mono">5</td><td class="mono">0x00020</td><td><code>FILE_DOWNLOAD</code></td><td>Downloads</td><td>User</td></tr>
+            <tr><td class="mono">6</td><td class="mono">0x00040</td><td><code>FILE_UPLOAD</code></td><td>Uploads</td><td>User</td></tr>
+            <tr><td class="mono">7</td><td class="mono">0x00080</td><td><code>FILE_DELETE</code></td><td>Deleting files and folders</td><td>Power User</td></tr>
+            <tr><td class="mono">8</td><td class="mono">0x00100</td><td><code>FILE_MANAGE_TREE</code></td><td>New folders and drop boxes, move, alias, catalog generation</td><td>Power User</td></tr>
+            <tr><td class="mono">16</td><td class="mono">0x10000</td><td><code>USER_KICK</code></td><td><code>AdminDisconnect</code>, the connection list, peer addresses in presence and user info</td><td>Admin</td></tr>
+            <tr><td class="mono">17</td><td class="mono">0x20000</td><td><code>USER_BAN</code></td><td>A ban with a disconnect, the ban list, lifting bans</td><td>Admin</td></tr>
+            <tr><td class="mono">18</td><td class="mono">0x40000</td><td><code>USER_ADMIN</code></td><td>Accounts (create, edit, reset passwords), roles, newsgroup create/edit/delete, deleting others' news posts</td><td>Admin</td></tr>
+            <tr><td class="mono">19</td><td class="mono">0x80000</td><td><code>SERVER_ADMIN</code></td><td>Server settings, history, IP rules, broadcast, shutdown; logging in to a full server</td><td>Admin</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>Class defaults are cumulative (a User has the Guest bits too), and an Admin holds every bit. Per-file and per-newsgroup class thresholds apply on top, to the account's class.</p>
     </section>
 
     <!-- ═══════════════════════════════════════════════════════ CHAT -->
@@ -834,15 +858,15 @@
       <h3>Moderation &amp; administration</h3>
       <div class="tbl-wrap">
         <table>
-          <thead><tr><th>Opcode</th><th>Name</th><th>Required class</th><th>Effect</th></tr></thead>
+          <thead><tr><th>Opcode</th><th>Name</th><th>Requires</th><th>Effect</th></tr></thead>
           <tbody>
-            <tr><td class="mono">0x42</td><td><code>AdminDisconnect</code></td><td><span class="pill red">Admin</span></td><td>Forcibly disconnects a user. May set a ban flag.</td></tr>
+            <tr><td class="mono">0x42</td><td><code>AdminDisconnect</code></td><td><span class="pill red">USER_KICK</span></td><td>Forcibly disconnects a user. May set a ban flag (which also needs <code>USER_BAN</code>).</td></tr>
             <tr><td class="mono">0x43–0x44</td><td><code>BanListRequest/Response</code></td><td><span class="pill red">USER_BAN</span></td><td>Lists the account bans in force, longest-lasting first (at most 500, with the total).</td></tr>
             <tr><td class="mono">0x45</td><td><code>BanRemove</code></td><td><span class="pill red">USER_BAN</span></td><td>Lifts a ban, subject to the rank of whoever set it (below). Answered with the updated ban list.</td></tr>
             <tr><td class="mono">0x66–0x68</td><td><code>NewsgroupCreate/Update/Delete</code></td><td><span class="pill red">USER_ADMIN</span></td><td>Defines, edits or deletes a newsgroup (a delete takes every post in it). Edit and delete also need read access to the group. Answered with the caller's newsgroup list.</td></tr>
-            <tr><td class="mono">0x75</td><td><code>AdminBroadcast</code></td><td><span class="pill red">Admin</span></td><td>Server-wide announcement delivered to all connected users.</td></tr>
-            <tr><td class="mono">0x76</td><td><code>AdminShutdown</code></td><td><span class="pill red">Admin</span></td><td>Initiates a graceful server shutdown.</td></tr>
-            <tr><td class="mono">0x7B–0x7E</td><td><code>IpRule*</code></td><td><span class="pill red">Admin</span></td><td>Allow/deny rules applied at the TCP accept layer before authentication.</td></tr>
+            <tr><td class="mono">0x75</td><td><code>AdminBroadcast</code></td><td><span class="pill red">SERVER_ADMIN</span></td><td>Server-wide announcement delivered to all connected users.</td></tr>
+            <tr><td class="mono">0x76</td><td><code>AdminShutdown</code></td><td><span class="pill red">SERVER_ADMIN</span></td><td>Initiates a graceful server shutdown.</td></tr>
+            <tr><td class="mono">0x7B–0x7E</td><td><code>IpRule*</code></td><td><span class="pill red">SERVER_ADMIN</span></td><td>Allow/deny rules applied at the TCP accept layer before authentication.</td></tr>
           </tbody>
         </table>
       </div>
@@ -1056,7 +1080,7 @@
         </div>
         <div class="card">
           <h3>Server-side permissions</h3>
-          <p>Access control is enforced on the server. The file ACL model (<code>min_class_read</code>, <code>min_class_write</code>) and IP allow/deny rules are evaluated at the connection layer before any data is served. There is no client-side permission boundary that could be bypassed.</p>
+          <p>Access control is enforced on the server. The file ACL model (<code>min_class_read</code>, <code>min_class_write</code>) and IP allow/deny rules are evaluated at the connection layer before any data is served. There is no client-side permission boundary that could be bypassed: the client hides controls the session's <a class="inline" href="#privileges">privileges</a> don't cover only as a convenience.</p>
         </div>
         <div class="card">
           <h3>Local storage</h3>

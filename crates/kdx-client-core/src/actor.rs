@@ -2819,6 +2819,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
         let _ = login.reply.send(Ok(Session {
             session_id: result.session_id,
             class: result.class,
+            privileges: result.privileges,
         }));
         Ok(())
     }

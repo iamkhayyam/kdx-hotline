@@ -1,12 +1,16 @@
 // Server — remote server management. Settings (name/description/greeting/
 // max users, with port and throttle shown read-only since they're fixed at
 // process start), Broadcast to every connected session, and Shutdown
-// (gracefully stops the server — never touches the host machine).
+// (gracefully stops the server — never touches the host machine). All of it
+// needs SERVER_ADMIN (the Administration window only offers this window
+// with it); the Connections button needs USER_KICK as well.
 
 import { invoke } from "../bridge.js";
 import { open } from "../wm.js";
+import { getState, subscribe } from "../store.js";
 import { esc, num, errorText } from "../html.js";
 import { askConfirm, confirmThen } from "../confirm.js";
+import { canUseWindow } from "../privileges.js";
 
 export function buildServerAdmin() {
   const body = document.createElement("div");
@@ -104,6 +108,19 @@ export function buildServerAdmin() {
   $("#srv-history").addEventListener("click", () => open("history"));
   $("#srv-iprules").addEventListener("click", () => open("iprules"));
   $("#srv-connections").addEventListener("click", () => open("connections"));
+  // Offer the other admin windows only to a session that can use them.
+  const gateButtons = () => {
+    const session = getState().session;
+    for (const [sel, win] of [
+      ["#srv-history", "history"],
+      ["#srv-iprules", "iprules"],
+      ["#srv-connections", "connections"],
+    ]) {
+      $(sel).classList.toggle("hidden", !canUseWindow(session, win));
+    }
+  };
+  gateButtons();
+  subscribe(gateButtons);
 
   $("#srv-broadcast-form").addEventListener("submit", async (e) => {
     e.preventDefault();

@@ -1,12 +1,21 @@
+// Files — browse the server's file tree, transfer, and manage it. Every
+// tool is offered only to a session holding the privilege the server checks
+// for it (privileges.js): download FILE_DOWNLOAD, upload FILE_UPLOAD, delete
+// FILE_DELETE, and new folder / move / alias / catalog FILE_MANAGE_TREE.
+// Each folder's class limits are still the server's call.
+
 import { invoke } from "../bridge.js";
 import { showMenu } from "../menu.js";
+import { getState, subscribe } from "../store.js";
 import { esc, num, plainText, errorText } from "../html.js";
 import { askConfirm, confirmThen } from "../confirm.js";
+import { fileTools } from "../privileges.js";
 
 const KINDS = { 0: "[DIR]", 1: "[FILE]", 2: "[DROP]", 3: "[UP]", 4: "[→]" };
 const KIND_NAME = { 0: "folder", 1: "file", 2: "drop box", 3: "upload folder", 4: "alias" };
 const KIND_DIR = 0, KIND_FILE = 1, KIND_DROPBOX = 2, KIND_ALIAS = 4;
 const CLASS_NAME = ["guest", "user", "power user", "admin"];
+const NO_DOWNLOAD = "you can't download files (needs FILE_DOWNLOAD)";
 
 export function buildFiles() {
   const body = document.createElement("div");
@@ -117,18 +126,19 @@ export function buildFiles() {
       tr.addEventListener("click", () => onEntry(e));
       tr.addEventListener("contextmenu", (ev) => {
         ev.preventDefault();
+        const may = tools();
         const items = [];
-        if (e.kind === KIND_FILE) items.push({ label: "Download…", fn: () => downloadEntry(e) });
-        else items.push({ label: "Open", fn: () => onEntry(e) });
+        if (e.kind !== KIND_FILE) items.push({ label: "Open", fn: () => onEntry(e) });
+        else if (may.download) items.push({ label: "Download…", fn: () => downloadEntry(e) });
         items.push({ label: "Get Info", fn: () => showInfo(e) });
         items.push({ label: "Copy Name", fn: () => copyText(e.name) });
-        items.push({ label: "Select for Move", fn: () => selectForOp(e, "move") });
+        if (may.move) items.push({ label: "Select for Move", fn: () => selectForOp(e, "move") });
         // Alias-into is available for any non-alias entry (chains are
         // refused server-side too).
-        if (e.kind !== KIND_ALIAS) {
+        if (may.alias && e.kind !== KIND_ALIAS) {
           items.push({ label: "Select for Alias", fn: () => selectForOp(e, "alias") });
         }
-        items.push({ label: "Delete", fn: () => deleteEntry(e) });
+        if (may.delete) items.push({ label: "Delete", fn: () => deleteEntry(e) });
         items.push({ label: "Refresh", fn: refresh });
         showMenu(ev.clientX, ev.clientY, items);
       });
@@ -167,7 +177,8 @@ export function buildFiles() {
 
   function onSearchHit(e) {
     if (e.kind === KIND_FILE) {
-      downloadEntryAt(e.path);
+      if (tools().download) downloadEntryAt(e.path);
+      else searchStatus.textContent = NO_DOWNLOAD;
       return;
     }
     exitSearch();
@@ -187,7 +198,7 @@ export function buildFiles() {
       filter.value = "";
       refresh();
     } else if (e.kind === KIND_FILE) {
-      downloadEntry(e);
+      openFile(e);
     } else if (e.kind === KIND_ALIAS) {
       // Try to list through the alias — if the target is a folder this
       // navigates into it; if the target is a file the server returns a
@@ -198,9 +209,15 @@ export function buildFiles() {
         filter.value = "";
         refresh();
       } catch {
-        downloadEntry(e);
+        openFile(e);
       }
     }
+  }
+
+  /** Opening a file downloads it; without FILE_DOWNLOAD, it shows its info. */
+  function openFile(e) {
+    if (tools().download) downloadEntry(e);
+    else showInfo(e);
   }
 
   async function downloadEntry(e) {
@@ -351,6 +368,21 @@ export function buildFiles() {
       renderPendingBanner();
     };
   }
+
+  // What this session may do here; the toolbar follows it (the session
+  // arrives with hydration, after the window is built).
+  function tools() {
+    return fileTools(getState().session);
+  }
+  function gateToolbar() {
+    const may = tools();
+    body.querySelector("#f-newfolder").classList.toggle("hidden", !may.newFolder);
+    body.querySelector("#f-upload").classList.toggle("hidden", !may.upload);
+    body.querySelector("#f-gen-catalog").classList.toggle("hidden", !may.catalog);
+    if (!may.newFolder) mkform.classList.add("hidden");
+  }
+  gateToolbar();
+  subscribe(gateToolbar);
 
   filter.addEventListener("input", render);
   body.querySelector("#f-up").onclick = () => {
