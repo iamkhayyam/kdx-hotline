@@ -425,7 +425,7 @@ Library/WebKit/net.kdx.hotline.client/
     </div>
   </div>
 
-  <h3>2. Code signing <span class="badge badge-done">ad-hoc</span> <span class="badge badge-todo">Developer ID</span></h3>
+  <h3>2. Code signing <span class="badge badge-done">ad-hoc</span> <span class="badge badge-done">Developer ID wired in CI</span> <span class="badge badge-todo">needs secrets</span></h3>
   <div class="task-group">
     <div class="task">
       <div class="task-head"><strong>Entitlements only apply to a signed bundle</strong></div>
@@ -434,23 +434,31 @@ Library/WebKit/net.kdx.hotline.client/
     </div>
     <div class="task">
       <div class="task-head"><strong>Developer ID (for distribution)</strong></div>
-      <p>The environment overrides the config's <code>"-"</code>. In CI, add repository secrets and pass them to the <em>Build client bundle (macOS app)</em> step only when set (an empty <code>APPLE_CERTIFICATE</code> makes Tauri try to import an empty certificate):</p>
-      <pre><span class="key">APPLE_CERTIFICATE</span>           <span class="cm"># base64 of the "Developer ID Application" .p12</span>
+      <p><code>APPLE_SIGNING_IDENTITY</code> in the environment overrides the config's <code>"-"</code>. <code>.github/workflows/release.yml</code> does this on its own once these <strong>repository secrets</strong> are set (Settings → Secrets and variables → Actions):</p>
+      <pre><span class="key">APPLE_CERTIFICATE</span>           <span class="cm"># base64 of the "Developer ID Application" .p12  (base64 -i cert.p12 | pbcopy)</span>
 <span class="key">APPLE_CERTIFICATE_PASSWORD</span>  <span class="cm"># its export password</span>
 <span class="key">APPLE_SIGNING_IDENTITY</span>      <span class="cm"># "Developer ID Application: Name (TEAMID)"</span></pre>
+      <p>On the macOS runner the workflow then:</p>
+      <ol>
+        <li>imports the certificate into a throwaway keychain (random password, first in the search list) and checks the identity is in it — deleted again when the job ends, whatever happened;</li>
+        <li>hands <code>APPLE_SIGNING_IDENTITY</code> (and notarization credentials, below) to <code>cargo tauri build</code> only — no other step sees them, and unset secrets are never exported as empty values;</li>
+        <li>signs the separately built dmg and the <code>kdxd</code> server binary (hardened runtime, secure timestamp) with the same identity;</li>
+        <li>verifies every build, ad-hoc or not: <code>codesign --verify --deep --strict</code>, the three sandbox entitlements and <code>container-migration.plist</code> present — a release without the sandbox fails instead of shipping.</li>
+      </ol>
+      <p>Without the secrets (forks, or before they're added) the release is ad-hoc signed exactly as before and the run carries a warning. Half a set of secrets fails the run rather than silently falling back. Consider moving the secrets to a protected <em>environment</em> with required reviewers if more people can push tags.</p>
       <p>Locally, with the certificate in your login keychain: <code>APPLE_SIGNING_IDENTITY="Developer ID Application: Name (TEAMID)" cargo tauri build --bundles app</code>.</p>
     </div>
   </div>
 
-  <h3>3. Notarization <span class="badge badge-todo">needs an Apple account</span></h3>
+  <h3>3. Notarization <span class="badge badge-done">wired in CI</span> <span class="badge badge-todo">needs an Apple account</span></h3>
   <div class="task-group">
     <div class="task">
       <div class="task-head"><strong>Tauri notarizes the .app when credentials are present</strong></div>
-      <p>Requires a Developer ID signature and the hardened runtime (<code>hardenedRuntime: true</code>, set). Provide either an Apple ID or an App Store Connect API key:</p>
+      <p>Requires a Developer ID signature and the hardened runtime (<code>hardenedRuntime: true</code>, set). Add <em>one</em> complete set of repository secrets — an Apple ID or an App Store Connect API key:</p>
       <pre><span class="key">APPLE_ID</span> + <span class="key">APPLE_PASSWORD</span> <span class="cm">(app-specific password)</span> + <span class="key">APPLE_TEAM_ID</span>
 <span class="cm"># or</span>
-<span class="key">APPLE_API_ISSUER</span> + <span class="key">APPLE_API_KEY</span> + <span class="key">APPLE_API_KEY_PATH</span> <span class="cm">(the .p8)</span></pre>
-      <p>Tauri submits, waits and staples the ticket to <code>KDX.app</code>. The release workflow builds the dmg separately (<code>bundle_dmg.sh</code>), so notarize and staple the dmg too:</p>
+<span class="key">APPLE_API_ISSUER</span> + <span class="key">APPLE_API_KEY</span> <span class="cm">(key id)</span> + <span class="key">APPLE_API_KEY_P8</span> <span class="cm">(the .p8 file's contents)</span></pre>
+      <p>The workflow writes the <code>.p8</code> to a private temp file (removed at the end of the job) and passes Tauri <code>APPLE_API_KEY_PATH</code>. Tauri submits <code>KDX.app</code>, waits and staples the ticket; the workflow then notarizes the dmg (built separately by <code>bundle_dmg.sh</code>) and staples it, and notarizes <code>kdxd-macos.zip</code> (a zip can't hold a stapled ticket, so Gatekeeper checks <code>kdxd</code> online). With credentials, verification also runs <code>stapler validate</code> and <code>spctl --assess</code> on the app and the dmg. Notarization credentials without the Developer ID secrets fail the run. To do it by hand:</p>
       <pre><span class="cmd">xcrun notarytool submit KDX_0.1.0_aarch64.dmg --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_PASSWORD" --wait</span>
 <span class="cmd">xcrun stapler staple KDX_0.1.0_aarch64.dmg</span></pre>
     </div>

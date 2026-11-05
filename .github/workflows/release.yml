@@ -57,6 +57,99 @@ jobs:
       - name: Install tauri-cli
         run: cargo install tauri-cli --locked --version "=2.12.4"
 
+      # ---- macOS signing setup -------------------------------------------
+      # Developer ID signing and notarization turn on when the repository
+      # secrets below are set (see docs/packaging.html#macos); without them
+      # the build is ad-hoc signed (tauri.conf.json signingIdentity "-") and
+      # still sandboxed, but Gatekeeper will block it on other Macs.
+      #
+      #   APPLE_CERTIFICATE           base64 of the "Developer ID Application" .p12
+      #   APPLE_CERTIFICATE_PASSWORD  its export password
+      #   APPLE_SIGNING_IDENTITY      "Developer ID Application: Name (TEAMID)"
+      # Notarization, either an Apple ID ...
+      #   APPLE_ID, APPLE_PASSWORD (app-specific password), APPLE_TEAM_ID
+      # ... or an App Store Connect API key:
+      #   APPLE_API_ISSUER, APPLE_API_KEY (key id), APPLE_API_KEY_P8 (.p8 contents)
+      #
+      # Secrets are only handed to the steps that need them. The certificate
+      # goes into a throwaway keychain that is deleted when the job ends.
+      - name: Import Developer ID certificate (macOS)
+        id: macsign
+        if: runner.os == 'macOS'
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+        run: |
+          set -euo pipefail
+          # Notarization credentials: a complete Apple ID triple, a complete
+          # API key, or nothing. Half a set is a configuration error.
+          notarize=none
+          if [ -n "$APPLE_ID$APPLE_PASSWORD$APPLE_TEAM_ID" ]; then
+            if [ -z "$APPLE_ID" ] || [ -z "$APPLE_PASSWORD" ] || [ -z "$APPLE_TEAM_ID" ]; then
+              echo "::error::APPLE_ID, APPLE_PASSWORD and APPLE_TEAM_ID must be set together"; exit 1
+            fi
+            notarize=apple-id
+          fi
+          if [ -n "$APPLE_API_ISSUER$APPLE_API_KEY$APPLE_API_KEY_P8" ]; then
+            if [ -z "$APPLE_API_ISSUER" ] || [ -z "$APPLE_API_KEY" ] || [ -z "$APPLE_API_KEY_P8" ]; then
+              echo "::error::APPLE_API_ISSUER, APPLE_API_KEY and APPLE_API_KEY_P8 must be set together"; exit 1
+            fi
+            notarize=api-key
+          fi
+
+          if [ -z "$APPLE_CERTIFICATE$APPLE_CERTIFICATE_PASSWORD$APPLE_SIGNING_IDENTITY" ]; then
+            if [ "$notarize" != none ]; then
+              echo "::error::notarization credentials are set but the Developer ID certificate secrets are not"; exit 1
+            fi
+            echo "::warning::No Developer ID secrets: KDX.app is ad-hoc signed and not notarized (Gatekeeper will block it on other Macs)"
+            printf 'mode=adhoc\nnotarize=none\n' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ -z "$APPLE_CERTIFICATE" ] || [ -z "$APPLE_CERTIFICATE_PASSWORD" ] || [ -z "$APPLE_SIGNING_IDENTITY" ]; then
+            echo "::error::APPLE_CERTIFICATE, APPLE_CERTIFICATE_PASSWORD and APPLE_SIGNING_IDENTITY must be set together"; exit 1
+          fi
+          if [ "$notarize" = none ]; then
+            echo "::warning::Developer ID signing without notarization credentials: Gatekeeper will still warn on first launch"
+          fi
+
+          umask 077
+          keychain="$RUNNER_TEMP/kdx-signing.keychain-db"
+          keychain_password="$(openssl rand -base64 32)"
+          echo "::add-mask::$keychain_password"
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          cert="$RUNNER_TEMP/developer-id.p12"
+          printf '%s' "$APPLE_CERTIFICATE" | base64 --decode > "$cert"
+          security import "$cert" -k "$keychain" -P "$APPLE_CERTIFICATE_PASSWORD" \
+            -T /usr/bin/codesign -T /usr/bin/security
+          rm -f "$cert"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s \
+            -k "$keychain_password" "$keychain" > /dev/null
+          # Put it first in the search list so codesign (and Tauri) find it.
+          read -r -a existing <<< "$(security list-keychains -d user | tr -d '"' | xargs)"
+          security list-keychains -d user -s "$keychain" "${existing[@]}"
+          if ! security find-identity -v -p codesigning "$keychain" | grep -qF "$APPLE_SIGNING_IDENTITY"; then
+            echo "::error::APPLE_SIGNING_IDENTITY was not found in the imported certificate"; exit 1
+          fi
+
+          if [ "$notarize" = api-key ]; then
+            mkdir -p "$RUNNER_TEMP/notary"
+            printf '%s' "$APPLE_API_KEY_P8" > "$RUNNER_TEMP/notary/AuthKey.p8"
+          fi
+          {
+            echo "keychain=$keychain"
+            echo "mode=developer-id"
+            echo "notarize=$notarize"
+          } >> "$GITHUB_OUTPUT"
+
       # ---- Server: plain release binary (no Tauri, builds everywhere) ----
       - name: Build kdxd (release)
         run: cargo build -p kdxd --release --locked
@@ -64,10 +157,35 @@ jobs:
       # ---- Client: Tauri bundle. macOS builds the .app here and the .dmg is
       #      produced by the bundled create-dmg script manually (the tauri CLI
       #      invocation trips the script's option parser on this version).
+      #      With Developer ID secrets, Tauri signs with that identity (from
+      #      the keychain imported above) and notarizes + staples KDX.app.
       - name: Build client bundle (macOS app)
         if: runner.os == 'macOS'
         working-directory: apps/kdx-client/src-tauri
-        run: cargo tauri build --bundles app
+        env:
+          MODE: ${{ steps.macsign.outputs.mode }}
+          NOTARIZE: ${{ steps.macsign.outputs.notarize }}
+          SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          NOTARY_APPLE_ID: ${{ secrets.APPLE_ID }}
+          NOTARY_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          NOTARY_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          NOTARY_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          NOTARY_API_KEY: ${{ secrets.APPLE_API_KEY }}
+        run: |
+          set -euo pipefail
+          # Only export what applies, so an unset secret never reaches Tauri
+          # as an empty value (Tauri treats a set-but-empty variable as set).
+          if [ "$MODE" = developer-id ]; then
+            export APPLE_SIGNING_IDENTITY="$SIGNING_IDENTITY"
+          fi
+          case "$NOTARIZE" in
+            apple-id)
+              export APPLE_ID="$NOTARY_APPLE_ID" APPLE_PASSWORD="$NOTARY_PASSWORD" APPLE_TEAM_ID="$NOTARY_TEAM_ID" ;;
+            api-key)
+              export APPLE_API_ISSUER="$NOTARY_API_ISSUER" APPLE_API_KEY="$NOTARY_API_KEY" \
+                APPLE_API_KEY_PATH="$RUNNER_TEMP/notary/AuthKey.p8" ;;
+          esac
+          cargo tauri build --bundles app
 
       - name: Build client bundle (Windows / Linux)
         if: runner.os != 'macOS'
@@ -82,14 +200,97 @@ jobs:
           sh bundle_dmg.sh --volname "KDX" KDX_0.1.0_x64.dmg ../macos/KDX.app
 
       # ---- Package the server per-OS: binary + example config + service ----
+      # On macOS kdxd is signed like the app (Developer ID + hardened runtime,
+      # or ad-hoc), so the downloaded binary isn't blocked when it is run.
       - name: Package server (macOS)
         if: runner.os == 'macOS'
+        env:
+          MODE: ${{ steps.macsign.outputs.mode }}
+          SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
         run: |
+          set -euo pipefail
           mkdir -p dist/kdxd
           cp target/release/kdxd dist/kdxd/
+          if [ "$MODE" = developer-id ]; then
+            codesign --force --timestamp --options runtime --sign "$SIGNING_IDENTITY" dist/kdxd/kdxd
+          else
+            codesign --force --options runtime --sign - dist/kdxd/kdxd
+          fi
+          codesign --verify --strict --verbose=2 dist/kdxd/kdxd
           cp crates/kdxd/kdxd.example.toml dist/kdxd/
           cp crates/kdxd/net.kdx.hotline.server.plist dist/kdxd/
           cd dist && zip -r ../kdxd-macos.zip kdxd
+
+      # The app was notarized by Tauri; the dmg (built separately) and the
+      # kdxd zip are signed/notarized here. A dmg gets its ticket stapled;
+      # a zip can't hold one, so Gatekeeper checks kdxd's ticket online.
+      - name: Sign and notarize dmg and kdxd (macOS)
+        if: runner.os == 'macOS' && steps.macsign.outputs.mode == 'developer-id'
+        env:
+          NOTARIZE: ${{ steps.macsign.outputs.notarize }}
+          SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          NOTARY_APPLE_ID: ${{ secrets.APPLE_ID }}
+          NOTARY_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          NOTARY_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          NOTARY_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          NOTARY_API_KEY: ${{ secrets.APPLE_API_KEY }}
+        run: |
+          set -euo pipefail
+          dmg=$(find target/release/bundle/dmg -maxdepth 1 -name 'KDX_*.dmg' | head -n 1)
+          if [ -z "$dmg" ]; then echo "::error::no KDX dmg was built"; exit 1; fi
+          codesign --force --timestamp --sign "$SIGNING_IDENTITY" "$dmg"
+          codesign --verify --strict --verbose=2 "$dmg"
+          notarize() {
+            case "$NOTARIZE" in
+              apple-id)
+                xcrun notarytool submit "$1" --wait \
+                  --apple-id "$NOTARY_APPLE_ID" --password "$NOTARY_PASSWORD" --team-id "$NOTARY_TEAM_ID" ;;
+              api-key)
+                xcrun notarytool submit "$1" --wait \
+                  --issuer "$NOTARY_API_ISSUER" --key-id "$NOTARY_API_KEY" --key "$RUNNER_TEMP/notary/AuthKey.p8" ;;
+            esac
+          }
+          if [ "$NOTARIZE" != none ]; then
+            notarize "$dmg"
+            xcrun stapler staple "$dmg"
+            xcrun stapler validate "$dmg"
+            notarize kdxd-macos.zip
+          fi
+
+      # Fail the release rather than ship a bundle without the sandbox, a
+      # broken signature, or (with credentials) a missing notarization.
+      - name: Verify macOS signatures
+        if: runner.os == 'macOS'
+        env:
+          MODE: ${{ steps.macsign.outputs.mode }}
+          NOTARIZE: ${{ steps.macsign.outputs.notarize }}
+        run: |
+          set -euo pipefail
+          app=target/release/bundle/macos/KDX.app
+          codesign --verify --deep --strict --verbose=2 "$app"
+          codesign -dvv "$app" 2>&1 | grep -E '^(Authority|Identifier|TeamIdentifier|flags|Runtime)' || true
+          entitlements=$(codesign -d --entitlements - --xml "$app" 2>/dev/null)
+          for key in com.apple.security.app-sandbox com.apple.security.network.client \
+                     com.apple.security.files.user-selected.read-write; do
+            if ! printf '%s' "$entitlements" | grep -qF "$key"; then
+              echo "::error::KDX.app is missing the $key entitlement"; exit 1
+            fi
+          done
+          test -f "$app/Contents/Resources/container-migration.plist"
+          if [ "$MODE" = developer-id ] && [ "$NOTARIZE" != none ]; then
+            xcrun stapler validate "$app"
+            spctl --assess --type execute --verbose=2 "$app"
+            dmg=$(find target/release/bundle/dmg -maxdepth 1 -name 'KDX_*.dmg' | head -n 1)
+            spctl --assess --type open --context context:primary-signature --verbose=2 "$dmg"
+          fi
+
+      - name: Remove signing keychain (macOS)
+        if: always() && runner.os == 'macOS' && steps.macsign.outputs.keychain != ''
+        env:
+          KEYCHAIN: ${{ steps.macsign.outputs.keychain }}
+        run: |
+          security delete-keychain "$KEYCHAIN" || true
+          rm -rf "$RUNNER_TEMP/notary"
 
       - name: Package server (Windows)
         if: runner.os == 'Windows'
