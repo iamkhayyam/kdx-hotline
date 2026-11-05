@@ -180,7 +180,8 @@ async fn global_roster_tracks_presence_live() {
     // Get Info on bob shows his detail.
     let info = alice.get_user_info("bob").await.unwrap();
     assert_eq!(info.class, 2);
-    assert!(!info.address.is_empty());
+    // Alice (no USER_KICK) doesn't get to see peer addresses.
+    assert!(info.address.is_empty());
     // Unknown user errors.
     assert!(alice.get_user_info("nobody").await.is_err());
 
@@ -1460,19 +1461,27 @@ async fn interview_mode_mutes_non_panelists_and_toggles_off() {
     next_event(&mut e_att).await;
     attendee.login("attendee", "pw").await.unwrap();
 
-    // Both join the lobby.
-    panel.join("lobby").await.unwrap();
-    attendee.join("lobby").await.unwrap();
+    // The panelist founds a room (only a server admin may mute the lobby),
+    // and the attendee joins once it exists.
+    panel.join("stage").await.unwrap();
+    loop {
+        if let Event::UserList { room, .. } = next_event(&mut e_panel).await {
+            if room == "stage" {
+                break;
+            }
+        }
+    }
+    attendee.join("stage").await.unwrap();
 
     // Panelist turns interview mode on.
-    panel.set_room_flags("lobby", 0, true).await.unwrap();
+    panel.set_room_flags("stage", 0, true).await.unwrap();
 
     // Attendee's send is silently dropped (they get an Info notice; the
     // panel does NOT see the attendee's line).
-    attendee.send_chat("lobby", 0, "am I allowed to speak?").await.unwrap();
+    attendee.send_chat("stage", 0, "am I allowed to speak?").await.unwrap();
 
     // Panel's send goes through fine.
-    panel.send_chat("lobby", 0, "welcome").await.unwrap();
+    panel.send_chat("stage", 0, "welcome").await.unwrap();
 
     // Wait for the panel's own line to appear on their own transcript —
     // the attendee's must NOT be seen among the panel's chat events.
@@ -1492,8 +1501,8 @@ async fn interview_mode_mutes_non_panelists_and_toggles_off() {
     assert!(saw_panel, "panel's own line should reach the room");
 
     // Toggle interview mode off — attendee can speak again.
-    panel.set_room_flags("lobby", 0, false).await.unwrap();
-    attendee.send_chat("lobby", 0, "thanks").await.unwrap();
+    panel.set_room_flags("stage", 0, false).await.unwrap();
+    attendee.send_chat("stage", 0, "thanks").await.unwrap();
     let mut saw_attendee = false;
     for _ in 0..30 {
         let ev = next_event(&mut e_panel).await;

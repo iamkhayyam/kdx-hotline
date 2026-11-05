@@ -260,6 +260,11 @@ impl AuthManager {
         let now = Instant::now();
         self.sessions.retain(|_, s| s.expires_at > now);
     }
+
+    /// The configured idle session lifetime (`session_ttl_secs`).
+    pub fn session_ttl(&self) -> Duration {
+        self.session_ttl
+    }
 }
 
 #[cfg(test)]
