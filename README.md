@@ -140,13 +140,16 @@ launch moves an earlier unsandboxed build's state into the container
 Entitlements only apply to a **signed** bundle. `tauri.conf.json` sets
 `signingIdentity: "-"`, so every `cargo tauri build` is ad-hoc signed (with
 the hardened runtime) and sandboxed; `cargo tauri dev` / `cargo run` are
-not. For distribution, sign with a Developer ID and notarize by setting
-`APPLE_SIGNING_IDENTITY` (plus `APPLE_CERTIFICATE` /
-`APPLE_CERTIFICATE_PASSWORD` in CI) and `APPLE_ID` / `APPLE_PASSWORD` /
-`APPLE_TEAM_ID`; until then, users open the downloaded app once via System
-Settings → Privacy & Security → *Open Anyway*. Details, verification
-commands and the manual macOS test checklist:
-[docs/packaging.html](docs/packaging.html#macos).
+not. The release workflow signs with a **Developer ID and notarizes**
+automatically once these repository secrets are set: `APPLE_CERTIFICATE`,
+`APPLE_CERTIFICATE_PASSWORD`, `APPLE_SIGNING_IDENTITY`, plus either
+`APPLE_ID` / `APPLE_PASSWORD` / `APPLE_TEAM_ID` or `APPLE_API_ISSUER` /
+`APPLE_API_KEY` / `APPLE_API_KEY_P8`. It signs and notarizes `KDX.app`, the
+dmg (stapled) and the `kdxd` binary, and fails a release whose app lacks the
+sandbox entitlements. Without the secrets releases stay ad-hoc signed and
+users open the downloaded app once via System Settings → Privacy & Security
+→ *Open Anyway*. Details, verification commands and the manual macOS test
+checklist: [docs/packaging.html](docs/packaging.html#macos).
 
 ### Server (kdxd)
 
