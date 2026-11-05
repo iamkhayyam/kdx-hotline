@@ -41,9 +41,8 @@ jobs:
       - name: Test
         run: cargo test --workspace --exclude kdx-client --locked
 
-      # Report-only for now: not every crate is warning-free yet.
       - name: Clippy
-        run: cargo clippy --workspace --exclude kdx-client --tests --locked
+        run: cargo clippy --workspace --exclude kdx-client --tests --locked -- -D warnings
 
   tauri-check:
     name: Check the Tauri client
@@ -62,6 +61,7 @@ jobs:
         uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch
         with:
           toolchain: stable
+          components: clippy
 
       - name: Cache cargo
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
@@ -76,6 +76,9 @@ jobs:
       # Unit tests include the per-window command ACL check (mock runtime).
       - name: cargo test (kdx-client)
         run: cargo test -p kdx-client --locked
+
+      - name: Clippy (kdx-client)
+        run: cargo clippy -p kdx-client --tests --locked -- -D warnings
 
   webview:
     name: Webview JS checks

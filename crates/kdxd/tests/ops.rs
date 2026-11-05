@@ -2,7 +2,6 @@
 //! dev identity, IP-rule matching on dual-stack listeners, denied-peer
 //! floods, graceful shutdown, tracker self-registration and `kdxd useradd`.
 
-#[allow(dead_code)]
 mod common;
 
 use std::io::Write;

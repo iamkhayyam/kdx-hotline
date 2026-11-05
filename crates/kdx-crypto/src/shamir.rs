@@ -93,13 +93,13 @@ pub fn split(secret: &[u8], threshold: u8, shares: u8) -> Result<SplitResult, Cr
     let mut rng = rand::rngs::OsRng;
     let mut holder: Vec<Vec<u8>> = vec![Vec::with_capacity(secret.len()); n];
 
-    for col in 0..secret.len() {
+    for &secret_byte in secret {
         // One random degree-(t-1) polynomial per byte column, constant term = secret byte.
         let mut coeffs = vec![0u8; t - 1];
         rng.fill_bytes(&mut coeffs);
         for (pos, data) in holder.iter_mut().enumerate() {
             let x = (pos + 1) as u8;
-            let mut acc = secret[col];
+            let mut acc = secret_byte;
             let mut xp = x;
             for &c in &coeffs {
                 acc ^= gf_mul(c, xp);
@@ -167,7 +167,7 @@ pub fn combine(shares: &[Share], threshold: u8) -> Result<Vec<u8>, CryptoError> 
     }
 
     let mut out = vec![0u8; len];
-    for col in 0..len {
+    for (col, out_byte) in out.iter_mut().enumerate() {
         // Lagrange interpolation at x = 0: f(0) = Σ yᵢ · Lᵢ(0).
         let mut acc = 0u8;
         for (i, si) in chosen.iter().enumerate() {
@@ -186,7 +186,7 @@ pub fn combine(shares: &[Share], threshold: u8) -> Result<Vec<u8>, CryptoError> 
             acc ^= gf_mul(si.data[col], li);
             li.zeroize();
         }
-        out[col] = acc;
+        *out_byte = acc;
         acc.zeroize();
     }
     Ok(out)
