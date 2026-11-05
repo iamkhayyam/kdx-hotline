@@ -35,18 +35,24 @@ cargo test  --workspace     # 243 tests, no external services needed
 ## Run the server
 
 ```sh
-# Create an account (guest | user | power | admin; default user):
-cargo run -p kdxd -- useradd phraq s3cret power
+# Create an account (guest | user | power | admin; default user). The
+# password is prompted for without echo; scripts can pipe it in instead
+# with --password-stdin:
+cargo run -p kdxd -- useradd phraq --prompt power
+printf '%s\n' "$PASS" | cargo run -p kdxd -- useradd phraq --password-stdin power
 
 # Start the server (defaults to 0.0.0.0:10700 with a self-signed dev cert):
 cargo run -p kdxd
 ```
 
 Both commands default to a `kdx.db` SQLite file and a `files/` directory in
-the working directory. Pass a TOML config path to either to override — see
-`crates/kdxd/kdxd.example.toml` for every field with its default value, or
-`Config` in `crates/kdxd/src/config.rs` for the definitions (bind address,
-TLS cert paths, session TTL, upload/download throttles).
+the working directory (`useradd` prints the database it wrote to). Pass a
+TOML config path to either to override — relative paths in it are resolved
+against the config file's directory. See `crates/kdxd/kdxd.example.toml`
+for every field with its default value, or `Config` in
+`crates/kdxd/src/config.rs` for the definitions (bind address, TLS cert
+paths, session TTL, upload/download throttles, connection limits,
+`public_host`). kdxd refuses to run as root unless given `--allow-root`.
 
 ## Run the client
 
@@ -61,8 +67,10 @@ desktop, resize from any edge (look for the corner triangle), minimize to
 the Dock, or close it independently. In the **Connect** window enter the
 server host (`127.0.0.1`), port (`10700`), and your account. On first contact
 you'll get a **trust-on-first-use** prompt showing the server's certificate
-fingerprint — this is expected against a self-signed dev server; the
-fingerprint changes each time the dev server restarts. Trust it to continue.
+fingerprint — this is expected against a self-signed dev server. The dev
+certificate is cached next to the database (`dev-cert.der` / `dev-key.der`),
+so the fingerprint stays the same across restarts until you delete those
+files. Trust it to continue.
 After login you're placed in `#lobby`; use the **Files** window to browse,
 upload, and download, and the **Transfers** window shows a live per-chunk
 bitmap.
@@ -110,10 +118,17 @@ and the matching service file (`net.kdx.hotline.server.plist` on macOS,
 `kdxd.service` on Linux). Install:
 
 - **macOS**: `sudo cp kdxd /usr/local/bin/` — run manually
-  (`kdxd kdxd.toml`) or as a launchd agent with the included plist.
+  (`kdxd kdxd.toml`) or as a launchd daemon with the included plist, which
+  runs it as the `_kdx` role account (the comment at the top of the plist
+  has the one-time account and `/var/kdx` setup).
 - **Linux**: `sudo cp kdxd /usr/local/bin/` + the systemd unit
-  (`sudo cp kdxd.service /etc/systemd/system/`), create the `kdx` user and
-  `/etc/kdx/kdxd.toml` from the example, then `systemctl enable --now kdxd`.
+  (`sudo cp kdxd.service /etc/systemd/system/`), create the `kdx` user
+  (`useradd --system --home-dir /var/lib/kdx --no-create-home --shell
+  /usr/sbin/nologin kdx`; systemd creates `/var/lib/kdx` itself, mode 0700)
+  and `/etc/kdx/kdxd.toml` from the example with `database =
+  "/var/lib/kdx/kdx.db"` and `files_root = "/var/lib/kdx/files"`, then
+  `systemctl enable --now kdxd`. Add accounts as the service user:
+  `sudo -u kdx kdxd useradd NAME --prompt admin /etc/kdx/kdxd.toml`.
 - **Windows**: copy `kdxd.exe` anywhere; run `kdxd kdxd.toml` (the example
   config documents every option).
 
