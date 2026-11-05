@@ -309,7 +309,7 @@
         </div>
         <div class="row">
           <div class="off">18–19</div>
-          <div class="fld"><span class="nm">checksum</span> <span class="sz">2 bytes</span><br>CRC32C of the preceding 18 bytes, folded to 16 bits by XOR-ing the two halves: <code>(crc32c &gt;&gt; 16) ^ (crc32c &amp; 0xFFFF)</code>. Framing-corruption guard only — integrity and authenticity are provided by TLS.</div>
+          <div class="fld"><span class="nm">checksum</span> <span class="sz">2 bytes</span><br>CRC-32 (IEEE 802.3 — the zlib/PNG/Ethernet CRC: reflected polynomial <code>0xEDB88320</code>, init and final XOR <code>0xFFFFFFFF</code>; <em>not</em> CRC-32C) of the preceding 18 bytes, folded to 16 bits by XOR-ing the two halves: <code>(crc32 &gt;&gt; 16) ^ (crc32 &amp; 0xFFFF)</code>. Check value: CRC-32 of <code>"123456789"</code> is <code>0xCBF43926</code>, which folds to <code>0xF2D2</code>. Framing-corruption guard only — integrity and authenticity are provided by TLS.</div>
         </div>
       </div>
 
@@ -327,7 +327,7 @@
 <span class="a">00 00 00 2A</span> <span class="c">// 8–11   4    sequence = 42</span>
 <span class="a">00 00 00 0D</span> <span class="c">// 12–15  4    length = 13 bytes of payload</span>
 <span class="a">00 00</span>       <span class="c">// 16–17  2    reserved</span>
-<span class="a">XX XX</span>       <span class="c">// 18–19  2    CRC32C(bytes 0–17) folded to 16 bits</span>
+<span class="a">37 2B</span>       <span class="c">// 18–19  2    CRC-32(bytes 0–17) = 0xF6E5C1CE, folded to 16 bits</span>
 <span class="c">// ... 13 bytes of payload follow</span></pre>
     </section>
 

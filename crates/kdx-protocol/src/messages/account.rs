@@ -1,6 +1,6 @@
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
-use super::wire::{expect_end, get_str, put_str};
+use super::wire::{expect_end, get_str, list_capacity, put_count32, put_str};
 use crate::ProtocolError;
 
 /// Client → server: provision a new account. Requires `USER_ADMIN`. The
@@ -121,8 +121,8 @@ impl AccountListRequest {
 impl AccountListResponse {
     pub fn encode(&self) -> Bytes {
         let mut buf = BytesMut::new();
-        buf.put_u32(self.accounts.len() as u32);
-        for a in &self.accounts {
+        let n = put_count32(&mut buf, self.accounts.len());
+        for a in &self.accounts[..n] {
             put_str(&mut buf, &a.username);
             buf.put_u8(a.base_class);
             buf.put_u32(a.granted);
@@ -136,7 +136,9 @@ impl AccountListResponse {
             return Err(ProtocolError::MalformedPayload("AccountListResponse"));
         }
         let count = payload.get_u32() as usize;
-        let mut accounts = Vec::with_capacity(count.min(1024));
+        // Minimum entry: username prefix + class + granted + revoked.
+        let min_entry = 2 + 1 + 4 + 4;
+        let mut accounts = Vec::with_capacity(list_capacity(count, payload.remaining(), min_entry));
         for _ in 0..count {
             let username = get_str(&mut payload, "AccountListResponse")?;
             if payload.remaining() < 1 + 4 + 4 {

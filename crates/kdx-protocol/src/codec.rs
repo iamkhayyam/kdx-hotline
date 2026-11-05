@@ -77,11 +77,19 @@ impl Encoder<KdxFrame> for KdxCodec {
     type Error = ProtocolError;
 
     fn encode(&mut self, frame: KdxFrame, dst: &mut BytesMut) -> Result<(), ProtocolError> {
-        debug_assert_eq!(frame.header.length as usize, frame.payload.len());
-        if frame.header.length > self.max_payload {
+        // Check the payload actually being written, not just what the header
+        // claims: a mismatch would desynchronize the peer's framing.
+        let len = frame.payload.len();
+        if len > self.max_payload as usize {
             return Err(ProtocolError::PayloadTooLarge {
-                length: frame.header.length,
+                length: u32::try_from(len).unwrap_or(u32::MAX),
                 max: self.max_payload,
+            });
+        }
+        if frame.header.length as usize != len {
+            return Err(ProtocolError::LengthMismatch {
+                header: frame.header.length,
+                payload: len,
             });
         }
         dst.reserve(HEADER_LEN + frame.payload.len());
@@ -187,6 +195,31 @@ mod tests {
             codec.decode(&mut wire),
             Err(ProtocolError::PayloadTooLarge { .. })
         ));
+    }
+
+    #[test]
+    fn encoder_checks_payload_len_not_just_header() {
+        let mut codec = KdxCodec::new(64);
+        let mut buf = BytesMut::new();
+
+        // Header understates an oversized payload: still rejected.
+        let mut lying = frame(PacketType::FileTransferData, 0, &[0u8; 65]);
+        lying.header.length = 1;
+        assert!(matches!(
+            codec.encode(lying, &mut buf),
+            Err(ProtocolError::PayloadTooLarge { length: 65, max: 64 })
+        ));
+
+        // Header length disagrees with an in-range payload: rejected.
+        for claimed in [0, 3, 5, 64, 1000] {
+            let mut mismatched = frame(PacketType::Ping, 0, b"abcd");
+            mismatched.header.length = claimed;
+            assert!(matches!(
+                codec.encode(mismatched, &mut buf),
+                Err(ProtocolError::LengthMismatch { payload: 4, .. })
+            ));
+        }
+        assert!(buf.is_empty(), "nothing may be written on error");
     }
 
     #[test]

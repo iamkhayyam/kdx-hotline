@@ -1,6 +1,6 @@
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
-use super::wire::{expect_end, get_str, put_str};
+use super::wire::{expect_end, get_str, list_capacity, put_count32, put_str};
 use crate::ProtocolError;
 
 /// One server in the tracker directory.
@@ -43,8 +43,8 @@ impl TrackerListRequest {
 impl TrackerListResponse {
     pub fn encode(&self) -> Bytes {
         let mut buf = BytesMut::new();
-        buf.put_u32(self.servers.len() as u32);
-        for s in &self.servers {
+        let n = put_count32(&mut buf, self.servers.len());
+        for s in &self.servers[..n] {
             put_str(&mut buf, &s.name);
             put_str(&mut buf, &s.host);
             buf.put_u16(s.port);
@@ -59,7 +59,9 @@ impl TrackerListResponse {
             return Err(ProtocolError::MalformedPayload("TrackerListResponse"));
         }
         let count = payload.get_u32() as usize;
-        let mut servers = Vec::with_capacity(count.min(4096));
+        // Minimum entry: name/host/description prefixes + port + two counts.
+        let min_entry = 2 * 3 + 2 + 4 + 4;
+        let mut servers = Vec::with_capacity(list_capacity(count, payload.remaining(), min_entry));
         for _ in 0..count {
             let name = get_str(&mut payload, "TrackerListResponse")?;
             let host = get_str(&mut payload, "TrackerListResponse")?;

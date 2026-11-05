@@ -29,8 +29,12 @@ pub enum ProtocolError {
     UnsupportedVersion(u8),
     #[error("unknown packet type 0x{0:02X}")]
     UnknownPacketType(u8),
+    #[error("reserved header bytes are not zero")]
+    NonZeroReserved,
     #[error("frame payload of {length} bytes exceeds maximum {max}")]
     PayloadTooLarge { length: u32, max: u32 },
+    #[error("frame header declares {header} payload bytes but carries {payload}")]
+    LengthMismatch { header: u32, payload: usize },
     #[error("fragment sequence out of order: expected {expected}, got {got}")]
     FragmentOutOfOrder { expected: u32, got: u32 },
     #[error("frame interleaved into an open fragment group")]
