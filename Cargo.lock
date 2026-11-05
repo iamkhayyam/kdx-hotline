@@ -1906,7 +1906,7 @@ dependencies = [
 
 [[package]]
 name = "kdx-client"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "kdx-client-core",
  "keyring",
@@ -1922,7 +1922,7 @@ dependencies = [
 
 [[package]]
 name = "kdx-client-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64 0.22.1",
  "bitvec",
@@ -1949,7 +1949,7 @@ dependencies = [
 
 [[package]]
 name = "kdx-crypto"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "argon2",
  "hmac",
@@ -1962,7 +1962,7 @@ dependencies = [
 
 [[package]]
 name = "kdx-protocol"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bitflags 2.13.0",
  "bytes",
@@ -1974,7 +1974,7 @@ dependencies = [
 
 [[package]]
 name = "kdx-server-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bitflags 2.13.0",
  "bitvec",
@@ -1998,7 +1998,7 @@ dependencies = [
 
 [[package]]
 name = "kdx-storage"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "sqlx",
  "tempfile",
@@ -2010,7 +2010,7 @@ dependencies = [
 
 [[package]]
 name = "kdxd"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "futures-util",

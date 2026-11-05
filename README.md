@@ -103,9 +103,9 @@ attaches a client installer and a server zip for **macOS, Windows, and Linux**
 
 | Platform | Artifact |
 |---|---|
-| macOS | `KDX_0.1.0_*.dmg` (drag the app to Applications) |
-| Windows | `KDX_0.1.0_x64-setup.exe` (NSIS, per-user install) |
-| Linux | `kdx_0.1.0_amd64.deb` + `kdx_0.1.0_amd64.AppImage` |
+| macOS | `KDX_0.2.0_*.dmg` (drag the app to Applications) |
+| Windows | `KDX_0.2.0_x64-setup.exe` (NSIS, per-user install) |
+| Linux | `kdx_0.2.0_amd64.deb` + `kdx_0.2.0_amd64.AppImage` |
 
 Build locally (requires the target OS):
 
@@ -122,7 +122,7 @@ script — the `.app` is already built; finish the dmg manually:
 
 ```sh
 cd target/release/bundle/dmg
-sh bundle_dmg.sh --volname "KDX" KDX_0.1.0_aarch64.dmg ../macos/KDX.app
+sh bundle_dmg.sh --volname "KDX" KDX_0.2.0_aarch64.dmg ../macos/KDX.app
 ```
 
 #### macOS: App Sandbox, signing, notarization
