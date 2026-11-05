@@ -73,8 +73,9 @@ async fn useradd(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let pool = kdx_storage::connect(&config.database).await?;
-    let phc = kdx_crypto::hash_password(password)?;
-    kdx_storage::accounts::create(&pool, username, &phc, class).await?;
+    // Stores only the SCRAM credential (salt, params, StoredKey, ServerKey).
+    let credential = kdx_crypto::hash_password(password)?;
+    kdx_storage::accounts::create(&pool, username, &credential, class, 0, 0).await?;
     println!("created account '{username}' (class {class}) in {}", config.database.display());
     Ok(())
 }

@@ -126,7 +126,7 @@ mod tests {
     #[tokio::test]
     async fn create_assign_and_read_back_privileges() {
         let (pool, _dir) = pool().await;
-        let account = kdx_storage::accounts::create(&pool, "phraq", "phc", 1)
+        let account = kdx_storage::accounts::create(&pool, "phraq", "phc", 1, 0, 0)
             .await
             .unwrap();
         let mgr = RoleManager::new(pool);
@@ -162,7 +162,7 @@ mod tests {
     #[tokio::test]
     async fn unassign_removes_role_from_account() {
         let (pool, _dir) = pool().await;
-        let account = kdx_storage::accounts::create(&pool, "acidburn", "phc", 1)
+        let account = kdx_storage::accounts::create(&pool, "acidburn", "phc", 1, 0, 0)
             .await
             .unwrap();
         let mgr = RoleManager::new(pool);

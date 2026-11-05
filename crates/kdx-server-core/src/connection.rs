@@ -101,6 +101,9 @@ pub struct ServerCtx {
     /// connections and let the server task wind down. Not touched anywhere
     /// else in the request path.
     pub shutdown: Arc<Notify>,
+    /// Server-wide brute-force throttle for logins (per peer IP and per
+    /// peer IP + username).
+    pub login_limiter: crate::auth::LoginLimiter,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -140,6 +143,9 @@ pub struct Connection<S> {
     /// and User Info. `"unknown"` for streams that don't have a real
     /// network peer (e.g. tests over `tokio::io::duplex`).
     peer_addr: String,
+    /// This connection's TLS exporter value (`kdx_crypto::TLS_EXPORTER_LABEL`)
+    /// that login proofs are bound to. All zeros for streams without TLS.
+    channel_binding: [u8; kdx_crypto::CHANNEL_BINDING_LEN],
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
@@ -158,7 +164,18 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
             session: None,
             next_sequence: 0,
             peer_addr,
+            channel_binding: [0u8; kdx_crypto::CHANNEL_BINDING_LEN],
         }
+    }
+
+    /// Bind logins on this connection to its TLS session: `binding` is the
+    /// session's `export_keying_material(32, kdx_crypto::TLS_EXPORTER_LABEL,
+    /// None)`, which the client reads from its own end. `kdxd`'s listener
+    /// must call this; without it (in-memory tests) the binding is all
+    /// zeros and a real TLS client's proof won't verify.
+    pub fn with_channel_binding(mut self, binding: [u8; kdx_crypto::CHANNEL_BINDING_LEN]) -> Self {
+        self.channel_binding = binding;
+        self
     }
 
     /// Run the connection to completion.
@@ -171,11 +188,20 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
     }
 
     /// Wait for `HandshakeInit`, validate the version, reply with
-    /// `HandshakeResp` carrying the feature intersection.
+    /// `HandshakeResp` carrying the feature intersection. The reply is under
+    /// the same timeout as the read, so a peer that never reads can't park
+    /// the connection here.
     async fn handshake(&mut self) -> Result<(), ConnectionError> {
-        let frame = timeout(HANDSHAKE_TIMEOUT, self.framed.next())
+        timeout(HANDSHAKE_TIMEOUT, self.handshake_exchange())
             .await
             .map_err(|_| ConnectionError::HandshakeTimeout)?
+    }
+
+    async fn handshake_exchange(&mut self) -> Result<(), ConnectionError> {
+        let frame = self
+            .framed
+            .next()
+            .await
             .ok_or(ConnectionError::PeerClosed)??;
 
         if frame.header.packet_type != PacketType::HandshakeInit {
@@ -186,6 +212,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
         }
         let init = HandshakeInit::decode(&frame.payload)?;
         debug!(version = init.version, features = init.features, "handshake init");
+        if init.version != PROTOCOL_VERSION {
+            return Err(ProtocolError::UnsupportedVersion(init.version).into());
+        }
 
         let resp = HandshakeResp {
             version: PROTOCOL_VERSION,
@@ -196,17 +225,31 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
         Ok(())
     }
 
-    /// Challenge-response login. Returns `false` on clean disconnect,
-    /// `true` once a session is established. Ping/Pong stays available so
-    /// clients can keep the connection warm at a login prompt.
+    /// Challenge-response login: a SCRAM-style proof bound to this
+    /// connection's TLS channel (see `kdx_crypto::scram`). Returns `false` on
+    /// clean disconnect, `true` once a session is established. Ping/Pong
+    /// stays available so clients can keep the connection warm at a login
+    /// prompt.
+    ///
+    /// The whole phase — reads *and* writes (Pongs, challenges, results) —
+    /// must finish within `AUTH_TIMEOUT`, so a peer that stops reading can't
+    /// park the connection in a blocked send.
     async fn authenticate(&mut self) -> Result<bool, ConnectionError> {
         let deadline = tokio::time::Instant::now() + AUTH_TIMEOUT;
+        timeout_at(deadline, self.authenticate_until_done())
+            .await
+            .map_err(|_| ConnectionError::AuthTimeout)?
+    }
+
+    async fn authenticate_until_done(&mut self) -> Result<bool, ConnectionError> {
+        let peer_ip = self.peer_ip();
         let mut failures: u8 = 0;
 
         loop {
-            let frame = timeout_at(deadline, self.framed.next())
+            let frame = self
+                .framed
+                .next()
                 .await
-                .map_err(|_| ConnectionError::AuthTimeout)?
                 .ok_or(ConnectionError::PeerClosed)??;
 
             match frame.header.packet_type {
@@ -216,8 +259,41 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                 }
                 PacketType::Disconnect => return Ok(false),
                 PacketType::AuthRequest => {
-                    let request = AuthRequest::decode(&frame.payload)?;
-                    let (data, pending) = self.ctx.auth.begin(&request.username).await?;
+                    let username = AuthRequest::decode(&frame.payload)?.username;
+
+                    // Refusals answered straight away (no challenge round,
+                    // no DB work). Each still costs one of this connection's
+                    // attempts; throttled ones aren't audited, so a blocked
+                    // source can't flood the history log.
+                    let shown =
+                        crate::limits::truncate_utf8(&username, crate::limits::MAX_USERNAME_LEN);
+                    let refusal = if let Err(wait) = self.ctx.login_limiter.check(peer_ip, shown) {
+                        Some(format!(
+                            "too many failed login attempts; try again in {}s",
+                            wait.as_secs().max(1)
+                        ))
+                    } else if username.len() > crate::limits::MAX_USERNAME_LEN {
+                        self.ctx.login_limiter.record_failure(peer_ip, shown);
+                        self.record_history(
+                            Some(shown.to_owned()),
+                            "login_failed",
+                            format!("peer={}, username too long", self.peer_addr),
+                        );
+                        Some("invalid credentials".to_string())
+                    } else {
+                        None
+                    };
+                    if let Some(message) = refusal {
+                        failures += 1;
+                        self.send_auth_failure(message).await?;
+                        if failures >= MAX_AUTH_ATTEMPTS {
+                            return Err(ConnectionError::TooManyAuthAttempts);
+                        }
+                        continue;
+                    }
+
+                    let (data, pending) =
+                        self.ctx.auth.begin(&username, self.channel_binding).await?;
                     let challenge_msg = AuthChallenge {
                         challenge: data.challenge,
                         salt: data.salt,
@@ -233,9 +309,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                     .await?;
 
                     // The very next auth packet must be the response.
-                    let response_frame = timeout_at(deadline, self.framed.next())
+                    let response_frame = self
+                        .framed
+                        .next()
                         .await
-                        .map_err(|_| ConnectionError::AuthTimeout)?
                         .ok_or(ConnectionError::PeerClosed)??;
                     if response_frame.header.packet_type != PacketType::AuthResponse {
                         return Err(ConnectionError::UnexpectedPacket {
@@ -246,18 +323,31 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                     let response = AuthResponse::decode(&response_frame.payload)?;
 
                     match self.ctx.auth.complete(pending, &response.response).await {
-                        Ok(session) => {
+                        Ok(verified) => {
+                            let session = verified.session;
+                            if self.server_is_full_for(&session).await {
+                                failures += 1;
+                                self.send_auth_failure("server is full".into()).await?;
+                                if failures >= MAX_AUTH_ATTEMPTS {
+                                    return Err(ConnectionError::TooManyAuthAttempts);
+                                }
+                                continue;
+                            }
+                            // Register the session now, but keep it only once
+                            // the result (and greeting) actually went out: on
+                            // a send error or the auth timeout the guard
+                            // unregisters it, so nothing leaks.
+                            let ctx = self.ctx.clone();
+                            let registration = ctx.auth.activate(&session);
                             let result = AuthResult {
                                 success: true,
                                 session_id: *session.id.as_bytes(),
                                 class: session.class as u8,
                                 message: format!("welcome, {}", session.username),
+                                server_signature: verified.server_signature,
                             };
                             self.send(PacketType::AuthResult, PacketFlags::empty(), result.encode())
                                 .await?;
-                            debug!(user = %session.username, "authenticated");
-                            self.record_history(Some(session.username.clone()), "login", String::new());
-                            self.session = Some(session);
                             let greeting = self.ctx.settings.greeting().await;
                             if !greeting.is_empty() {
                                 self.send(
@@ -267,49 +357,56 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                                 )
                                 .await?;
                             }
+                            registration.keep();
+                            self.ctx.login_limiter.record_success(peer_ip, &username);
+                            debug!(user = %session.username, "authenticated");
+                            self.record_history(
+                                Some(session.username.clone()),
+                                "login",
+                                format!("peer={}", self.peer_addr),
+                            );
+                            self.session = Some(session);
                             return Ok(true);
                         }
                         Err(crate::auth::AuthError::InvalidCredentials) => {
                             failures += 1;
-                            let result = AuthResult {
-                                success: false,
-                                session_id: [0u8; 16],
-                                class: 0,
-                                message: "invalid credentials".into(),
-                            };
-                            self.send(PacketType::AuthResult, PacketFlags::empty(), result.encode())
-                                .await?;
+                            self.ctx.login_limiter.record_failure(peer_ip, &username);
                             self.record_history(
-                                Some(request.username.clone()),
+                                Some(username.clone()),
                                 "login_failed",
-                                String::new(),
+                                format!("peer={}", self.peer_addr),
                             );
+                            self.send_auth_failure("invalid credentials".into()).await?;
                             if failures >= MAX_AUTH_ATTEMPTS {
                                 return Err(ConnectionError::TooManyAuthAttempts);
                             }
                         }
                         // Correct password but the account is banned: refuse
-                        // the login outright (no retry budget spent — retrying
-                        // won't help until the ban lapses).
+                        // the login. It still counts as a failed attempt
+                        // (here and in the limiter), so a banned user can't
+                        // loop logins — each a DB read and history write —
+                        // for free.
                         Err(crate::auth::AuthError::Banned { until, reason }) => {
+                            failures += 1;
+                            self.ctx.login_limiter.record_failure(peer_ip, &username);
+                            let reason = crate::limits::truncate_utf8(
+                                &reason,
+                                crate::limits::MAX_REASON_LEN,
+                            );
                             let message = if reason.is_empty() {
                                 format!("banned until {until}")
                             } else {
                                 format!("banned until {until}: {reason}")
                             };
-                            let result = AuthResult {
-                                success: false,
-                                session_id: [0u8; 16],
-                                class: 0,
-                                message,
-                            };
-                            self.send(PacketType::AuthResult, PacketFlags::empty(), result.encode())
-                                .await?;
                             self.record_history(
-                                Some(request.username.clone()),
+                                Some(username.clone()),
                                 "login_banned",
-                                reason.clone(),
+                                format!("peer={}, reason={}", self.peer_addr, reason),
                             );
+                            self.send_auth_failure(message).await?;
+                            if failures >= MAX_AUTH_ATTEMPTS {
+                                return Err(ConnectionError::TooManyAuthAttempts);
+                            }
                         }
                         Err(e) => return Err(e.into()),
                     }
@@ -322,6 +419,42 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                 }
             }
         }
+    }
+
+    /// Send a failed `AuthResult` (no session, no server signature).
+    async fn send_auth_failure(&mut self, message: String) -> Result<(), ProtocolError> {
+        let result = AuthResult {
+            success: false,
+            session_id: [0u8; 16],
+            class: 0,
+            message,
+            server_signature: [0u8; 32],
+        };
+        self.send(
+            PacketType::AuthResult,
+            PacketFlags::empty(),
+            result.encode(),
+        )
+        .await
+    }
+
+    /// `max_users` (0 = unlimited) caps registered sessions. Accounts with
+    /// SERVER_ADMIN may always log in, so an operator can't be locked out
+    /// of a full server.
+    async fn server_is_full_for(&self, session: &Session) -> bool {
+        let max_users = self.ctx.settings.snapshot().await.max_users as usize;
+        max_users != 0
+            && !session.privileges.contains(Privileges::SERVER_ADMIN)
+            && self.ctx.auth.live_session_count() >= max_users
+    }
+
+    /// The peer's IP, for the login limiter. Streams without a network peer
+    /// (tests) share the unspecified address.
+    fn peer_ip(&self) -> std::net::IpAddr {
+        self.peer_addr
+            .parse::<std::net::SocketAddr>()
+            .map(|addr| addr.ip())
+            .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED))
     }
 
     async fn dispatch_loop(&mut self) -> Result<(), ConnectionError> {
@@ -2086,7 +2219,7 @@ fn role_to_wire(role: Role) -> RoleInfo {
 mod tests {
     use super::*;
     use crate::auth::Privileges;
-    use kdx_crypto::{client_response, hash_password};
+    use kdx_crypto::{client_proof, hash_password, AuthContext};
     use kdx_storage::accounts;
 
     async fn test_ctx() -> (Arc<ServerCtx>, tempfile::TempDir) {
@@ -2095,7 +2228,7 @@ mod tests {
             .await
             .unwrap();
         let phc = hash_password("s3cret").unwrap();
-        accounts::create(&pool, "phraq", &phc, 2).await.unwrap();
+        accounts::create(&pool, "phraq", &phc, 2, 0, 0).await.unwrap();
         let tree = FileTree::load(pool.clone()).await.unwrap();
         let transfers = TransferManager::new(
             pool.clone(),
@@ -2128,6 +2261,7 @@ mod tests {
             ),
             bind_port: 0,
             shutdown: Arc::new(Notify::new()),
+            login_limiter: crate::auth::LoginLimiter::new(),
         });
         (ctx, dir)
     }
@@ -2164,7 +2298,9 @@ mod tests {
         assert_eq!(resp.header.packet_type, PacketType::HandshakeResp);
     }
 
-    /// Run one login round; returns the AuthResult.
+    /// Run one login round; returns the AuthResult. A successful result's
+    /// server signature is verified. Duplex streams have no TLS session, so
+    /// both ends use the all-zero channel binding.
     async fn do_login(
         client: &mut Framed<tokio::io::DuplexStream, KdxCodec>,
         seq: &mut u32,
@@ -2182,29 +2318,43 @@ mod tests {
         assert_eq!(challenge_frame.header.packet_type, PacketType::AuthChallenge);
         let challenge = AuthChallenge::decode(&challenge_frame.payload).unwrap();
 
-        let response = client_response(
+        let proof = client_proof(
             password,
-            &challenge.salt,
-            &kdx_crypto::KdfParams {
-                m_cost: challenge.m_cost,
-                t_cost: challenge.t_cost,
-                p_cost: challenge.p_cost,
+            &AuthContext {
+                username,
+                challenge: &challenge.challenge,
+                salt: &challenge.salt,
+                params: kdx_crypto::KdfParams {
+                    m_cost: challenge.m_cost,
+                    t_cost: challenge.t_cost,
+                    p_cost: challenge.p_cost,
+                },
+                channel_binding: &[0u8; kdx_crypto::CHANNEL_BINDING_LEN],
             },
-            &challenge.challenge,
         )
         .unwrap();
         client
             .send(client_frame(
                 PacketType::AuthResponse,
                 bump(seq),
-                AuthResponse { response }.encode(),
+                AuthResponse {
+                    response: proof.proof,
+                }
+                .encode(),
             ))
             .await
             .unwrap();
 
         let result_frame = client.next().await.unwrap().unwrap();
         assert_eq!(result_frame.header.packet_type, PacketType::AuthResult);
-        AuthResult::decode(&result_frame.payload).unwrap()
+        let result = AuthResult::decode(&result_frame.payload).unwrap();
+        if result.success {
+            assert!(
+                proof.verify_server_signature(&result.server_signature),
+                "server signature did not verify"
+            );
+        }
+        result
     }
 
     fn bump(seq: &mut u32) -> u32 {
@@ -2293,6 +2443,346 @@ mod tests {
         ));
     }
 
+    /// Send a bare `AuthRequest` and return the server's next frame.
+    async fn send_auth_request(
+        client: &mut Framed<tokio::io::DuplexStream, KdxCodec>,
+        seq: &mut u32,
+        username: &str,
+    ) -> KdxFrame {
+        let request = AuthRequest {
+            username: username.into(),
+        };
+        client
+            .send(client_frame(
+                PacketType::AuthRequest,
+                bump(seq),
+                request.encode(),
+            ))
+            .await
+            .unwrap();
+        client.next().await.unwrap().unwrap()
+    }
+
+    /// One failed login round with a bogus proof (no Argon2 on our side).
+    async fn fail_login(
+        client: &mut Framed<tokio::io::DuplexStream, KdxCodec>,
+        seq: &mut u32,
+        username: &str,
+    ) -> AuthResult {
+        let frame = send_auth_request(client, seq, username).await;
+        assert_eq!(frame.header.packet_type, PacketType::AuthChallenge);
+        client
+            .send(client_frame(
+                PacketType::AuthResponse,
+                bump(seq),
+                AuthResponse {
+                    response: [0u8; 32],
+                }
+                .encode(),
+            ))
+            .await
+            .unwrap();
+        let frame = client.next().await.unwrap().unwrap();
+        assert_eq!(frame.header.packet_type, PacketType::AuthResult);
+        AuthResult::decode(&frame.payload).unwrap()
+    }
+
+    /// Poll the history log until it holds at least `n` entries (login
+    /// paths record on detached tasks).
+    async fn wait_for_history(ctx: &ServerCtx, n: usize) -> Vec<crate::history::HistoryEntry> {
+        for _ in 0..200 {
+            let entries = ctx.history.recent(100).await.unwrap();
+            if entries.len() >= n {
+                return entries;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("history never reached {n} entries");
+    }
+
+    #[tokio::test]
+    async fn oversized_username_is_refused_before_any_lookup() {
+        let (ctx, _dir) = test_ctx().await;
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let conn = tokio::spawn(Connection::new(server, ctx.clone()).run());
+        let mut client = client_framed(client);
+        let mut seq = 0;
+        do_handshake(&mut client, &mut seq).await;
+
+        let huge = "x".repeat(10_000);
+        for _ in 0..MAX_AUTH_ATTEMPTS {
+            // Refused outright: no challenge round, and each one counts.
+            let frame = send_auth_request(&mut client, &mut seq, &huge).await;
+            assert_eq!(frame.header.packet_type, PacketType::AuthResult);
+            let result = AuthResult::decode(&frame.payload).unwrap();
+            assert!(!result.success);
+        }
+        assert!(matches!(
+            conn.await.unwrap().unwrap_err(),
+            ConnectionError::TooManyAuthAttempts
+        ));
+
+        // The audit rows carry a bounded actor, not the 10 KB name.
+        let entries = wait_for_history(&ctx, MAX_AUTH_ATTEMPTS as usize).await;
+        for entry in &entries {
+            assert_eq!(entry.action, "login_failed");
+            let actor = entry.actor.as_deref().unwrap_or_default();
+            assert!(
+                actor.len() <= crate::limits::MAX_USERNAME_LEN,
+                "{} bytes",
+                actor.len()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn banned_attempts_count_toward_the_attempt_limit() {
+        let (ctx, _dir) = test_ctx().await;
+        let id = ctx.auth.account_id("phraq").await.unwrap().unwrap();
+        let until = unix_now() as i64 + 10_000;
+        ctx.auth.set_ban(&id, until, "spam", "sysop").await.unwrap();
+
+        let (client, server) = tokio::io::duplex(8192);
+        let conn = tokio::spawn(
+            Connection::new_with_peer(server, ctx.clone(), "10.0.0.9:1234".into()).run(),
+        );
+        let mut client = client_framed(client);
+        let mut seq = 0;
+        do_handshake(&mut client, &mut seq).await;
+        for _ in 0..MAX_AUTH_ATTEMPTS {
+            let result = do_login(&mut client, &mut seq, "phraq", "s3cret").await;
+            assert!(!result.success);
+            assert!(
+                result.message.starts_with("banned until"),
+                "{}",
+                result.message
+            );
+        }
+        // Correct password or not, a banned account can't loop logins.
+        assert!(matches!(
+            conn.await.unwrap().unwrap_err(),
+            ConnectionError::TooManyAuthAttempts
+        ));
+        let entries = wait_for_history(&ctx, MAX_AUTH_ATTEMPTS as usize).await;
+        assert!(entries
+            .iter()
+            .all(|e| e.action == "login_banned" && e.detail.contains("peer=10.0.0.9:1234")));
+    }
+
+    #[tokio::test]
+    async fn failed_logins_are_throttled_and_logged_with_the_peer() {
+        let (ctx, _dir) = test_ctx().await;
+        let peer = "10.0.0.9:1234";
+        let ip: std::net::IpAddr = "10.0.0.9".parse().unwrap();
+        // Failures on the wire land in the shared limiter (not just the
+        // per-connection counter).
+        let (client, server) = tokio::io::duplex(8192);
+        let conn = tokio::spawn(Connection::new_with_peer(server, ctx.clone(), peer.into()).run());
+        let mut client = client_framed(client);
+        let mut seq = 0;
+        do_handshake(&mut client, &mut seq).await;
+        for _ in 0..MAX_AUTH_ATTEMPTS {
+            assert!(!fail_login(&mut client, &mut seq, "phraq").await.success);
+        }
+        assert!(conn.await.unwrap().is_err());
+        assert_eq!(
+            ctx.login_limiter.failure_count(ip, "phraq"),
+            MAX_AUTH_ATTEMPTS as u32
+        );
+
+        // More failures from that address (as further connections would add)
+        // put the pair into a long backoff — no wall-clock race in the test.
+        for _ in 0..9 {
+            ctx.login_limiter.record_failure(ip, "phraq");
+        }
+
+        // Now even the right password from that address is refused without a
+        // challenge round...
+        let (client, server) = tokio::io::duplex(8192);
+        let conn = tokio::spawn(Connection::new_with_peer(server, ctx.clone(), peer.into()).run());
+        let mut client = client_framed(client);
+        let mut seq = 0;
+        do_handshake(&mut client, &mut seq).await;
+        let frame = send_auth_request(&mut client, &mut seq, "phraq").await;
+        assert_eq!(frame.header.packet_type, PacketType::AuthResult);
+        let refused = AuthResult::decode(&frame.payload).unwrap();
+        assert!(!refused.success);
+        assert!(
+            refused.message.contains("too many failed login attempts"),
+            "{}",
+            refused.message
+        );
+        drop(client);
+        let _ = conn.await;
+
+        // ...while the same account from another address still gets in.
+        let (client, server) = tokio::io::duplex(8192);
+        let conn = tokio::spawn(
+            Connection::new_with_peer(server, ctx.clone(), "10.0.0.10:1".into()).run(),
+        );
+        let mut client = client_framed(client);
+        let mut seq = 0;
+        do_handshake(&mut client, &mut seq).await;
+        assert!(do_login(&mut client, &mut seq, "phraq", "s3cret").await.success);
+        client
+            .send(client_frame(PacketType::Disconnect, bump(&mut seq), Bytes::new()))
+            .await
+            .unwrap();
+        conn.await.unwrap().unwrap();
+
+        // Three failures and one login are audited, each with its source
+        // (throttled refusals are not, so they can't flood the log).
+        let entries = wait_for_history(&ctx, 4).await;
+        let failed: Vec<_> = entries
+            .iter()
+            .filter(|e| e.action == "login_failed")
+            .collect();
+        assert_eq!(failed.len(), MAX_AUTH_ATTEMPTS as usize);
+        assert!(failed
+            .iter()
+            .all(|e| e.detail.contains("peer=10.0.0.9:1234")));
+        assert!(entries
+            .iter()
+            .any(|e| e.action == "login" && e.detail.contains("peer=10.0.0.10:1")));
+    }
+
+    #[tokio::test]
+    async fn auth_phase_deadline_covers_blocked_writes() {
+        let (ctx, _dir) = test_ctx().await;
+        // Pause only after the DB is set up (sqlx dislikes a paused clock);
+        // nothing below touches the database.
+        tokio::time::pause();
+        let (client, server) = tokio::io::duplex(1024);
+        let conn = tokio::spawn(Connection::new(server, ctx).run());
+        let mut client = client_framed(client);
+        let mut seq = 0;
+        do_handshake(&mut client, &mut seq).await;
+
+        // Flood Pings and never read a Pong: the server blocks writing Pongs
+        // into the full pipe. The auth deadline must still end it.
+        let flood = tokio::spawn(async move {
+            loop {
+                let ping = client_frame(
+                    PacketType::Ping,
+                    bump(&mut seq),
+                    Bytes::from(vec![7u8; 512]),
+                );
+                if client.send(ping).await.is_err() {
+                    break;
+                }
+            }
+        });
+        let outcome = tokio::time::timeout(AUTH_TIMEOUT * 2, conn)
+            .await
+            .expect("connection outlived the auth deadline");
+        assert!(matches!(
+            outcome.unwrap().unwrap_err(),
+            ConnectionError::AuthTimeout
+        ));
+        flood.abort();
+    }
+
+    #[tokio::test]
+    async fn undeliverable_login_does_not_leak_a_session() {
+        let (ctx, _dir) = test_ctx().await;
+        let (client, server) = tokio::io::duplex(8192);
+        let conn = tokio::spawn(Connection::new(server, ctx.clone()).run());
+        let mut client = client_framed(client);
+        let mut seq = 0;
+        do_handshake(&mut client, &mut seq).await;
+
+        // Answer the challenge correctly, then vanish before the result.
+        let frame = send_auth_request(&mut client, &mut seq, "phraq").await;
+        let challenge = AuthChallenge::decode(&frame.payload).unwrap();
+        let proof = client_proof(
+            "s3cret",
+            &AuthContext {
+                username: "phraq",
+                challenge: &challenge.challenge,
+                salt: &challenge.salt,
+                params: kdx_crypto::KdfParams {
+                    m_cost: challenge.m_cost,
+                    t_cost: challenge.t_cost,
+                    p_cost: challenge.p_cost,
+                },
+                channel_binding: &[0u8; kdx_crypto::CHANNEL_BINDING_LEN],
+            },
+        )
+        .unwrap();
+        client
+            .send(client_frame(
+                PacketType::AuthResponse,
+                bump(&mut seq),
+                AuthResponse {
+                    response: proof.proof,
+                }
+                .encode(),
+            ))
+            .await
+            .unwrap();
+        drop(client);
+
+        assert!(conn.await.unwrap().is_err());
+        assert_eq!(ctx.auth.live_session_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn full_server_refuses_logins_but_not_admins() {
+        let (ctx, _dir) = admin_test_ctx().await;
+        ctx.settings
+            .update("Test Server".into(), String::new(), String::new(), 1)
+            .await;
+
+        let (client1, server1) = tokio::io::duplex(8192);
+        let conn1 = tokio::spawn(Connection::new(server1, ctx.clone()).run());
+        let mut client1 = client_framed(client1);
+        let mut seq1 = 0;
+        do_handshake(&mut client1, &mut seq1).await;
+        assert!(do_login(&mut client1, &mut seq1, "plain", "s3cret").await.success);
+
+        // A second ordinary login gets a clean refusal...
+        let (client2, server2) = tokio::io::duplex(8192);
+        let conn2 = tokio::spawn(Connection::new(server2, ctx.clone()).run());
+        let mut client2 = client_framed(client2);
+        let mut seq2 = 0;
+        do_handshake(&mut client2, &mut seq2).await;
+        let full = do_login(&mut client2, &mut seq2, "plain", "s3cret").await;
+        assert!(!full.success);
+        assert_eq!(full.message, "server is full");
+        // ...but an admin still gets in.
+        let admin = do_login(&mut client2, &mut seq2, "sysop", "s3cret").await;
+        assert!(admin.success, "{}", admin.message);
+        assert_eq!(ctx.auth.live_session_count(), 2);
+
+        for (mut client, mut seq, conn) in [(client1, seq1, conn1), (client2, seq2, conn2)] {
+            client
+                .send(client_frame(PacketType::Disconnect, bump(&mut seq), Bytes::new()))
+                .await
+                .unwrap();
+            conn.await.unwrap().unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn handshake_rejects_other_protocol_versions_in_the_payload() {
+        let (ctx, _dir) = test_ctx().await;
+        let (client, server) = tokio::io::duplex(4096);
+        let conn = tokio::spawn(Connection::new(server, ctx).run());
+        let mut client = client_framed(client);
+        let init = HandshakeInit {
+            version: 1,
+            features: 0,
+        };
+        client
+            .send(client_frame(PacketType::HandshakeInit, 0, init.encode()))
+            .await
+            .unwrap();
+        assert!(matches!(
+            conn.await.unwrap().unwrap_err(),
+            ConnectionError::Protocol(ProtocolError::UnsupportedVersion(1))
+        ));
+    }
+
     #[tokio::test]
     async fn chat_before_auth_is_rejected() {
         let (ctx, _dir) = test_ctx().await;
@@ -2357,8 +2847,8 @@ mod tests {
             .await
             .unwrap();
         let phc = hash_password("s3cret").unwrap();
-        accounts::create(&pool, "sysop", &phc, 3).await.unwrap();
-        accounts::create(&pool, "plain", &phc, 1).await.unwrap();
+        accounts::create(&pool, "sysop", &phc, 3, 0, 0).await.unwrap();
+        accounts::create(&pool, "plain", &phc, 1, 0, 0).await.unwrap();
         let tree = FileTree::load(pool.clone()).await.unwrap();
         let transfers = TransferManager::new(
             pool.clone(),
@@ -2391,6 +2881,7 @@ mod tests {
             ),
             bind_port: 0,
             shutdown: Arc::new(Notify::new()),
+            login_limiter: crate::auth::LoginLimiter::new(),
         });
         (ctx, dir)
     }

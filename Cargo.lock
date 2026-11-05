@@ -63,6 +63,7 @@ dependencies = [
  "blake2",
  "cpufeatures",
  "password-hash",
+ "zeroize",
 ]
 
 [[package]]
@@ -1929,6 +1930,7 @@ name = "kdx-crypto"
 version = "0.1.0"
 dependencies = [
  "argon2",
+ "hmac",
  "rand",
  "sha2",
  "subtle",

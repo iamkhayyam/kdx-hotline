@@ -10,8 +10,11 @@ pub struct AuthRequest {
 }
 
 /// Server → client: a fresh random challenge plus the Argon2id salt and cost
-/// parameters the client needs to recompute its verifier locally. The
-/// password itself never crosses the wire.
+/// parameters the client needs to recompute its salted password locally. The
+/// password itself never crosses the wire. Clients must bound the parameters
+/// (`kdx_crypto::KdfParams::check_bounds`) before running Argon2.
+///
+/// Wire: `challenge[32] m_cost:u32 t_cost:u32 p_cost:u32 salt_len:u16 salt`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthChallenge {
     pub challenge: [u8; 32],
@@ -21,20 +24,31 @@ pub struct AuthChallenge {
     pub p_cost: u32,
 }
 
-/// Client → server: `SHA-256(challenge || argon2id(password, salt, params))`.
+/// Client → server: the SCRAM-style `ClientProof` (`ClientKey XOR
+/// HMAC(StoredKey, AuthMessage)`, see `kdx_crypto::scram`), bound to the
+/// username, the challenge and the TLS channel.
+///
+/// Wire: `proof[32]`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthResponse {
     pub response: [u8; 32],
 }
 
-/// Server → client: outcome. On success carries the session id and the
-/// account's base class (0 guest, 1 user, 2 power user, 3 admin).
+/// Server → client: outcome. On success carries the session id, the
+/// account's base class (0 guest, 1 user, 2 power user, 3 admin) and the
+/// `ServerSignature` (`HMAC(ServerKey, AuthMessage)`) the client must verify
+/// before trusting the login. On failure the signature is all zeros. A
+/// failure may also be sent directly in reply to `AuthRequest` (throttled,
+/// server full, invalid username) without a challenge round.
+///
+/// Wire: `success:u8 session_id[16] class:u8 message:str server_signature[32]`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthResult {
     pub success: bool,
     pub session_id: [u8; 16],
     pub class: u8,
     pub message: String,
+    pub server_signature: [u8; 32],
 }
 
 impl AuthRequest {
@@ -103,11 +117,12 @@ impl AuthResponse {
 
 impl AuthResult {
     pub fn encode(&self) -> Bytes {
-        let mut buf = BytesMut::with_capacity(1 + 16 + 1 + 2 + self.message.len());
+        let mut buf = BytesMut::with_capacity(1 + 16 + 1 + 2 + self.message.len() + 32);
         buf.put_u8(self.success as u8);
         buf.put_slice(&self.session_id);
         buf.put_u8(self.class);
         put_str(&mut buf, &self.message);
+        buf.put_slice(&self.server_signature);
         buf.freeze()
     }
 
@@ -120,14 +135,17 @@ impl AuthResult {
         payload.copy_to_slice(&mut session_id);
         let class = payload.get_u8();
         let message = get_str(&mut payload, "AuthResult")?;
-        if payload.has_remaining() {
+        if payload.remaining() != 32 {
             return Err(ProtocolError::MalformedPayload("AuthResult"));
         }
+        let mut server_signature = [0u8; 32];
+        payload.copy_to_slice(&mut server_signature);
         Ok(Self {
             success,
             session_id,
             class,
             message,
+            server_signature,
         })
     }
 }
@@ -169,8 +187,25 @@ mod tests {
             session_id: [3u8; 16],
             class: 2,
             message: "welcome back".into(),
+            server_signature: [5u8; 32],
         };
         assert_eq!(AuthResult::decode(&msg.encode()).unwrap(), msg);
+    }
+
+    #[test]
+    fn result_requires_exactly_one_signature() {
+        let msg = AuthResult {
+            success: false,
+            session_id: [0u8; 16],
+            class: 0,
+            message: "invalid credentials".into(),
+            server_signature: [0u8; 32],
+        };
+        let bytes = msg.encode().to_vec();
+        assert!(AuthResult::decode(&bytes[..bytes.len() - 1]).is_err());
+        let mut long = bytes.clone();
+        long.push(0);
+        assert!(AuthResult::decode(&long).is_err());
     }
 
     #[test]

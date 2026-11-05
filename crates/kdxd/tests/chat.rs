@@ -6,51 +6,17 @@ mod common;
 
 use common::{bump, connect_tls, frame, kdx_handshake, test_config, TlsClient};
 use futures_util::{SinkExt, StreamExt};
-use kdx_crypto::{client_response, hash_password, KdfParams};
+use kdx_crypto::hash_password;
 use kdx_protocol::messages::{
-    AuthChallenge, AuthRequest, AuthResponse, AuthResult, ChatEvent, ChatJoin, ChatSend,
-    ChatUserList, CHAT_ACTION, CHAT_SYSTEM,
+    ChatEvent, ChatJoin, ChatSend, ChatUserList, CHAT_ACTION, CHAT_SYSTEM,
 };
 use kdx_protocol::{KdxFrame, PacketType};
 use kdx_storage::accounts;
 use kdxd::serve;
 
 async fn login(client: &mut TlsClient, seq: &mut u32, username: &str, password: &str) {
-    client
-        .send(frame(
-            PacketType::AuthRequest,
-            bump(seq),
-            AuthRequest {
-                username: username.into(),
-            }
-            .encode(),
-        ))
-        .await
-        .unwrap();
-    let challenge_frame = client.next().await.unwrap().unwrap();
-    let challenge = AuthChallenge::decode(&challenge_frame.payload).unwrap();
-    let response = client_response(
-        password,
-        &challenge.salt,
-        &KdfParams {
-            m_cost: challenge.m_cost,
-            t_cost: challenge.t_cost,
-            p_cost: challenge.p_cost,
-        },
-        &challenge.challenge,
-    )
-    .unwrap();
-    client
-        .send(frame(
-            PacketType::AuthResponse,
-            bump(seq),
-            AuthResponse { response }.encode(),
-        ))
-        .await
-        .unwrap();
-    let result_frame = client.next().await.unwrap().unwrap();
-    let result = AuthResult::decode(&result_frame.payload).unwrap();
-    assert!(result.success, "{}", result.message);
+    // Channel-bound SCRAM login (protocol v2); see tests/common.
+    common::login(client, seq, username, password).await;
 }
 
 async fn next_frame(client: &mut TlsClient) -> KdxFrame {
@@ -95,7 +61,7 @@ async fn two_clients_chat_in_lobby() {
     let pool = kdx_storage::connect(&dir.path().join("kdx.db")).await.unwrap();
     for name in ["alice", "bob"] {
         let phc = hash_password("pw").unwrap();
-        accounts::create(&pool, name, &phc, 1).await.unwrap();
+        accounts::create(&pool, name, &phc, 1, 0, 0).await.unwrap();
     }
 
     let mut alice = connect_tls(server.local_addr).await;
@@ -175,7 +141,7 @@ async fn spammer_gets_flood_warning() {
     let server = serve(test_config(&dir)).await.unwrap();
     let pool = kdx_storage::connect(&dir.path().join("kdx.db")).await.unwrap();
     let phc = hash_password("pw").unwrap();
-    accounts::create(&pool, "spammer", &phc, 1).await.unwrap();
+    accounts::create(&pool, "spammer", &phc, 1, 0, 0).await.unwrap();
 
     let mut client = connect_tls(server.local_addr).await;
     let mut seq = 0u32;

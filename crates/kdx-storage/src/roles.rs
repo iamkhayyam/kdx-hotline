@@ -159,7 +159,7 @@ mod tests {
     #[tokio::test]
     async fn assign_unassign_and_lookup() {
         let pool = pool().await;
-        let account = crate::accounts::create(&pool, "phraq", "phc", 1)
+        let account = crate::accounts::create(&pool, "phraq", "phc", 1, 0, 0)
             .await
             .unwrap();
         let role = create(&pool, "VIP", 0b1, 1, None).await.unwrap();
@@ -178,7 +178,7 @@ mod tests {
     #[tokio::test]
     async fn delete_role_cascades_from_account() {
         let pool = pool().await;
-        let account = crate::accounts::create(&pool, "acidburn", "phc", 1)
+        let account = crate::accounts::create(&pool, "acidburn", "phc", 1, 0, 0)
             .await
             .unwrap();
         let role = create(&pool, "VIP", 0b1, 1, None).await.unwrap();

@@ -4,8 +4,10 @@ use crate::{PacketFlags, PacketType, ProtocolError};
 
 /// Wire magic identifying a KDX packet.
 pub const MAGIC: [u8; 4] = *b"KDX\0";
-/// Current protocol version.
-pub const PROTOCOL_VERSION: u8 = 1;
+/// Current protocol version. v2: SCRAM-style, TLS-channel-bound login proof
+/// (`AuthResponse` semantics changed, `AuthResult` gained a server
+/// signature); v1 peers are rejected at the frame header.
+pub const PROTOCOL_VERSION: u8 = 2;
 /// Fixed header size on the wire.
 pub const HEADER_LEN: usize = 20;
 

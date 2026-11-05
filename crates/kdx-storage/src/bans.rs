@@ -77,7 +77,7 @@ mod tests {
         let pool = crate::connect(&dir.path().join("test.db")).await.unwrap();
         // The ban tests only need a row to satisfy the FK; the PHC contents are
         // never verified here, so a placeholder is fine.
-        let acct = crate::accounts::create(&pool, "crash", "phc$placeholder", 1)
+        let acct = crate::accounts::create(&pool, "crash", "phc$placeholder", 1, 0, 0)
             .await
             .unwrap();
         (pool, acct.id, dir)

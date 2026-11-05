@@ -1,16 +1,22 @@
-//! Challenge-response authentication and the in-memory session table.
+//! Challenge-response authentication (SCRAM-style, TLS-channel-bound; see
+//! `kdx_crypto::scram`) and the in-memory session table.
 
 use std::time::Duration;
 
 use dashmap::DashMap;
-use kdx_crypto::KdfParams;
+use kdx_crypto::{KdfParams, StoredCredential, CHANNEL_BINDING_LEN};
 use kdx_storage::accounts::{self, AccountRow};
-use kdx_storage::SqlitePool;
+use kdx_storage::{SqlitePool, StorageError};
+use rand::RngCore;
+use tokio::sync::OnceCell;
 use tokio::time::Instant;
-use tracing::debug;
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use super::classes::{effective_privileges, BaseClass, Privileges};
+
+/// `server_secrets` row holding the key for unknown-user decoy salts.
+const DECOY_KEY_SECRET: &str = "auth.decoy_salt_key";
 
 #[derive(Debug, thiserror::Error)]
 pub enum AuthError {
@@ -22,10 +28,14 @@ pub enum AuthError {
     Banned { until: i64, reason: String },
     #[error("an account with that name already exists")]
     AccountExists,
+    #[error("username must be 1 to {} bytes", crate::limits::MAX_USERNAME_LEN)]
+    InvalidUsername,
     #[error("storage error: {0}")]
     Storage(#[from] kdx_storage::StorageError),
     #[error("crypto error: {0}")]
     Crypto(#[from] kdx_crypto::CryptoError),
+    #[error("internal error: {0}")]
+    Internal(&'static str),
 }
 
 /// An authenticated session.
@@ -48,20 +58,64 @@ pub struct ChallengeData {
 }
 
 /// Server-side state for one in-flight login attempt, held by the
-/// connection task between challenge and response.
+/// connection task between challenge and response. It pins the whole
+/// transcript the client's proof must be bound to.
 #[derive(Debug)]
 pub struct PendingAuth {
     challenge: [u8; 32],
-    /// `None` when the username didn't exist — we still issued a decoy
-    /// challenge so the wire looks identical (anti-enumeration), and the
-    /// response check will simply fail.
-    account: Option<AccountRow>,
+    /// The username exactly as requested (part of the AuthMessage).
+    username: String,
+    /// This connection's TLS exporter value.
+    channel_binding: [u8; CHANNEL_BINDING_LEN],
+    /// The salt sent in the challenge (real or decoy).
+    salt: Vec<u8>,
+    /// `None` when the username didn't exist (or its credential is
+    /// unusable) — we still issued a decoy challenge so the wire looks
+    /// identical (anti-enumeration), and the response check will simply fail.
+    account: Option<(AccountRow, StoredCredential)>,
+}
+
+/// A verified login, not yet registered: the connection registers it with
+/// [`AuthManager::activate`] once it is ready to deliver the result.
+#[derive(Debug)]
+pub struct Verified {
+    pub session: Session,
+    /// `HMAC(ServerKey, AuthMessage)`, returned in the successful
+    /// `AuthResult` so the client can authenticate the server.
+    pub server_signature: [u8; 32],
+}
+
+/// Keeps an activated session registered only if the login completes: drop
+/// it without calling [`SessionGuard::keep`] (an error return, a timeout
+/// cancelling the future) and the session is removed again.
+#[must_use = "dropping the guard ends the session"]
+pub struct SessionGuard<'a> {
+    auth: &'a AuthManager,
+    id: Option<Uuid>,
+}
+
+impl SessionGuard<'_> {
+    /// The login was delivered; keep the session.
+    pub fn keep(mut self) {
+        self.id = None;
+    }
+}
+
+impl Drop for SessionGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(id) = self.id.take() {
+            self.auth.end_session(id);
+        }
+    }
 }
 
 pub struct AuthManager {
     pool: SqlitePool,
     sessions: DashMap<Uuid, Session>,
     session_ttl: Duration,
+    /// Per-server key for unknown-user decoy salts. Initialising it also
+    /// converts legacy credentials (see [`AuthManager::prepare`]).
+    decoy_key: OnceCell<[u8; 32]>,
 }
 
 impl AuthManager {
@@ -70,54 +124,166 @@ impl AuthManager {
             pool,
             sessions: DashMap::new(),
             session_ttl,
+            decoy_key: OnceCell::new(),
         }
     }
 
-    /// Start a login: look up the account and issue a challenge. Unknown
-    /// usernames get a decoy challenge with plausible salt/params so the
-    /// response from the wire can't distinguish "no such user" from "wrong
-    /// password".
-    pub async fn begin(&self, username: &str) -> Result<(ChallengeData, PendingAuth), AuthError> {
+    /// One-time startup work: convert any legacy (protocol v1) Argon2 PHC
+    /// rows — which are password-equivalent — to SCRAM credentials and wipe
+    /// the PHC strings, then load (or generate) the decoy-salt key.
+    /// Idempotent. `begin` runs it lazily too, but a server should call it
+    /// at startup so old hashes don't sit in the database until the next
+    /// login attempt.
+    pub async fn prepare(&self) -> Result<(), AuthError> {
+        self.decoy_key().await.map(|_| ())
+    }
+
+    async fn decoy_key(&self) -> Result<&[u8; 32], AuthError> {
+        self.decoy_key
+            .get_or_try_init(|| async {
+                self.upgrade_legacy_credentials().await?;
+                let mut candidate = [0u8; 32];
+                rand::rngs::OsRng.fill_bytes(&mut candidate);
+                let stored =
+                    accounts::server_secret(&self.pool, DECOY_KEY_SECRET, &candidate).await?;
+                <[u8; 32]>::try_from(stored)
+                    .map_err(|_| AuthError::Internal("stored decoy key has the wrong length"))
+            })
+            .await
+    }
+
+    async fn upgrade_legacy_credentials(&self) -> Result<usize, AuthError> {
+        let rows = accounts::legacy_rows(&self.pool).await?;
+        let mut converted = 0;
+        for row in rows {
+            match StoredCredential::from_legacy_phc(&row.password_phc) {
+                Ok(credential) => {
+                    if accounts::upgrade_credential(&self.pool, &row.id, &credential.encode())
+                        .await?
+                    {
+                        converted += 1;
+                    }
+                }
+                Err(e) => warn!(
+                    user = %row.username,
+                    error = %e,
+                    "cannot convert legacy password hash; the account cannot log in"
+                ),
+            }
+        }
+        if converted > 0 {
+            info!(
+                converted,
+                "converted legacy password hashes to SCRAM credentials"
+            );
+            // Don't leave the wiped hashes in free pages or the WAL.
+            if let Err(e) = accounts::compact(&self.pool).await {
+                warn!(error = %e, "could not compact the database after credential conversion");
+            }
+        }
+        Ok(converted)
+    }
+
+    /// The usable credential for an account row, converting a legacy row on
+    /// the fly. `None` (logged) if the row's credential can't be used.
+    async fn credential_for(&self, row: &AccountRow) -> Option<StoredCredential> {
+        if let Some(encoded) = &row.credential {
+            return match StoredCredential::decode(encoded) {
+                Ok(credential) => Some(credential),
+                Err(e) => {
+                    warn!(user = %row.username, error = %e, "unusable stored credential");
+                    None
+                }
+            };
+        }
+        match StoredCredential::from_legacy_phc(&row.password_phc) {
+            Ok(credential) => {
+                if let Err(e) =
+                    accounts::upgrade_credential(&self.pool, &row.id, &credential.encode()).await
+                {
+                    warn!(user = %row.username, error = %e, "could not store converted credential");
+                }
+                Some(credential)
+            }
+            Err(e) => {
+                warn!(user = %row.username, error = %e, "cannot convert legacy password hash");
+                None
+            }
+        }
+    }
+
+    /// Start a login: look up the account and issue a challenge bound to
+    /// `channel_binding` (this connection's TLS exporter value). Unknown
+    /// usernames get a decoy challenge — a salt keyed by a per-server secret
+    /// and the same parameters real accounts use — so the response from the
+    /// wire can't distinguish "no such user" from "wrong password".
+    pub async fn begin(
+        &self,
+        username: &str,
+        channel_binding: [u8; CHANNEL_BINDING_LEN],
+    ) -> Result<(ChallengeData, PendingAuth), AuthError> {
+        let decoy_key = *self.decoy_key().await?;
         let challenge = kdx_crypto::generate_challenge();
-        let account = accounts::by_username(&self.pool, username).await?;
+        let account = match accounts::by_username(&self.pool, username).await? {
+            Some(row) => self.credential_for(&row).await.map(|c| (row, c)),
+            None => None,
+        };
 
         let (salt, params) = match &account {
-            Some(row) => kdx_crypto::extract_kdf(&row.password_phc)?,
-            None => {
-                // Deterministic decoy salt per username, so retries don't
-                // reveal freshness either.
-                use sha2::{Digest, Sha256};
-                let digest = Sha256::digest(username.as_bytes());
-                (
-                    digest[..16].to_vec(),
-                    KdfParams {
-                        m_cost: 19456,
-                        t_cost: 2,
-                        p_cost: 1,
-                    },
-                )
-            }
+            Some((_, credential)) => (credential.salt.clone(), credential.params),
+            None => (
+                kdx_crypto::decoy_salt(&decoy_key, username),
+                KdfParams::DEFAULT,
+            ),
         };
 
         Ok((
             ChallengeData {
                 challenge,
-                salt,
+                salt: salt.clone(),
                 params,
             },
-            PendingAuth { challenge, account },
+            PendingAuth {
+                challenge,
+                username: username.to_owned(),
+                channel_binding,
+                salt,
+                account,
+            },
         ))
     }
 
-    /// Verify the client's response and mint a session.
-    pub async fn complete(&self, pending: PendingAuth, response: &[u8; 32]) -> Result<Session, AuthError> {
-        let Some(account) = pending.account else {
+    /// Verify the client's proof and build (but don't register) a session.
+    pub async fn complete(
+        &self,
+        pending: PendingAuth,
+        proof: &[u8; 32],
+    ) -> Result<Verified, AuthError> {
+        let Some((account, credential)) = pending.account else {
+            // Same work as a wrong password against a real record, so the
+            // failure takes the same time.
+            let decoy = StoredCredential {
+                salt: pending.salt,
+                params: KdfParams::DEFAULT,
+                stored_key: [0u8; 32],
+                server_key: [0u8; 32],
+            };
+            let _ = decoy.verify_proof(
+                &pending.username,
+                &pending.challenge,
+                &pending.channel_binding,
+                proof,
+            );
             return Err(AuthError::InvalidCredentials);
         };
-        let expected = kdx_crypto::expected_response(&account.password_phc, &pending.challenge)?;
-        if !kdx_crypto::verify_response(&expected, response) {
+        let Some(server_signature) = credential.verify_proof(
+            &pending.username,
+            &pending.challenge,
+            &pending.channel_binding,
+            proof,
+        ) else {
             return Err(AuthError::InvalidCredentials);
-        }
+        };
 
         // Credentials check out, but an active ban still refuses the login.
         // Checked only after verification so ban status isn't observable to
@@ -138,6 +304,7 @@ impl AuthManager {
         let role_privileges = roles
             .iter()
             .fold(Privileges::empty(), |acc, r| acc | Privileges::from_bits_truncate(r.privileges as u32));
+        let now = Instant::now();
         let session = Session {
             id: Uuid::new_v4(),
             account_id: account.id,
@@ -149,11 +316,33 @@ impl AuthManager {
                 account.granted as u32,
                 account.revoked as u32,
             ),
-            expires_at: Instant::now() + self.session_ttl,
+            // A huge configured TTL must not overflow (and panic) here.
+            expires_at: now
+                .checked_add(self.session_ttl)
+                .unwrap_or_else(|| now + Duration::from_secs(u32::MAX as u64)),
         };
+        Ok(Verified {
+            session,
+            server_signature,
+        })
+    }
+
+    /// Register a verified session. Call right before delivering the
+    /// successful `AuthResult`, and `keep()` the guard once it (and anything
+    /// else the login sends) went out — otherwise the session is removed
+    /// again, so an undeliverable login can't leak one.
+    pub fn activate(&self, session: &Session) -> SessionGuard<'_> {
         self.sessions.insert(session.id, session.clone());
-        debug!(user = %session.username, class = ?class, "session created");
-        Ok(session)
+        debug!(user = %session.username, class = ?session.class, "session created");
+        SessionGuard {
+            auth: self,
+            id: Some(session.id),
+        }
+    }
+
+    /// Number of registered sessions (for the `max_users` cap).
+    pub fn live_session_count(&self) -> usize {
+        self.sessions.len()
     }
 
     /// Resolve a username to its account id, for admin operations (e.g. role
@@ -174,8 +363,10 @@ impl AuthManager {
     }
 
     /// Provision a new account. `password` is the initial plaintext (arriving
-    /// only over TLS); it is Argon2id-hashed here and never stored in the
-    /// clear. `granted`/`revoked` are applied as privilege overrides.
+    /// only over TLS); only its SCRAM credential is stored (Argon2 runs on a
+    /// blocking thread). The account and its `granted`/`revoked` privilege
+    /// overrides are written in one INSERT; a taken name (including a
+    /// concurrent create) is [`AuthError::AccountExists`].
     pub async fn create_account(
         &self,
         username: &str,
@@ -184,15 +375,27 @@ impl AuthManager {
         granted: i64,
         revoked: i64,
     ) -> Result<(), AuthError> {
-        if accounts::by_username(&self.pool, username).await?.is_some() {
-            return Err(AuthError::AccountExists);
+        if username.is_empty() || username.len() > crate::limits::MAX_USERNAME_LEN {
+            return Err(AuthError::InvalidUsername);
         }
-        let phc = kdx_crypto::hash_password(password)?;
-        accounts::create(&self.pool, username, &phc, base_class).await?;
-        if granted != 0 || revoked != 0 {
-            accounts::set_overrides(&self.pool, username, granted, revoked).await?;
+        let password = password.to_owned();
+        let credential = tokio::task::spawn_blocking(move || kdx_crypto::hash_password(&password))
+            .await
+            .map_err(|_| AuthError::Internal("credential derivation task failed"))??;
+        match accounts::create(
+            &self.pool,
+            username,
+            &credential,
+            base_class,
+            granted,
+            revoked,
+        )
+        .await
+        {
+            Ok(_) => Ok(()),
+            Err(e) if is_unique_violation(&e) => Err(AuthError::AccountExists),
+            Err(e) => Err(e.into()),
         }
-        Ok(())
     }
 
     /// Change an existing account's class and privilege overrides (not its
@@ -262,10 +465,27 @@ impl AuthManager {
     }
 }
 
+/// A UNIQUE-constraint violation from the database (a taken username).
+fn is_unique_violation(err: &StorageError) -> bool {
+    match err {
+        StorageError::Sqlx(e) => e
+            .as_database_error()
+            .is_some_and(|d| d.is_unique_violation()),
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kdx_crypto::{client_response, hash_password};
+    use kdx_crypto::{client_proof, hash_password, AuthContext, ClientProof};
+
+    /// Channel binding used by these tests (no TLS here).
+    const BINDING: [u8; 32] = [0x42; 32];
+
+    /// A protocol-v1 row for password "legacy pass" (Argon2id defaults,
+    /// 16-byte salt), as the old server stored it.
+    const LEGACY_PHC: &str = "$argon2id$v=19$m=19456,t=2,p=1$a2R4bGVnYWN5c2FsdDE2IQ$1MaVnJW11DoDj6dBG8Pyjl8ME3i+BpQLmf5+5xVimQU";
 
     async fn test_pool() -> (SqlitePool, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
@@ -276,12 +496,36 @@ mod tests {
     }
 
     async fn seed(pool: &SqlitePool, username: &str, password: &str, class: i64) {
-        let phc = hash_password(password).unwrap();
-        accounts::create(pool, username, &phc, class).await.unwrap();
+        let credential = hash_password(password).unwrap();
+        accounts::create(pool, username, &credential, class, 0, 0)
+            .await
+            .unwrap();
     }
 
-    fn answer(data: &ChallengeData, password: &str) -> [u8; 32] {
-        client_response(password, &data.salt, &data.params, &data.challenge).unwrap()
+    fn prove(username: &str, data: &ChallengeData, password: &str) -> ClientProof {
+        client_proof(
+            password,
+            &AuthContext {
+                username,
+                challenge: &data.challenge,
+                salt: &data.salt,
+                params: data.params,
+                channel_binding: &BINDING,
+            },
+        )
+        .unwrap()
+    }
+
+    async fn login(
+        mgr: &AuthManager,
+        username: &str,
+        password: &str,
+    ) -> Result<Verified, AuthError> {
+        let (data, pending) = mgr.begin(username, BINDING).await.unwrap();
+        let proof = prove(username, &data, password);
+        let verified = mgr.complete(pending, &proof.proof).await?;
+        assert!(proof.verify_server_signature(&verified.server_signature));
+        Ok(verified)
     }
 
     #[tokio::test]
@@ -290,12 +534,31 @@ mod tests {
         seed(&pool, "phraq", "s3cret", 2).await;
         let mgr = AuthManager::new(pool, Duration::from_secs(60));
 
-        let (data, pending) = mgr.begin("phraq").await.unwrap();
-        let session = mgr.complete(pending, &answer(&data, "s3cret")).await.unwrap();
-
+        let session = login(&mgr, "phraq", "s3cret").await.unwrap().session;
         assert_eq!(session.class, BaseClass::PowerUser);
         assert!(session.privileges.contains(Privileges::CHAT_CREATE_ROOM));
+
+        // Verified but not yet registered until the connection activates it.
+        assert!(mgr.validate(session.id).is_none());
+        mgr.activate(&session).keep();
         assert!(mgr.validate(session.id).is_some());
+        assert_eq!(mgr.live_session_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn dropped_session_guard_unregisters() {
+        let (pool, _dir) = test_pool().await;
+        seed(&pool, "phraq", "s3cret", 1).await;
+        let mgr = AuthManager::new(pool, Duration::from_secs(60));
+
+        let session = login(&mgr, "phraq", "s3cret").await.unwrap().session;
+        {
+            let _guard = mgr.activate(&session);
+            assert!(mgr.validate(session.id).is_some());
+            // e.g. the AuthResult send failed and authenticate() returned.
+        }
+        assert!(mgr.validate(session.id).is_none());
+        assert_eq!(mgr.live_session_count(), 0);
     }
 
     #[tokio::test]
@@ -304,20 +567,131 @@ mod tests {
         seed(&pool, "phraq", "s3cret", 1).await;
         let mgr = AuthManager::new(pool, Duration::from_secs(60));
 
-        let (data, pending) = mgr.begin("phraq").await.unwrap();
-        let result = mgr.complete(pending, &answer(&data, "wrong")).await;
+        let result = login(&mgr, "phraq", "wrong").await;
+        assert!(matches!(result, Err(AuthError::InvalidCredentials)));
+    }
+
+    #[tokio::test]
+    async fn proof_for_another_channel_is_rejected() {
+        let (pool, _dir) = test_pool().await;
+        seed(&pool, "phraq", "s3cret", 1).await;
+        let mgr = AuthManager::new(pool, Duration::from_secs(60));
+
+        // The challenge was issued on a connection whose binding is BINDING,
+        // but the proof was computed for a different TLS session (a relay).
+        let (data, pending) = mgr.begin("phraq", BINDING).await.unwrap();
+        let relayed = client_proof(
+            "s3cret",
+            &AuthContext {
+                username: "phraq",
+                challenge: &data.challenge,
+                salt: &data.salt,
+                params: data.params,
+                channel_binding: &[0x13; 32],
+            },
+        )
+        .unwrap();
+        let result = mgr.complete(pending, &relayed.proof).await;
         assert!(matches!(result, Err(AuthError::InvalidCredentials)));
     }
 
     #[tokio::test]
     async fn unknown_user_gets_indistinguishable_challenge() {
         let (pool, _dir) = test_pool().await;
+        seed(&pool, "phraq", "s3cret", 1).await;
         let mgr = AuthManager::new(pool, Duration::from_secs(60));
 
-        let (data, pending) = mgr.begin("nobody").await.unwrap();
-        assert_eq!(data.salt.len(), 16);
-        let result = mgr.complete(pending, &answer(&data, "anything")).await;
+        let (real, _) = mgr.begin("phraq", BINDING).await.unwrap();
+        let (data, pending) = mgr.begin("nobody", BINDING).await.unwrap();
+        assert_eq!(data.salt.len(), real.salt.len());
+        assert_eq!(data.params, real.params);
+        assert_eq!(data.params, KdfParams::DEFAULT);
+        let proof = prove("nobody", &data, "anything");
+        let result = mgr.complete(pending, &proof.proof).await;
         assert!(matches!(result, Err(AuthError::InvalidCredentials)));
+    }
+
+    #[tokio::test]
+    async fn decoy_salt_is_not_predictable_but_is_stable() {
+        use sha2::{Digest, Sha256};
+        let (pool, _dir) = test_pool().await;
+        let mgr = AuthManager::new(pool.clone(), Duration::from_secs(60));
+
+        let (first, _) = mgr.begin("nobody", BINDING).await.unwrap();
+        // Protocol v1 used SHA-256(username)[..16]: anyone could compute it
+        // and tell "no such account" from a real (random) salt.
+        assert_ne!(first.salt[..], Sha256::digest(b"nobody")[..16]);
+        // Stable across retries, and across restarts (the key is persisted).
+        let (again, _) = mgr.begin("nobody", BINDING).await.unwrap();
+        assert_eq!(first.salt, again.salt);
+        let restarted = AuthManager::new(pool, Duration::from_secs(60));
+        let (after_restart, _) = restarted.begin("nobody", BINDING).await.unwrap();
+        assert_eq!(first.salt, after_restart.salt);
+
+        // A different server (different secret) gives a different salt.
+        let (other_pool, _other_dir) = test_pool().await;
+        let other = AuthManager::new(other_pool, Duration::from_secs(60));
+        let (elsewhere, _) = other.begin("nobody", BINDING).await.unwrap();
+        assert_ne!(first.salt, elsewhere.salt);
+    }
+
+    #[tokio::test]
+    async fn legacy_rows_are_converted_and_still_log_in() {
+        let (pool, _dir) = test_pool().await;
+        accounts::create_legacy(&pool, "oldtimer", LEGACY_PHC, 1)
+            .await
+            .unwrap();
+        let mgr = AuthManager::new(pool.clone(), Duration::from_secs(60));
+        mgr.prepare().await.unwrap();
+
+        // The password-equivalent PHC string is gone; a credential replaced it.
+        let row = accounts::by_username(&pool, "oldtimer")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.password_phc, "");
+        let credential = StoredCredential::decode(row.credential.as_deref().unwrap()).unwrap();
+        assert!(credential.matches_password("legacy pass").unwrap());
+
+        // And the user logs in with the unchanged password.
+        let session = login(&mgr, "oldtimer", "legacy pass")
+            .await
+            .unwrap()
+            .session;
+        assert_eq!(session.username, "oldtimer");
+        assert!(matches!(
+            login(&mgr, "oldtimer", "wrong").await,
+            Err(AuthError::InvalidCredentials)
+        ));
+    }
+
+    #[tokio::test]
+    async fn create_account_writes_overrides_and_maps_duplicates() {
+        let (pool, _dir) = test_pool().await;
+        let mgr = AuthManager::new(pool.clone(), Duration::from_secs(60));
+        mgr.create_account("muted", "pw", 1, 0, Privileges::CHAT_SEND.bits() as i64)
+            .await
+            .unwrap();
+        let row = accounts::by_username(&pool, "muted")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.revoked, Privileges::CHAT_SEND.bits() as i64);
+        assert_eq!(row.password_phc, "");
+        assert!(row.credential.is_some());
+
+        let dup = mgr.create_account("muted", "other", 3, 0, 0).await;
+        assert!(matches!(dup, Err(AuthError::AccountExists)), "{dup:?}");
+
+        let long = "x".repeat(crate::limits::MAX_USERNAME_LEN + 1);
+        assert!(matches!(
+            mgr.create_account(&long, "pw", 1, 0, 0).await,
+            Err(AuthError::InvalidUsername)
+        ));
+
+        // The created account logs in with its overrides applied.
+        let session = login(&mgr, "muted", "pw").await.unwrap().session;
+        assert!(!session.privileges.contains(Privileges::CHAT_SEND));
     }
 
     #[tokio::test]
@@ -334,9 +708,7 @@ mod tests {
         .unwrap();
         let mgr = AuthManager::new(pool, Duration::from_secs(60));
 
-        let (data, pending) = mgr.begin("phraq").await.unwrap();
-        let session = mgr.complete(pending, &answer(&data, "s3cret")).await.unwrap();
-
+        let session = login(&mgr, "phraq", "s3cret").await.unwrap().session;
         assert!(session.privileges.contains(Privileges::CHAT_SET_TOPIC)); // granted beyond class
         assert!(!session.privileges.contains(Privileges::FILE_UPLOAD)); // revoked from class
     }
@@ -353,8 +725,7 @@ mod tests {
             .unwrap();
         let mgr = AuthManager::new(pool, Duration::from_secs(60));
 
-        let (data, pending) = mgr.begin("lamer").await.unwrap();
-        let result = mgr.complete(pending, &answer(&data, "s3cret")).await;
+        let result = login(&mgr, "lamer", "s3cret").await;
         match result {
             Err(AuthError::Banned { reason, .. }) => assert_eq!(reason, "spamming"),
             other => panic!("expected Banned, got {other:?}"),
@@ -376,8 +747,15 @@ mod tests {
             .unwrap();
         let mgr = AuthManager::new(pool, Duration::from_secs(60));
 
-        let (data, pending) = mgr.begin("reformed").await.unwrap();
-        assert!(mgr.complete(pending, &answer(&data, "s3cret")).await.is_ok());
+        assert!(login(&mgr, "reformed", "s3cret").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn huge_session_ttl_does_not_panic() {
+        let (pool, _dir) = test_pool().await;
+        seed(&pool, "phraq", "s3cret", 1).await;
+        let mgr = AuthManager::new(pool, Duration::from_secs(i64::MAX as u64));
+        assert!(login(&mgr, "phraq", "s3cret").await.is_ok());
     }
 
     #[tokio::test]
@@ -386,8 +764,8 @@ mod tests {
         seed(&pool, "phraq", "s3cret", 1).await;
         let mgr = AuthManager::new(pool, Duration::from_secs(30));
 
-        let (data, pending) = mgr.begin("phraq").await.unwrap();
-        let session = mgr.complete(pending, &answer(&data, "s3cret")).await.unwrap();
+        let session = login(&mgr, "phraq", "s3cret").await.unwrap().session;
+        mgr.activate(&session).keep();
         assert!(mgr.validate(session.id).is_some());
 
         // Pause the clock only now — sqlx's pool timeouts misbehave under a
