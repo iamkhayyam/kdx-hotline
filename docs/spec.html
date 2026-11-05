@@ -259,7 +259,7 @@
 
       <div class="stats">
         <div class="cell"><div class="k">Header</div><div class="v">20 <small>bytes</small></div></div>
-        <div class="cell"><div class="k">Packet types</div><div class="v">76</div></div>
+        <div class="cell"><div class="k">Opcode ranges</div><div class="v">9</div></div>
         <div class="cell"><div class="k">Auth rounds</div><div class="v">4 <small>messages</small></div></div>
         <div class="cell"><div class="k">Chunk size</div><div class="v">32 <small>KiB default</small></div></div>
         <div class="cell"><div class="k">Node kinds</div><div class="v">5</div></div>
@@ -289,7 +289,7 @@
         </div>
         <div class="row">
           <div class="off">5</div>
-          <div class="fld"><span class="nm">type</span> <span class="sz">1 byte</span><br>Packet opcode — one of 76 defined values. See <a class="inline" href="#types">Packet types</a>.</div>
+          <div class="fld"><span class="nm">type</span> <span class="sz">1 byte</span><br>Packet opcode. See <a class="inline" href="#types">Packet types</a> for defined ranges.</div>
         </div>
         <div class="row">
           <div class="off">6–7</div>
@@ -335,58 +335,58 @@
     <section id="types">
       <div class="eyebrow">Protocol</div>
       <h2>Packet types</h2>
-      <p>Opcodes occupy a single byte (0x00–0xFF). The 76 defined values are grouped into functional ranges. Unknown opcodes are connection-fatal.</p>
+      <p>Opcodes occupy a single byte (0x00–0xFF), grouped into nine functional ranges. Unknown opcodes are connection-fatal.</p>
 
       <div class="tbl-wrap">
         <table>
           <thead>
-            <tr><th>Range</th><th>Group</th><th>Opcodes</th></tr>
+            <tr><th>Range</th><th>Group</th><th>Description</th></tr>
           </thead>
           <tbody>
             <tr>
               <td class="mono">0x01–0x0F</td>
               <td>Connection management</td>
-              <td><code>HandshakeInit</code> 0x01 &nbsp;·&nbsp; <code>HandshakeResp</code> 0x02 &nbsp;·&nbsp; <code>Ping</code> 0x03 &nbsp;·&nbsp; <code>Pong</code> 0x04 &nbsp;·&nbsp; <code>Disconnect</code> 0x0F</td>
+              <td>Handshake, keepalive, and orderly disconnect.</td>
             </tr>
             <tr>
               <td class="mono">0x10–0x13</td>
               <td>Authentication</td>
-              <td><code>AuthRequest</code> 0x10 &nbsp;·&nbsp; <code>AuthChallenge</code> 0x11 &nbsp;·&nbsp; <code>AuthResponse</code> 0x12 &nbsp;·&nbsp; <code>AuthResult</code> 0x13</td>
+              <td>Four-message challenge-response flow. See <a class="inline" href="#auth">Authentication</a>.</td>
             </tr>
             <tr>
               <td class="mono">0x20–0x2E</td>
               <td>File operations</td>
-              <td><code>FileListRequest/Response</code> 0x20–0x21 &nbsp;·&nbsp; <code>FileTransferStart/Data/End</code> 0x22–0x24 &nbsp;·&nbsp; <code>FileCreateFolder</code> 0x25 &nbsp;·&nbsp; <code>FileDelete</code> 0x26 &nbsp;·&nbsp; <code>FileGenerateCatalog/FileCatalogGenerated</code> 0x27–0x28 &nbsp;·&nbsp; <code>FileSearchRequest/Response</code> 0x29–0x2A &nbsp;·&nbsp; <code>FileMove</code> 0x2B &nbsp;·&nbsp; <code>FileAlias</code> 0x2C &nbsp;·&nbsp; <code>FileInfoRequest/Response</code> 0x2D–0x2E</td>
+              <td>Directory listing, transfer initiation, folder management, search, and file metadata.</td>
             </tr>
             <tr>
               <td class="mono">0x30–0x3A</td>
               <td>Chat &amp; presence</td>
-              <td><code>ChatMessage</code> 0x30 &nbsp;·&nbsp; <code>ChatJoin/Leave</code> 0x31–0x32 &nbsp;·&nbsp; <code>ChatUserList</code> 0x33 &nbsp;·&nbsp; <code>ChatTopicSet</code> 0x34 &nbsp;·&nbsp; <code>PresenceListRequest/Response</code> 0x35–0x36 &nbsp;·&nbsp; <code>PresenceChange</code> 0x37 &nbsp;·&nbsp; <code>UserInfoRequest/Response</code> 0x38–0x39 &nbsp;·&nbsp; <code>SetIdentity</code> 0x3A</td>
+              <td>Room messages, join/leave, user list, topic, presence updates, and identity.</td>
             </tr>
             <tr>
               <td class="mono">0x40–0x42</td>
               <td>Private messages &amp; admin</td>
-              <td><code>PrivateSend</code> 0x40 &nbsp;·&nbsp; <code>PrivateMessage</code> 0x41 &nbsp;·&nbsp; <code>AdminDisconnect</code> 0x42</td>
+              <td>Direct messaging between users and privileged disconnect.</td>
             </tr>
             <tr>
               <td class="mono">0x50–0x5C</td>
               <td>Roles &amp; accounts</td>
-              <td><code>RoleListRequest/Response</code> 0x50–0x51 &nbsp;·&nbsp; <code>RoleCreate/Update/Delete</code> 0x52–0x54 &nbsp;·&nbsp; <code>RoleAssign/Unassign</code> 0x55–0x56 &nbsp;·&nbsp; <code>AccountRolesRequest/Response</code> 0x57–0x58 &nbsp;·&nbsp; <code>AccountCreate/Update</code> 0x59–0x5A &nbsp;·&nbsp; <code>AccountListRequest/Response</code> 0x5B–0x5C</td>
+              <td>Role CRUD, role assignment, and account management. Admin-class only.</td>
             </tr>
             <tr>
               <td class="mono">0x60–0x66</td>
               <td>News</td>
-              <td><code>NewsgroupListRequest/Response</code> 0x60–0x61 &nbsp;·&nbsp; <code>NewsThreadListRequest/Response</code> 0x62–0x63 &nbsp;·&nbsp; <code>NewsPostCreate/Delete</code> 0x64–0x65 &nbsp;·&nbsp; <code>NewsgroupCreate</code> 0x66</td>
+              <td>Newsgroup and thread listing, post creation and deletion.</td>
             </tr>
             <tr>
               <td class="mono">0x70–0x81</td>
               <td>Infrastructure</td>
-              <td><code>TrackerListRequest/Response</code> 0x70–0x71 &nbsp;·&nbsp; <code>ServerSettingsRequest/Response/Update</code> 0x72–0x74 &nbsp;·&nbsp; <code>AdminBroadcast</code> 0x75 &nbsp;·&nbsp; <code>AdminShutdown</code> 0x76 &nbsp;·&nbsp; <code>ChatInvite/Invited</code> 0x77–0x78 &nbsp;·&nbsp; <code>HistoryListRequest/Response</code> 0x79–0x7A &nbsp;·&nbsp; <code>IpRuleListRequest/Response</code> 0x7B–0x7C &nbsp;·&nbsp; <code>IpRuleCreate/Delete</code> 0x7D–0x7E &nbsp;·&nbsp; <code>ConnectionListRequest/Response</code> 0x7F–0x80 &nbsp;·&nbsp; <code>ChatRoomFlags</code> 0x81</td>
+              <td>Tracker registry, server settings, broadcast, shutdown, IP rules, connection list, and room flags.</td>
             </tr>
             <tr>
               <td class="mono">0xF0–0xF2</td>
               <td>System</td>
-              <td><code>Error</code> 0xF0 &nbsp;·&nbsp; <code>Warning</code> 0xF1 &nbsp;·&nbsp; <code>Info</code> 0xF2</td>
+              <td>Error, warning, and informational server messages.</td>
             </tr>
           </tbody>
         </table>
