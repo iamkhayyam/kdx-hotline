@@ -36,12 +36,12 @@ use tracing::warn;
 
 pub use config::{
     ClientConfig, TrustPolicy, DEFAULT_CONNECT_TIMEOUT, DEFAULT_KEEPALIVE, DEFAULT_REQUEST_TIMEOUT,
-    DEFAULT_WRITE_TIMEOUT,
+    DEFAULT_STALE_PARTIAL_AGE, DEFAULT_WRITE_TIMEOUT,
 };
 pub use error::ClientError;
 pub use event::{
-    AccountSummary, Direction, Event, FileSearchEntry, HistoryEntry, IpRule, NewsPost,
-    NewsgroupInfo, PresenceUser, RoleInfo, ServerSettings, TrackerServer,
+    AccountSummary, BanEntry, BanList, Direction, Event, FileSearchEntry, HistoryEntry, IpRule,
+    NewsPost, NewsgroupInfo, PresenceUser, RoleInfo, ServerSettings, TrackerServer,
 };
 pub use handle::{ClientHandle, Session};
 // Re-exported so consumers (the Tauri app) can name the file-listing shape
@@ -49,6 +49,7 @@ pub use handle::{ClientHandle, Session};
 pub use kdx_protocol::messages::{FileInfoResponse, FileListResponse};
 pub use local_name::safe_local_file_name;
 pub use tls::{spki_fingerprint, KnownHosts};
+pub use transfer::TRANSFERS_DIR;
 
 use actor::{Actor, ActorOptions};
 use futures_util::StreamExt;
@@ -69,9 +70,29 @@ const KDX_ALPN: &[u8] = b"kdx/1";
 /// itself refused the server's key (`previous` is the pin it was compared
 /// with); any other handshake failure is `ClientError::Tls`. A
 /// `known_hosts.toml` that can't be read is `ClientError::KnownHosts`.
+///
+/// Partial downloads in `config.data_dir` that nothing has touched for
+/// `config.stale_partial_age` are deleted first.
 pub async fn connect(
     config: ClientConfig,
 ) -> Result<(ClientHandle, mpsc::Receiver<Event>), ClientError> {
+    let transfers_dir = config.data_dir.join(transfer::TRANSFERS_DIR);
+    if let Some(max_age) = config.stale_partial_age {
+        // Before any download of this connection can start, so a resume
+        // never races the sweep. A failure only means nothing was swept.
+        let dir = transfers_dir.clone();
+        let swept = tokio::task::spawn_blocking(move || {
+            transfer::sweep_stale_partials(&dir, max_age, std::time::SystemTime::now())
+        })
+        .await;
+        match swept {
+            Ok(Ok(0)) => {}
+            Ok(Ok(n)) => tracing::info!("removed {n} stale partial download(s)"),
+            Ok(Err(e)) => warn!("could not sweep stale partial downloads: {e}"),
+            Err(e) => warn!("could not sweep stale partial downloads: {e}"),
+        }
+    }
+
     let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
     let known_hosts = KnownHosts::new(&config.data_dir);
 
@@ -154,6 +175,8 @@ pub async fn connect(
         request_timeout: bounded(config.request_timeout, Duration::ZERO),
         write_timeout: bounded(config.write_timeout, Duration::ZERO),
         server_id: format!("{}:{}", config.host, config.port),
+        transfers_dir: Some(transfers_dir),
+        ..ActorOptions::default()
     };
     let actor = Actor::new(framed, cmd_rx, event_tx.clone())
         .with_options(options)

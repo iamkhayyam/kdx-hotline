@@ -1715,3 +1715,116 @@ async fn a_second_login_is_refused_at_once() {
 
     ts.stop();
 }
+
+#[tokio::test]
+async fn admin_lists_and_lifts_a_ban_and_the_user_logs_back_in() {
+    let ts = TestServer::start().await;
+    ts.seed_account("sysop", "pw", 3).await; // Admin: USER_BAN
+    ts.seed_account("lamer", "pw", 1).await;
+
+    let (sysop, mut es, _d1) = ts.connect_client().await;
+    next_event(&mut es).await;
+    sysop.login("sysop", "pw").await.unwrap();
+    assert_eq!(sysop.list_bans().await.unwrap().total, 0);
+
+    // The ban request is handled before the listing that follows it.
+    sysop.disconnect_user("lamer", "spam", 3600).await.unwrap();
+    let list = sysop.list_bans().await.unwrap();
+    assert_eq!(list.total, 1);
+    let ban = &list.bans[0];
+    assert_eq!(
+        (ban.username.as_str(), ban.reason.as_str(), ban.banned_by.as_str(), ban.banned_by_class),
+        ("lamer", "spam", "sysop", 3)
+    );
+
+    let (lamer, mut el, _d2) = ts.connect_client().await;
+    next_event(&mut el).await;
+    assert!(matches!(lamer.login("lamer", "pw").await, Err(ClientError::AuthFailed(_))));
+
+    // Unban answers with the updated list; a second unban is a server error
+    // for that call only.
+    let after = sysop.remove_ban("lamer").await.unwrap();
+    assert_eq!((after.total, after.bans.len()), (0, 0));
+    match sysop.remove_ban("lamer").await {
+        Err(ClientError::Server(msg)) => assert_eq!(msg, "lamer is not banned"),
+        other => panic!("expected a server error, got {other:?}"),
+    }
+    assert_eq!(sysop.list_bans().await.unwrap().total, 0);
+
+    let (again, mut ea, _d3) = ts.connect_client().await;
+    next_event(&mut ea).await;
+    again.login("lamer", "pw").await.expect("unbanned user logs in");
+
+    ts.stop();
+}
+
+#[tokio::test]
+async fn plain_user_cannot_list_or_lift_bans() {
+    let ts = TestServer::start().await;
+    ts.seed_account("plain", "pw", 1).await;
+
+    let (client, mut events, _d) = ts.connect_client().await;
+    next_event(&mut events).await;
+    client.login("plain", "pw").await.unwrap();
+
+    assert!(matches!(client.list_bans().await, Err(ClientError::Server(_))));
+    assert!(matches!(client.remove_ban("plain").await, Err(ClientError::Server(_))));
+    // The refusals didn't desynchronize the connection.
+    client.list_users().await.unwrap();
+
+    ts.stop();
+}
+
+#[tokio::test]
+async fn admin_edits_and_deletes_newsgroups() {
+    let ts = TestServer::start().await;
+    ts.seed_account("sysop", "pw", 3).await; // Admin: USER_ADMIN
+    ts.seed_account("plain", "pw", 1).await;
+
+    let (sysop, mut es, _d1) = ts.connect_client().await;
+    next_event(&mut es).await;
+    sysop.login("sysop", "pw").await.unwrap();
+    sysop.create_newsgroup("general", "chatter", 0, 1).await.unwrap();
+    let groups = sysop.create_newsgroup("ops", "", 0, 0).await.unwrap();
+    let general = groups.iter().find(|g| g.name == "general").unwrap().id.clone();
+    sysop.create_post(&general, "", "hello", "first").await.unwrap();
+
+    let groups = sysop.update_newsgroup(&general, "lobby", "renamed", 1, 2).await.unwrap();
+    let lobby = groups.iter().find(|g| g.id == general).expect("still listed");
+    assert_eq!(
+        (lobby.name.as_str(), lobby.description.as_str(), lobby.min_read_class, lobby.min_post_class),
+        ("lobby", "renamed", 1, 2)
+    );
+    // Posts survive an edit.
+    assert_eq!(sysop.list_thread(&general).await.unwrap().len(), 1);
+
+    match sysop.update_newsgroup(&general, "ops", "", 0, 0).await {
+        Err(ClientError::Server(msg)) => assert!(msg.contains("already exists"), "{msg}"),
+        other => panic!("expected a duplicate-name error, got {other:?}"),
+    }
+    assert!(matches!(
+        sysop.update_newsgroup("not-a-uuid", "x", "", 0, 0).await,
+        Err(ClientError::InvalidInput(_))
+    ));
+    assert!(matches!(
+        sysop.delete_newsgroup("not-a-uuid").await,
+        Err(ClientError::InvalidInput(_))
+    ));
+
+    // A plain user may neither edit nor delete.
+    let (plain, mut ep, _d2) = ts.connect_client().await;
+    next_event(&mut ep).await;
+    plain.login("plain", "pw").await.unwrap();
+    assert!(matches!(
+        plain.update_newsgroup(&general, "mine", "", 0, 0).await,
+        Err(ClientError::Server(_))
+    ));
+    assert!(matches!(plain.delete_newsgroup(&general).await, Err(ClientError::Server(_))));
+
+    let groups = sysop.delete_newsgroup(&general).await.unwrap();
+    assert_eq!(groups.iter().map(|g| g.name.as_str()).collect::<Vec<_>>(), ["ops"]);
+    assert!(matches!(sysop.list_thread(&general).await, Err(ClientError::Server(_))));
+    assert_eq!(plain.list_newsgroups().await.unwrap().len(), 1);
+
+    ts.stop();
+}

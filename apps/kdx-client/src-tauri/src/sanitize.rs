@@ -10,8 +10,9 @@
 //! `kdx_client_core::safe_local_file_name` is being added in client-core as
 //! well; once it lands this can delegate to it (keep these tests).
 
-/// Longest suggested name, in bytes (well under every OS's 255 limit, leaving
-/// room for a `.kdxpart` sidecar suffix).
+/// Longest suggested name, in bytes (well under every OS's 255 limit;
+/// client-core never appends a suffix to it — partial downloads live in the
+/// app's data directory).
 const MAX_NAME_BYTES: usize = 200;
 /// Name used when nothing usable survives sanitizing.
 const FALLBACK: &str = "download";

@@ -4,12 +4,16 @@ use std::time::Duration;
 
 use tokio::sync::{mpsc, oneshot, watch};
 
-use kdx_protocol::messages::{FileInfoResponse, FileListResponse};
+use kdx_crypto::{AuthContext, KdfParams, PasswordChangeContext, StoredCredential};
+use kdx_protocol::messages::{
+    Credential, FileInfoResponse, FileListResponse, PasswordChangeChallenge, PasswordChangeResult,
+};
+use zeroize::Zeroizing;
 
 use crate::error::ClientError;
 use crate::event::{
-    AccountSummary, FileSearchEntry, HistoryEntry, IpRule, NewsPost, NewsgroupInfo, PresenceUser,
-    RoleInfo, ServerSettings, TrackerServer,
+    AccountSummary, BanList, FileSearchEntry, HistoryEntry, IpRule, NewsPost, NewsgroupInfo,
+    PresenceUser, RoleInfo, ServerSettings, TrackerServer,
 };
 
 /// A logged-in session's identity.
@@ -37,6 +41,15 @@ impl std::fmt::Debug for Password {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("Password(<redacted>)")
     }
+}
+
+/// A password-change challenge, plus what the proof must be bound to that
+/// only the actor knows: the logged-in username and the TLS exporter value.
+#[derive(Debug)]
+pub(crate) struct ChangeChallenge {
+    pub challenge: PasswordChangeChallenge,
+    pub username: String,
+    pub channel_binding: [u8; kdx_crypto::CHANNEL_BINDING_LEN],
 }
 
 /// Commands sent from a `ClientHandle` into the connection actor. Each
@@ -237,7 +250,7 @@ pub(crate) enum Command {
     },
     CreateAccount {
         username: String,
-        password: String,
+        credential: Credential,
         base_class: u8,
         granted: u32,
         revoked: u32,
@@ -249,6 +262,21 @@ pub(crate) enum Command {
         granted: u32,
         revoked: u32,
         reply: oneshot::Sender<Result<Vec<AccountSummary>, ClientError>>,
+    },
+    SetAccountPassword {
+        username: String,
+        credential: Credential,
+        reply: oneshot::Sender<Result<Vec<AccountSummary>, ClientError>>,
+    },
+    /// `PasswordChangeBegin`; answered with the challenge (or `Error`).
+    BeginPasswordChange {
+        reply: oneshot::Sender<Result<ChangeChallenge, ClientError>>,
+    },
+    /// `PasswordChangeProof`; answered with the result (or `Error`).
+    FinishPasswordChange {
+        proof: [u8; 32],
+        credential: Credential,
+        reply: oneshot::Sender<Result<PasswordChangeResult, ClientError>>,
     },
     ListNewsgroups {
         reply: oneshot::Sender<Result<Vec<NewsgroupInfo>, ClientError>>,
@@ -275,6 +303,25 @@ pub(crate) enum Command {
         post_id: String,
         reply: oneshot::Sender<Result<Vec<NewsPost>, ClientError>>,
     },
+    ListBans {
+        reply: oneshot::Sender<Result<BanList, ClientError>>,
+    },
+    RemoveBan {
+        username: String,
+        reply: oneshot::Sender<Result<BanList, ClientError>>,
+    },
+    UpdateNewsgroup {
+        id: String,
+        name: String,
+        description: String,
+        min_read_class: u8,
+        min_post_class: u8,
+        reply: oneshot::Sender<Result<Vec<NewsgroupInfo>, ClientError>>,
+    },
+    DeleteNewsgroup {
+        id: String,
+        reply: oneshot::Sender<Result<Vec<NewsgroupInfo>, ClientError>>,
+    },
 }
 
 /// Handle to a connected KDX client. Cloneable; every method round-trips a
@@ -293,6 +340,10 @@ pub struct ClientHandle {
     /// full or the actor is blocked writing to a stalled server.
     pub(crate) shutdown: Arc<watch::Sender<bool>>,
     pub(crate) request_timeout: Duration,
+    /// Held for a whole password change: the server keeps one challenge per
+    /// connection, so two interleaved changes would answer each other's
+    /// challenges (and be counted as wrong passwords).
+    pub(crate) password_change: Arc<tokio::sync::Mutex<()>>,
 }
 
 /// Longest string the wire's u16 length prefix can carry.
@@ -309,6 +360,39 @@ fn wire(s: &str) -> Result<String, ClientError> {
         )));
     }
     Ok(s.to_owned())
+}
+
+/// Derive a fresh SCRAM credential for `password` on a blocking thread
+/// (Argon2 is CPU- and memory-heavy), wiping the copy it works on.
+async fn derive_stored(password: &str) -> Result<StoredCredential, ClientError> {
+    let password = Zeroizing::new(password.to_owned());
+    tokio::task::spawn_blocking(move || StoredCredential::derive(&password))
+        .await
+        .map_err(|_| blocking_failed())?
+        .map_err(ClientError::from)
+}
+
+/// [`derive_stored`], in wire form. Refuses an empty password.
+async fn derive_credential(password: &str) -> Result<Credential, ClientError> {
+    if password.is_empty() {
+        return Err(ClientError::InvalidInput("a password is required".into()));
+    }
+    Ok(to_wire(&derive_stored(password).await?))
+}
+
+fn to_wire(credential: &StoredCredential) -> Credential {
+    Credential {
+        m_cost: credential.params.m_cost,
+        t_cost: credential.params.t_cost,
+        p_cost: credential.params.p_cost,
+        salt: credential.salt.clone(),
+        stored_key: credential.stored_key,
+        server_key: credential.server_key,
+    }
+}
+
+fn blocking_failed() -> ClientError {
+    ClientError::Io(std::io::Error::other("credential derivation failed"))
 }
 
 impl ClientHandle {
@@ -682,10 +766,16 @@ impl ClientHandle {
         .await
     }
 
-    /// Download `remote_path` (a `/dir/file` path) to `local`, resuming from a
-    /// `.kdxpart` sidecar if one matches this server and remote file. The
-    /// bytes accumulate in `<local>.kdxdata` and are renamed to `local` only
-    /// after the whole-file hash verifies. Resolves on completion.
+    /// Download `remote_path` (a `/dir/file` path) to `local`. Resolves on
+    /// completion.
+    ///
+    /// The bytes accumulate in the client's data directory
+    /// (`ClientConfig::data_dir`/`transfers/`, with a `.kdxpart` resume
+    /// sidecar), never beside `local`: only after the whole-file hash
+    /// verifies is the file moved (or, across filesystems, copied) to
+    /// `local`, so a sandboxed app needs write access to `local` alone. An
+    /// interrupted download of the same file from the same server to the
+    /// same `local` resumes, also after a reconnect or restart.
     ///
     /// `local` is used verbatim: derive its file name from server-supplied
     /// names only via [`crate::safe_local_file_name`].
@@ -846,9 +936,12 @@ impl ClientHandle {
         self.send(|reply| Command::ListAccounts { reply }).await
     }
 
-    /// Provision a new account. The `password` is its initial password (sent
-    /// only over TLS and hashed server-side). Requires `USER_ADMIN`. Resolves
-    /// with the server's full, updated account list.
+    /// Provision a new account with initial password `password`. Its
+    /// credential (fresh salt, Argon2id, StoredKey/ServerKey) is derived
+    /// here, on a blocking thread; the password itself never leaves this
+    /// process. Requires `USER_ADMIN`. Resolves with the server's full,
+    /// updated account list. Password policy (length etc.) is the caller's:
+    /// the server can't see the password to enforce any.
     pub async fn create_account(
         &self,
         username: &str,
@@ -857,16 +950,112 @@ impl ClientHandle {
         granted: u32,
         revoked: u32,
     ) -> Result<Vec<AccountSummary>, ClientError> {
-        let (username, password) = (wire(username)?, wire(password)?);
+        let username = wire(username)?;
+        let credential = derive_credential(password).await?;
         self.send(|reply| Command::CreateAccount {
             username,
-            password,
+            credential,
             base_class,
             granted,
             revoked,
             reply,
         })
         .await
+    }
+
+    /// Reset another account's password to `new_password` (an
+    /// administrator's reset: no proof of the old one). The credential is
+    /// derived here; the password never leaves this process. Requires
+    /// `USER_ADMIN` and the right to manage that account (the same rules as
+    /// [`ClientHandle::update_account`]); your own password goes through
+    /// [`ClientHandle::change_password`] instead. The server disconnects the
+    /// account's live sessions. Resolves with the updated account list.
+    pub async fn set_account_password(
+        &self,
+        username: &str,
+        new_password: &str,
+    ) -> Result<Vec<AccountSummary>, ClientError> {
+        let username = wire(username)?;
+        let credential = derive_credential(new_password).await?;
+        self.send(|reply| Command::SetAccountPassword {
+            username,
+            credential,
+            reply,
+        })
+        .await
+    }
+
+    /// Change the logged-in account's own password. Proves knowledge of
+    /// `current` with a fresh challenge-response bound to this TLS session
+    /// and hands the server a credential derived here from `new` — neither
+    /// password crosses the wire. The server's answer is accepted only with
+    /// a server signature proving it held the old credential (otherwise the
+    /// connection is dropped, as for a login). On success the server signs
+    /// out the account's other sessions; this one stays logged in, and the
+    /// server's message is returned.
+    ///
+    /// Fails with `ClientError::AuthFailed` for a wrong current password
+    /// (the server counts these like failed logins, and drops the
+    /// connection after a few), and `ClientError::Server` when the server
+    /// refuses (guest account, throttled, not supported). Runs Argon2 twice,
+    /// on blocking threads.
+    pub async fn change_password(&self, current: &str, new: &str) -> Result<String, ClientError> {
+        if new.is_empty() {
+            return Err(ClientError::InvalidInput("the new password is empty".into()));
+        }
+        let current = Zeroizing::new(current.to_owned());
+        let _one_at_a_time = self.password_change.lock().await;
+        // Derive the new credential while the server picks a challenge.
+        let (derived, begun) = tokio::join!(
+            derive_stored(new),
+            self.send(|reply| Command::BeginPasswordChange { reply })
+        );
+        let new_credential = derived?;
+        let ChangeChallenge {
+            challenge,
+            username,
+            channel_binding,
+        } = begun?;
+        let for_proof = new_credential.clone();
+        let proof = tokio::task::spawn_blocking(move || {
+            kdx_crypto::password_change_proof(
+                &current,
+                &PasswordChangeContext {
+                    current: AuthContext {
+                        username: &username,
+                        challenge: &challenge.challenge,
+                        salt: &challenge.salt,
+                        params: KdfParams {
+                            m_cost: challenge.m_cost,
+                            t_cost: challenge.t_cost,
+                            p_cost: challenge.p_cost,
+                        },
+                        channel_binding: &channel_binding,
+                    },
+                    new_credential: &for_proof,
+                },
+            )
+        })
+        .await
+        .map_err(|_| blocking_failed())??;
+        let credential = to_wire(&new_credential);
+        let result = self
+            .send(|reply| Command::FinishPasswordChange {
+                proof: proof.proof,
+                credential,
+                reply,
+            })
+            .await?;
+        if !result.success {
+            return Err(ClientError::AuthFailed(result.message));
+        }
+        if !proof.verify_server_signature(&result.server_signature) {
+            self.disconnect().await;
+            return Err(ClientError::AuthFailed(
+                "server failed to prove it knows this account".into(),
+            ));
+        }
+        Ok(result.message)
     }
 
     /// Change an account's class and privilege overrides (not its password).
@@ -951,6 +1140,51 @@ impl ClientHandle {
     pub async fn delete_post(&self, post_id: &str) -> Result<Vec<NewsPost>, ClientError> {
         let post_id = wire(post_id)?;
         self.send(|reply| Command::DeletePost { post_id, reply }).await
+    }
+
+    /// List the account bans in force (the Bans window), longest-lasting
+    /// first; `BanList::total` says whether the server cut the list.
+    /// Requires `USER_BAN`; otherwise resolves to `ClientError::Server`.
+    pub async fn list_bans(&self) -> Result<BanList, ClientError> {
+        self.send(|reply| Command::ListBans { reply }).await
+    }
+
+    /// Lift the ban on `username`. Requires `USER_BAN`, and a ban set by a
+    /// higher class can only be lifted by that class or above (or by whoever
+    /// set it, or an Admin). Resolves with the server's updated ban list.
+    pub async fn remove_ban(&self, username: &str) -> Result<BanList, ClientError> {
+        let username = wire(username)?;
+        self.send(|reply| Command::RemoveBan { username, reply }).await
+    }
+
+    /// Edit a newsgroup's name, description and class thresholds. Requires
+    /// `USER_ADMIN` and read access to the group. Resolves with the updated
+    /// newsgroup list (the ones the caller may read).
+    pub async fn update_newsgroup(
+        &self,
+        id: &str,
+        name: &str,
+        description: &str,
+        min_read_class: u8,
+        min_post_class: u8,
+    ) -> Result<Vec<NewsgroupInfo>, ClientError> {
+        let (id, name, description) = (wire(id)?, wire(name)?, wire(description)?);
+        self.send(|reply| Command::UpdateNewsgroup {
+            id,
+            name,
+            description,
+            min_read_class,
+            min_post_class,
+            reply,
+        })
+        .await
+    }
+
+    /// Delete a newsgroup and every post in it. Requires `USER_ADMIN` and read
+    /// access to the group. Resolves with the updated newsgroup list.
+    pub async fn delete_newsgroup(&self, id: &str) -> Result<Vec<NewsgroupInfo>, ClientError> {
+        let id = wire(id)?;
+        self.send(|reply| Command::DeleteNewsgroup { id, reply }).await
     }
 
     /// Ask the actor to close the connection. Takes effect promptly even if

@@ -68,8 +68,33 @@ pub enum NewsError {
     NoSuchParent,
     #[error("class thresholds must be between 0 and 3")]
     InvalidClass,
+    #[error("you may not read this newsgroup")]
+    NotReadable,
     #[error("storage error: {0}")]
     Storage(#[from] kdx_storage::StorageError),
+}
+
+/// Validate a newsgroup's name and description (NewsgroupCreate and
+/// NewsgroupUpdate): a non-blank name and the `limits.rs` length caps. The
+/// message is safe to show the client.
+pub fn validate_group_fields(name: &str, description: &str) -> Result<(), String> {
+    if name.trim().is_empty() {
+        return Err("newsgroup name is required".into());
+    }
+    crate::limits::check_len("newsgroup name", name, crate::limits::MAX_NAME_LEN)?;
+    crate::limits::check_len(
+        "newsgroup description",
+        description,
+        crate::limits::MAX_LONG_DESCRIPTION_LEN,
+    )
+}
+
+/// A newsgroup removed by [`NewsManager::delete_group`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeletedGroup {
+    pub name: String,
+    /// Posts (replies included) deleted with it.
+    pub posts: u64,
 }
 
 /// Token bucket for one account's posting.
@@ -193,6 +218,66 @@ impl NewsManager {
         group_from_row(row)
     }
 
+    /// Edit a newsgroup as a reader of class `reader_class`: refused with
+    /// `NotReadable` if its current read threshold is above that (checked
+    /// atomically with the write), `NoSuchGroup` if it doesn't exist, and a
+    /// storage `AlreadyExists` if the new name is taken.
+    pub async fn update_group(
+        &self,
+        id: Uuid,
+        name: &str,
+        description: &str,
+        min_read_class: u8,
+        min_post_class: u8,
+        reader_class: u8,
+    ) -> Result<Newsgroup, NewsError> {
+        if min_read_class > MAX_CLASS_THRESHOLD || min_post_class > MAX_CLASS_THRESHOLD {
+            return Err(NewsError::InvalidClass);
+        }
+        let updated = storage::update_group(
+            &self.pool,
+            &id.to_string(),
+            name,
+            description,
+            min_read_class as i64,
+            min_post_class as i64,
+            reader_class as i64,
+        )
+        .await?;
+        if !updated {
+            return Err(self.why_untouched(id).await);
+        }
+        Ok(Newsgroup {
+            id,
+            name: name.to_owned(),
+            description: description.to_owned(),
+            min_read_class,
+            min_post_class,
+        })
+    }
+
+    /// Delete a newsgroup and every post in it, as a reader of class
+    /// `reader_class` (same refusals as [`Self::update_group`]). Atomic.
+    pub async fn delete_group(&self, id: Uuid, reader_class: u8) -> Result<DeletedGroup, NewsError> {
+        match storage::delete_group(&self.pool, &id.to_string(), reader_class as i64).await? {
+            Some(deleted) => Ok(DeletedGroup {
+                name: deleted.name,
+                posts: deleted.posts.max(0) as u64,
+            }),
+            None => Err(self.why_untouched(id).await),
+        }
+    }
+
+    /// Why a guarded update/delete matched no row: the group is gone, or
+    /// the caller can't read it.
+    async fn why_untouched(&self, id: Uuid) -> NewsError {
+        match storage::group_by_id(&self.pool, &id.to_string()).await {
+            Ok(Some(_)) => NewsError::NotReadable,
+            Ok(None) => NewsError::NoSuchGroup,
+            Err(e) => NewsError::Storage(e),
+        }
+    }
+
     pub async fn list_groups(&self) -> Result<Vec<Newsgroup>, NewsError> {
         storage::all_groups(&self.pool)
             .await?
@@ -256,6 +341,8 @@ impl NewsManager {
             // The only way the guarded insert writes nothing: the parent
             // isn't a post in this group.
             kdx_storage::StorageError::NotFound => NewsError::NoSuchParent,
+            // The group was deleted after the caller looked it up.
+            kdx_storage::StorageError::ForeignKey => NewsError::NoSuchGroup,
             other => NewsError::Storage(other),
         })?;
         post_from_row(row)
@@ -334,6 +421,53 @@ mod tests {
             news.create_post(g1.id, Some(root.id), "b", "re", "r", 2).await,
             Err(NewsError::NoSuchParent)
         ));
+    }
+
+    #[tokio::test]
+    async fn update_and_delete_group_explain_refusals() {
+        let (news, _dir) = mgr().await;
+        let g = news.create_group("general", "", 0, 0).await.unwrap();
+        let staff = news.create_group("staff", "", 3, 3).await.unwrap();
+        news.create_post(g.id, None, "a", "s", "b", 1).await.unwrap();
+
+        let edited = news.update_group(g.id, "lobby", "hi", 1, 2, 2).await.unwrap();
+        assert_eq!(edited, news.group(g.id).await.unwrap());
+        assert!(matches!(
+            news.update_group(g.id, "lobby", "", 4, 0, 3).await,
+            Err(NewsError::InvalidClass)
+        ));
+        assert!(matches!(
+            news.update_group(staff.id, "x", "", 0, 0, 2).await,
+            Err(NewsError::NotReadable)
+        ));
+        assert!(matches!(
+            news.update_group(Uuid::new_v4(), "x", "", 0, 0, 3).await,
+            Err(NewsError::NoSuchGroup)
+        ));
+        assert!(matches!(
+            news.update_group(g.id, "staff", "", 0, 0, 3).await,
+            Err(NewsError::Storage(kdx_storage::StorageError::AlreadyExists))
+        ));
+
+        assert!(matches!(news.delete_group(staff.id, 2).await, Err(NewsError::NotReadable)));
+        let deleted = news.delete_group(g.id, 2).await.unwrap();
+        assert_eq!(deleted, DeletedGroup { name: "lobby".into(), posts: 1 });
+        assert!(matches!(news.delete_group(g.id, 3).await, Err(NewsError::NoSuchGroup)));
+        // A post racing the delete is told the group is gone.
+        assert!(matches!(
+            news.create_post(g.id, None, "a", "late", "b", 2).await,
+            Err(NewsError::NoSuchGroup)
+        ));
+    }
+
+    #[test]
+    fn group_field_validation() {
+        assert!(validate_group_fields("general", "").is_ok());
+        assert!(validate_group_fields("  ", "").is_err());
+        let long_name = "n".repeat(crate::limits::MAX_NAME_LEN + 1);
+        assert!(validate_group_fields(&long_name, "").unwrap_err().contains("name"));
+        let long_desc = "d".repeat(crate::limits::MAX_LONG_DESCRIPTION_LEN + 1);
+        assert!(validate_group_fields("g", &long_desc).unwrap_err().contains("description"));
     }
 
     #[test]

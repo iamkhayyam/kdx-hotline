@@ -46,6 +46,124 @@ impl AdminDisconnect {
     }
 }
 
+/// Client → server: list the account bans currently in force. Requires
+/// `USER_BAN`. Empty payload. Answered with a `BanListResponse` (or an
+/// `Error`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BanListRequest;
+
+/// One active ban, as shown in the Bans window.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BanEntry {
+    /// The banned account.
+    pub username: String,
+    /// Unix seconds; the ban is in force while `now < until`.
+    pub until: u64,
+    pub reason: String,
+    /// Username of the account that set (or now owns) the ban.
+    pub banned_by: String,
+    /// Base class (0 guest … 3 admin) of `banned_by` when the ban was set.
+    /// Lifting it takes a higher class, the same banner, or an Admin.
+    pub banned_by_class: u8,
+}
+
+/// Server → client: the active bans, longest-lasting first (`until`
+/// descending, then username), at most a server-side cap of them; `total`
+/// is how many are in force altogether, so a client can tell the list was
+/// cut. The cap drops the bans closest to lapsing on their own. Reply to
+/// `BanListRequest` and to a successful `BanRemove`.
+///
+/// Wire: `total:u32 count:u32` then per entry
+/// `username:str until:u64 reason:str banned_by:str banned_by_class:u8`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BanListResponse {
+    pub total: u32,
+    pub bans: Vec<BanEntry>,
+}
+
+/// Client → server: lift the ban on `username`. Requires `USER_BAN`; a ban
+/// set by a higher class can only be lifted by that class or above (or by
+/// its own banner, or any Admin). Answered with the updated
+/// `BanListResponse`, or an `Error` (no such ban, outranked, ...).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BanRemove {
+    pub username: String,
+}
+
+impl BanListRequest {
+    pub fn encode(&self) -> Bytes {
+        Bytes::new()
+    }
+    pub fn decode(payload: &[u8]) -> Result<Self, ProtocolError> {
+        expect_end(payload, "BanListRequest")?;
+        Ok(Self)
+    }
+}
+
+/// Smallest wire encoding of a [`BanEntry`]: three empty strings, `until`
+/// and the class byte.
+const MIN_BAN_ENTRY_LEN: usize = 2 * 3 + 8 + 1;
+
+impl BanListResponse {
+    pub fn encode(&self) -> Bytes {
+        let mut buf = BytesMut::new();
+        buf.put_u32(self.total);
+        let n = put_count32(&mut buf, self.bans.len());
+        for b in &self.bans[..n] {
+            put_str(&mut buf, &b.username);
+            buf.put_u64(b.until);
+            put_str(&mut buf, &b.reason);
+            put_str(&mut buf, &b.banned_by);
+            buf.put_u8(b.banned_by_class);
+        }
+        buf.freeze()
+    }
+    pub fn decode(mut payload: &[u8]) -> Result<Self, ProtocolError> {
+        if payload.remaining() < 8 {
+            return Err(ProtocolError::MalformedPayload("BanListResponse"));
+        }
+        let total = payload.get_u32();
+        let count = payload.get_u32() as usize;
+        let mut bans =
+            Vec::with_capacity(list_capacity(count, payload.remaining(), MIN_BAN_ENTRY_LEN));
+        for _ in 0..count {
+            let username = get_str(&mut payload, "BanListResponse")?;
+            if payload.remaining() < 8 {
+                return Err(ProtocolError::MalformedPayload("BanListResponse"));
+            }
+            let until = payload.get_u64();
+            let reason = get_str(&mut payload, "BanListResponse")?;
+            let banned_by = get_str(&mut payload, "BanListResponse")?;
+            if payload.remaining() < 1 {
+                return Err(ProtocolError::MalformedPayload("BanListResponse"));
+            }
+            let banned_by_class = payload.get_u8();
+            bans.push(BanEntry {
+                username,
+                until,
+                reason,
+                banned_by,
+                banned_by_class,
+            });
+        }
+        expect_end(payload, "BanListResponse")?;
+        Ok(Self { total, bans })
+    }
+}
+
+impl BanRemove {
+    pub fn encode(&self) -> Bytes {
+        let mut buf = BytesMut::with_capacity(2 + self.username.len());
+        put_str(&mut buf, &self.username);
+        buf.freeze()
+    }
+    pub fn decode(mut payload: &[u8]) -> Result<Self, ProtocolError> {
+        let username = get_str(&mut payload, "BanRemove")?;
+        expect_end(payload, "BanRemove")?;
+        Ok(Self { username })
+    }
+}
+
 /// Client → server: fetch the live server settings. Requires `SERVER_ADMIN`.
 /// Empty payload.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -516,6 +634,49 @@ mod tests {
         put_str(&mut buf, "r");
         buf.put_u8(0); // only 1 of 4 ban_secs bytes
         assert!(AdminDisconnect::decode(&buf).is_err());
+    }
+
+    #[test]
+    fn ban_list_and_remove_round_trip() {
+        assert!(BanListRequest::decode(&BanListRequest.encode()).is_ok());
+        assert!(BanListRequest::decode(&[0]).is_err());
+
+        let resp = BanListResponse {
+            total: 7,
+            bans: vec![
+                BanEntry {
+                    username: "lamer".into(),
+                    until: 1_900_000_000,
+                    reason: "flooding the boards".into(),
+                    banned_by: "sysop".into(),
+                    banned_by_class: 3,
+                },
+                BanEntry {
+                    username: "zero".into(),
+                    until: 1_800_000_000,
+                    reason: String::new(),
+                    banned_by: "mod".into(),
+                    banned_by_class: 2,
+                },
+            ],
+        };
+        let enc = resp.encode();
+        assert_eq!(BanListResponse::decode(&enc).unwrap(), resp);
+        // Every strict prefix is refused (no partial lists).
+        for len in 0..enc.len() {
+            assert!(BanListResponse::decode(&enc[..len]).is_err(), "prefix {len}");
+        }
+        let empty = BanListResponse { total: 0, bans: vec![] };
+        assert_eq!(BanListResponse::decode(&empty.encode()).unwrap(), empty);
+        assert_eq!(empty.encode().len(), 8);
+
+        let remove = BanRemove { username: "lamer".into() };
+        assert_eq!(BanRemove::decode(&remove.encode()).unwrap(), remove);
+        // Trailing bytes and a short string are both malformed.
+        let mut trailing = BytesMut::from(&remove.encode()[..]);
+        trailing.put_u8(0);
+        assert!(BanRemove::decode(&trailing).is_err());
+        assert!(BanRemove::decode(&[0, 5, b'l']).is_err());
     }
 
     #[test]

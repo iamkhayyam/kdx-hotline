@@ -13,9 +13,14 @@ use std::time::Duration;
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use kdx_protocol::messages::{
+    AccountSetPassword, PasswordChangeBegin, PasswordChangeChallenge, PasswordChangeProof,
+    PasswordChangeResult,
+};
+use kdx_protocol::messages::{
     AccountCreate, AccountListRequest, AccountListResponse, AccountRolesRequest,
     AccountRolesResponse, AccountSummary, AccountUpdate, AdminBroadcast, AdminDisconnect,
-    AdminShutdown, AuthChallenge, AuthRequest, AuthResponse, AuthResult, ChatInvite, ChatInvited,
+    AdminShutdown, AuthChallenge, AuthRequest, AuthResponse, AuthResult,
+    BanEntry as WireBanEntry, BanListRequest, BanListResponse, BanRemove, ChatInvite, ChatInvited,
     ChatJoin, ChatLeave, ChatRoomFlags as WireChatRoomFlags, ChatSend, ChatTopic,
     ConnectionListRequest, ConnectionListResponse, FileCatalogGenerated, FileCreateFolder,
     FileDelete,
@@ -26,7 +31,8 @@ use kdx_protocol::messages::{
     HistoryListRequest, HistoryListResponse, IpRuleCreate, IpRuleDelete,
     IpRuleEntry as WireIpRule, IpRuleListRequest, IpRuleListResponse, NewsPost as WireNewsPost,
     NewsPostCreate, NewsPostDelete, NewsThreadListRequest, NewsThreadListResponse, NewsgroupCreate,
-    NewsgroupInfo, NewsgroupListRequest, NewsgroupListResponse, PresenceListRequest,
+    NewsgroupDelete, NewsgroupInfo, NewsgroupListRequest, NewsgroupListResponse, NewsgroupUpdate,
+    PresenceListRequest,
     PresenceListResponse, PrivateMessage, PrivateSend, RoleAssign, RoleCreate, RoleDelete, RoleInfo,
     SetIdentity,
     RoleListRequest, RoleListResponse, RoleUnassign, RoleUpdate, ServerSettingsRequest,
@@ -46,6 +52,7 @@ use tracing::{debug, warn};
 use uuid::Uuid;
 
 use crate::auth::{AuthManager, BaseClass, Privileges, Role, RoleManager, Session};
+use crate::auth::{AuthError, CredentialStamp, PendingPasswordChange};
 use crate::auth::policy::{self, Refusal};
 use crate::chat::{Member, Outbound, RoomCommand, RoomManager};
 use crate::files::{FileTree, NodeKind};
@@ -72,6 +79,12 @@ pub const MAX_REASSEMBLED_PAYLOAD: usize = kdx_protocol::MAX_REASSEMBLED_PAYLOAD
 pub const SERVER_FEATURES: u16 = 0;
 /// Failed login attempts allowed before the connection is dropped.
 pub const MAX_AUTH_ATTEMPTS: u8 = 3;
+/// Wrong current passwords a logged-in connection may send in password
+/// changes before it is dropped (on top of the login limiter), so a
+/// hijacked session can't be used to guess its owner's password.
+pub const MAX_PASSWORD_CHANGE_FAILURES: u8 = 3;
+/// Disconnect reason once `MAX_PASSWORD_CHANGE_FAILURES` is reached.
+const TOO_MANY_PASSWORD_FAILURES: &str = "too many failed password attempts";
 
 /// Depth of a connection's outbound event queue. Room broadcasts to a full
 /// queue are dropped for that member rather than stalling the room.
@@ -101,6 +114,10 @@ const FILE_SEARCH_LIMIT: usize = 200;
 /// Cap on entries returned in one `HistoryListResponse`, regardless of the
 /// `limit` a client requests.
 const HISTORY_LIST_LIMIT: u32 = 500;
+
+/// Cap on bans returned in one `BanListResponse` (the longest-lasting ones;
+/// the response's `total` says how many are in force).
+pub const BAN_LIST_LIMIT: u32 = 500;
 
 /// Shared server-wide services handed to every connection.
 pub struct ServerCtx {
@@ -177,6 +194,13 @@ pub struct Connection<S> {
     /// This connection's TLS exporter value (`kdx_crypto::TLS_EXPORTER_LABEL`)
     /// that login proofs are bound to. All zeros for streams without TLS.
     channel_binding: [u8; kdx_crypto::CHANNEL_BINDING_LEN],
+    /// The credential this connection's login was proven against (see
+    /// `stale_login_reason`). `None` until login.
+    login_stamp: Option<CredentialStamp>,
+    /// A password change between its challenge and its proof.
+    password_change: Option<PendingPasswordChange>,
+    /// Wrong current passwords sent in password changes on this connection.
+    password_change_failures: u8,
     #[cfg(test)]
     hooks: TestHooks,
 }
@@ -211,6 +235,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
             next_sequence: 0,
             peer_addr,
             channel_binding: [0u8; kdx_crypto::CHANNEL_BINDING_LEN],
+            login_stamp: None,
+            password_change: None,
+            password_change_failures: 0,
             #[cfg(test)]
             hooks: TestHooks::default(),
         }
@@ -372,6 +399,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
 
                     match self.ctx.auth.complete(pending, &response.response).await {
                         Ok(verified) => {
+                            let credential_stamp = verified.credential_stamp;
                             let session = verified.session;
                             // Register the session now (unless the server is
                             // full), but keep it only once the result (and
@@ -415,6 +443,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                                 format!("peer={}", self.peer_addr),
                             );
                             self.session = Some(session);
+                            self.login_stamp = Some(credential_stamp);
                             return Ok(true);
                         }
                         Err(crate::auth::AuthError::InvalidCredentials) => {
@@ -512,6 +541,23 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
             Err(e) => {
                 warn!(error = %e, "could not re-check a new session's account");
                 return Some(RECHECK_FAILED.to_string());
+            }
+        }
+        // A password change or reset whose kick missed us: the password this
+        // login proved is no longer the account's.
+        if let Some(stamp) = self.login_stamp {
+            match self
+                .ctx
+                .auth
+                .credential_stamp(&session.username, &session.account_id)
+                .await
+            {
+                Ok(Some(current)) if current == stamp => {}
+                Ok(_) => return Some(policy::PASSWORD_CHANGED.to_string()),
+                Err(e) => {
+                    warn!(error = %e, "could not re-check a new session's credential");
+                    return Some(RECHECK_FAILED.to_string());
+                }
             }
         }
         match self.ctx.auth.active_ban(&session.account_id).await {
@@ -1727,6 +1773,44 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                         Err(refusal) => self.send_refusal(refusal).await?,
                     }
                 }
+                // Self-service password change (see `kdx_crypto::scram`):
+                // Begin → Challenge, then Proof → Result. A wrong current
+                // password counts in the login limiter and against this
+                // connection, which is dropped after a few.
+                PacketType::PasswordChangeBegin => {
+                    PasswordChangeBegin::decode(&frame.payload)?;
+                    self.begin_password_change().await?;
+                }
+                PacketType::PasswordChangeProof => {
+                    let proof = PasswordChangeProof::decode(&frame.payload)?;
+                    if self.finish_password_change(proof).await? {
+                        self.farewell(outbound_rx, Some(TOO_MANY_PASSWORD_FAILURES.into()))
+                            .await;
+                        break Ok(());
+                    }
+                }
+                // Admin password reset: policy-gated like AccountUpdate;
+                // kicks the target's live sessions.
+                PacketType::AccountSetPassword => {
+                    let req = AccountSetPassword::decode(&frame.payload)?;
+                    let session = self.session.as_ref().expect("authed").clone();
+                    match policy::set_account_password(&self.ctx, &session, &req).await {
+                        Ok(()) => {
+                            let _ = self
+                                .ctx
+                                .history
+                                .record(
+                                    unix_now(),
+                                    Some(&session.username),
+                                    "password_reset",
+                                    &format!("target={}", req.username),
+                                )
+                                .await;
+                            self.reply_account_list().await?
+                        }
+                        Err(refusal) => self.send_refusal(refusal).await?,
+                    }
+                }
                 PacketType::TrackerListRequest => {
                     let req = TrackerListRequest::decode(&frame.payload)?;
                     let filter = (!req.filter.trim().is_empty()).then_some(req.filter.as_str());
@@ -2009,22 +2093,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                         continue;
                     }
                     let admin_name = session.username.clone();
-                    if create.name.trim().is_empty() {
-                        self.send_error("newsgroup name is required").await?;
-                        continue;
-                    }
-                    if let Err(msg) = crate::limits::check_len(
-                        "newsgroup name",
-                        &create.name,
-                        crate::limits::MAX_NAME_LEN,
-                    )
-                    .and_then(|()| {
-                        crate::limits::check_len(
-                            "newsgroup description",
-                            &create.description,
-                            crate::limits::MAX_LONG_DESCRIPTION_LEN,
-                        )
-                    }) {
+                    if let Err(msg) =
+                        crate::news::validate_group_fields(&create.name, &create.description)
+                    {
                         self.send_error(&msg).await?;
                         continue;
                     }
@@ -2050,6 +2121,87 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                             self.reply_newsgroup_list().await?
                         }
                         Err(e) => self.send_refusal(news_refusal("newsgroup create", e)).await?,
+                    }
+                }
+                // Newsgroup edits and deletes: USER_ADMIN (checked against the
+                // stored account too), and only on a group the actor can read
+                // — the same line news-post moderation draws. The read check
+                // and the write are atomic in storage.
+                PacketType::NewsgroupUpdate => {
+                    let update = NewsgroupUpdate::decode(&frame.payload)?;
+                    let session = self.session.as_ref().expect("authed").clone();
+                    let actor = match policy::resolve_actor(&self.ctx, &session, Privileges::USER_ADMIN)
+                        .await
+                    {
+                        Ok(actor) => actor,
+                        Err(refusal) => {
+                            self.send_refusal(refusal).await?;
+                            continue;
+                        }
+                    };
+                    if let Err(msg) =
+                        crate::news::validate_group_fields(&update.name, &update.description)
+                    {
+                        self.send_error(&msg).await?;
+                        continue;
+                    }
+                    let group_id = Uuid::from_bytes(update.id);
+                    match self
+                        .ctx
+                        .news
+                        .update_group(
+                            group_id,
+                            &update.name,
+                            &update.description,
+                            update.min_read_class,
+                            update.min_post_class,
+                            actor.authority.class as u8,
+                        )
+                        .await
+                    {
+                        Ok(group) => {
+                            let detail = format!(
+                                "{} (id={}, read={}, post={})",
+                                group.name, group.id, group.min_read_class, group.min_post_class
+                            );
+                            let _ = self
+                                .ctx
+                                .history
+                                .record(unix_now(), Some(&actor.username), "newsgroup_updated", &detail)
+                                .await;
+                            self.reply_newsgroup_list().await?
+                        }
+                        Err(e) => self.send_refusal(news_refusal("newsgroup update", e)).await?,
+                    }
+                }
+                PacketType::NewsgroupDelete => {
+                    let delete = NewsgroupDelete::decode(&frame.payload)?;
+                    let session = self.session.as_ref().expect("authed").clone();
+                    let actor = match policy::resolve_actor(&self.ctx, &session, Privileges::USER_ADMIN)
+                        .await
+                    {
+                        Ok(actor) => actor,
+                        Err(refusal) => {
+                            self.send_refusal(refusal).await?;
+                            continue;
+                        }
+                    };
+                    let group_id = Uuid::from_bytes(delete.id);
+                    // Deletes the group's posts with it, in one transaction.
+                    match self.ctx.news.delete_group(group_id, actor.authority.class as u8).await {
+                        Ok(deleted) => {
+                            let detail = format!(
+                                "{} (id={}, {} post(s))",
+                                deleted.name, group_id, deleted.posts
+                            );
+                            let _ = self
+                                .ctx
+                                .history
+                                .record(unix_now(), Some(&actor.username), "newsgroup_deleted", &detail)
+                                .await;
+                            self.reply_newsgroup_list().await?
+                        }
+                        Err(e) => self.send_refusal(news_refusal("newsgroup delete", e)).await?,
                     }
                 }
                 PacketType::NewsThreadListRequest => {
@@ -2288,6 +2440,36 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                         .await?;
                     }
                 }
+                // Ban list / unban: USER_BAN, checked against the stored
+                // account too (as for AdminDisconnect). Lifting a ban follows
+                // the rank rule bans are placed by (`policy::may_lift_ban`).
+                PacketType::BanListRequest => {
+                    BanListRequest::decode(&frame.payload)?;
+                    let session = self.session.as_ref().expect("authed").clone();
+                    match policy::check_ban_viewer(&self.ctx, &session).await {
+                        Ok(_) => self.reply_ban_list().await?,
+                        Err(refusal) => self.send_refusal(refusal).await?,
+                    }
+                }
+                PacketType::BanRemove => {
+                    let remove = BanRemove::decode(&frame.payload)?;
+                    let session = self.session.as_ref().expect("authed").clone();
+                    match policy::remove_ban(&self.ctx, &session, &remove.username).await {
+                        Ok(ban) => {
+                            let detail = format!(
+                                "target={}, banned_by={}, until={}, reason={}",
+                                ban.username, ban.banned_by, ban.until, ban.reason
+                            );
+                            let _ = self
+                                .ctx
+                                .history
+                                .record(unix_now(), Some(&session.username), "ban_removed", &detail)
+                                .await;
+                            self.reply_ban_list().await?
+                        }
+                        Err(refusal) => self.send_refusal(refusal).await?,
+                    }
+                }
                 other => {
                     warn!(packet_type = ?other, "unhandled packet type");
                     self.send(
@@ -2299,6 +2481,163 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                 }
             }
         }
+    }
+
+    /// `PasswordChangeBegin`: issue a change challenge for this session's
+    /// own account, replacing any earlier one. Guest accounts are typically
+    /// shared, so they can't (an administrator resets them instead); a
+    /// source the login limiter is holding off waits like a login would.
+    async fn begin_password_change(&mut self) -> Result<(), ConnectionError> {
+        let session = self.session.as_ref().expect("authed").clone();
+        self.password_change = None;
+        if session.class == BaseClass::Guest {
+            return self
+                .send_error("guest accounts can't change their password; ask an administrator")
+                .await;
+        }
+        if let Err(wait) = self.ctx.login_limiter.check(self.peer_ip(), &session.username) {
+            return self
+                .send_error(&format!(
+                    "too many failed password attempts; try again in {}s",
+                    wait.as_secs().max(1)
+                ))
+                .await;
+        }
+        match self
+            .ctx
+            .auth
+            .begin_password_change(&session, self.channel_binding)
+            .await
+        {
+            Ok((data, pending)) => {
+                self.password_change = Some(pending);
+                let challenge = PasswordChangeChallenge {
+                    challenge: data.challenge,
+                    salt: data.salt,
+                    m_cost: data.params.m_cost,
+                    t_cost: data.params.t_cost,
+                    p_cost: data.params.p_cost,
+                };
+                self.send(
+                    PacketType::PasswordChangeChallenge,
+                    PacketFlags::empty(),
+                    challenge.encode(),
+                )
+                .await
+            }
+            Err(e @ AuthError::AccountGone) => self.send_error(&e.to_string()).await,
+            Err(e) => {
+                self.send_refusal(Refusal::internal("password change", e))
+                    .await
+            }
+        }
+    }
+
+    /// `PasswordChangeProof`: verify the proof of the current password
+    /// against the outstanding challenge and store the new credential, then
+    /// sign out the account's other sessions. Answers with a
+    /// `PasswordChangeResult` (or an `Error` when there is nothing to
+    /// answer: no challenge, an unacceptable credential). Returns `true`
+    /// when this connection has now sent too many wrong passwords and must
+    /// be dropped.
+    async fn finish_password_change(
+        &mut self,
+        msg: PasswordChangeProof,
+    ) -> Result<bool, ConnectionError> {
+        let session = self.session.as_ref().expect("authed").clone();
+        let Some(pending) = self.password_change.take() else {
+            self.send_error("no password change in progress; start again")
+                .await?;
+            return Ok(false);
+        };
+        if pending.expired() {
+            self.send_error("the password change timed out; start again")
+                .await?;
+            return Ok(false);
+        }
+        let new = match policy::credential_from_wire(&msg.credential) {
+            Ok(credential) => credential,
+            Err(refusal) => {
+                self.send_refusal(refusal).await?;
+                return Ok(false);
+            }
+        };
+        let peer_ip = self.peer_ip();
+        let (result, drop_connection) = match self
+            .ctx
+            .auth
+            .complete_password_change(pending, &msg.proof, &new)
+            .await
+        {
+            Ok(server_signature) => {
+                self.ctx
+                    .login_limiter
+                    .record_success(peer_ip, &session.username);
+                // Stored before the kick, so a login racing it can't keep
+                // the old password (see `stale_login_reason`).
+                let others = self
+                    .ctx
+                    .presence
+                    .disconnect_others(&session.username, session.id, policy::PASSWORD_CHANGED)
+                    .await;
+                let _ = self
+                    .ctx
+                    .history
+                    .record(
+                        unix_now(),
+                        Some(&session.username),
+                        "password_changed",
+                        &format!("peer={}, other sessions signed out: {others}", self.peer_addr),
+                    )
+                    .await;
+                let message = match others {
+                    0 => "password changed".to_string(),
+                    n => format!("password changed; {n} other session(s) signed out"),
+                };
+                let result = PasswordChangeResult {
+                    success: true,
+                    message,
+                    server_signature,
+                };
+                (result, false)
+            }
+            Err(AuthError::InvalidCredentials) => {
+                self.password_change_failures = self.password_change_failures.saturating_add(1);
+                self.ctx
+                    .login_limiter
+                    .record_failure(peer_ip, &session.username);
+                self.record_history(
+                    Some(session.username.clone()),
+                    "password_change_failed",
+                    format!("peer={}", self.peer_addr),
+                );
+                let result = PasswordChangeResult {
+                    success: false,
+                    message: "the current password is incorrect".into(),
+                    server_signature: [0u8; 32],
+                };
+                (
+                    result,
+                    self.password_change_failures >= MAX_PASSWORD_CHANGE_FAILURES,
+                )
+            }
+            Err(e @ (AuthError::CredentialChanged | AuthError::AccountGone)) => {
+                self.send_error(&e.to_string()).await?;
+                return Ok(false);
+            }
+            Err(e) => {
+                self.send_refusal(Refusal::internal("password change", e))
+                    .await?;
+                return Ok(false);
+            }
+        };
+        self.send(
+            PacketType::PasswordChangeResult,
+            PacketFlags::empty(),
+            result.encode(),
+        )
+        .await?;
+        Ok(drop_connection)
     }
 
     /// Parting words of a server-initiated close: flush events already
@@ -2681,8 +3020,39 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
         Ok(())
     }
 
+    /// Send the bans in force (at most [`BAN_LIST_LIMIT`], longest-lasting
+    /// first) — the reply to `BanListRequest` and to a successful
+    /// `BanRemove`, so the Bans window re-renders from one message shape.
+    async fn reply_ban_list(&mut self) -> Result<(), ConnectionError> {
+        match self.ctx.roles.active_bans(unix_now() as i64, BAN_LIST_LIMIT).await {
+            Ok((bans, total)) => {
+                let response = BanListResponse {
+                    total: u32::try_from(total).unwrap_or(u32::MAX),
+                    bans: bans
+                        .into_iter()
+                        .map(|b| WireBanEntry {
+                            username: b.username,
+                            until: b.until.max(0) as u64,
+                            // Reasons are capped when a ban is set; clip any
+                            // older row so one can't bloat the reply.
+                            reason: crate::limits::truncate_utf8(&b.reason, crate::limits::MAX_REASON_LEN)
+                                .to_owned(),
+                            banned_by: b.banned_by,
+                            banned_by_class: b.banned_by_class as u8,
+                        })
+                        .collect(),
+                };
+                self.send(PacketType::BanListResponse, PacketFlags::empty(), response.encode())
+                    .await?;
+            }
+            Err(e) => self.send_refusal(Refusal::internal("ban listing", e)).await?,
+        }
+        Ok(())
+    }
+
     /// Send the newsgroups the caller may read (filtered by their class) — the
-    /// reply to `NewsgroupListRequest` and to a successful create.
+    /// reply to `NewsgroupListRequest` and to a successful create, edit or
+    /// delete.
     async fn reply_newsgroup_list(&mut self) -> Result<(), ConnectionError> {
         let my_class = self.session.as_ref().expect("authed").class as u8;
         match self.ctx.news.list_groups().await {
@@ -5217,7 +5587,7 @@ mod tests {
                 PacketType::AccountCreate,
                 AccountCreate {
                     username: "puppet".into(),
-                    password: "pw".into(),
+                    credential: wire_credential("pw"),
                     base_class: 1,
                     granted: Privileges::SERVER_ADMIN.bits(),
                     revoked: 0,
@@ -5227,8 +5597,14 @@ mod tests {
             // ...or of its own rank.
             (
                 PacketType::AccountCreate,
-                AccountCreate { username: "peer".into(), password: "pw".into(), base_class: 2, granted: 0, revoked: 0 }
-                    .encode(),
+                AccountCreate {
+                    username: "peer".into(),
+                    credential: wire_credential("pw"),
+                    base_class: 2,
+                    granted: 0,
+                    revoked: 0,
+                }
+                .encode(),
             ),
             // A role carrying privileges it lacks.
             (
@@ -5768,5 +6144,719 @@ mod tests {
         assert_eq!(disconnect_reason(&mut client).await, "goodnight");
         conn.await.unwrap().unwrap();
         assert_eq!(ctx.auth.live_session_count(), 0);
+    }
+
+    // ---- ban list / unban, newsgroup edit / delete ----
+
+    fn ban_list(frame: &KdxFrame) -> BanListResponse {
+        assert_eq!(
+            frame.header.packet_type,
+            PacketType::BanListResponse,
+            "expected a ban list, got {:?}: {}",
+            frame.header.packet_type,
+            String::from_utf8_lossy(&frame.payload)
+        );
+        BanListResponse::decode(&frame.payload).unwrap()
+    }
+
+    fn banned_names(frame: &KdxFrame) -> Vec<String> {
+        ban_list(frame).bans.into_iter().map(|b| b.username).collect()
+    }
+
+    async fn ban(client: &mut Client, seq: &mut u32, username: &str, secs: u32) {
+        let req = AdminDisconnect { username: username.into(), reason: format!("ban {username}"), ban_secs: secs };
+        let frame = send_and_recv(client, seq, PacketType::AdminDisconnect, req.encode()).await;
+        assert_eq!(frame.header.packet_type, PacketType::Info, "{}", String::from_utf8_lossy(&frame.payload));
+    }
+
+    async fn unban(client: &mut Client, seq: &mut u32, username: &str) -> KdxFrame {
+        let req = BanRemove { username: username.into() };
+        send_and_recv(client, seq, PacketType::BanRemove, req.encode()).await
+    }
+
+    async fn list_bans(client: &mut Client, seq: &mut u32) -> KdxFrame {
+        send_and_recv(client, seq, PacketType::BanListRequest, BanListRequest.encode()).await
+    }
+
+    /// One login attempt for `username` on a fresh connection.
+    async fn try_login(ctx: &Arc<ServerCtx>, username: &str) -> AuthResult {
+        let (client, server) = tokio::io::duplex(8192);
+        let conn = tokio::spawn(Connection::new(server, ctx.clone()).run());
+        let mut client = client_framed(client);
+        let mut seq = 0;
+        do_handshake(&mut client, &mut seq).await;
+        let result = do_login(&mut client, &mut seq, username, "s3cret").await;
+        drop(client);
+        let _ = conn.await;
+        result
+    }
+
+    async fn history_action(ctx: &ServerCtx, action: &str) -> Vec<crate::history::HistoryEntry> {
+        let entries = ctx.history.recent(100).await.unwrap();
+        entries.into_iter().filter(|e| e.action == action).collect()
+    }
+
+    #[tokio::test]
+    async fn ban_list_is_gated_on_user_ban_and_lists_active_bans() {
+        let (ctx, _dir) = admin_test_ctx().await;
+        seed(&ctx, "lamer", 1, Privileges::empty()).await;
+
+        // A plain user can neither list nor lift bans.
+        let (mut plain, mut pseq, plain_conn) = connect_as(&ctx, "plain", "unknown").await;
+        let frame = list_bans(&mut plain, &mut pseq).await;
+        assert!(error_text(&frame).contains("USER_BAN"));
+        let frame = unban(&mut plain, &mut pseq, "lamer").await;
+        assert!(error_text(&frame).contains("USER_BAN"));
+        hang_up(plain, pseq, plain_conn).await;
+
+        let (mut sysop, mut seq, conn) = connect_as(&ctx, "sysop", "unknown").await;
+        let frame = list_bans(&mut sysop, &mut seq).await;
+        assert_eq!(ban_list(&frame), BanListResponse { total: 0, bans: vec![] });
+
+        ban(&mut sysop, &mut seq, "lamer", 3600).await;
+        ban(&mut sysop, &mut seq, "plain", 60).await;
+        let list = ban_list(&list_bans(&mut sysop, &mut seq).await);
+        assert_eq!(list.total, 2);
+        // Longest-lasting first.
+        let names: Vec<_> = list.bans.iter().map(|b| b.username.as_str()).collect();
+        assert_eq!(names, ["lamer", "plain"]);
+        let lamer = &list.bans[0];
+        assert_eq!(
+            (lamer.banned_by.as_str(), lamer.banned_by_class, lamer.reason.as_str()),
+            ("sysop", 3, "ban lamer")
+        );
+        assert!(lamer.until > unix_now());
+
+        // A lapsed ban is not listed.
+        let id = ctx.auth.account_id("plain").await.unwrap().unwrap();
+        ctx.auth.set_ban(&id, 1, "old", "sysop").await.unwrap();
+        assert_eq!(banned_names(&list_bans(&mut sysop, &mut seq).await), ["lamer"]);
+
+        hang_up(sysop, seq, conn).await;
+    }
+
+    #[tokio::test]
+    async fn unban_follows_the_rank_bans_are_placed_by() {
+        let (ctx, _dir) = admin_test_ctx().await;
+        let mod_privs = Privileges::USER_KICK | Privileges::USER_BAN;
+        seed(&ctx, "mod", 2, mod_privs).await;
+        seed(&ctx, "othermod", 2, mod_privs).await;
+        seed(&ctx, "lamer", 1, Privileges::empty()).await;
+        seed(&ctx, "climber", 1, Privileges::empty()).await;
+
+        let (mut sysop, mut seq, conn) = connect_as(&ctx, "sysop", "unknown").await;
+        ban(&mut sysop, &mut seq, "plain", 3600).await;
+        let (mut moderator, mut mseq, mconn) = connect_as(&ctx, "mod", "unknown").await;
+        ban(&mut moderator, &mut mseq, "lamer", 3600).await;
+        ban(&mut moderator, &mut mseq, "climber", 3600).await;
+
+        // A moderator can't lift an admin's ban...
+        let frame = unban(&mut moderator, &mut mseq, "plain").await;
+        assert!(error_text(&frame).contains("rank"), "{}", error_text(&frame));
+        // ...nor can a peer moderator lift another moderator's.
+        let (mut other, mut oseq, oconn) = connect_as(&ctx, "othermod", "unknown").await;
+        let frame = unban(&mut other, &mut oseq, "lamer").await;
+        assert!(error_text(&frame).contains("rank"), "{}", error_text(&frame));
+        hang_up(other, oseq, oconn).await;
+        assert_eq!(ban_list(&list_bans(&mut sysop, &mut seq).await).total, 3, "refusals changed nothing");
+
+        // The banner may lift their own ban; the reply is the updated list.
+        let frame = unban(&mut moderator, &mut mseq, "lamer").await;
+        assert!(!banned_names(&frame).contains(&"lamer".to_string()));
+        // Lifting what isn't there is a plain error.
+        let frame = unban(&mut moderator, &mut mseq, "lamer").await;
+        assert_eq!(error_text(&frame), "lamer is not banned");
+        let frame = unban(&mut moderator, &mut mseq, "nobody").await;
+        assert_eq!(error_text(&frame), "no such account");
+
+        // Promoted past the moderator while banned: out of their reach now,
+        // as a kick would be.
+        ctx.auth.update_account("climber", 3, 0, 0).await.unwrap();
+        let frame = unban(&mut moderator, &mut mseq, "climber").await;
+        assert!(error_text(&frame).contains("higher-class"), "{}", error_text(&frame));
+        hang_up(moderator, mseq, mconn).await;
+
+        // An admin lifts anything, a moderator's ban included.
+        let frame = unban(&mut sysop, &mut seq, "climber").await;
+        assert_eq!(banned_names(&frame), ["plain"]);
+        let removed = history_action(&ctx, "ban_removed").await;
+        assert_eq!(removed.len(), 2);
+        assert!(removed.iter().any(|e| e.actor.as_deref() == Some("sysop")
+            && e.detail.contains("target=climber")
+            && e.detail.contains("banned_by=mod")));
+
+        hang_up(sysop, seq, conn).await;
+    }
+
+    #[tokio::test]
+    async fn unban_lets_the_user_log_in_again() {
+        let (ctx, _dir) = admin_test_ctx().await;
+        let (mut sysop, mut seq, conn) = connect_as(&ctx, "sysop", "unknown").await;
+        ban(&mut sysop, &mut seq, "plain", 3600).await;
+
+        let refused = try_login(&ctx, "plain").await;
+        assert!(!refused.success);
+        assert!(refused.message.starts_with("banned until"), "{}", refused.message);
+
+        let frame = unban(&mut sysop, &mut seq, "plain").await;
+        assert_eq!(ban_list(&frame), BanListResponse { total: 0, bans: vec![] });
+
+        let (plain, pseq, plain_conn) = connect_as(&ctx, "plain", "unknown").await;
+        hang_up(plain, pseq, plain_conn).await;
+        hang_up(sysop, seq, conn).await;
+    }
+
+    fn group_names(frame: &KdxFrame) -> Vec<String> {
+        assert_eq!(
+            frame.header.packet_type,
+            PacketType::NewsgroupListResponse,
+            "expected a newsgroup list, got {:?}: {}",
+            frame.header.packet_type,
+            String::from_utf8_lossy(&frame.payload)
+        );
+        NewsgroupListResponse::decode(&frame.payload)
+            .unwrap()
+            .groups
+            .into_iter()
+            .map(|g| g.name)
+            .collect()
+    }
+
+    async fn create_group(client: &mut Client, seq: &mut u32, name: &str, read: u8, post: u8) -> [u8; 16] {
+        let create = NewsgroupCreate {
+            name: name.into(),
+            description: String::new(),
+            min_read_class: read,
+            min_post_class: post,
+        };
+        let frame = send_and_recv(client, seq, PacketType::NewsgroupCreate, create.encode()).await;
+        newsgroup_id(&frame, name)
+    }
+
+    fn group_update(id: [u8; 16], name: &str, read: u8, post: u8) -> Bytes {
+        NewsgroupUpdate {
+            id,
+            name: name.into(),
+            description: "edited".into(),
+            min_read_class: read,
+            min_post_class: post,
+        }
+        .encode()
+    }
+
+    #[tokio::test]
+    async fn newsgroup_update_is_validated_unique_and_needs_read_access() {
+        let (ctx, _dir) = admin_test_ctx().await;
+        seed(&ctx, "helpdesk", 2, Privileges::USER_ADMIN).await;
+        let (mut sysop, mut seq, conn) = connect_as(&ctx, "sysop", "unknown").await;
+        let general = create_group(&mut sysop, &mut seq, "general", 0, 1).await;
+        let staff = create_group(&mut sysop, &mut seq, "staff", 3, 3).await;
+        create_group(&mut sysop, &mut seq, "ops", 0, 0).await;
+
+        // A valid edit answers with the (caller-filtered) newsgroup list.
+        let update = group_update(general, "lobby", 0, 2);
+        let frame = send_and_recv(&mut sysop, &mut seq, PacketType::NewsgroupUpdate, update).await;
+        assert_eq!(group_names(&frame), ["lobby", "ops", "staff"]);
+        let stored = ctx.news.group(Uuid::from_bytes(general)).await.unwrap();
+        assert_eq!(
+            (stored.name.as_str(), stored.description.as_str(), stored.min_post_class),
+            ("lobby", "edited", 2)
+        );
+        let updated = history_action(&ctx, "newsgroup_updated").await;
+        assert!(updated[0].detail.starts_with("lobby"), "{}", updated[0].detail);
+
+        // Validated like NewsgroupCreate; nothing changes on a refusal.
+        let long = "n".repeat(crate::limits::MAX_NAME_LEN + 1);
+        let refusals = [
+            (group_update(general, "  ", 0, 0), "required"),
+            (group_update(general, &long, 0, 0), "too long"),
+            (group_update(general, "lobby", 4, 0), "between 0 and 3"),
+            (group_update(general, "lobby", 0, 9), "between 0 and 3"),
+            (group_update(general, "ops", 0, 0), "already exists"),
+            (group_update([7; 16], "ghost", 0, 0), "no such newsgroup"),
+        ];
+        for (payload, want) in refusals {
+            let frame = send_and_recv(&mut sysop, &mut seq, PacketType::NewsgroupUpdate, payload).await;
+            let text = error_text(&frame);
+            assert!(text.contains(want), "wanted {want:?}, got {text:?}");
+            assert!(!text.contains("UNIQUE"), "leaked: {text}");
+        }
+        assert_eq!(ctx.news.group(Uuid::from_bytes(general)).await.unwrap(), stored);
+        hang_up(sysop, seq, conn).await;
+
+        // A delegated USER_ADMIN can't edit a group it can't read...
+        let (mut helpdesk, mut hseq, hconn) = connect_as(&ctx, "helpdesk", "unknown").await;
+        let update = group_update(staff, "open", 0, 0);
+        let frame = send_and_recv(&mut helpdesk, &mut hseq, PacketType::NewsgroupUpdate, update).await;
+        assert_eq!(error_text(&frame), "you may not read this newsgroup");
+        assert_eq!(ctx.news.group(Uuid::from_bytes(staff)).await.unwrap().name, "staff");
+        // ...but edits one it can; its reply hides groups above its class.
+        let update = group_update(general, "lounge", 0, 1);
+        let frame = send_and_recv(&mut helpdesk, &mut hseq, PacketType::NewsgroupUpdate, update).await;
+        assert_eq!(group_names(&frame), ["lounge", "ops"]);
+        hang_up(helpdesk, hseq, hconn).await;
+
+        // No USER_ADMIN, no edits.
+        let (mut plain, mut pseq, plain_conn) = connect_as(&ctx, "plain", "unknown").await;
+        let update = group_update(general, "mine", 0, 0);
+        let frame = send_and_recv(&mut plain, &mut pseq, PacketType::NewsgroupUpdate, update).await;
+        assert!(error_text(&frame).contains("USER_ADMIN"));
+        assert_eq!(ctx.news.group(Uuid::from_bytes(general)).await.unwrap().name, "lounge");
+        hang_up(plain, pseq, plain_conn).await;
+    }
+
+    #[tokio::test]
+    async fn newsgroup_delete_takes_its_posts_and_is_admin_only() {
+        let (ctx, _dir) = admin_test_ctx().await;
+        seed(&ctx, "helpdesk", 2, Privileges::USER_ADMIN).await;
+        let (mut sysop, mut seq, conn) = connect_as(&ctx, "sysop", "unknown").await;
+        let doomed = create_group(&mut sysop, &mut seq, "doomed", 0, 0).await;
+        let staff = create_group(&mut sysop, &mut seq, "staff", 3, 3).await;
+        let keep = create_group(&mut sysop, &mut seq, "keep", 0, 0).await;
+        let post = news_post(doomed, [0; 16], "root");
+        let frame = send_and_recv(&mut sysop, &mut seq, PacketType::NewsPostCreate, post).await;
+        let root = thread_posts(&frame)[0].id;
+        let post = news_post(doomed, root, "re: root");
+        send_and_recv(&mut sysop, &mut seq, PacketType::NewsPostCreate, post).await;
+        let post = news_post(keep, [0; 16], "stays");
+        send_and_recv(&mut sysop, &mut seq, PacketType::NewsPostCreate, post).await;
+
+        // Refused: no USER_ADMIN, or a group the caller can't read.
+        let (mut plain, mut pseq, plain_conn) = connect_as(&ctx, "plain", "unknown").await;
+        let post = news_post(doomed, root, "re: re");
+        let frame = send_and_recv(&mut plain, &mut pseq, PacketType::NewsPostCreate, post).await;
+        assert_eq!(thread_posts(&frame).len(), 3);
+        let delete = NewsgroupDelete { id: doomed }.encode();
+        let frame = send_and_recv(&mut plain, &mut pseq, PacketType::NewsgroupDelete, delete.clone()).await;
+        assert!(error_text(&frame).contains("USER_ADMIN"));
+        let (mut helpdesk, mut hseq, hconn) = connect_as(&ctx, "helpdesk", "unknown").await;
+        let delete_staff = NewsgroupDelete { id: staff }.encode();
+        let frame = send_and_recv(&mut helpdesk, &mut hseq, PacketType::NewsgroupDelete, delete_staff).await;
+        assert_eq!(error_text(&frame), "you may not read this newsgroup");
+        hang_up(helpdesk, hseq, hconn).await;
+        assert_eq!(ctx.news.posts(Uuid::from_bytes(doomed)).await.unwrap().len(), 3);
+        assert!(ctx.news.group(Uuid::from_bytes(staff)).await.is_ok());
+
+        // The admin's delete takes every post (replies included) with it.
+        let frame = send_and_recv(&mut sysop, &mut seq, PacketType::NewsgroupDelete, delete.clone()).await;
+        assert_eq!(group_names(&frame), ["keep", "staff"]);
+        assert!(ctx.news.posts(Uuid::from_bytes(doomed)).await.unwrap().is_empty());
+        assert_eq!(ctx.news.posts(Uuid::from_bytes(keep)).await.unwrap().len(), 1);
+        let deleted = history_action(&ctx, "newsgroup_deleted").await;
+        let detail = &deleted[0].detail;
+        assert!(detail.contains("doomed") && detail.contains("3 post(s)"), "{detail}");
+
+        // The group is gone for everyone, and a second delete says so.
+        let list = NewsThreadListRequest { newsgroup_id: doomed }.encode();
+        let frame = send_and_recv(&mut plain, &mut pseq, PacketType::NewsThreadListRequest, list).await;
+        assert_eq!(error_text(&frame), "no such newsgroup");
+        let post = news_post(doomed, [0; 16], "late");
+        let frame = send_and_recv(&mut plain, &mut pseq, PacketType::NewsPostCreate, post).await;
+        assert_eq!(error_text(&frame), "no such newsgroup");
+        let frame = send_and_recv(&mut sysop, &mut seq, PacketType::NewsgroupDelete, delete).await;
+        assert_eq!(error_text(&frame), "no such newsgroup");
+
+        hang_up(plain, pseq, plain_conn).await;
+        hang_up(sysop, seq, conn).await;
+    }
+
+    // ---- password change and admin reset ----
+
+    fn to_wire(c: &kdx_crypto::StoredCredential) -> kdx_protocol::messages::Credential {
+        kdx_protocol::messages::Credential {
+            m_cost: c.params.m_cost,
+            t_cost: c.params.t_cost,
+            p_cost: c.params.p_cost,
+            salt: c.salt.clone(),
+            stored_key: c.stored_key,
+            server_key: c.server_key,
+        }
+    }
+
+    /// A credential for `password` derived the way a client does it, as it
+    /// goes on the wire.
+    fn wire_credential(password: &str) -> kdx_protocol::messages::Credential {
+        to_wire(&kdx_crypto::StoredCredential::derive(password).unwrap())
+    }
+
+    /// Run a password change from `current` to `new` on `client` (logged
+    /// in as `username`): the server's `PasswordChangeResult` (its
+    /// signature checked on success), or the text of its `Error`.
+    async fn change_password(
+        client: &mut Client,
+        seq: &mut u32,
+        username: &str,
+        current: &str,
+        new: &str,
+    ) -> Result<PasswordChangeResult, String> {
+        let new = kdx_crypto::StoredCredential::derive(new).unwrap();
+        let frame = send_and_recv(
+            client,
+            seq,
+            PacketType::PasswordChangeBegin,
+            PasswordChangeBegin.encode(),
+        )
+        .await;
+        if frame.header.packet_type == PacketType::Error {
+            return Err(error_text(&frame));
+        }
+        assert_eq!(frame.header.packet_type, PacketType::PasswordChangeChallenge);
+        let challenge = PasswordChangeChallenge::decode(&frame.payload).unwrap();
+        let proof = kdx_crypto::password_change_proof(
+            current,
+            &kdx_crypto::PasswordChangeContext {
+                current: AuthContext {
+                    username,
+                    challenge: &challenge.challenge,
+                    salt: &challenge.salt,
+                    params: kdx_crypto::KdfParams {
+                        m_cost: challenge.m_cost,
+                        t_cost: challenge.t_cost,
+                        p_cost: challenge.p_cost,
+                    },
+                    channel_binding: &[0u8; kdx_crypto::CHANNEL_BINDING_LEN],
+                },
+                new_credential: &new,
+            },
+        )
+        .unwrap();
+        let msg = PasswordChangeProof {
+            proof: proof.proof,
+            credential: to_wire(&new),
+        };
+        let frame =
+            send_and_recv(client, seq, PacketType::PasswordChangeProof, msg.encode()).await;
+        if frame.header.packet_type == PacketType::Error {
+            return Err(error_text(&frame));
+        }
+        assert_eq!(frame.header.packet_type, PacketType::PasswordChangeResult);
+        let result = PasswordChangeResult::decode(&frame.payload).unwrap();
+        if result.success {
+            assert!(
+                proof.verify_server_signature(&result.server_signature),
+                "password change server signature did not verify"
+            );
+        } else {
+            assert_eq!(result.server_signature, [0u8; 32]);
+        }
+        Ok(result)
+    }
+
+    /// Log in with `password` on a fresh connection; returns whether the
+    /// server accepted it (hanging up again either way).
+    async fn can_log_in(ctx: &Arc<ServerCtx>, username: &str, password: &str) -> bool {
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let conn = tokio::spawn(Connection::new(server, ctx.clone()).run());
+        let mut client = client_framed(client);
+        let mut seq = 0;
+        do_handshake(&mut client, &mut seq).await;
+        let result = do_login(&mut client, &mut seq, username, password).await;
+        if result.success {
+            hang_up(client, seq, conn).await;
+        } else {
+            drop(client);
+            let _ = conn.await;
+        }
+        result.success
+    }
+
+    async fn history_actions(ctx: &ServerCtx) -> Vec<(String, String)> {
+        ctx.history.flush().await;
+        ctx.history
+            .recent(100)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|e| (e.action, e.detail))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn password_change_replaces_the_credential_and_signs_out_other_sessions() {
+        let (ctx, _dir) = admin_test_ctx().await;
+        let (mut mine, mut seq, my_conn) = connect_as(&ctx, "plain", "192.0.2.1:1000").await;
+        let (mut other, _other_seq, other_conn) = connect_as(&ctx, "plain", "192.0.2.2:1000").await;
+        let (bystander, by_seq, by_conn) = connect_as(&ctx, "sysop", "192.0.2.3:1000").await;
+
+        let result = change_password(&mut mine, &mut seq, "plain", "s3cret", "n3w-pass")
+            .await
+            .unwrap();
+        assert!(result.success, "{}", result.message);
+        assert!(result.message.contains("1 other session"), "{}", result.message);
+
+        // The account's other session is signed out; this one stays, and so
+        // does everyone else.
+        assert_eq!(disconnect_reason(&mut other).await, policy::PASSWORD_CHANGED);
+        other_conn.await.unwrap().unwrap();
+        let pong = send_and_recv(&mut mine, &mut seq, PacketType::Ping, Bytes::from_static(b"p")).await;
+        assert_eq!(pong.header.packet_type, PacketType::Pong);
+        hang_up(bystander, by_seq, by_conn).await;
+
+        // Only the new password works from now on.
+        assert!(!can_log_in(&ctx, "plain", "s3cret").await);
+        assert!(can_log_in(&ctx, "plain", "n3w-pass").await);
+        let history = history_actions(&ctx).await;
+        assert!(
+            history.iter().any(|(action, detail)| action == "password_changed"
+                && detail.contains("peer=192.0.2.1:1000")),
+            "{history:?}"
+        );
+        hang_up(mine, seq, my_conn).await;
+    }
+
+    #[tokio::test]
+    async fn wrong_current_passwords_are_counted_and_end_the_connection() {
+        let (ctx, _dir) = admin_test_ctx().await;
+        let peer: std::net::IpAddr = "192.0.2.9".parse().unwrap();
+        let (mut client, mut seq, conn) = connect_as(&ctx, "plain", "192.0.2.9:4000").await;
+
+        // A proof without a challenge, and an unacceptable new credential,
+        // are refused without costing an attempt.
+        let stray = PasswordChangeProof {
+            proof: [1; 32],
+            credential: wire_credential("x"),
+        };
+        let frame =
+            send_and_recv(&mut client, &mut seq, PacketType::PasswordChangeProof, stray.encode())
+                .await;
+        assert!(error_text(&frame).contains("no password change in progress"));
+        send_and_recv(&mut client, &mut seq, PacketType::PasswordChangeBegin, Bytes::new()).await;
+        let mut weak = wire_credential("x");
+        weak.m_cost = 8;
+        let frame = send_and_recv(
+            &mut client,
+            &mut seq,
+            PacketType::PasswordChangeProof,
+            PasswordChangeProof { proof: [1; 32], credential: weak }.encode(),
+        )
+        .await;
+        assert!(error_text(&frame).starts_with("invalid credential"));
+        assert_eq!(ctx.login_limiter.failure_count(peer, "plain"), 0);
+
+        // Wrong current passwords: refused, counted in the login limiter.
+        for attempt in 1..MAX_PASSWORD_CHANGE_FAILURES {
+            let result = change_password(&mut client, &mut seq, "plain", "guess", "hijacked")
+                .await
+                .unwrap();
+            assert!(!result.success);
+            assert_eq!(result.message, "the current password is incorrect");
+            assert_eq!(ctx.login_limiter.failure_count(peer, "plain"), attempt as u32);
+        }
+        // The last allowed one is answered, then the connection is dropped.
+        let result = change_password(&mut client, &mut seq, "plain", "guess", "hijacked")
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert_eq!(disconnect_reason(&mut client).await, TOO_MANY_PASSWORD_FAILURES);
+        conn.await.unwrap().unwrap();
+        assert_eq!(
+            ctx.login_limiter.failure_count(peer, "plain"),
+            MAX_PASSWORD_CHANGE_FAILURES as u32
+        );
+
+        // Nothing changed, and every failure was audited.
+        assert!(can_log_in(&ctx, "plain", "s3cret").await);
+        assert!(!can_log_in(&ctx, "plain", "hijacked").await);
+        let failures = history_actions(&ctx)
+            .await
+            .into_iter()
+            .filter(|(action, _)| action == "password_change_failed")
+            .count();
+        assert!(failures >= 1, "failed changes must be audited");
+    }
+
+    #[tokio::test]
+    async fn a_throttled_source_cannot_start_a_password_change() {
+        let (ctx, _dir) = admin_test_ctx().await;
+        let peer: std::net::IpAddr = "192.0.2.10".parse().unwrap();
+        let (mut client, mut seq, conn) = connect_as(&ctx, "plain", "192.0.2.10:4000").await;
+        // Failures for this account from this address (wrong logins from
+        // another connection, say) have the pair in a long backoff: the
+        // session can't use password changes to keep guessing.
+        for _ in 0..crate::auth::limiter::PAIR_FREE_FAILURES + 10 {
+            ctx.login_limiter.record_failure(peer, "plain");
+        }
+        let refused = change_password(&mut client, &mut seq, "plain", "s3cret", "n3w")
+            .await
+            .unwrap_err();
+        assert!(refused.contains("too many failed password attempts"), "{refused}");
+        hang_up(client, seq, conn).await;
+        assert!(can_log_in(&ctx, "plain", "s3cret").await);
+    }
+
+    #[tokio::test]
+    async fn guest_accounts_cannot_change_their_password() {
+        let (ctx, _dir) = admin_test_ctx().await;
+        seed(&ctx, "visitor", 0, Privileges::empty()).await;
+        let (mut client, mut seq, conn) = connect_as(&ctx, "visitor", "unknown").await;
+        let refused = change_password(&mut client, &mut seq, "visitor", "s3cret", "mine now")
+            .await
+            .unwrap_err();
+        assert!(refused.contains("guest accounts"), "{refused}");
+        hang_up(client, seq, conn).await;
+        assert!(can_log_in(&ctx, "visitor", "s3cret").await);
+    }
+
+    #[tokio::test]
+    async fn admin_password_reset_honors_the_policy_and_kicks_the_target() {
+        let (ctx, _dir) = admin_test_ctx().await;
+        seed(&ctx, "helpdesk", 2, Privileges::USER_ADMIN).await;
+        seed(&ctx, "deputy", 3, Privileges::empty()).await;
+        seed(&ctx, "peer", 2, Privileges::empty()).await;
+        let (mut target, _target_seq, target_conn) = connect_as(&ctx, "plain", "192.0.2.5:1").await;
+        let (mut helpdesk, mut seq, helpdesk_conn) = connect_as(&ctx, "helpdesk", "unknown").await;
+
+        let reset = |username: &str, password: &str| {
+            AccountSetPassword {
+                username: username.into(),
+                credential: wire_credential(password),
+            }
+            .encode()
+        };
+        // A delegated (PowerUser) admin can't reset an Admin, a peer, or
+        // itself, nor a missing account, nor store a weak credential.
+        for (who, expected) in [
+            ("sysop", "at or above your rank"),
+            ("deputy", "at or above your rank"),
+            ("peer", "at or above your rank"),
+            ("helpdesk", "Change Password"),
+            ("nobody", "no such account"),
+        ] {
+            let frame =
+                send_and_recv(&mut helpdesk, &mut seq, PacketType::AccountSetPassword, reset(who, "pwned"))
+                    .await;
+            let text = error_text(&frame);
+            assert!(text.contains(expected), "{who}: {text}");
+        }
+        let mut weak = wire_credential("pwned");
+        weak.salt.truncate(4);
+        let frame = send_and_recv(
+            &mut helpdesk,
+            &mut seq,
+            PacketType::AccountSetPassword,
+            AccountSetPassword { username: "plain".into(), credential: weak }.encode(),
+        )
+        .await;
+        assert!(error_text(&frame).starts_with("invalid credential"));
+        for who in ["sysop", "deputy", "peer", "helpdesk"] {
+            assert!(can_log_in(&ctx, who, "s3cret").await, "{who}'s password must be untouched");
+        }
+
+        // A lower account it manages: reset, and its session is kicked.
+        let frame = send_and_recv(
+            &mut helpdesk,
+            &mut seq,
+            PacketType::AccountSetPassword,
+            reset("plain", "temp-pass"),
+        )
+        .await;
+        assert_eq!(frame.header.packet_type, PacketType::AccountListResponse);
+        assert_eq!(disconnect_reason(&mut target).await, policy::PASSWORD_RESET);
+        target_conn.await.unwrap().unwrap();
+        assert!(!can_log_in(&ctx, "plain", "s3cret").await);
+        assert!(can_log_in(&ctx, "plain", "temp-pass").await);
+        let history = history_actions(&ctx).await;
+        assert!(
+            history
+                .iter()
+                .any(|(action, detail)| action == "password_reset" && detail == "target=plain"),
+            "{history:?}"
+        );
+        hang_up(helpdesk, seq, helpdesk_conn).await;
+
+        // A full Admin may reset another Admin; a user without USER_ADMIN
+        // may reset nobody.
+        let (mut sysop, mut sseq, sysop_conn) = connect_as(&ctx, "sysop", "unknown").await;
+        let frame =
+            send_and_recv(&mut sysop, &mut sseq, PacketType::AccountSetPassword, reset("deputy", "d3puty"))
+                .await;
+        assert_eq!(frame.header.packet_type, PacketType::AccountListResponse);
+        hang_up(sysop, sseq, sysop_conn).await;
+        assert!(can_log_in(&ctx, "deputy", "d3puty").await);
+        let (mut peer, mut pseq, peer_conn) = connect_as(&ctx, "peer", "unknown").await;
+        let frame =
+            send_and_recv(&mut peer, &mut pseq, PacketType::AccountSetPassword, reset("plain", "x"))
+                .await;
+        assert!(error_text(&frame).contains("USER_ADMIN"));
+        hang_up(peer, pseq, peer_conn).await;
+    }
+
+    #[tokio::test]
+    async fn account_create_stores_the_client_derived_credential() {
+        let (ctx, _dir) = admin_test_ctx().await;
+        let (mut sysop, mut seq, conn) = connect_as(&ctx, "sysop", "unknown").await;
+        let credential = kdx_crypto::StoredCredential::derive("letmein").unwrap();
+        let create = AccountCreate {
+            username: "newbie".into(),
+            credential: to_wire(&credential),
+            base_class: 1,
+            granted: 0,
+            revoked: 0,
+        };
+        let frame = send_and_recv(&mut sysop, &mut seq, PacketType::AccountCreate, create.encode()).await;
+        assert_eq!(frame.header.packet_type, PacketType::AccountListResponse);
+
+        // A weak credential is refused and creates nothing.
+        let mut weak = to_wire(&credential);
+        weak.t_cost = 1;
+        let bad = AccountCreate {
+            username: "weakling".into(),
+            credential: weak,
+            base_class: 1,
+            granted: 0,
+            revoked: 0,
+        };
+        let frame = send_and_recv(&mut sysop, &mut seq, PacketType::AccountCreate, bad.encode()).await;
+        assert!(error_text(&frame).starts_with("invalid credential"));
+        hang_up(sysop, seq, conn).await;
+
+        // Stored exactly as derived by the client, and the account logs in.
+        let pool = kdx_storage::connect(&_dir.path().join("test.db")).await.unwrap();
+        let row = accounts::by_username(&pool, "newbie").await.unwrap().unwrap();
+        assert_eq!(row.credential, Some(credential.encode()));
+        assert!(accounts::by_username(&pool, "weakling").await.unwrap().is_none());
+        assert!(can_log_in(&ctx, "newbie", "letmein").await);
+    }
+
+    #[tokio::test]
+    async fn a_password_change_racing_a_login_wins() {
+        let (ctx, _dir) = admin_test_ctx().await;
+        let id = ctx.auth.account_id("plain").await.unwrap().unwrap();
+
+        // Reset while the old password's proof is outstanding: refused.
+        let (mut client, mut seq, conn, challenge) = pending_login(&ctx, "unknown", "plain").await;
+        let fresh = kdx_crypto::StoredCredential::derive("fresh").unwrap();
+        assert!(ctx.auth.set_credential(&id, &fresh).await.unwrap());
+        let result = answer_challenge(&mut client, &mut seq, "plain", "s3cret", &challenge).await;
+        assert!(!result.success);
+        drop(client);
+        let _ = conn.await;
+
+        // Verified on the old credential, replaced before joining presence
+        // (so the reset's kick found nobody): caught when it joins.
+        let binding = [0u8; kdx_crypto::CHANNEL_BINDING_LEN];
+        let (data, pending) = ctx.auth.begin("plain", binding).await.unwrap();
+        let proof = client_proof(
+            "fresh",
+            &AuthContext {
+                username: "plain",
+                challenge: &data.challenge,
+                salt: &data.salt,
+                params: data.params,
+                channel_binding: &binding,
+            },
+        )
+        .unwrap();
+        let verified = ctx.auth.complete(pending, &proof.proof).await.unwrap();
+        let (_client, server) = tokio::io::duplex(1024);
+        let mut conn = Connection::new(server, ctx.clone());
+        conn.login_stamp = Some(verified.credential_stamp);
+        assert_eq!(conn.stale_login_reason(&verified.session).await, None);
+        let newer = kdx_crypto::StoredCredential::derive("newer").unwrap();
+        assert!(ctx.auth.set_credential(&id, &newer).await.unwrap());
+        assert_eq!(
+            conn.stale_login_reason(&verified.session).await.as_deref(),
+            Some(policy::PASSWORD_CHANGED)
+        );
     }
 }

@@ -11,9 +11,9 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use kdx_client_core::{
-    connect as core_connect, trust_server, AccountSummary, ClientConfig, ClientError, ClientHandle,
-    FileInfoResponse, FileSearchEntry, HistoryEntry, IpRule, NewsPost, NewsgroupInfo,
-    PresenceUser, RoleInfo, ServerSettings, TrackerServer,
+    connect as core_connect, trust_server, AccountSummary, BanList, ClientConfig, ClientError,
+    ClientHandle, FileInfoResponse, FileSearchEntry, HistoryEntry, IpRule, NewsPost,
+    NewsgroupInfo, PresenceUser, RoleInfo, ServerSettings, TrackerServer,
 };
 use serde::Serialize;
 use tauri::{AppHandle, Manager, Runtime, State, Window};
@@ -73,6 +73,10 @@ pub struct FileListDto {
     pub entries: Vec<FileEntryDto>,
 }
 
+/// The client's state directory: `known_hosts.toml` and (under
+/// `transfers/`) partial downloads. Tauri's app_data_dir, which under the
+/// macOS App Sandbox resolves inside the app's container — the only place
+/// besides a dialog-chosen file that the app writes to.
 fn data_dir<R: Runtime>(app: &AppHandle<R>) -> Result<PathBuf, CmdError> {
     app.path().app_data_dir().map_err(CmdError::msg)
 }
@@ -624,6 +628,11 @@ fn transfer_error(e: ClientError) -> CmdError {
 /// dialog. The dialog opens in the Downloads folder with the server's name
 /// reduced to a safe basename (no directories, UNC paths, bidi tricks or
 /// reserved device names). Resolves `false` if the user cancelled.
+///
+/// Sandbox-safe: the dialog grants write access to the chosen file only, and
+/// client-core writes nothing else there — partial bytes and resume state
+/// stay in [`data_dir`] until the verified file is moved into place.
+/// Choosing the same file again resumes an interrupted download.
 #[tauri::command]
 pub async fn download<R: Runtime>(
     app: AppHandle<R>,
@@ -758,6 +767,8 @@ pub async fn list_accounts(state: State<'_, AppState>) -> CmdResult<Vec<AccountS
     with_client(&state, |c| async move { c.list_accounts().await }).await
 }
 
+/// Create an account. Its credential is derived from `password` in
+/// client-core; the password itself never goes to the server.
 #[tauri::command]
 pub async fn create_account(
     state: State<'_, AppState>,
@@ -784,6 +795,35 @@ pub async fn update_account(
 ) -> CmdResult<Vec<AccountSummary>> {
     with_client(&state, |c| async move {
         c.update_account(&username, base_class, granted, revoked).await
+    })
+    .await
+}
+
+/// Reset another account's password (Accounts window). The credential is
+/// derived from `new_password` in client-core; the server never sees it.
+#[tauri::command]
+pub async fn set_account_password(
+    state: State<'_, AppState>,
+    username: String,
+    new_password: String,
+) -> CmdResult<Vec<AccountSummary>> {
+    with_client(&state, |c| async move {
+        c.set_account_password(&username, &new_password).await
+    })
+    .await
+}
+
+/// Change the logged-in account's own password (Connect window). Proves the
+/// current password and sends a credential derived from the new one;
+/// neither password leaves this process. Returns the server's message.
+#[tauri::command]
+pub async fn change_password(
+    state: State<'_, AppState>,
+    current_password: String,
+    new_password: String,
+) -> CmdResult<String> {
+    with_client(&state, |c| async move {
+        c.change_password(&current_password, &new_password).await
     })
     .await
 }
@@ -833,6 +873,37 @@ pub async fn create_post(
 #[tauri::command]
 pub async fn delete_post(state: State<'_, AppState>, post_id: String) -> CmdResult<Vec<NewsPost>> {
     with_client(&state, |c| async move { c.delete_post(&post_id).await }).await
+}
+
+#[tauri::command]
+pub async fn update_newsgroup(
+    state: State<'_, AppState>,
+    id: String,
+    name: String,
+    description: String,
+    min_read_class: u8,
+    min_post_class: u8,
+) -> CmdResult<Vec<NewsgroupInfo>> {
+    with_client(&state, |c| async move {
+        c.update_newsgroup(&id, &name, &description, min_read_class, min_post_class)
+            .await
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn delete_newsgroup(state: State<'_, AppState>, id: String) -> CmdResult<Vec<NewsgroupInfo>> {
+    with_client(&state, |c| async move { c.delete_newsgroup(&id).await }).await
+}
+
+#[tauri::command]
+pub async fn list_bans(state: State<'_, AppState>) -> CmdResult<BanList> {
+    with_client(&state, |c| async move { c.list_bans().await }).await
+}
+
+#[tauri::command]
+pub async fn remove_ban(state: State<'_, AppState>, username: String) -> CmdResult<BanList> {
+    with_client(&state, |c| async move { c.remove_ban(&username).await }).await
 }
 
 #[derive(Serialize)]

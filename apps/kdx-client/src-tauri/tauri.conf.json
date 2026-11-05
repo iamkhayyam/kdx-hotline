@@ -41,7 +41,12 @@
     "category": "SocialNetworking",
     "macOS": {
       "minimumSystemVersion": "10.15",
-      "entitlements": "entitlements.plist"
+      "entitlements": "entitlements.plist",
+      "signingIdentity": "-",
+      "hardenedRuntime": true,
+      "files": {
+        "Resources/container-migration.plist": "./container-migration.plist"
+      }
     },
     "windows": {
       "nsis": {

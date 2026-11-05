@@ -3,8 +3,21 @@
   "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+  <!-- Run in the macOS App Sandbox. Everything KDX writes on its own lives
+       in its container (Tauri's app_data_dir: known_hosts.toml, and partial
+       downloads + resume sidecars under transfers/; the webview's storage;
+       Address Book passwords in the user's keychain). Only applied when the
+       app is code-signed (see docs/packaging.html). -->
+  <key>com.apple.security.app-sandbox</key>
+  <true/>
   <!-- KDX is a chat/file-sharing client: outbound TCP only. -->
   <key>com.apple.security.network.client</key>
+  <true/>
+  <!-- Upload reads, and download writes, only the file the user picks in
+       the native Open/Save dialog. Deliberately no
+       files.downloads.read-write: the Save dialog merely starts in
+       ~/Downloads, and the dialog's own grant covers the chosen file. -->
+  <key>com.apple.security.files.user-selected.read-write</key>
   <true/>
 </dict>
 </plist>

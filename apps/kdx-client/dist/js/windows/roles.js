@@ -36,6 +36,7 @@ export function buildRoles() {
       <button class="mini" id="rl-history">History…</button>
       <button class="mini" id="rl-iprules">IP Rules…</button>
       <button class="mini" id="rl-connections">Connections…</button>
+      <button class="mini" id="rl-bans">Bans…</button>
       <button class="mini" id="rl-new">New Role</button>
       <button class="mini" id="rl-refresh">Refresh</button>
     </div>
@@ -182,6 +183,7 @@ export function buildRoles() {
   $("#rl-history").addEventListener("click", () => open("history"));
   $("#rl-iprules").addEventListener("click", () => open("iprules"));
   $("#rl-connections").addEventListener("click", () => open("connections"));
+  $("#rl-bans").addEventListener("click", () => open("bans"));
   filter.addEventListener("input", render);
 
   editor.addEventListener("submit", async (e) => {

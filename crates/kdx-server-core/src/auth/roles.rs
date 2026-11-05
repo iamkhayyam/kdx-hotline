@@ -53,6 +53,31 @@ fn class_from_stored(value: i64) -> BaseClass {
     BaseClass::try_from(value.clamp(0, 3) as u8).unwrap_or(BaseClass::Admin)
 }
 
+/// A ban in force, with the class of whoever set it (who may lift it
+/// depends on that; see [`super::policy::may_lift_ban`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BanRecord {
+    /// The banned account.
+    pub username: String,
+    /// Unix seconds; in force while `now < until`.
+    pub until: i64,
+    pub reason: String,
+    pub banned_by: String,
+    pub banned_by_class: BaseClass,
+}
+
+/// What [`RoleManager::remove_ban`] did. The record's `username` is the
+/// account the caller named.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BanRemoval {
+    /// The ban was in force and has been lifted.
+    Removed(BanRecord),
+    /// No ban in force on that account.
+    NotBanned,
+    /// The ban is in force but the rank check refused to lift it.
+    Refused(BanRecord),
+}
+
 pub struct RoleManager {
     pool: SqlitePool,
     /// Held across check-then-write for every account/role/ban mutation.
@@ -150,6 +175,55 @@ impl RoleManager {
             now,
         )
         .await?)
+    }
+
+    /// The bans in force at `now`, longest-lasting first, at most `limit`
+    /// of them, plus how many are in force altogether.
+    pub async fn active_bans(&self, now: i64, limit: u32) -> Result<(Vec<BanRecord>, u64), RoleError> {
+        let (rows, total) = kdx_storage::bans::list_active(&self.pool, now, limit as i64).await?;
+        let bans = rows
+            .into_iter()
+            .map(|r| BanRecord {
+                username: r.username,
+                until: r.until,
+                reason: r.reason,
+                banned_by: r.banned_by,
+                banned_by_class: class_from_stored(r.banned_by_class),
+            })
+            .collect();
+        Ok((bans, total.max(0) as u64))
+    }
+
+    /// Lift the ban in force on `username`'s account (`account_id`) if
+    /// `allow(banned_by, banned_by_class)` accepts it; the check and the
+    /// delete are atomic (see [`kdx_storage::bans::remove_if`]).
+    pub async fn remove_ban<F>(
+        &self,
+        account_id: &str,
+        username: &str,
+        now: i64,
+        allow: F,
+    ) -> Result<BanRemoval, RoleError>
+    where
+        F: FnOnce(&str, BaseClass) -> bool + Send,
+    {
+        use kdx_storage::bans::{RankedBan, Removal};
+        let record = |ban: RankedBan| BanRecord {
+            username: username.to_owned(),
+            until: ban.until,
+            reason: ban.reason,
+            banned_by: ban.banned_by,
+            banned_by_class: class_from_stored(ban.banned_by_class),
+        };
+        let removal = kdx_storage::bans::remove_if(&self.pool, account_id, now, |ban| {
+            allow(&ban.banned_by, class_from_stored(ban.banned_by_class))
+        })
+        .await?;
+        Ok(match removal {
+            Removal::Removed(ban) => BanRemoval::Removed(record(ban)),
+            Removal::NotBanned => BanRemoval::NotBanned,
+            Removal::Refused(ban) => BanRemoval::Refused(record(ban)),
+        })
     }
 
     pub async fn create(

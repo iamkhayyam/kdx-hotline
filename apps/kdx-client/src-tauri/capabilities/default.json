@@ -21,7 +21,8 @@
     "iprules",
     "connections",
     "news",
-    "trackers"
+    "trackers",
+    "bans"
   ],
   "permissions": [
     "core:default",

@@ -64,6 +64,15 @@ pub struct Config {
     /// when this is set; otherwise nothing is advertised.
     #[serde(default)]
     pub public_host: Option<String>,
+    /// Days a blob that no file entry references stays in
+    /// `files_root/.orphaned/` before a sweep deletes it. 0 keeps
+    /// quarantined blobs until removed by hand.
+    #[serde(default = "default_orphan_retention_days")]
+    pub orphan_retention_days: u64,
+}
+
+fn default_orphan_retention_days() -> u64 {
+    30
 }
 
 fn default_server_name() -> String {
@@ -107,6 +116,8 @@ pub const MAX_TLS_HANDSHAKE_TIMEOUT_SECS: u64 = 300;
 pub const MAX_MAX_CONNECTIONS: usize = 1_000_000;
 /// Longest accepted `public_host` (a DNS name is at most 253 bytes).
 pub const MAX_PUBLIC_HOST_LEN: usize = 253;
+/// Upper bound for `orphan_retention_days` (about 100 years).
+pub const MAX_ORPHAN_RETENTION_DAYS: u64 = 36_500;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -136,6 +147,7 @@ impl Default for Config {
             max_connections: default_max_connections(),
             max_connections_per_ip: default_max_connections_per_ip(),
             public_host: None,
+            orphan_retention_days: default_orphan_retention_days(),
         }
     }
 }
@@ -272,7 +284,20 @@ impl Config {
         if self.files_root.as_os_str().is_empty() {
             return Err("files_root must not be empty".into());
         }
+        if self.orphan_retention_days > MAX_ORPHAN_RETENTION_DAYS {
+            return Err(format!(
+                "orphan_retention_days = {} is out of range (0..={MAX_ORPHAN_RETENTION_DAYS}; 0 keeps them)",
+                self.orphan_retention_days
+            ));
+        }
         Ok(())
+    }
+
+    /// How long a quarantined orphan blob is kept (`None`: until removed
+    /// by hand), from `orphan_retention_days`.
+    pub fn orphan_retention(&self) -> Option<std::time::Duration> {
+        (self.orphan_retention_days > 0)
+            .then(|| std::time::Duration::from_secs(self.orphan_retention_days * 24 * 60 * 60))
     }
 }
 
@@ -488,6 +513,22 @@ mod tests {
         .is_ok());
         let in_place = state.path().join("kdx.db");
         assert!(check_data_location("database", Path::new("kdx.db"), &in_place, state.path(), Path::is_file).is_ok());
+    }
+
+    #[test]
+    fn orphan_retention_days_bounds_and_meaning() {
+        let day = std::time::Duration::from_secs(24 * 60 * 60);
+        let (config, _dir) = load_str("");
+        assert_eq!(config.unwrap().orphan_retention(), Some(30 * day));
+        let (config, _dir) = load_str("orphan_retention_days = 0");
+        assert_eq!(config.unwrap().orphan_retention(), None);
+        let (config, _dir) = load_str(&format!("orphan_retention_days = {MAX_ORPHAN_RETENTION_DAYS}"));
+        assert_eq!(
+            config.unwrap().orphan_retention(),
+            Some(MAX_ORPHAN_RETENTION_DAYS as u32 * day)
+        );
+        let too_long = format!("orphan_retention_days = {}", MAX_ORPHAN_RETENTION_DAYS + 1);
+        assert!(invalid(&too_long).contains("orphan_retention_days"));
     }
 
     #[test]

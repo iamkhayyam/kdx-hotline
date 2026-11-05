@@ -481,3 +481,92 @@ async fn client_abort_frees_slot_and_keeps_progress() {
 
     server.handle.abort();
 }
+
+// G3: an upload into someone else's drop box can't tell whether its name is
+// taken — a taken name is stored under a free variant and the replies are
+// identical — while the box's owner still gets the explicit refusal.
+#[tokio::test]
+async fn drop_box_upload_never_reveals_a_taken_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let pool = kdx_storage::connect(&dir.path().join("kdx.db")).await.unwrap();
+    let phc = hash_password("pw").unwrap();
+    for name in ["boss", "dropper", "other"] {
+        accounts::create(&pool, name, &phc, 1, 0, 0).await.unwrap(); // plain Users
+    }
+    // A drop box owned by boss that Users may upload into.
+    file_tree::create_folder(&pool, file_tree::ROOT_ID, "inbox", 2, 0, 1, Some("boss"))
+        .await
+        .unwrap();
+    let server = serve(test_config(&dir)).await.unwrap();
+    let (mut dropper, mut dseq) = logged_in(&server, "dropper").await;
+    let (mut other, mut oseq) = logged_in(&server, "other").await;
+    sync(&mut dropper, &mut dseq).await; // other's arrival
+    sync(&mut other, &mut oseq).await;
+    let data = test_blob(CHUNK + 100);
+
+    // The first upload takes the name; the second asks for it again.
+    let mut replies = Vec::new();
+    for _ in 0..2 {
+        let accept =
+            start_upload(&mut dropper, &mut dseq, "/inbox", "secret.bin", &data, [0u8; 16]).await;
+        send_chunks(&mut dropper, &mut dseq, &data, accept.transfer_id, &[]).await;
+        let end = expect_end(&mut dropper).await;
+        assert_eq!(end.status, TRANSFER_VERIFIED, "{}", end.message);
+        replies.push((accept, end));
+    }
+    let shape = |(a, e): &(TransferAccept, TransferEnd)| {
+        let accept = (a.chunk_size, a.total_chunks, a.size, a.sha256, a.have_bitmap.clone());
+        (accept, e.status, e.message.clone())
+    };
+    assert_eq!(shape(&replies[0]), shape(&replies[1]), "a taken name changed the replies");
+    assert_ne!(replies[0].0.transfer_id, replies[1].0.transfer_id);
+
+    // Two uploads racing for the same (taken) name are both accepted.
+    let first = start_upload(&mut dropper, &mut dseq, "/inbox", "secret.bin", &data, [0u8; 16]).await;
+    let second = start_upload(&mut other, &mut oseq, "/inbox", "secret.bin", &data, [0u8; 16]).await;
+    send_chunks(&mut dropper, &mut dseq, &data, first.transfer_id, &[]).await;
+    send_chunks(&mut other, &mut oseq, &data, second.transfer_id, &[]).await;
+    assert_eq!(expect_end(&mut dropper).await.status, TRANSFER_VERIFIED);
+    assert_eq!(expect_end(&mut other).await.status, TRANSFER_VERIFIED);
+
+    // The owner sees every upload, each under its own name...
+    let (mut boss, mut bseq) = logged_in(&server, "boss").await;
+    boss.send(frame(
+        PacketType::FileListRequest,
+        bump(&mut bseq),
+        FileListRequest { path: "/inbox".into() }.encode(),
+    ))
+    .await
+    .unwrap();
+    let list = loop {
+        // (Skipping anything pushed at login.)
+        let reply = boss.next().await.unwrap().unwrap();
+        if reply.header.packet_type == PacketType::FileListResponse {
+            break FileListResponse::decode(&reply.payload).unwrap();
+        }
+    };
+    let names: Vec<&str> = list.entries.iter().map(|e| e.name.as_str()).collect();
+    assert_eq!(names, ["secret (2).bin", "secret (3).bin", "secret (4).bin", "secret.bin"]);
+    assert!(list.entries.iter().all(|e| e.size == data.len() as u64));
+    assert_eq!(stored(&dir), (4, 0));
+
+    // ...and, able to list the box, still gets the explicit refusal.
+    let request = TransferRequest {
+        direction: kdx_protocol::messages::DIRECTION_UPLOAD,
+        path: "/inbox".into(),
+        name: "secret.bin".into(),
+        size: data.len() as u64,
+        chunk_size: CHUNK as u32,
+        sha256: Sha256::digest(&data).into(),
+        resume_id: [0u8; 16],
+        have_bitmap: vec![],
+    };
+    boss.send(frame(PacketType::FileTransferStart, bump(&mut bseq), request.encode()))
+        .await
+        .unwrap();
+    let reply = boss.next().await.unwrap().unwrap();
+    assert_eq!(reply.header.packet_type, PacketType::Error);
+    assert!(String::from_utf8_lossy(&reply.payload).contains("already exists"));
+
+    server.handle.abort();
+}

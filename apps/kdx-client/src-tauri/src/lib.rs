@@ -2,6 +2,8 @@
 //! client-core `ClientHandle`, and a per-connection task forwards core events
 //! to the webview.
 
+#[cfg(test)]
+mod bundle_tests;
 mod commands;
 mod events;
 mod sanitize;
@@ -119,6 +121,12 @@ fn app_builder<R: Runtime>(builder: tauri::Builder<R>) -> tauri::Builder<R> {
             commands::delete_post,
             commands::get_file_info,
             commands::set_identity,
+            commands::update_newsgroup,
+            commands::delete_newsgroup,
+            commands::list_bans,
+            commands::remove_ban,
+            commands::change_password,
+            commands::set_account_password,
         ])
 }
 
@@ -170,7 +178,7 @@ mod acl_tests {
     /// which every window has for hydration).
     const POLICY: &[(&str, &[&str])] = &[
         ("main", &["disconnect", "list_users", "save_secret"]),
-        ("connect", &["connect", "trust", "login", "join_room"]),
+        ("connect", &["connect", "trust", "login", "join_room", "change_password"]),
         (
             "chat",
             &[
@@ -219,7 +227,10 @@ mod acl_tests {
                 "disconnect_user",
             ],
         ),
-        ("accounts", &["list_accounts", "create_account", "update_account"]),
+        (
+            "accounts",
+            &["list_accounts", "create_account", "update_account", "set_account_password"],
+        ),
         (
             "server",
             &[
@@ -240,9 +251,12 @@ mod acl_tests {
                 "list_thread",
                 "create_post",
                 "delete_post",
+                "update_newsgroup",
+                "delete_newsgroup",
             ],
         ),
         ("trackers", &["list_servers"]),
+        ("bans", &["list_bans", "remove_ban"]),
     ];
 
     fn mock_app() -> tauri::App<MockRuntime> {

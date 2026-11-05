@@ -77,6 +77,31 @@ pub struct NewsgroupCreate {
     pub min_post_class: u8,
 }
 
+/// Client → server: rename / redescribe / re-gate an existing newsgroup.
+/// Requires `USER_ADMIN` and that the caller may read the group; validated
+/// like `NewsgroupCreate`. Answered with the updated `NewsgroupListResponse`
+/// (filtered by the caller's read class) or an `Error`.
+///
+/// Wire: `id[16] name:str description:str min_read_class:u8 min_post_class:u8`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewsgroupUpdate {
+    pub id: [u8; 16],
+    pub name: String,
+    pub description: String,
+    pub min_read_class: u8,
+    pub min_post_class: u8,
+}
+
+/// Client → server: delete a newsgroup together with every post in it.
+/// Requires `USER_ADMIN` and that the caller may read the group. Answered
+/// with the updated `NewsgroupListResponse` or an `Error`.
+///
+/// Wire: `id[16]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NewsgroupDelete {
+    pub id: [u8; 16],
+}
+
 fn get_id(payload: &mut &[u8], ctx: &'static str) -> Result<[u8; 16], ProtocolError> {
     if payload.remaining() < 16 {
         return Err(ProtocolError::MalformedPayload(ctx));
@@ -276,9 +301,74 @@ impl NewsgroupCreate {
     }
 }
 
+impl NewsgroupUpdate {
+    pub fn encode(&self) -> Bytes {
+        let mut buf = BytesMut::new();
+        buf.put_slice(&self.id);
+        put_str(&mut buf, &self.name);
+        put_str(&mut buf, &self.description);
+        buf.put_u8(self.min_read_class);
+        buf.put_u8(self.min_post_class);
+        buf.freeze()
+    }
+    pub fn decode(mut payload: &[u8]) -> Result<Self, ProtocolError> {
+        let id = get_id(&mut payload, "NewsgroupUpdate")?;
+        let name = get_str(&mut payload, "NewsgroupUpdate")?;
+        let description = get_str(&mut payload, "NewsgroupUpdate")?;
+        if payload.remaining() < 2 {
+            return Err(ProtocolError::MalformedPayload("NewsgroupUpdate"));
+        }
+        let min_read_class = payload.get_u8();
+        let min_post_class = payload.get_u8();
+        expect_end(payload, "NewsgroupUpdate")?;
+        Ok(Self {
+            id,
+            name,
+            description,
+            min_read_class,
+            min_post_class,
+        })
+    }
+}
+
+impl NewsgroupDelete {
+    pub fn encode(&self) -> Bytes {
+        Bytes::copy_from_slice(&self.id)
+    }
+    pub fn decode(mut payload: &[u8]) -> Result<Self, ProtocolError> {
+        let id = get_id(&mut payload, "NewsgroupDelete")?;
+        expect_end(payload, "NewsgroupDelete")?;
+        Ok(Self { id })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn newsgroup_update_delete_round_trip() {
+        let u = NewsgroupUpdate {
+            id: [5u8; 16],
+            name: "staff".into(),
+            description: "moderators only".into(),
+            min_read_class: 2,
+            min_post_class: 3,
+        };
+        let enc = u.encode();
+        assert_eq!(NewsgroupUpdate::decode(&enc).unwrap(), u);
+        for len in 0..enc.len() {
+            assert!(NewsgroupUpdate::decode(&enc[..len]).is_err(), "prefix {len}");
+        }
+        let mut long = BytesMut::from(&enc[..]);
+        long.put_u8(0);
+        assert!(NewsgroupUpdate::decode(&long).is_err());
+
+        let d = NewsgroupDelete { id: [6u8; 16] };
+        assert_eq!(NewsgroupDelete::decode(&d.encode()).unwrap(), d);
+        assert!(NewsgroupDelete::decode(&[6u8; 15]).is_err());
+        assert!(NewsgroupDelete::decode(&[6u8; 17]).is_err());
+    }
 
     #[test]
     fn newsgroup_list_round_trip() {

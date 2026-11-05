@@ -14,6 +14,12 @@ pub enum PacketType {
     AuthChallenge = 0x11,
     AuthResponse = 0x12,
     AuthResult = 0x13,
+    // Password change (0x14-0x17): a logged-in user replaces their own
+    // credential, proving the current password (see kdx_crypto::scram).
+    PasswordChangeBegin = 0x14,
+    PasswordChangeChallenge = 0x15,
+    PasswordChangeProof = 0x16,
+    PasswordChangeResult = 0x17,
 
     // File operations (0x20-0x2F)
     FileListRequest = 0x20,
@@ -52,6 +58,10 @@ pub enum PacketType {
     PrivateMessage = 0x41,
     // Admin: forcibly disconnect / ban a user (0x42)
     AdminDisconnect = 0x42,
+    // Admin: list and lift account bans (0x43-0x45)
+    BanListRequest = 0x43,
+    BanListResponse = 0x44,
+    BanRemove = 0x45,
 
     // Roles / account admin (0x50-0x58)
     RoleListRequest = 0x50,
@@ -67,8 +77,10 @@ pub enum PacketType {
     AccountUpdate = 0x5A,
     AccountListRequest = 0x5B,
     AccountListResponse = 0x5C,
+    // Admin password reset (0x5D)
+    AccountSetPassword = 0x5D,
 
-    // Public News (0x60-0x66)
+    // Public News (0x60-0x68)
     NewsgroupListRequest = 0x60,
     NewsgroupListResponse = 0x61,
     NewsThreadListRequest = 0x62,
@@ -76,6 +88,8 @@ pub enum PacketType {
     NewsPostCreate = 0x64,
     NewsPostDelete = 0x65,
     NewsgroupCreate = 0x66,
+    NewsgroupUpdate = 0x67,
+    NewsgroupDelete = 0x68,
 
     // Tracker directory (0x70-0x71)
     TrackerListRequest = 0x70,
@@ -119,7 +133,7 @@ pub enum PacketType {
 impl PacketType {
     /// Every defined packet type, in declaration order. The tests below check
     /// this against `TryFrom<u8>` so the two cannot drift apart.
-    pub const ALL: [PacketType; 79] = [
+    pub const ALL: [PacketType; 89] = [
         PacketType::HandshakeInit,
         PacketType::HandshakeResp,
         PacketType::Ping,
@@ -129,6 +143,10 @@ impl PacketType {
         PacketType::AuthChallenge,
         PacketType::AuthResponse,
         PacketType::AuthResult,
+        PacketType::PasswordChangeBegin,
+        PacketType::PasswordChangeChallenge,
+        PacketType::PasswordChangeProof,
+        PacketType::PasswordChangeResult,
         PacketType::FileListRequest,
         PacketType::FileListResponse,
         PacketType::FileTransferStart,
@@ -158,6 +176,9 @@ impl PacketType {
         PacketType::PrivateSend,
         PacketType::PrivateMessage,
         PacketType::AdminDisconnect,
+        PacketType::BanListRequest,
+        PacketType::BanListResponse,
+        PacketType::BanRemove,
         PacketType::RoleListRequest,
         PacketType::RoleListResponse,
         PacketType::RoleCreate,
@@ -171,6 +192,7 @@ impl PacketType {
         PacketType::AccountUpdate,
         PacketType::AccountListRequest,
         PacketType::AccountListResponse,
+        PacketType::AccountSetPassword,
         PacketType::NewsgroupListRequest,
         PacketType::NewsgroupListResponse,
         PacketType::NewsThreadListRequest,
@@ -178,6 +200,8 @@ impl PacketType {
         PacketType::NewsPostCreate,
         PacketType::NewsPostDelete,
         PacketType::NewsgroupCreate,
+        PacketType::NewsgroupUpdate,
+        PacketType::NewsgroupDelete,
         PacketType::TrackerListRequest,
         PacketType::TrackerListResponse,
         PacketType::ServerSettingsRequest,
@@ -217,6 +241,10 @@ impl TryFrom<u8> for PacketType {
             0x11 => AuthChallenge,
             0x12 => AuthResponse,
             0x13 => AuthResult,
+            0x14 => PasswordChangeBegin,
+            0x15 => PasswordChangeChallenge,
+            0x16 => PasswordChangeProof,
+            0x17 => PasswordChangeResult,
             0x20 => FileListRequest,
             0x21 => FileListResponse,
             0x22 => FileTransferStart,
@@ -246,6 +274,9 @@ impl TryFrom<u8> for PacketType {
             0x40 => PrivateSend,
             0x41 => PrivateMessage,
             0x42 => AdminDisconnect,
+            0x43 => BanListRequest,
+            0x44 => BanListResponse,
+            0x45 => BanRemove,
             0x50 => RoleListRequest,
             0x51 => RoleListResponse,
             0x52 => RoleCreate,
@@ -259,6 +290,7 @@ impl TryFrom<u8> for PacketType {
             0x5A => AccountUpdate,
             0x5B => AccountListRequest,
             0x5C => AccountListResponse,
+            0x5D => AccountSetPassword,
             0x60 => NewsgroupListRequest,
             0x61 => NewsgroupListResponse,
             0x62 => NewsThreadListRequest,
@@ -266,6 +298,8 @@ impl TryFrom<u8> for PacketType {
             0x64 => NewsPostCreate,
             0x65 => NewsPostDelete,
             0x66 => NewsgroupCreate,
+            0x67 => NewsgroupUpdate,
+            0x68 => NewsgroupDelete,
             0x70 => TrackerListRequest,
             0x71 => TrackerListResponse,
             0x72 => ServerSettingsRequest,

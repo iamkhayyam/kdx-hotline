@@ -21,6 +21,12 @@ database = "kdx.db"
 # Directory where uploaded file bytes are stored. Created automatically.
 files_root = "files"
 
+# Stored bytes that no file entry references (left behind by a crash or a
+# restored database) are moved into files_root/.orphaned/ at startup and
+# once a day, named <id>.<unix time>; move one back to files_root/<id> to
+# restore it. They are deleted after this many days (0 = keep them).
+orphan_retention_days = 30
+
 # Idle session lifetime in seconds before the client must reauthenticate
 # (1 to 2592000, i.e. 30 days).
 session_ttl_secs = 1800

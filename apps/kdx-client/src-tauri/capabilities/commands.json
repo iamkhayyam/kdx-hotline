@@ -8,9 +8,15 @@
     },
     {
       "identifier": "connect-commands",
-      "description": "Connect window: the only place that connects, pins keys and logs in.",
+      "description": "Connect window: the only place that connects, pins keys, logs in and changes the logged-in account's password.",
       "windows": ["connect"],
-      "permissions": ["allow-connect", "allow-trust", "allow-login", "allow-join-room"]
+      "permissions": [
+        "allow-connect",
+        "allow-trust",
+        "allow-login",
+        "allow-join-room",
+        "allow-change-password"
+      ]
     },
     {
       "identifier": "chat-commands",
@@ -89,7 +95,12 @@
     {
       "identifier": "accounts-commands",
       "windows": ["accounts"],
-      "permissions": ["allow-list-accounts", "allow-create-account", "allow-update-account"]
+      "permissions": [
+        "allow-list-accounts",
+        "allow-create-account",
+        "allow-update-account",
+        "allow-set-account-password"
+      ]
     },
     {
       "identifier": "server-commands",
@@ -124,13 +135,21 @@
         "allow-create-newsgroup",
         "allow-list-thread",
         "allow-create-post",
-        "allow-delete-post"
+        "allow-delete-post",
+        "allow-update-newsgroup",
+        "allow-delete-newsgroup"
       ]
     },
     {
       "identifier": "trackers-commands",
       "windows": ["trackers"],
       "permissions": ["allow-list-servers"]
+    },
+    {
+      "identifier": "bans-commands",
+      "description": "Bans window: list the bans in force and lift one (USER_BAN, server-enforced).",
+      "windows": ["bans"],
+      "permissions": ["allow-list-bans", "allow-remove-ban"]
     }
   ]
 }

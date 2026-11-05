@@ -66,7 +66,7 @@ refuses to start and names both paths; make the setting absolute.) See
 `crates/kdxd/kdxd.example.toml` for every field with its default value, or
 `Config` in `crates/kdxd/src/config.rs` for the definitions (bind address, TLS cert
 paths, session TTL, upload/download throttles, connection limits,
-`public_host`). kdxd refuses to run as root unless given `--allow-root`.
+`public_host`, `orphan_retention_days`). kdxd refuses to run as root unless given `--allow-root`.
 
 ## Run the client
 
@@ -125,6 +125,29 @@ cd target/release/bundle/dmg
 sh bundle_dmg.sh --volname "KDX" KDX_0.1.0_aarch64.dmg ../macos/KDX.app
 ```
 
+#### macOS: App Sandbox, signing, notarization
+
+The macOS app runs in the **App Sandbox** (`entitlements.plist`: sandbox,
+outbound network, and the file picked in the Open/Save dialog — nothing
+else). Everything KDX stores — pinned server keys, partial downloads and
+their resume state (`transfers/`), the webview's bookmarks/settings — lives
+in its container (`~/Library/Containers/net.kdx.hotline.client/`);
+Address Book passwords are in the login keychain. A download is written to
+the chosen file only once its whole-file hash verifies. A first sandboxed
+launch moves an earlier unsandboxed build's state into the container
+(`container-migration.plist`).
+
+Entitlements only apply to a **signed** bundle. `tauri.conf.json` sets
+`signingIdentity: "-"`, so every `cargo tauri build` is ad-hoc signed (with
+the hardened runtime) and sandboxed; `cargo tauri dev` / `cargo run` are
+not. For distribution, sign with a Developer ID and notarize by setting
+`APPLE_SIGNING_IDENTITY` (plus `APPLE_CERTIFICATE` /
+`APPLE_CERTIFICATE_PASSWORD` in CI) and `APPLE_ID` / `APPLE_PASSWORD` /
+`APPLE_TEAM_ID`; until then, users open the downloaded app once via System
+Settings → Privacy & Security → *Open Anyway*. Details, verification
+commands and the manual macOS test checklist:
+[docs/packaging.html](docs/packaging.html#macos).
+
 ### Server (kdxd)
 
 Each release carries `kdxd-<os>.zip`: the release binary, `kdxd.example.toml`,
@@ -163,6 +186,18 @@ Local server build: `cargo build -p kdxd --release` → `target/release/kdxd`.
   a copy of the database is not enough to log in (it still permits offline
   guessing at Argon2id cost, so keep it private — kdxd creates it `0600`).
   Failed logins are throttled per address and per address+username.
+- No password crosses the wire for any purpose. Clients derive every stored
+  credential themselves: a logged-in user changes their password (Connect
+  window → Change Password…) by proving the current one with a fresh,
+  TLS-bound proof under its own domain label and sending a credential derived
+  from the new one; wrong current passwords count as failed logins and three
+  drop the connection, and the account's other sessions are signed out. An
+  administrator resets a password it may manage (Accounts → Set Password…,
+  same rank rules as editing the account; never its own) or creates an
+  account by sending a client-derived credential; the target's sessions are
+  kicked. Because the server never sees passwords, password strength is
+  enforced only by the client (the desktop app requires 8+ characters, typed
+  twice). Guest accounts, often shared, can't change their own password.
 - The server bounds every client-controlled size and rate (frame and
   reassembly caps, input lengths, per-connection pacing, connection caps,
   handshake/idle/write timeouts, room and transfer limits) and runs as an

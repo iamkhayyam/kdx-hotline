@@ -15,7 +15,8 @@ pub use challenge::{
 };
 pub use password::{hash_password, verify_password};
 pub use scram::{
-    client_proof, decoy_salt, AuthContext, ClientProof, StoredCredential, CHANNEL_BINDING_LEN,
+    client_proof, decoy_salt, password_change_proof, AuthContext, ClientProof,
+    PasswordChangeContext, StoredCredential, CHANNEL_BINDING_LEN,
     TLS_EXPORTER_LABEL,
 };
 pub use shamir::{

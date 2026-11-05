@@ -73,6 +73,25 @@ pub async fn delete(pool: &SqlitePool, id: &str) -> Result<(), StorageError> {
     Ok(())
 }
 
+/// Point an unfinished upload at a new destination name (an upload that may
+/// not learn its name was taken moves on to a free variant of it).
+pub async fn set_name(pool: &SqlitePool, id: &str, name: &str) -> Result<(), StorageError> {
+    sqlx::query("UPDATE transfer_state SET name = ? WHERE id = ?")
+        .bind(name)
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Every unfinished upload's id, in no particular order.
+pub async fn all_ids(pool: &SqlitePool) -> Result<Vec<String>, StorageError> {
+    let ids = sqlx::query_scalar::<_, String>("SELECT id FROM transfer_state")
+        .fetch_all(pool)
+        .await?;
+    Ok(ids)
+}
+
 /// Mark a row as recently used (a resume), restarting its expiry clock.
 pub async fn touch(pool: &SqlitePool, id: &str) -> Result<(), StorageError> {
     sqlx::query("UPDATE transfer_state SET updated_at = datetime('now') WHERE id = ?")
@@ -174,5 +193,20 @@ mod tests {
         // A touch makes it fresh again.
         touch(&pool, "a").await.unwrap();
         assert!(list_stale(&pool, 24 * 60 * 60).await.unwrap().is_empty());
+
+        let mut ids = all_ids(&pool).await.unwrap();
+        ids.sort();
+        assert_eq!(ids, vec!["a", "b", "c"]);
+    }
+
+    #[tokio::test]
+    async fn set_name_renames_one_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = crate::connect(&dir.path().join("t.db")).await.unwrap();
+        create(&pool, &row("a", "acct-1")).await.unwrap();
+        create(&pool, &row("b", "acct-1")).await.unwrap();
+        set_name(&pool, "a", "a (2).bin").await.unwrap();
+        assert_eq!(get(&pool, "a").await.unwrap().unwrap().name, "a (2).bin");
+        assert_eq!(get(&pool, "b").await.unwrap().unwrap().name, "b.bin");
     }
 }

@@ -6,7 +6,7 @@
 //! independently, so unused-method warnings per binary are expected.
 #![allow(dead_code)]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use kdx_client_core::{connect, trust_server, ClientConfig, ClientError, ClientHandle, Event};
 use kdx_storage::accounts;
@@ -64,17 +64,33 @@ impl TestServer {
     /// holds `known_hosts.toml` and must outlive the client.
     pub async fn connect_client(&self) -> (ClientHandle, Receiver<Event>, tempfile::TempDir) {
         let data_dir = tempfile::tempdir().unwrap();
-        let cfg = ClientConfig::new("127.0.0.1", self.port(), data_dir.path());
+        let (client, events) = self.connect_client_in(data_dir.path()).await;
+        (client, events, data_dir)
+    }
 
+    /// Like [`connect_client`](Self::connect_client), but with an existing
+    /// data dir (the same app restarting: pins and partial downloads
+    /// persist). Pins the server on first contact.
+    pub async fn connect_client_in(&self, data_dir: &Path) -> (ClientHandle, Receiver<Event>) {
+        self.connect_client_with(data_dir, |_| {}).await
+    }
+
+    /// [`connect_client_in`](Self::connect_client_in) with a tweaked config.
+    pub async fn connect_client_with(
+        &self,
+        data_dir: &Path,
+        tweak: impl FnOnce(&mut ClientConfig),
+    ) -> (ClientHandle, Receiver<Event>) {
+        let mut cfg = ClientConfig::new("127.0.0.1", self.port(), data_dir);
+        tweak(&mut cfg);
         match connect(cfg.clone()).await {
+            Ok(pair) => return pair,
             Err(ClientError::UntrustedCertificate { fingerprint, .. }) => {
-                trust_server(data_dir.path(), "127.0.0.1", self.port(), &fingerprint).unwrap();
+                trust_server(data_dir, "127.0.0.1", self.port(), &fingerprint).unwrap();
             }
             Err(e) => panic!("unexpected first-contact error: {e}"),
-            Ok(_) => panic!("first contact should be untrusted"),
         }
-        let (client, events) = connect(cfg).await.expect("connect after pinning");
-        (client, events, data_dir)
+        connect(cfg).await.expect("connect after pinning")
     }
 
     pub fn stop(self) {

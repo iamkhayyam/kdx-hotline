@@ -16,15 +16,20 @@ mod tracker;
 mod wire;
 
 pub use account::{
-    AccountCreate, AccountListRequest, AccountListResponse, AccountSummary, AccountUpdate,
+    AccountCreate, AccountListRequest, AccountListResponse, AccountSetPassword, AccountSummary,
+    AccountUpdate, Credential,
 };
 pub use admin::{
-    AdminBroadcast, AdminDisconnect, AdminShutdown, ConnectionListRequest,
+    AdminBroadcast, AdminDisconnect, AdminShutdown, BanEntry, BanListRequest, BanListResponse,
+    BanRemove, ConnectionListRequest,
     ConnectionListResponse, HistoryEntry, HistoryListRequest, HistoryListResponse, IpRuleCreate,
     IpRuleDelete, IpRuleEntry, IpRuleListRequest, IpRuleListResponse, ServerSettingsRequest,
     ServerSettingsResponse, ServerSettingsUpdate,
 };
-pub use auth::{AuthChallenge, AuthRequest, AuthResponse, AuthResult};
+pub use auth::{
+    AuthChallenge, AuthRequest, AuthResponse, AuthResult, PasswordChangeBegin,
+    PasswordChangeChallenge, PasswordChangeProof, PasswordChangeResult,
+};
 pub use chat::{
     ChatEvent, ChatInvite, ChatInvited, ChatJoin, ChatLeave, ChatRoomFlags, ChatSend, ChatTopic,
     ChatUserList, CHAT_ACTION, CHAT_SYSTEM,
@@ -40,7 +45,8 @@ pub use file::{
 pub use handshake::{HandshakeInit, HandshakeResp};
 pub use news::{
     NewsPost, NewsPostCreate, NewsPostDelete, NewsThreadListRequest, NewsThreadListResponse,
-    NewsgroupCreate, NewsgroupInfo, NewsgroupListRequest, NewsgroupListResponse,
+    NewsgroupCreate, NewsgroupDelete, NewsgroupInfo, NewsgroupListRequest, NewsgroupListResponse,
+    NewsgroupUpdate,
 };
 pub use presence::{
     PresenceChange, PresenceEntry, PresenceListRequest, PresenceListResponse, SetIdentity,

@@ -21,6 +21,17 @@
 //!   (the target, or every holder) is one the actor may manage.
 //! - **Last admin.** No change may leave the server without an Admin-class
 //!   account that still holds both USER_ADMIN and SERVER_ADMIN.
+//! - **Password reset.** Setting another account's password follows the
+//!   rank rule above (whoever may edit the account may reset it), and is
+//!   never allowed on your own account: changing your own password needs
+//!   proof of the current one (the password-change flow), so a hijacked
+//!   session can't lock its owner out.
+//!
+//! Lifting a ban (USER_BAN) follows the rule bans are placed by (see
+//! `kdx_storage::bans::set_ranked`): a ban may be lifted by any Admin, by a
+//! class strictly above the class that set it, or by its own banner at the
+//! same or a higher class — so a lower rank can never undo a higher rank's
+//! ban. As with kicks, nobody acts on an account of a higher class.
 //!
 //! The actor's authority is the login snapshot narrowed by the stored account
 //! (lower class, intersected privileges): a demotion bites these checks at
@@ -29,13 +40,16 @@
 
 use std::fmt::Display;
 
-use kdx_protocol::messages::{AccountCreate, AccountUpdate, RoleCreate, RoleUpdate};
+use kdx_crypto::{KdfParams, StoredCredential};
+use kdx_protocol::messages::{
+    AccountCreate, AccountSetPassword, AccountUpdate, Credential, RoleCreate, RoleUpdate,
+};
 use kdx_storage::StorageError;
 use uuid::Uuid;
 
 use super::classes::{effective_privileges, BaseClass, Privileges};
 use super::manager::{AuthError, Session};
-use super::roles::RoleError;
+use super::roles::{BanRecord, BanRemoval, RoleError};
 use crate::connection::ServerCtx;
 use crate::limits;
 
@@ -45,6 +59,15 @@ pub const ADMIN_CORE: Privileges = Privileges::USER_ADMIN.union(Privileges::SERV
 
 /// Disconnect reason sent to a live session whose privileges just changed.
 pub const PRIVILEGES_CHANGED: &str = "your privileges changed — please reconnect";
+
+/// Disconnect reason for an account's other sessions after a password change
+/// (and for a login that was proven against the replaced credential).
+pub const PASSWORD_CHANGED: &str = "your password was changed — please log in again";
+
+/// Disconnect reason for an account's sessions after an admin reset its
+/// password.
+pub const PASSWORD_RESET: &str =
+    "your password was reset by an administrator — please log in again";
 
 /// Keep only privilege bits that are defined today, so junk bits stored in
 /// an override can't silently become a grant when a new privilege is added.
@@ -73,6 +96,12 @@ pub enum Denied {
     SelfEscalation,
     #[error("refusing: this would leave the server without an administrator")]
     LastAdmin,
+    #[error("that ban was set by someone at or above your rank")]
+    BanOutranks,
+    #[error("cannot unban a higher-class user")]
+    UnbanOutranks,
+    #[error("use Change Password to change your own password")]
+    OwnPassword,
 }
 
 /// A failed admin request, split by what the client may see.
@@ -294,6 +323,39 @@ pub fn check_account_update(
     Ok(class)
 }
 
+/// AccountSetPassword on `target` (its current stored state): the actor must
+/// be allowed to manage it, and it must not be the actor's own account.
+pub fn check_password_reset(actor: &Actor, target: &AccountState) -> Result<(), Denied> {
+    if target.username == actor.username {
+        return Err(Denied::OwnPassword);
+    }
+    if !actor.authority.may_manage(&target.authority()) {
+        return Err(Denied::TargetOutranks);
+    }
+    Ok(())
+}
+
+/// A credential from the wire (AccountCreate, AccountSetPassword, a password
+/// change), checked to be fit to store: KDF parameters and salt length
+/// within the client bounds, non-zero keys. The password behind it is the
+/// deriving client's business; the server never sees it.
+pub fn credential_from_wire(wire: &Credential) -> Result<StoredCredential, Refusal> {
+    let credential = StoredCredential {
+        salt: wire.salt.clone(),
+        params: KdfParams {
+            m_cost: wire.m_cost,
+            t_cost: wire.t_cost,
+            p_cost: wire.p_cost,
+        },
+        stored_key: wire.stored_key,
+        server_key: wire.server_key,
+    };
+    credential
+        .check_acceptable()
+        .map_err(|e| Refusal::denied(format!("invalid credential: {e}")))?;
+    Ok(credential)
+}
+
 /// A role's privileges must all be ones the actor could grant.
 pub fn check_role_privileges(actor: &Authority, role: Privileges) -> Result<(), Denied> {
     if actor.privileges.contains(role) {
@@ -310,6 +372,17 @@ pub fn check_role_holders(actor: &Authority, holders: &[AccountState]) -> Result
     } else {
         Err(Denied::HolderOutranks)
     }
+}
+
+/// Whether `actor` may lift a ban set by `banned_by` at class
+/// `banned_by_class` — the mirror of `kdx_storage::bans::set_ranked`, under
+/// which a ban is replaced outright only by a higher class or by its own
+/// banner at the same or a higher class. Admins may lift any ban.
+pub fn may_lift_ban(actor: &Actor, banned_by: &str, banned_by_class: BaseClass) -> bool {
+    let class = actor.authority.class;
+    class == BaseClass::Admin
+        || class > banned_by_class
+        || (actor.username == banned_by && class >= banned_by_class)
 }
 
 /// Whether going from `before` to `after` takes away an administrator.
@@ -405,17 +478,18 @@ fn role_exists_message(name: &str) -> String {
 /// AccountCreate under the policy.
 pub async fn create_account(ctx: &ServerCtx, session: &Session, req: &AccountCreate) -> Result<(), Refusal> {
     const WHAT: &str = "account create";
-    if req.username.is_empty() || req.password.is_empty() {
-        return Err(Refusal::denied("username and password are required"));
+    if req.username.is_empty() {
+        return Err(Refusal::denied("a username is required"));
     }
     limits::check_len("username", &req.username, limits::MAX_USERNAME_LEN).map_err(Refusal::denied)?;
+    let credential = credential_from_wire(&req.credential)?;
     let _guard = ctx.roles.lock_mutations().await;
     let actor = resolve_actor(ctx, session, Privileges::USER_ADMIN).await?;
     let class = check_account_create(&actor.authority, req.base_class, req.granted, req.revoked)?;
     ctx.auth
-        .create_account(
+        .create_account_with_credential(
             &req.username,
-            &req.password,
+            &credential,
             class as i64,
             known_bits(req.granted) as i64,
             known_bits(req.revoked) as i64,
@@ -453,6 +527,72 @@ pub async fn update_account(ctx: &ServerCtx, session: &Session, req: &AccountUpd
         .await
         .map_err(|e| Refusal::auth(WHAT, e, "no such account"))?;
     kick_changed(ctx, vec![target]).await;
+    Ok(())
+}
+
+/// The account performing a ban-list request: anyone holding USER_BAN
+/// (checked against the stored account too, like every admin request).
+pub async fn check_ban_viewer(ctx: &ServerCtx, session: &Session) -> Result<Actor, Refusal> {
+    resolve_actor(ctx, session, Privileges::USER_BAN).await
+}
+
+/// BanRemove under the policy: lifts the ban on `username` and returns it.
+/// Refused unless the actor holds USER_BAN, the target doesn't outrank the
+/// actor, and [`may_lift_ban`] allows it; the rank check and the delete are
+/// atomic, so a concurrent higher-rank re-ban is never lifted by mistake.
+pub async fn remove_ban(ctx: &ServerCtx, session: &Session, username: &str) -> Result<BanRecord, Refusal> {
+    const WHAT: &str = "unban";
+    if username.is_empty() {
+        return Err(Refusal::denied("username is required"));
+    }
+    limits::check_len("username", username, limits::MAX_USERNAME_LEN).map_err(Refusal::denied)?;
+    // Same serialization as other privilege-checked mutations, so a
+    // demotion can't land between the actor check and the write.
+    let _guard = ctx.roles.lock_mutations().await;
+    let actor = resolve_actor(ctx, session, Privileges::USER_BAN).await?;
+    let target = existing_account(ctx, WHAT, username).await?;
+    if target.class > actor.authority.class {
+        return Err(Denied::UnbanOutranks.into());
+    }
+    let now = crate::presence::unix_now() as i64;
+    let removal = ctx
+        .roles
+        .remove_ban(&target.account_id, &target.username, now, |banned_by, class| {
+            may_lift_ban(&actor, banned_by, class)
+        })
+        .await
+        .map_err(|e| Refusal::internal(WHAT, e))?;
+    match removal {
+        BanRemoval::Removed(ban) => Ok(ban),
+        BanRemoval::NotBanned => Err(Refusal::denied(format!("{} is not banned", target.username))),
+        BanRemoval::Refused(_) => Err(Denied::BanOutranks.into()),
+    }
+}
+
+/// AccountSetPassword under the policy: store the admin-supplied credential
+/// for the target, then disconnect its live sessions.
+pub async fn set_account_password(
+    ctx: &ServerCtx,
+    session: &Session,
+    req: &AccountSetPassword,
+) -> Result<(), Refusal> {
+    const WHAT: &str = "password reset";
+    let credential = credential_from_wire(&req.credential)?;
+    let _guard = ctx.roles.lock_mutations().await;
+    let actor = resolve_actor(ctx, session, Privileges::USER_ADMIN).await?;
+    let target = existing_account(ctx, WHAT, &req.username).await?;
+    check_password_reset(&actor, &target)?;
+    let stored = ctx
+        .auth
+        .set_credential(&target.account_id, &credential)
+        .await
+        .map_err(|e| Refusal::auth(WHAT, e, "no such account"))?;
+    if !stored {
+        return Err(Refusal::denied("no such account"));
+    }
+    // Written before the kick, so a login racing it can't keep the old
+    // password (see `Connection::stale_login_reason`).
+    ctx.presence.disconnect(&target.username, PASSWORD_RESET).await;
     Ok(())
 }
 
@@ -668,6 +808,54 @@ mod tests {
     }
 
     #[test]
+    fn password_reset_follows_the_rank_rules_and_never_targets_yourself() {
+        let user = state("user", BaseClass::User, Privileges::empty(), Privileges::empty());
+        let peer = state("peer", BaseClass::PowerUser, Privileges::empty(), Privileges::empty());
+        let helpdesk = helpdesk();
+        let delegated = actor_of(&helpdesk);
+        assert_eq!(check_password_reset(&delegated, &user), Ok(()));
+        assert_eq!(check_password_reset(&delegated, &peer), Err(Denied::TargetOutranks));
+        assert_eq!(check_password_reset(&delegated, &sysop()), Err(Denied::TargetOutranks));
+        assert_eq!(check_password_reset(&delegated, &helpdesk), Err(Denied::OwnPassword));
+        // A lower-class account holding a privilege the actor lacks is off
+        // limits too.
+        let kicker = state("kicker", BaseClass::User, Privileges::USER_KICK, Privileges::empty());
+        assert_eq!(check_password_reset(&delegated, &kicker), Err(Denied::TargetOutranks));
+
+        let admin = actor_of(&sysop());
+        let other = state("other", BaseClass::Admin, Privileges::empty(), Privileges::empty());
+        assert_eq!(check_password_reset(&admin, &other), Ok(()));
+        assert_eq!(check_password_reset(&admin, &peer), Ok(()));
+        assert_eq!(check_password_reset(&admin, &sysop()), Err(Denied::OwnPassword));
+    }
+
+    #[test]
+    fn wire_credentials_are_validated() {
+        let good = StoredCredential::derive("pw").unwrap();
+        let wire = |c: &StoredCredential| Credential {
+            m_cost: c.params.m_cost,
+            t_cost: c.params.t_cost,
+            p_cost: c.params.p_cost,
+            salt: c.salt.clone(),
+            stored_key: c.stored_key,
+            server_key: c.server_key,
+        };
+        assert_eq!(credential_from_wire(&wire(&good)).unwrap(), good);
+        let mut cheap = wire(&good);
+        cheap.m_cost = 8;
+        let mut short_salt = wire(&good);
+        short_salt.salt.truncate(4);
+        let mut zero_key = wire(&good);
+        zero_key.stored_key = [0; 32];
+        for bad in [cheap, short_salt, zero_key] {
+            match credential_from_wire(&bad) {
+                Err(Refusal::Denied(message)) => assert!(message.starts_with("invalid credential")),
+                other => panic!("{bad:?} accepted: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
     fn role_rules() {
         let actor = helpdesk().authority();
         assert!(check_role_privileges(&actor, Privileges::USER_ADMIN | Privileges::CHAT_SEND).is_ok());
@@ -692,6 +880,29 @@ mod tests {
         assert!(!removes_administrator(&admin, &harmless));
         assert!(privileges_changed(&admin, &harmless));
         assert!(!privileges_changed(&admin, &admin.clone()));
+    }
+
+    #[test]
+    fn ban_lifting_mirrors_ranked_placement() {
+        let class = |c| state("x", c, Privileges::USER_BAN, Privileges::empty());
+        let actor = |name: &str, c| Actor {
+            username: name.into(),
+            authority: class(c).authority(),
+        };
+        let moderator = actor("mod", BaseClass::PowerUser);
+        // A higher rank's ban stays put; so does a peer's.
+        assert!(!may_lift_ban(&moderator, "sysop", BaseClass::Admin));
+        assert!(!may_lift_ban(&moderator, "othermod", BaseClass::PowerUser));
+        // One's own ban, or a lower rank's, can go.
+        assert!(may_lift_ban(&moderator, "mod", BaseClass::PowerUser));
+        assert!(may_lift_ban(&moderator, "helper", BaseClass::User));
+        // A banner since demoted below the ban's class can't undo it.
+        let demoted = actor("mod", BaseClass::User);
+        assert!(!may_lift_ban(&demoted, "mod", BaseClass::PowerUser));
+        // Admins lift anything, other admins' bans included.
+        let admin = actor("sysop", BaseClass::Admin);
+        assert!(may_lift_ban(&admin, "root", BaseClass::Admin));
+        assert!(may_lift_ban(&admin, "mod", BaseClass::PowerUser));
     }
 
     #[test]

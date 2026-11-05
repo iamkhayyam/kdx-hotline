@@ -113,6 +113,7 @@ body::before {
   font-family: var(--mono);
 }
 .mini:hover { border-color: var(--alert); color: #fff; }
+.mini:disabled, .mini:disabled:hover { opacity: .4; cursor: default; color: #f0b8b8; border-color: var(--chrome); background: #240707; }
 .no-timestamps .chat-line .ts { display: none; }
 
 /* Address Book */
@@ -475,6 +476,8 @@ td.fmeta { color: var(--grey-dim); font-size: 11px; }
 .rl-assign-result { margin-top: 6px; font-size: 11px; color: var(--grey-dim); min-height: 1.4em; }
 .ipr-status { margin: 0; padding: 0 8px; color: var(--alert); min-height: 0; }
 .ipr-status:not(:empty) { padding: 4px 8px; }
+.ban-note { margin: 0; padding: 0 8px; color: var(--amber); min-height: 0; }
+.ban-note:not(:empty) { padding: 4px 8px; border-top: 1px solid var(--chrome-dim); }
 .mini.danger { color: var(--alert); border-color: var(--alert); }
 .mini.danger:hover { background: rgba(122, 10, 10, 0.28); }
 
@@ -517,6 +520,9 @@ td.fmeta { color: var(--grey-dim); font-size: 11px; }
 .news-group.active { background: rgba(122,10,10,.28); color: #b6ffcb; }
 .news-group-name { flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .news-group-meta { color: var(--grey-dim); font-size: 10px; }
+.news-group-admin { display: flex; }
+.news-group-admin .mini { flex: 1; margin: 0 6px 6px; }
+.news-group-admin .mini + .mini { margin-left: 0; }
 .news-main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
 .news-toolbar { display: flex; align-items: center; gap: 8px; padding: 5px 10px; border-bottom: 1px solid var(--chrome-dim); background: var(--panel-deep); }
 .news-toolbar .spacer { flex: 1; }
@@ -552,3 +558,9 @@ td.fmeta { color: var(--grey-dim); font-size: 11px; }
 @media (prefers-reduced-motion: reduce) {
   .conn::before { animation: none !important; }
 }
+
+/* password change (Connect) / reset (Accounts) */
+.pw-change { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--chrome-dim); }
+.pw-form { margin-top: 4px; }
+.pw-actions { display: flex; gap: 8px; }
+.ac-setpw { margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--chrome-dim); }

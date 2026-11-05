@@ -1,12 +1,16 @@
 // Public News — newsgroups with threaded posts. Left pane is the server →
 // newsgroup tree; the right pane shows a newsgroup's threads (indented by
 // reply depth), a reading area for the selected post, and a composer for new
-// threads and replies. Creating newsgroups and deleting others' posts are
-// server-enforced on USER_ADMIN; posting is gated by the group's post class.
+// threads and replies. Creating, editing and deleting newsgroups and deleting
+// others' posts are server-enforced on USER_ADMIN (edit/delete also need read
+// access to the group); posting is gated by the group's post class. The
+// newsgroup Edit/Delete controls are only shown to admins (moderation.js).
 
 import { invoke } from "../bridge.js";
-import { getState } from "../store.js";
+import { getState, subscribe } from "../store.js";
 import { esc, num, errorText } from "../html.js";
+import { askConfirm, confirmThen } from "../confirm.js";
+import { canManageNewsgroups, newsgroupFormError } from "../moderation.js";
 
 const CLASS_NAME = ["guest", "user", "power user", "admin"];
 
@@ -18,6 +22,10 @@ export function buildNews() {
       <div class="news-hdr">Newsgroups</div>
       <div class="news-group-list" id="news-groups"></div>
       <button class="mini" id="news-newgroup">New Newsgroup…</button>
+      <div class="news-group-admin hidden" id="news-group-admin">
+        <button class="mini" id="news-editgroup" disabled>Edit…</button>
+        <button class="mini danger" id="news-delgroup" disabled>Delete…</button>
+      </div>
     </div>
     <div class="news-main">
       <div class="news-toolbar">
@@ -39,6 +47,7 @@ export function buildNews() {
         <div class="rl-assign-result" id="news-compose-result"></div>
       </form>
       <form class="news-newgroup hidden" id="news-newgroup-form">
+        <div class="news-compose-to" id="ng-head">New newsgroup</div>
         <div class="ab-grid">
           <label>Name<input id="ng-name" spellcheck="false" autocomplete="off" /></label>
           <label>Read class
@@ -50,7 +59,7 @@ export function buildNews() {
         </div>
         <input id="ng-desc" placeholder="description" spellcheck="false" autocomplete="off" />
         <div class="ab-actions">
-          <button type="submit" class="btn">Create</button>
+          <button type="submit" class="btn" id="ng-submit">Create</button>
           <button type="button" class="btn" id="ng-cancel">Cancel</button>
         </div>
         <div class="rl-assign-result" id="ng-result"></div>
@@ -64,16 +73,19 @@ export function buildNews() {
   const titleEl = $("#news-title");
   const composer = $("#news-composer");
   const newgroupForm = $("#news-newgroup-form");
+  const groupAdmin = $("#news-group-admin");
 
   let groups = [];
   let group = null; // selected newsgroup
   let posts = []; // posts of the selected group
   let selected = null; // selected post
   let replyTo = null; // post being replied to (null = new thread)
+  let editing = null; // newsgroup open in the editor (null = creating one)
 
   async function refresh() {
     try {
       groups = await invoke("list_newsgroups");
+      syncSelection();
       renderGroups();
       if (group) await openGroup(group.id);
     } catch (err) {
@@ -81,7 +93,43 @@ export function buildNews() {
     }
   }
 
+  /** Newsgroup Edit/Delete: shown to admins, live while a group is open. */
+  function updateAdminControls() {
+    groupAdmin.classList.toggle("hidden", !canManageNewsgroups(getState().session));
+    $("#news-editgroup").disabled = !group;
+    $("#news-delgroup").disabled = !group;
+  }
+
+  /** After the group list changed: follow the open group's new name, or
+   * close it if it's gone (deleted, or no longer readable). */
+  function syncSelection() {
+    if (!group) return;
+    const fresh = groups.find((g) => g.id === group.id);
+    if (fresh) {
+      group = fresh;
+      titleEl.textContent = fresh.name;
+    } else {
+      clearGroup();
+    }
+  }
+
+  function clearGroup() {
+    group = null;
+    posts = [];
+    selected = null;
+    titleEl.textContent = "select a newsgroup";
+    $("#news-compose").disabled = true;
+    threadsEl.innerHTML = "";
+    readingEl.innerHTML = "";
+    composer.classList.add("hidden");
+    if (editing) {
+      editing = null;
+      newgroupForm.classList.add("hidden");
+    }
+  }
+
   function renderGroups() {
+    updateAdminControls();
     if (!groups.length) {
       groupsEl.innerHTML = '<div class="empty">no newsgroups</div>';
       return;
@@ -224,35 +272,90 @@ export function buildNews() {
     }
   });
 
-  // New Newsgroup (admin-only; the server enforces it).
-  $("#news-newgroup").addEventListener("click", () => {
+  // New / Edit Newsgroup share one form (USER_ADMIN; the server enforces
+  // it, and that the editor can read the group).
+  function openGroupForm(g) {
+    editing = g || null;
+    $("#ng-head").textContent = g ? `Edit “${g.name}”` : "New newsgroup";
+    $("#ng-submit").textContent = g ? "Save" : "Create";
+    $("#ng-name").value = g ? g.name : "";
+    $("#ng-desc").value = g ? g.description : "";
+    $("#ng-read").value = String(g ? g.min_read_class : 0);
+    $("#ng-post").value = String(g ? g.min_post_class : 1);
+    $("#ng-result").textContent = "";
     newgroupForm.classList.remove("hidden");
     composer.classList.add("hidden");
-    $("#ng-name").value = "";
-    $("#ng-desc").value = "";
-    $("#ng-result").textContent = "";
     $("#ng-name").focus();
-  });
-  $("#ng-cancel").addEventListener("click", () => newgroupForm.classList.add("hidden"));
+  }
+  function closeGroupForm() {
+    editing = null;
+    newgroupForm.classList.add("hidden");
+  }
+
+  $("#news-newgroup").addEventListener("click", () => openGroupForm(null));
+  $("#news-editgroup").addEventListener("click", () => group && openGroupForm(group));
+  $("#ng-cancel").addEventListener("click", closeGroupForm);
   newgroupForm.addEventListener("submit", async (e) => {
     e.preventDefault();
-    const name = $("#ng-name").value.trim();
-    if (!name) return;
+    const fields = {
+      name: $("#ng-name").value.trim(),
+      description: $("#ng-desc").value.trim(),
+      readClass: parseInt($("#ng-read").value, 10),
+      postClass: parseInt($("#ng-post").value, 10),
+    };
+    const problem = newsgroupFormError(fields);
+    if (problem) {
+      $("#ng-result").textContent = problem;
+      return;
+    }
+    const args = {
+      name: fields.name,
+      description: fields.description,
+      minReadClass: fields.readClass,
+      minPostClass: fields.postClass,
+    };
     try {
-      groups = await invoke("create_newsgroup", {
-        name,
-        description: $("#ng-desc").value.trim(),
-        minReadClass: parseInt($("#ng-read").value, 10) || 0,
-        minPostClass: parseInt($("#ng-post").value, 10) || 0,
-      });
-      newgroupForm.classList.add("hidden");
+      groups = editing
+        ? await invoke("update_newsgroup", { id: editing.id, ...args })
+        : await invoke("create_newsgroup", args);
+      closeGroupForm();
+      syncSelection();
       renderGroups();
     } catch (err) {
       $("#ng-result").textContent = errorText(err);
     }
   });
 
-  return { body, refresh };
+  // Delete Newsgroup: takes every post in it, so always confirm first.
+  $("#news-delgroup").addEventListener("click", async () => {
+    const g = group;
+    if (!g) return;
+    await confirmThen(
+      () =>
+        askConfirm(`Delete the newsgroup “${g.name}” and every post in it?\nThis cannot be undone.`, {
+          confirmLabel: "Delete",
+          danger: true,
+        }),
+      async () => {
+        try {
+          groups = await invoke("delete_newsgroup", { id: g.id });
+          if (editing && editing.id === g.id) closeGroupForm();
+          syncSelection();
+          renderGroups();
+        } catch (err) {
+          const msg = document.createElement("div");
+          msg.className = "empty";
+          msg.textContent = errorText(err);
+          readingEl.replaceChildren(msg);
+        }
+      }
+    );
+  });
+
+  // A login (or hydration) changes who "me" is, and with it the controls.
+  subscribe(updateAdminControls);
+
+  return { body, refresh, afterHydrate: updateAdminControls };
 }
 
 function replySubject(s) {

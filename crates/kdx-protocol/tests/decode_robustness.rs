@@ -166,6 +166,17 @@ fn news_post(id: u8, parent: u8) -> NewsPost {
     }
 }
 
+fn credential(salt_len: usize) -> Credential {
+    Credential {
+        m_cost: 19_456,
+        t_cost: 2,
+        p_cost: 1,
+        salt: vec![3; salt_len],
+        stored_key: [4; 32],
+        server_key: [5; 32],
+    }
+}
+
 fn role(name: &str) -> RoleInfo {
     RoleInfo {
         id: [7; 16],
@@ -184,13 +195,29 @@ fn cases() -> Vec<(&'static str, Vec<Bytes>, Probe)> {
             "AccountCreate",
             vec![AccountCreate {
                 username: "acidburn".into(),
-                password: "hacktheplanet".into(),
+                credential: credential(16),
                 base_class: 2,
                 granted: 8,
                 revoked: 64,
             }
             .encode()],
             canonical!(AccountCreate),
+        ),
+        (
+            "AccountSetPassword",
+            vec![
+                AccountSetPassword {
+                    username: "phraq".into(),
+                    credential: credential(16),
+                }
+                .encode(),
+                AccountSetPassword {
+                    username: String::new(),
+                    credential: credential(0),
+                }
+                .encode(),
+            ],
+            canonical!(AccountSetPassword),
         ),
         (
             "AccountUpdate",
@@ -242,6 +269,43 @@ fn cases() -> Vec<(&'static str, Vec<Bytes>, Probe)> {
             }
             .encode()],
             canonical!(AdminDisconnect),
+        ),
+        (
+            "BanListRequest",
+            vec![BanListRequest.encode()],
+            canonical!(BanListRequest),
+        ),
+        (
+            "BanListResponse",
+            vec![
+                BanListResponse { total: 0, bans: vec![] }.encode(),
+                BanListResponse {
+                    total: 3,
+                    bans: vec![
+                        BanEntry {
+                            username: "lamer".into(),
+                            until: 1_900_000_000,
+                            reason: "flood".into(),
+                            banned_by: "sysop".into(),
+                            banned_by_class: 3,
+                        },
+                        BanEntry {
+                            username: "zero".into(),
+                            until: 1_800_000_000,
+                            reason: String::new(),
+                            banned_by: "mod".into(),
+                            banned_by_class: 2,
+                        },
+                    ],
+                }
+                .encode(),
+            ],
+            canonical!(BanListResponse),
+        ),
+        (
+            "BanRemove",
+            vec![BanRemove { username: "lamer".into() }.encode()],
+            canonical!(BanRemove),
         ),
         (
             "ServerSettingsRequest",
@@ -394,6 +458,51 @@ fn cases() -> Vec<(&'static str, Vec<Bytes>, Probe)> {
                 Bytes::from(b)
             }],
             decode_only!(AuthResult),
+        ),
+        // ---- auth.rs: password change (canonical)
+        (
+            "PasswordChangeBegin",
+            vec![PasswordChangeBegin.encode()],
+            canonical!(PasswordChangeBegin),
+        ),
+        (
+            "PasswordChangeChallenge",
+            vec![PasswordChangeChallenge {
+                challenge: [7; 32],
+                salt: vec![3; 16],
+                m_cost: 19_456,
+                t_cost: 2,
+                p_cost: 1,
+            }
+            .encode()],
+            canonical!(PasswordChangeChallenge),
+        ),
+        (
+            "PasswordChangeProof",
+            vec![PasswordChangeProof {
+                proof: [9; 32],
+                credential: credential(16),
+            }
+            .encode()],
+            canonical!(PasswordChangeProof),
+        ),
+        (
+            "PasswordChangeResult",
+            vec![
+                PasswordChangeResult {
+                    success: true,
+                    message: "password changed".into(),
+                    server_signature: [6; 32],
+                }
+                .encode(),
+                PasswordChangeResult {
+                    success: false,
+                    message: String::new(),
+                    server_signature: [0; 32],
+                }
+                .encode(),
+            ],
+            canonical!(PasswordChangeResult),
         ),
         // ---- handshake.rs (decode only)
         (
@@ -743,6 +852,23 @@ fn cases() -> Vec<(&'static str, Vec<Bytes>, Probe)> {
             }
             .encode()],
             canonical!(NewsgroupCreate),
+        ),
+        (
+            "NewsgroupUpdate",
+            vec![NewsgroupUpdate {
+                id: [4; 16],
+                name: "staff".into(),
+                description: "mods".into(),
+                min_read_class: 2,
+                min_post_class: 3,
+            }
+            .encode()],
+            canonical!(NewsgroupUpdate),
+        ),
+        (
+            "NewsgroupDelete",
+            vec![NewsgroupDelete { id: [4; 16] }.encode()],
+            canonical!(NewsgroupDelete),
         ),
         // ---- presence.rs
         (
