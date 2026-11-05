@@ -62,6 +62,8 @@ const COMMANDS: &[&str] = &[
     "delete_newsgroup",
     "list_bans",
     "remove_ban",
+    "change_password",
+    "set_account_password",
 ];
 
 fn main() {

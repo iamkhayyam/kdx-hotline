@@ -10,8 +10,14 @@ use common::{
     channel_binding, connect_tls, kdx_handshake, login_result, prove, request_challenge,
     send_proof, test_config, TlsClient,
 };
-use kdx_crypto::{hash_password, AuthContext, KdfParams, StoredCredential};
-use kdx_protocol::messages::AuthResult;
+use kdx_crypto::{
+    hash_password, password_change_proof, AuthContext, KdfParams, PasswordChangeContext,
+    StoredCredential,
+};
+use kdx_protocol::messages::{
+    AuthResult, Credential, PasswordChangeBegin, PasswordChangeChallenge, PasswordChangeProof,
+    PasswordChangeResult,
+};
 use kdx_protocol::PacketType;
 use kdx_server_core::auth::Privileges;
 use kdx_storage::accounts;
@@ -357,6 +363,123 @@ async fn oversized_username_is_refused_over_tls() {
     assert!(history
         .iter()
         .all(|e| e.actor.as_deref().map_or(0, str::len) <= 64));
+
+    server.handle.abort();
+}
+
+/// Read the next frame that isn't an unsolicited push (presence, greeting).
+async fn next_reply(client: &mut TlsClient) -> kdx_protocol::KdxFrame {
+    use futures_util::StreamExt;
+    loop {
+        let frame = client.next().await.unwrap().unwrap();
+        if !matches!(
+            frame.header.packet_type,
+            PacketType::PresenceChange | PacketType::Info
+        ) {
+            return frame;
+        }
+    }
+}
+
+fn wire(credential: &StoredCredential) -> Credential {
+    Credential {
+        m_cost: credential.params.m_cost,
+        t_cost: credential.params.t_cost,
+        p_cost: credential.params.p_cost,
+        salt: credential.salt.clone(),
+        stored_key: credential.stored_key,
+        server_key: credential.server_key,
+    }
+}
+
+/// Self-service password change over real TLS: the change proof is bound to
+/// this session's exporter (a proof made for another session fails, as a
+/// wrong password), the server proves itself with the old ServerKey, and
+/// afterwards only the new password logs in. Neither password is sent.
+#[tokio::test]
+async fn password_change_over_tls_is_channel_bound() {
+    use futures_util::SinkExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let server = serve(test_config(&dir)).await.unwrap();
+    let pool = kdx_storage::connect(&dir.path().join("kdx.db"))
+        .await
+        .unwrap();
+    let credential = hash_password("correct horse").unwrap();
+    accounts::create(&pool, "phraq", &credential, 1, 0, 0)
+        .await
+        .unwrap();
+
+    let (mut client, mut seq) = handshaken(server.local_addr).await;
+    common::login(&mut client, &mut seq, "phraq", "correct horse").await;
+    let binding = channel_binding(&client);
+    let (other, _) = handshaken(server.local_addr).await;
+    let foreign_binding = channel_binding(&other);
+    let new = StoredCredential::derive("battery staple").unwrap();
+    let localhost: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+
+    for (binding, should_succeed) in [(foreign_binding, false), (binding, true)] {
+        client
+            .send(common::frame(
+                PacketType::PasswordChangeBegin,
+                common::bump(&mut seq),
+                PasswordChangeBegin.encode(),
+            ))
+            .await
+            .unwrap();
+        let frame = next_reply(&mut client).await;
+        assert_eq!(frame.header.packet_type, PacketType::PasswordChangeChallenge);
+        let challenge = PasswordChangeChallenge::decode(&frame.payload).unwrap();
+        let proof = password_change_proof(
+            "correct horse",
+            &PasswordChangeContext {
+                current: AuthContext {
+                    username: "phraq",
+                    challenge: &challenge.challenge,
+                    salt: &challenge.salt,
+                    params: KdfParams {
+                        m_cost: challenge.m_cost,
+                        t_cost: challenge.t_cost,
+                        p_cost: challenge.p_cost,
+                    },
+                    channel_binding: &binding,
+                },
+                new_credential: &new,
+            },
+        )
+        .unwrap();
+        client
+            .send(common::frame(
+                PacketType::PasswordChangeProof,
+                common::bump(&mut seq),
+                PasswordChangeProof {
+                    proof: proof.proof,
+                    credential: wire(&new),
+                }
+                .encode(),
+            ))
+            .await
+            .unwrap();
+        let frame = next_reply(&mut client).await;
+        assert_eq!(frame.header.packet_type, PacketType::PasswordChangeResult);
+        let result = PasswordChangeResult::decode(&frame.payload).unwrap();
+        assert_eq!(result.success, should_succeed, "{}", result.message);
+        if should_succeed {
+            assert!(proof.verify_server_signature(&result.server_signature));
+        } else {
+            // A proof for another TLS session is a wrong password.
+            assert_eq!(server.ctx.login_limiter.failure_count(localhost, "phraq"), 1);
+        }
+    }
+    // The success cleared the (address, account) pair again.
+    assert_eq!(server.ctx.login_limiter.failure_count(localhost, "phraq"), 0);
+
+    // Stored exactly as the client derived it; only the new password works.
+    let row = accounts::by_username(&pool, "phraq").await.unwrap().unwrap();
+    assert_eq!(row.credential, Some(new.encode()));
+    let (mut again, mut seq) = handshaken(server.local_addr).await;
+    assert!(!login_result(&mut again, &mut seq, "phraq", "correct horse").await.success);
+    assert!(login_result(&mut again, &mut seq, "phraq", "battery staple").await.success);
 
     server.handle.abort();
 }

@@ -125,6 +125,8 @@ fn app_builder<R: Runtime>(builder: tauri::Builder<R>) -> tauri::Builder<R> {
             commands::delete_newsgroup,
             commands::list_bans,
             commands::remove_ban,
+            commands::change_password,
+            commands::set_account_password,
         ])
 }
 
@@ -176,7 +178,7 @@ mod acl_tests {
     /// which every window has for hydration).
     const POLICY: &[(&str, &[&str])] = &[
         ("main", &["disconnect", "list_users", "save_secret"]),
-        ("connect", &["connect", "trust", "login", "join_room"]),
+        ("connect", &["connect", "trust", "login", "join_room", "change_password"]),
         (
             "chat",
             &[
@@ -225,7 +227,10 @@ mod acl_tests {
                 "disconnect_user",
             ],
         ),
-        ("accounts", &["list_accounts", "create_account", "update_account"]),
+        (
+            "accounts",
+            &["list_accounts", "create_account", "update_account", "set_account_password"],
+        ),
         (
             "server",
             &[

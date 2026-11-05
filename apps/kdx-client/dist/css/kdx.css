@@ -558,3 +558,9 @@ td.fmeta { color: var(--grey-dim); font-size: 11px; }
 @media (prefers-reduced-motion: reduce) {
   .conn::before { animation: none !important; }
 }
+
+/* password change (Connect) / reset (Accounts) */
+.pw-change { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--chrome-dim); }
+.pw-form { margin-top: 4px; }
+.pw-actions { display: flex; gap: 8px; }
+.ac-setpw { margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--chrome-dim); }

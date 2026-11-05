@@ -30,6 +30,33 @@
 //! computed for the wrong exporter value and fails. The client also checks
 //! the ServerSignature, which only a holder of the account's ServerKey can
 //! produce, before treating the login as successful.
+//!
+//! # Password change
+//!
+//! A logged-in user changes their password with the same kind of proof over
+//! a different message ([`PasswordChangeContext`]): a distinct domain label,
+//! the login fields for the *current* credential (with a fresh change
+//! challenge), plus the whole *new* credential the client derived locally
+//! (fresh salt, StoredKey, ServerKey). Neither password crosses the wire,
+//! the proof authorizes exactly that new credential, and the distinct label
+//! means a login proof never verifies as a password-change proof or vice
+//! versa:
+//!
+//! ```text
+//! ChangeMessage   = "KDX-PWCHANGE-v1" 0x00
+//!                   || u32 len(username) || username
+//!                   || challenge (32)
+//!                   || u32 len(salt) || salt || m || t || p      (current)
+//!                   || channel_binding (32)
+//!                   || u32 len(new salt) || new salt || m || t || p
+//!                   || new StoredKey (32) || new ServerKey (32)
+//! ClientProof     = ClientKey XOR HMAC-SHA256(StoredKey, ChangeMessage)
+//! ServerSignature = HMAC-SHA256(ServerKey, ChangeMessage)       (current keys)
+//! ```
+//!
+//! A credential that arrives from a client (password change, admin reset,
+//! account creation) must pass [`StoredCredential::check_acceptable`] before
+//! a server stores it.
 
 use std::fmt;
 
@@ -51,6 +78,7 @@ pub const CHANNEL_BINDING_LEN: usize = 32;
 pub const TLS_EXPORTER_LABEL: &[u8] = b"EXPORTER-KDX-AUTH-v2";
 
 const AUTH_MESSAGE_LABEL: &[u8] = b"KDX-AUTH-v2\0";
+const PASSWORD_CHANGE_LABEL: &[u8] = b"KDX-PWCHANGE-v1\0";
 const DECOY_SALT_LABEL: &[u8] = b"KDX-decoy-salt-v1\0";
 const CREDENTIAL_SCHEME: &str = "kdx-scram-sha256";
 const CREDENTIAL_VERSION: &str = "v=1";
@@ -77,17 +105,48 @@ pub struct AuthContext<'a> {
 impl AuthContext<'_> {
     /// The canonical AuthMessage both sides MAC (see the module docs).
     pub fn auth_message(&self) -> Vec<u8> {
+        self.message_with_label(AUTH_MESSAGE_LABEL, 0)
+    }
+
+    /// `label` followed by every AuthMessage field, with room for `extra`
+    /// more bytes.
+    fn message_with_label(&self, label: &[u8], extra: usize) -> Vec<u8> {
         let mut m = Vec::with_capacity(
-            AUTH_MESSAGE_LABEL.len() + 4 + self.username.len() + 32 + 4 + self.salt.len() + 12 + 32,
+            label.len() + 4 + self.username.len() + 32 + 4 + self.salt.len() + 12 + 32 + extra,
         );
-        m.extend_from_slice(AUTH_MESSAGE_LABEL);
+        m.extend_from_slice(label);
         put_bytes(&mut m, self.username.as_bytes());
         m.extend_from_slice(self.challenge);
         put_bytes(&mut m, self.salt);
-        m.extend_from_slice(&self.params.m_cost.to_be_bytes());
-        m.extend_from_slice(&self.params.t_cost.to_be_bytes());
-        m.extend_from_slice(&self.params.p_cost.to_be_bytes());
+        put_params(&mut m, &self.params);
         m.extend_from_slice(self.channel_binding);
+        m
+    }
+}
+
+/// Everything a password-change proof is bound to: the login fields for the
+/// account's *current* credential (with a fresh change challenge) plus the
+/// complete *new* credential the client wants stored.
+#[derive(Debug, Clone, Copy)]
+pub struct PasswordChangeContext<'a> {
+    /// The session's username, the change challenge, the *current* salt and
+    /// parameters, and this connection's TLS exporter value.
+    pub current: AuthContext<'a>,
+    /// The credential to store if the proof verifies.
+    pub new_credential: &'a StoredCredential,
+}
+
+impl PasswordChangeContext<'_> {
+    /// The canonical ChangeMessage both sides MAC (see the module docs).
+    pub fn change_message(&self) -> Vec<u8> {
+        let new = self.new_credential;
+        let mut m = self
+            .current
+            .message_with_label(PASSWORD_CHANGE_LABEL, 4 + new.salt.len() + 12 + 64);
+        put_bytes(&mut m, &new.salt);
+        put_params(&mut m, &new.params);
+        m.extend_from_slice(&new.stored_key);
+        m.extend_from_slice(&new.server_key);
         m
     }
 }
@@ -118,18 +177,51 @@ impl ClientProof {
 /// memory-heavy by design; async callers should run this on a blocking
 /// thread (`tokio::task::spawn_blocking`).
 pub fn client_proof(password: &str, ctx: &AuthContext<'_>) -> Result<ClientProof, CryptoError> {
-    ctx.params.check_bounds(ctx.salt.len())?;
-    let salted = salted_password(password.as_bytes(), ctx.salt, &ctx.params)?;
+    prove(password, ctx.salt, &ctx.params, &ctx.auth_message())
+}
+
+/// Client side: prove knowledge of the *current* password for a change to
+/// `ctx.new_credential` (derive that from the new password first, with
+/// [`StoredCredential::derive`]). The returned proof's server signature is
+/// the one an honest server answers a successful change with.
+///
+/// Refuses, before running Argon2, current parameters outside the client
+/// bounds and a new credential that fails
+/// [`StoredCredential::check_acceptable`]. Runs Argon2 (blocking).
+pub fn password_change_proof(
+    current_password: &str,
+    ctx: &PasswordChangeContext<'_>,
+) -> Result<ClientProof, CryptoError> {
+    ctx.new_credential.check_acceptable()?;
+    let current = &ctx.current;
+    prove(
+        current_password,
+        current.salt,
+        &current.params,
+        &ctx.change_message(),
+    )
+}
+
+/// `ClientKey XOR HMAC(StoredKey, message)` for `password`, plus the
+/// ServerSignature an honest server answers with. Checks the KDF bounds
+/// before running Argon2.
+fn prove(
+    password: &str,
+    salt: &[u8],
+    params: &KdfParams,
+    message: &[u8],
+) -> Result<ClientProof, CryptoError> {
+    params.check_bounds(salt.len())?;
+    let salted = salted_password(password.as_bytes(), salt, params)?;
     let keys = Keys::from_salted_password(&salted);
-    let auth_message = ctx.auth_message();
-    let client_signature = Zeroizing::new(hmac(&keys.stored_key, &auth_message));
+    let client_signature = Zeroizing::new(hmac(&keys.stored_key, message));
     let mut proof = [0u8; 32];
     for (i, byte) in proof.iter_mut().enumerate() {
         *byte = keys.client_key[i] ^ client_signature[i];
     }
     Ok(ClientProof {
         proof,
-        server_signature: hmac(&keys.server_key, &auth_message),
+        server_signature: hmac(&keys.server_key, message),
     })
 }
 
@@ -239,18 +331,67 @@ impl StoredCredential {
             params: self.params,
             channel_binding,
         };
-        let auth_message = ctx.auth_message();
-        let client_signature = Zeroizing::new(hmac(&self.stored_key, &auth_message));
+        self.verify(&ctx.auth_message(), proof)
+    }
+
+    /// Server side: check a password-change proof made against this (the
+    /// account's current) credential for replacing it with `new` — like
+    /// [`StoredCredential::verify_proof`], but over the ChangeMessage.
+    /// Returns the `ServerSignature` (current ServerKey) on success. A login
+    /// proof never verifies here, nor does a change proof made for any other
+    /// new credential. Validate `new` with
+    /// [`StoredCredential::check_acceptable`] before storing it.
+    pub fn verify_password_change_proof(
+        &self,
+        username: &str,
+        challenge: &[u8; 32],
+        channel_binding: &[u8; CHANNEL_BINDING_LEN],
+        new: &StoredCredential,
+        proof: &[u8; 32],
+    ) -> Option<[u8; 32]> {
+        let ctx = PasswordChangeContext {
+            current: AuthContext {
+                username,
+                challenge,
+                salt: &self.salt,
+                params: self.params,
+                channel_binding,
+            },
+            new_credential: new,
+        };
+        self.verify(&ctx.change_message(), proof)
+    }
+
+    /// Recover `ClientKey = proof XOR HMAC(StoredKey, message)` and accept
+    /// iff `SHA-256(ClientKey) == StoredKey` (constant time); the answer is
+    /// `HMAC(ServerKey, message)`.
+    fn verify(&self, message: &[u8], proof: &[u8; 32]) -> Option<[u8; 32]> {
+        let client_signature = Zeroizing::new(hmac(&self.stored_key, message));
         let mut client_key = Zeroizing::new([0u8; 32]);
         for (i, byte) in client_key.iter_mut().enumerate() {
             *byte = proof[i] ^ client_signature[i];
         }
         let candidate: [u8; 32] = Sha256::digest(client_key.as_ref()).into();
         if bool::from(candidate.ct_eq(&self.stored_key)) {
-            Some(hmac(&self.server_key, &auth_message))
+            Some(hmac(&self.server_key, message))
         } else {
             None
         }
+    }
+
+    /// Whether a credential that came from a client (a password change, an
+    /// admin's reset, a new account) is fit to store: salt length and KDF
+    /// parameters within the client bounds ([`KdfParams::check_bounds`] —
+    /// no client would ever log in against anything outside them) and
+    /// non-zero keys (key lengths are fixed by the type). The password
+    /// behind it can't be checked here; password policy is the deriving
+    /// client's job.
+    pub fn check_acceptable(&self) -> Result<(), CryptoError> {
+        self.params.check_bounds(self.salt.len())?;
+        if self.stored_key == [0u8; 32] || self.server_key == [0u8; 32] {
+            return Err(CryptoError::UnacceptableKdf("credential key is all zeros"));
+        }
+        Ok(())
     }
 
     /// Direct password check (no challenge): re-derive and compare StoredKey
@@ -384,6 +525,12 @@ fn hmac(key: &[u8], message: &[u8]) -> [u8; 32] {
 fn put_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
     out.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
     out.extend_from_slice(bytes);
+}
+
+fn put_params(out: &mut Vec<u8>, params: &KdfParams) {
+    out.extend_from_slice(&params.m_cost.to_be_bytes());
+    out.extend_from_slice(&params.t_cost.to_be_bytes());
+    out.extend_from_slice(&params.p_cost.to_be_bytes());
 }
 
 fn to_hex(bytes: &[u8]) -> String {
@@ -621,6 +768,153 @@ mod tests {
         assert_ne!(a, decoy_salt(&secret_a, "somebody"));
         // Not the protocol-v1 predictable SHA-256(username) prefix.
         assert_ne!(a[..], Sha256::digest(b"nobody")[..SALT_LEN]);
+    }
+
+    fn change_ctx<'a>(
+        current: &'a StoredCredential,
+        challenge: &'a [u8; 32],
+        binding: &'a [u8; 32],
+        new: &'a StoredCredential,
+    ) -> PasswordChangeContext<'a> {
+        PasswordChangeContext {
+            current: ctx(current, challenge, binding),
+            new_credential: new,
+        }
+    }
+
+    #[test]
+    fn password_change_proof_verifies_and_signs() {
+        let current = StoredCredential::derive("open sesame").unwrap();
+        let new = StoredCredential::derive("open barley").unwrap();
+        let challenge = generate_challenge();
+        let client = password_change_proof(
+            "open sesame",
+            &change_ctx(&current, &challenge, &BINDING_A, &new),
+        )
+        .unwrap();
+        let signature = current
+            .verify_password_change_proof(USER, &challenge, &BINDING_A, &new, &client.proof)
+            .expect("change proof verifies");
+        assert!(client.verify_server_signature(&signature));
+        // The new credential works for the new password only.
+        assert!(new.matches_password("open barley").unwrap());
+        assert!(!new.matches_password("open sesame").unwrap());
+    }
+
+    #[test]
+    fn password_change_proof_needs_the_current_password() {
+        let current = StoredCredential::derive("open sesame").unwrap();
+        let new = StoredCredential::derive("open barley").unwrap();
+        let challenge = generate_challenge();
+        // Proving with the NEW password (or any other) is not enough.
+        for guess in ["open barley", "open salami"] {
+            let client =
+                password_change_proof(guess, &change_ctx(&current, &challenge, &BINDING_A, &new))
+                    .unwrap();
+            assert!(current
+                .verify_password_change_proof(USER, &challenge, &BINDING_A, &new, &client.proof)
+                .is_none());
+        }
+    }
+
+    #[test]
+    fn login_and_change_proofs_are_not_interchangeable() {
+        let current = StoredCredential::derive("open sesame").unwrap();
+        let new = StoredCredential::derive("open barley").unwrap();
+        let challenge = generate_challenge();
+
+        // A login proof (same challenge, same channel) is no change proof...
+        let login = client_proof("open sesame", &ctx(&current, &challenge, &BINDING_A)).unwrap();
+        assert!(current
+            .verify_proof(USER, &challenge, &BINDING_A, &login.proof)
+            .is_some());
+        assert!(current
+            .verify_password_change_proof(USER, &challenge, &BINDING_A, &new, &login.proof)
+            .is_none());
+
+        // ...and a change proof is no login proof.
+        let change = password_change_proof(
+            "open sesame",
+            &change_ctx(&current, &challenge, &BINDING_A, &new),
+        )
+        .unwrap();
+        assert!(current
+            .verify_proof(USER, &challenge, &BINDING_A, &change.proof)
+            .is_none());
+        // Different labels, so the messages differ even with every field equal.
+        let auth_message = ctx(&current, &challenge, &BINDING_A).auth_message();
+        let change_message = change_ctx(&current, &challenge, &BINDING_A, &new).change_message();
+        assert!(!change_message.starts_with(&auth_message[..12]));
+    }
+
+    #[test]
+    fn change_proof_is_bound_to_the_new_credential_channel_and_challenge() {
+        let current = StoredCredential::derive("open sesame").unwrap();
+        let new = StoredCredential::derive("open barley").unwrap();
+        let swapped = StoredCredential::derive("attacker's choice").unwrap();
+        let challenge = generate_challenge();
+        let client = password_change_proof(
+            "open sesame",
+            &change_ctx(&current, &challenge, &BINDING_A, &new),
+        )
+        .unwrap();
+        // Someone who swaps in their own credential can't reuse the proof.
+        assert!(current
+            .verify_password_change_proof(USER, &challenge, &BINDING_A, &swapped, &client.proof)
+            .is_none());
+        // Nor relay it to another TLS session, another challenge or account.
+        assert!(current
+            .verify_password_change_proof(USER, &challenge, &BINDING_B, &new, &client.proof)
+            .is_none());
+        assert!(current
+            .verify_password_change_proof(
+                USER,
+                &generate_challenge(),
+                &BINDING_A,
+                &new,
+                &client.proof
+            )
+            .is_none());
+        assert!(current
+            .verify_password_change_proof("someone-else", &challenge, &BINDING_A, &new, &client.proof)
+            .is_none());
+    }
+
+    #[test]
+    fn unacceptable_new_credentials_are_refused() {
+        let good = StoredCredential::derive("pw").unwrap();
+        good.check_acceptable().unwrap();
+        let tweak = |f: &dyn Fn(&mut StoredCredential)| {
+            let mut c = good.clone();
+            f(&mut c);
+            c
+        };
+        let bad = [
+            tweak(&|c| c.params.m_cost = 8),
+            tweak(&|c| c.params.t_cost = 1),
+            tweak(&|c| c.params.p_cost = 0),
+            tweak(&|c| c.params.m_cost = u32::MAX),
+            tweak(&|c| c.salt = vec![1; 8]),
+            tweak(&|c| c.salt = vec![1; 65]),
+            tweak(&|c| c.stored_key = [0; 32]),
+            tweak(&|c| c.server_key = [0; 32]),
+        ];
+        let current = StoredCredential::derive("open sesame").unwrap();
+        let challenge = generate_challenge();
+        for new in &bad {
+            assert!(
+                matches!(new.check_acceptable(), Err(CryptoError::UnacceptableKdf(_))),
+                "{new:?} accepted"
+            );
+            // The client refuses to authorize one too.
+            assert!(matches!(
+                password_change_proof(
+                    "open sesame",
+                    &change_ctx(&current, &challenge, &BINDING_A, new)
+                ),
+                Err(CryptoError::UnacceptableKdf(_))
+            ));
+        }
     }
 
     #[test]

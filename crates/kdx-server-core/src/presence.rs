@@ -85,6 +85,14 @@ pub enum PresenceCommand {
         reason: String,
         reply: oneshot::Sender<usize>,
     },
+    /// [`PresenceCommand::Disconnect`] for every connection of `username`
+    /// except session `except` (the caller's own, after a password change).
+    DisconnectOthers {
+        username: String,
+        except: Uuid,
+        reason: String,
+        reply: oneshot::Sender<usize>,
+    },
     /// Push an outbound frame to literally every connected session, regardless
     /// of username. Replies with the number of sessions it reached.
     BroadcastAll {
@@ -306,6 +314,26 @@ impl Presence {
         rx.await.unwrap_or(0)
     }
 
+    /// Like [`Presence::disconnect`], but spares session `except` — after a
+    /// password change, every *other* session of the account is signed out.
+    pub async fn disconnect_others(&self, username: &str, except: Uuid, reason: &str) -> usize {
+        let (reply, rx) = oneshot::channel();
+        if self
+            .tx
+            .send(PresenceCommand::DisconnectOthers {
+                username: username.to_owned(),
+                except,
+                reason: reason.to_owned(),
+                reply,
+            })
+            .await
+            .is_err()
+        {
+            return 0;
+        }
+        rx.await.unwrap_or(0)
+    }
+
     /// Push `outbound` to literally every connected session. Returns the
     /// number of sessions reached.
     pub async fn broadcast_all(&self, outbound: Outbound) -> usize {
@@ -457,6 +485,17 @@ fn handle(roster: &mut Roster, command: PresenceCommand) {
             remove(entries, dead);
             let _ = reply.send(reached);
         }
+        PresenceCommand::DisconnectOthers {
+            username,
+            except,
+            reason,
+            reply,
+        } => {
+            let (reached, dead) =
+                kill_where_id(entries, &reason, |id, e| *id != except && e.username == username);
+            remove(entries, dead);
+            let _ = reply.send(reached);
+        }
         PresenceCommand::BroadcastAll { outbound, reply } => {
             let (reached, dead) = try_send_where(entries, &outbound, |_| true);
             remove(entries, dead);
@@ -502,6 +541,24 @@ fn kill_where(
     for (session_id, entry) in entries.iter().filter(|(_, e)| filter(e)) {
         // Fails only when the receiver (the connection's dispatch loop) is
         // gone.
+        if entry.kill.send(Some(reason.to_owned())).is_ok() {
+            reached += 1;
+        } else {
+            dead.push(*session_id);
+        }
+    }
+    (reached, dead)
+}
+
+/// [`kill_where`] with a filter that also sees each session's id.
+fn kill_where_id(
+    entries: &HashMap<Uuid, Entry>,
+    reason: &str,
+    filter: impl Fn(&Uuid, &Entry) -> bool,
+) -> (usize, Vec<Uuid>) {
+    let mut reached = 0;
+    let mut dead = Vec::new();
+    for (session_id, entry) in entries.iter().filter(|(id, e)| filter(id, e)) {
         if entry.kill.send(Some(reason.to_owned())).is_ok() {
             reached += 1;
         } else {
@@ -583,6 +640,7 @@ pub fn unix_now() -> u64 {
 mod tests {
     use super::*;
     use bytes::Bytes;
+    use futures_util::FutureExt;
     use tokio::sync::mpsc::channel;
 
     fn member_channel() -> (mpsc::Sender<Outbound>, mpsc::Receiver<Outbound>) {
@@ -738,6 +796,27 @@ mod tests {
             .await
             .expect("the late joiner must be told to go");
         assert_eq!(fired.as_deref(), Some("server is shutting down"));
+    }
+
+    #[tokio::test]
+    async fn disconnect_others_spares_the_given_session() {
+        let presence = Presence::spawn();
+        let me = Uuid::new_v4();
+        let (tx_a, _rx_a) = member_channel();
+        let mut mine = join(&presence, me, "phraq", 1, "a", tx_a).await;
+        let (tx_b, _rx_b) = member_channel();
+        let mut other = join(&presence, Uuid::new_v4(), "phraq", 1, "b", tx_b).await;
+        let (tx_c, _rx_c) = member_channel();
+        let mut stranger = join(&presence, Uuid::new_v4(), "bob", 1, "c", tx_c).await;
+
+        let reached = presence
+            .disconnect_others("phraq", me, "your password was changed")
+            .await;
+        assert_eq!(reached, 1);
+        assert_eq!(other.fired().await.as_deref(), Some("your password was changed"));
+        // The kill is sent before the reply, so an unfired signal stays so.
+        assert!(mine.fired().now_or_never().is_none());
+        assert!(stranger.fired().now_or_never().is_none());
     }
 
     #[tokio::test]

@@ -166,6 +166,17 @@ fn news_post(id: u8, parent: u8) -> NewsPost {
     }
 }
 
+fn credential(salt_len: usize) -> Credential {
+    Credential {
+        m_cost: 19_456,
+        t_cost: 2,
+        p_cost: 1,
+        salt: vec![3; salt_len],
+        stored_key: [4; 32],
+        server_key: [5; 32],
+    }
+}
+
 fn role(name: &str) -> RoleInfo {
     RoleInfo {
         id: [7; 16],
@@ -184,13 +195,29 @@ fn cases() -> Vec<(&'static str, Vec<Bytes>, Probe)> {
             "AccountCreate",
             vec![AccountCreate {
                 username: "acidburn".into(),
-                password: "hacktheplanet".into(),
+                credential: credential(16),
                 base_class: 2,
                 granted: 8,
                 revoked: 64,
             }
             .encode()],
             canonical!(AccountCreate),
+        ),
+        (
+            "AccountSetPassword",
+            vec![
+                AccountSetPassword {
+                    username: "phraq".into(),
+                    credential: credential(16),
+                }
+                .encode(),
+                AccountSetPassword {
+                    username: String::new(),
+                    credential: credential(0),
+                }
+                .encode(),
+            ],
+            canonical!(AccountSetPassword),
         ),
         (
             "AccountUpdate",
@@ -431,6 +458,51 @@ fn cases() -> Vec<(&'static str, Vec<Bytes>, Probe)> {
                 Bytes::from(b)
             }],
             decode_only!(AuthResult),
+        ),
+        // ---- auth.rs: password change (canonical)
+        (
+            "PasswordChangeBegin",
+            vec![PasswordChangeBegin.encode()],
+            canonical!(PasswordChangeBegin),
+        ),
+        (
+            "PasswordChangeChallenge",
+            vec![PasswordChangeChallenge {
+                challenge: [7; 32],
+                salt: vec![3; 16],
+                m_cost: 19_456,
+                t_cost: 2,
+                p_cost: 1,
+            }
+            .encode()],
+            canonical!(PasswordChangeChallenge),
+        ),
+        (
+            "PasswordChangeProof",
+            vec![PasswordChangeProof {
+                proof: [9; 32],
+                credential: credential(16),
+            }
+            .encode()],
+            canonical!(PasswordChangeProof),
+        ),
+        (
+            "PasswordChangeResult",
+            vec![
+                PasswordChangeResult {
+                    success: true,
+                    message: "password changed".into(),
+                    server_signature: [6; 32],
+                }
+                .encode(),
+                PasswordChangeResult {
+                    success: false,
+                    message: String::new(),
+                    server_signature: [0; 32],
+                }
+                .encode(),
+            ],
+            canonical!(PasswordChangeResult),
         ),
         // ---- handshake.rs (decode only)
         (

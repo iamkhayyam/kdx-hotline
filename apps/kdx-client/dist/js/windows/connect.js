@@ -1,7 +1,8 @@
 import { invoke, emitUi, noteGeneration } from "../bridge.js";
-import { update, getState } from "../store.js";
+import { update, getState, subscribe } from "../store.js";
 import { esc, num, errorText } from "../html.js";
 import { canAutoSubmit } from "../bookmarks.js";
+import { MIN_PASSWORD_LENGTH, changePasswordProblem } from "../passwords.js";
 
 const CLASSES = ["guest", "user", "power user", "admin"];
 // Characters of a CHANGED server key the user must type back before it
@@ -34,6 +35,23 @@ export function buildConnect() {
     <p class="note">Challenge-response over TLS. <b>Your password never leaves this machine</b> — the server sends a one-time challenge and gets back only a keyed digest.</p>
     <div class="status" id="c-status"></div>
     <div id="c-tofu"></div>
+    <div class="pw-change hidden" id="c-account">
+      <button class="btn full" type="button" id="c-pw-open">Change Password…</button>
+      <form class="pw-form hidden" id="c-pw-form">
+        <div class="field"><label for="c-pw-current">Current password</label>
+          <input id="c-pw-current" type="password" autocomplete="current-password" /></div>
+        <div class="field"><label for="c-pw-new">New password</label>
+          <input id="c-pw-new" type="password" autocomplete="new-password" /></div>
+        <div class="field"><label for="c-pw-confirm">Confirm new password</label>
+          <input id="c-pw-confirm" type="password" autocomplete="new-password" /></div>
+        <div class="pw-actions">
+          <button class="btn" type="submit" id="c-pw-save">Change</button>
+          <button class="btn" type="button" id="c-pw-cancel">Cancel</button>
+        </div>
+        <p class="note">At least ${num(MIN_PASSWORD_LENGTH)} characters. <b>Neither password leaves this machine</b> — you prove the current one with a fresh challenge-response, and the server gets only a credential derived from the new one. Your other sessions on this server are signed out.</p>
+      </form>
+      <div class="status" id="c-pw-status"></div>
+    </div>
   `;
 
   const $ = (id) => body.querySelector(id);
@@ -200,6 +218,74 @@ export function buildConnect() {
   go.addEventListener("click", attempt);
   passEl.addEventListener("keydown", (e) => {
     if (e.key === "Enter") attempt();
+  });
+
+  // ---- Change Password (the logged-in account's own) ----
+  const account = $("#c-account");
+  const pwOpen = $("#c-pw-open");
+  const pwForm = $("#c-pw-form");
+  const pwSave = $("#c-pw-save");
+  const pwStatus = $("#c-pw-status");
+  const pwCurrent = $("#c-pw-current");
+  const pwNew = $("#c-pw-new");
+  const pwConfirm = $("#c-pw-confirm");
+
+  function setPwStatus(msg, cls) {
+    pwStatus.textContent = msg;
+    pwStatus.className = "status " + (cls || "");
+  }
+
+  function closePwForm() {
+    pwCurrent.value = "";
+    pwNew.value = "";
+    pwConfirm.value = "";
+    pwForm.classList.add("hidden");
+    pwOpen.classList.remove("hidden");
+  }
+
+  // Offered only while logged in; logging out (or being dropped) closes it.
+  function syncAccount(s) {
+    const loggedIn = s.connection === "online" && !!s.session;
+    account.classList.toggle("hidden", !loggedIn);
+    if (!loggedIn && !pwForm.classList.contains("hidden")) {
+      closePwForm();
+      setPwStatus("");
+    }
+  }
+  subscribe(syncAccount);
+  syncAccount(getState());
+
+  pwOpen.addEventListener("click", () => {
+    pwOpen.classList.add("hidden");
+    pwForm.classList.remove("hidden");
+    setPwStatus("");
+    pwCurrent.focus();
+  });
+  $("#c-pw-cancel").addEventListener("click", () => {
+    closePwForm();
+    setPwStatus("");
+  });
+  pwForm.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const current = pwCurrent.value;
+    const next = pwNew.value;
+    const problem = changePasswordProblem(current, next, pwConfirm.value);
+    if (problem) {
+      setPwStatus(problem, "err");
+      return;
+    }
+    pwSave.disabled = true;
+    setPwStatus("changing password…");
+    try {
+      const message = await invoke("change_password", { currentPassword: current, newPassword: next });
+      closePwForm();
+      setPwStatus(`${message}. Update any password saved for this server in the Address Book.`, "ok");
+    } catch (err) {
+      pwCurrent.value = "";
+      setPwStatus(errorText(err), "err");
+    } finally {
+      pwSave.disabled = false;
+    }
   });
 
   function askForPassword() {

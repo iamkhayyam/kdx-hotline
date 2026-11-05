@@ -7,6 +7,7 @@ pub mod roles;
 pub use classes::{effective_privileges, BaseClass, Privileges};
 pub use limiter::LoginLimiter;
 pub use manager::{
-    AuthError, AuthManager, ChallengeData, PendingAuth, Session, SessionGuard, Verified,
+    AuthError, AuthManager, ChallengeData, CredentialStamp, PendingAuth, PendingPasswordChange,
+    Session, SessionGuard, Verified, PASSWORD_CHANGE_TIMEOUT,
 };
 pub use roles::{BanRecord, BanRemoval, Role, RoleError, RoleManager};

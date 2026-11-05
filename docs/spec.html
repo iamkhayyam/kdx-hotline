@@ -108,6 +108,7 @@
   h1 { font-family: var(--mono); font-size: 30px; letter-spacing: .04em; color: var(--ink-bright); margin: 4px 0 10px; text-wrap: balance; }
   h2 { font-family: var(--mono); font-size: 21px; color: var(--green); margin: 2px 0 8px; letter-spacing: .02em; text-wrap: balance; }
   h3 { font-family: var(--mono); font-size: 14px; color: var(--amber); letter-spacing: .06em; text-transform: uppercase; margin: 22px 0 8px; }
+  h4 { font-family: var(--mono); font-size: 12px; color: var(--amber); letter-spacing: .04em; margin: 18px 0 6px; }
   p { margin: 10px 0; max-width: 70ch; }
   a.inline { color: var(--green); }
   strong { color: var(--ink-bright); font-weight: 600; }
@@ -289,7 +290,7 @@
         </div>
         <div class="row">
           <div class="off">5</div>
-          <div class="fld"><span class="nm">type</span> <span class="sz">1 byte</span><br>Packet opcode — one of 76 defined values. See <a class="inline" href="#types">Packet types</a>.</div>
+          <div class="fld"><span class="nm">type</span> <span class="sz">1 byte</span><br>Packet opcode — one of 89 defined values. See <a class="inline" href="#types">Packet types</a>.</div>
         </div>
         <div class="row">
           <div class="off">6–7</div>
@@ -335,7 +336,7 @@
     <section id="types">
       <div class="eyebrow">Protocol</div>
       <h2>Packet types</h2>
-      <p>Opcodes occupy a single byte (0x00–0xFF). The 84 defined values are grouped into functional ranges. Unknown opcodes are connection-fatal.</p>
+      <p>Opcodes occupy a single byte (0x00–0xFF). The 89 defined values are grouped into functional ranges. Unknown opcodes are connection-fatal.</p>
 
       <div class="tbl-wrap">
         <table>
@@ -349,9 +350,9 @@
               <td><code>HandshakeInit</code> 0x01 &nbsp;·&nbsp; <code>HandshakeResp</code> 0x02 &nbsp;·&nbsp; <code>Ping</code> 0x03 &nbsp;·&nbsp; <code>Pong</code> 0x04 &nbsp;·&nbsp; <code>Disconnect</code> 0x0F</td>
             </tr>
             <tr>
-              <td class="mono">0x10–0x13</td>
+              <td class="mono">0x10–0x17</td>
               <td>Authentication</td>
-              <td><code>AuthRequest</code> 0x10 &nbsp;·&nbsp; <code>AuthChallenge</code> 0x11 &nbsp;·&nbsp; <code>AuthResponse</code> 0x12 &nbsp;·&nbsp; <code>AuthResult</code> 0x13</td>
+              <td><code>AuthRequest</code> 0x10 &nbsp;·&nbsp; <code>AuthChallenge</code> 0x11 &nbsp;·&nbsp; <code>AuthResponse</code> 0x12 &nbsp;·&nbsp; <code>AuthResult</code> 0x13 &nbsp;·&nbsp; <code>PasswordChangeBegin/Challenge/Proof/Result</code> 0x14–0x17</td>
             </tr>
             <tr>
               <td class="mono">0x20–0x2E</td>
@@ -369,9 +370,9 @@
               <td><code>PrivateSend</code> 0x40 &nbsp;·&nbsp; <code>PrivateMessage</code> 0x41 &nbsp;·&nbsp; <code>AdminDisconnect</code> 0x42 &nbsp;·&nbsp; <code>BanListRequest/Response</code> 0x43–0x44 &nbsp;·&nbsp; <code>BanRemove</code> 0x45</td>
             </tr>
             <tr>
-              <td class="mono">0x50–0x5C</td>
+              <td class="mono">0x50–0x5D</td>
               <td>Roles &amp; accounts</td>
-              <td><code>RoleListRequest/Response</code> 0x50–0x51 &nbsp;·&nbsp; <code>RoleCreate/Update/Delete</code> 0x52–0x54 &nbsp;·&nbsp; <code>RoleAssign/Unassign</code> 0x55–0x56 &nbsp;·&nbsp; <code>AccountRolesRequest/Response</code> 0x57–0x58 &nbsp;·&nbsp; <code>AccountCreate/Update</code> 0x59–0x5A &nbsp;·&nbsp; <code>AccountListRequest/Response</code> 0x5B–0x5C</td>
+              <td><code>RoleListRequest/Response</code> 0x50–0x51 &nbsp;·&nbsp; <code>RoleCreate/Update/Delete</code> 0x52–0x54 &nbsp;·&nbsp; <code>RoleAssign/Unassign</code> 0x55–0x56 &nbsp;·&nbsp; <code>AccountRolesRequest/Response</code> 0x57–0x58 &nbsp;·&nbsp; <code>AccountCreate/Update</code> 0x59–0x5A &nbsp;·&nbsp; <code>AccountListRequest/Response</code> 0x5B–0x5C &nbsp;·&nbsp; <code>AccountSetPassword</code> 0x5D</td>
             </tr>
             <tr>
               <td class="mono">0x60–0x68</td>
@@ -493,7 +494,7 @@
     <section id="auth">
       <div class="eyebrow">Security</div>
       <h2>Authentication</h2>
-      <p>KDX uses a four-message <strong>challenge-response handshake</strong> modelled on <strong>SCRAM-SHA-256</strong> (RFC&nbsp;5802), with <strong>Argon2id</strong> in place of PBKDF2 and the proof <strong>bound to the TLS session</strong>. The password never crosses the wire during login. The server stores a salt, the Argon2id parameters and two derived keys — nothing that can be presented as a login. Each login uses a fresh 32-byte challenge from <code>OsRng</code>, and the server must prove it holds the account's credential before the client accepts the result.</p>
+      <p>KDX uses a four-message <strong>challenge-response handshake</strong> modelled on <strong>SCRAM-SHA-256</strong> (RFC&nbsp;5802), with <strong>Argon2id</strong> in place of PBKDF2 and the proof <strong>bound to the TLS session</strong>. No password ever crosses the wire — not to log in, and not to change a password, reset one or create an account (see <em>Password change, reset and new accounts</em>). The server stores a salt, the Argon2id parameters and two derived keys — nothing that can be presented as a login. Each login uses a fresh 32-byte challenge from <code>OsRng</code>, and the server must prove it holds the account's credential before the client accepts the result.</p>
 
       <div class="note amber">
         <span class="lbl">Protocol v2 replaces v1</span>
@@ -642,12 +643,108 @@
         <li><strong>Deadline and ordering.</strong> The whole auth phase, reads and writes, must finish within 60&nbsp;s of the handshake. After <code>AuthChallenge</code> the next frame must be <code>AuthResponse</code>, and anything else is connection-fatal. Outside a challenge round, <code>Ping</code>/<code>Pong</code> keep a login prompt alive.</li>
       </ul>
 
+      <h3>Password change, reset and new accounts</h3>
+      <p>Every credential the server stores is derived <strong>on a client</strong> from a password that never leaves it: a fresh random 16-byte salt, the default Argon2id parameters, and StoredKey/ServerKey exactly as in the key schedule above. The client library runs the Argon2 work on a blocking thread and keeps passwords in memory that is wiped on drop. On the wire a credential is:</p>
+      <div class="tbl-wrap">
+        <table>
+          <thead><tr><th>Field</th><th>Payload</th><th>Server checks before storing</th></tr></thead>
+          <tbody>
+            <tr><td><code>credential</code> (embedded)</td><td class="mono">m_cost:u32 t_cost:u32 p_cost:u32 salt_len:u16 salt stored_key[32] server_key[32]</td><td>Parameters and salt length within the client bounds above (a credential outside them could never be logged into); neither key all zeros. Refused with an <code>Error</code> otherwise.</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h4>Self-service change (logged in)</h4>
+      <div class="seq-diagram">
+        <div class="seq-headers">
+          <div class="seq-h">CLIENT</div>
+          <div class="seq-h mid">wire</div>
+          <div class="seq-h">SERVER</div>
+        </div>
+        <div class="seq-step">
+          <div class="seq-note left"><em>client</em>derive new credential from the new password<br>(in parallel with the request)</div>
+          <div class="seq-mid">
+            <div class="msg-name">PasswordChangeBegin</div>
+            <div class="msg-opcode">0x14</div>
+            <div class="seq-arrow-r"></div>
+            <div class="msg-fields">(empty)</div>
+          </div>
+          <div class="seq-note right"><em>server</em>refuse Guest accounts · limiter check<br>pin challenge · current credential<br>channel_binding (valid 60&nbsp;s)</div>
+        </div>
+        <div class="seq-step">
+          <div class="seq-note left"><em>client</em>check KDF bounds</div>
+          <div class="seq-mid">
+            <div class="msg-name">PasswordChangeChallenge</div>
+            <div class="msg-opcode">0x15</div>
+            <div class="seq-arrow-l"></div>
+            <div class="msg-fields">challenge[32] · m_cost · t_cost<br>p_cost · salt_len · salt (current)</div>
+          </div>
+          <div class="seq-note right"><em>server</em>same layout as AuthChallenge</div>
+        </div>
+        <div class="seq-step">
+          <div class="seq-note left"><em>client</em>proof = ClientKey<sub>current</sub> ⊕<br>HMAC(StoredKey<sub>current</sub>, ChangeMessage)</div>
+          <div class="seq-mid">
+            <div class="msg-name">PasswordChangeProof</div>
+            <div class="msg-opcode">0x16</div>
+            <div class="seq-arrow-r"></div>
+            <div class="msg-fields">proof[32] · new credential</div>
+          </div>
+          <div class="seq-note right"><em>server</em>validate credential · ct_eq proof<br>compare-and-swap store · sign out<br>the account's other sessions</div>
+        </div>
+        <div class="seq-step">
+          <div class="seq-note left"><em>client</em>ct_eq(server_signature, expected)<br>mismatch → fail + disconnect</div>
+          <div class="seq-mid">
+            <div class="msg-name">PasswordChangeResult</div>
+            <div class="msg-opcode">0x17</div>
+            <div class="seq-arrow-l"></div>
+            <div class="msg-fields">success · message<br>server_signature[32]</div>
+          </div>
+          <div class="seq-note right"><em>server</em>HMAC(ServerKey<sub>current</sub>, ChangeMessage)<br>(all zeros on failure)</div>
+        </div>
+      </div>
+      <pre><span class="c">// Same proof as a login, over a message with its own domain label: a login proof never</span>
+<span class="c">// verifies as a change proof or vice versa, and the proof authorizes exactly this new credential.</span>
+<span class="g">ChangeMessage</span>   = "KDX-PWCHANGE-v1" 0x00                       <span class="c">// 16-byte label</span>
+                <span class="a">||</span> len(username) <span class="a">||</span> username                   <span class="c">// the session's account</span>
+                <span class="a">||</span> challenge                                   <span class="c">// from PasswordChangeChallenge</span>
+                <span class="a">||</span> len(salt) <span class="a">||</span> salt <span class="a">||</span> m_cost <span class="a">||</span> t_cost <span class="a">||</span> p_cost  <span class="c">// current credential</span>
+                <span class="a">||</span> channel_binding                             <span class="c">// TLS exporter, as for login</span>
+                <span class="a">||</span> len(new salt) <span class="a">||</span> new salt <span class="a">||</span> new m_cost <span class="a">||</span> new t_cost <span class="a">||</span> new p_cost
+                <span class="a">||</span> new StoredKey <span class="a">||</span> new ServerKey              <span class="c">// 32 + 32 bytes</span></pre>
+      <div class="tbl-wrap">
+        <table>
+          <thead><tr><th>Opcode</th><th>Message</th><th>Payload</th><th>Notes</th></tr></thead>
+          <tbody>
+            <tr><td class="mono">0x14</td><td><code>PasswordChangeBegin</code></td><td class="mono">(empty)</td><td>Answered with <code>PasswordChangeChallenge</code> or <code>Error</code> (Guest class — usually a shared account; source throttled). A new Begin replaces an outstanding challenge.</td></tr>
+            <tr><td class="mono">0x15</td><td><code>PasswordChangeChallenge</code></td><td class="mono">challenge[32] m_cost:u32 t_cost:u32 p_cost:u32 salt_len:u16 salt</td><td>The current credential's salt and parameters. One proof per challenge, within 60&nbsp;s.</td></tr>
+            <tr><td class="mono">0x16</td><td><code>PasswordChangeProof</code></td><td class="mono">proof[32] credential</td><td>Answered with <code>PasswordChangeResult</code>, or <code>Error</code> when there is no live challenge, the credential is unacceptable, or the password was changed meanwhile.</td></tr>
+            <tr><td class="mono">0x17</td><td><code>PasswordChangeResult</code></td><td class="mono">success:u8 message:str server_signature[32]</td><td>Signature keyed with the <em>old</em> ServerKey. <code>success</code> is exactly 0 or 1.</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <ul class="clean">
+        <li><strong>Guessing.</strong> A wrong current password is a failure in the login limiter (same per-IP and per-(IP,&nbsp;account) buckets, so changes and logins share one budget; a throttled source gets an <code>Error</code> at Begin), is audited as <code>password_change_failed</code>, and the third one on a connection drops it with <code>too many failed password attempts</code>. Someone holding an unattended session therefore can't use it to guess the password, and can't change it without knowing it.</li>
+        <li><strong>Atomic.</strong> The new credential replaces exactly the one the challenge was issued for (compare-and-swap); a change or reset that landed in between wins and the proof is refused.</li>
+        <li><strong>Other sessions.</strong> The credential is written first, then every other session of the account is disconnected (<code>your password was changed — please log in again</code>); the session that changed it stays. A login proven with the old password that is still in flight fails at the proof, or is closed as it joins (the same re-check that catches demotions and bans).</li>
+        <li><strong>History.</strong> <code>password_changed</code> (with the peer address) on success.</li>
+      </ul>
+
+      <h4>Administrator reset — <code>AccountSetPassword</code> (0x5D)</h4>
+      <p>Payload <code>username:str credential</code>, derived by the admin's client from the new password. Requires <code>USER_ADMIN</code> and the same rank rules as <code>AccountUpdate</code>: an Admin may reset anyone whose privileges it holds, a delegated (non-Admin) account administrator only strictly lower classes — never a peer or an Admin. Nobody resets their <em>own</em> password this way (that needs the current one: the change flow above). The target's live sessions are disconnected (<code>your password was reset by an administrator</code>), the reset is audited as <code>password_reset</code>, and the reply is the account list (<code>AccountListResponse</code>) or an <code>Error</code>.</p>
+
+      <h4>New accounts — <code>AccountCreate</code> (0x59)</h4>
+      <p>Payload <code>username:str credential base_class:u8 granted:u32 revoked:u32</code>. The creating admin's client derives the credential from the initial password; the server validates and stores it as is. (Protocol v2 drafts carried the initial password itself here; they no longer do.) <code>kdxd useradd</code> derives the credential locally from a password typed on the server's console.</p>
+      <div class="note amber">
+        <span class="lbl">Password policy is client-side</span>
+        The server never sees a password, so it cannot judge one: minimum length and confirmation are enforced by the client (the desktop app asks for 8+ characters, typed twice). A modified client can store a weak password for an account it is allowed to set — its own, or one it administers.
+      </div>
+
       <h3>Security guarantees</h3>
       <div class="sec-guarantees">
         <div class="sec-g">
           <div class="g-tag">NO-PW</div>
-          <span class="g-title">Password never sent at login</span>
-          <span class="g-desc">Not in plaintext, not inside TLS: the client sends only the 32-byte <code>ClientProof</code>. The one exception is an admin's <code>AccountCreate</code>, which carries a new account's initial password inside TLS; the server derives the credential from it on receipt.</span>
+          <span class="g-title">Password never sent</span>
+          <span class="g-desc">Not in plaintext, not inside TLS: at login the client sends only the 32-byte <code>ClientProof</code>. Changing a password sends a proof plus a credential derived locally from the new one; an admin's reset or <code>AccountCreate</code> sends only a credential. The server never handles a password at all.</span>
         </div>
         <div class="sec-g">
           <div class="g-tag">FRESH</div>
@@ -667,7 +764,7 @@
         <div class="sec-g">
           <div class="g-tag">AT-REST</div>
           <span class="g-title">Stolen database ≠ login</span>
-          <span class="g-desc">Servers keep StoredKey and ServerKey, never ClientKey, so a database copy can't log in here, or anywhere else (salts are per-account and per-server). <em>Not</em> protected: offline guessing at Argon2id cost, and a thief holding ServerKey can pass the client's server check.</span>
+          <span class="g-desc">Servers keep StoredKey and ServerKey, never ClientKey, so a database copy can't log in here, or anywhere else (salts are per-account and per-server), nor change a password (that needs ClientKey too). <em>Not</em> protected: offline guessing at Argon2id cost, and a thief holding ServerKey can pass the client's server check for logins and password changes.</span>
         </div>
         <div class="sec-g">
           <div class="g-tag">ENUM</div>
@@ -683,6 +780,11 @@
           <div class="g-tag">LIMIT</div>
           <span class="g-title">Offline guessing by the verifier</span>
           <span class="g-desc"><em>Not</em> protected: any server that receives a proof, including an impostor whose certificate was accepted on first use, can test password guesses offline at one Argon2id run per guess (amortisable across victims if it reuses one salt). The client's KDF floors stop it from lowering that cost. Use a strong, per-server password.</span>
+        </div>
+        <div class="sec-g">
+          <div class="g-tag">CHANGE</div>
+          <span class="g-title">Password change &amp; reset</span>
+          <span class="g-desc">A change needs a fresh, channel-bound proof of the current password (throttled like logins; three wrong ones drop the connection), and signs out the account's other sessions; an admin reset obeys the account-management rank rules and kicks the target. <em>Not</em> protected: password strength (the server never sees the password, so only the client can enforce a policy), and an administrator — or whoever holds an administrator's session — can reset any account it outranks. A change doesn't revoke a database copy taken earlier, which still allows offline guessing of the <em>old</em> password.</span>
         </div>
       </div>
 
@@ -981,7 +1083,7 @@
         <li>Does not phone home on startup, shutdown, or any user action.</li>
         <li>Does not send crash reports or usage statistics to any party.</li>
         <li>Does not require a valid DNS name or a public IP — works on a LAN or Tailnet.</li>
-        <li>Does not store cleartext passwords, and never sends one during login. (An admin's <code>AccountCreate</code> carries a new account's initial password, inside TLS.)</li>
+        <li>Does not store cleartext passwords, and never sends one over the wire — not to log in, change or reset a password, or create an account. Credentials are derived on the client.</li>
         <li>Does not maintain session tokens in any external store — the 16-byte session ID exists only in server RAM for the lifetime of the connection.</li>
       </ul>
     </section>

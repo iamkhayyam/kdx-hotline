@@ -767,6 +767,8 @@ pub async fn list_accounts(state: State<'_, AppState>) -> CmdResult<Vec<AccountS
     with_client(&state, |c| async move { c.list_accounts().await }).await
 }
 
+/// Create an account. Its credential is derived from `password` in
+/// client-core; the password itself never goes to the server.
 #[tauri::command]
 pub async fn create_account(
     state: State<'_, AppState>,
@@ -793,6 +795,35 @@ pub async fn update_account(
 ) -> CmdResult<Vec<AccountSummary>> {
     with_client(&state, |c| async move {
         c.update_account(&username, base_class, granted, revoked).await
+    })
+    .await
+}
+
+/// Reset another account's password (Accounts window). The credential is
+/// derived from `new_password` in client-core; the server never sees it.
+#[tauri::command]
+pub async fn set_account_password(
+    state: State<'_, AppState>,
+    username: String,
+    new_password: String,
+) -> CmdResult<Vec<AccountSummary>> {
+    with_client(&state, |c| async move {
+        c.set_account_password(&username, &new_password).await
+    })
+    .await
+}
+
+/// Change the logged-in account's own password (Connect window). Proves the
+/// current password and sends a credential derived from the new one;
+/// neither password leaves this process. Returns the server's message.
+#[tauri::command]
+pub async fn change_password(
+    state: State<'_, AppState>,
+    current_password: String,
+    new_password: String,
+) -> CmdResult<String> {
+    with_client(&state, |c| async move {
+        c.change_password(&current_password, &new_password).await
     })
     .await
 }

@@ -1,6 +1,7 @@
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
-use super::wire::{get_str, put_str};
+use super::account::Credential;
+use super::wire::{expect_end, get_bool, get_str, put_str};
 use crate::ProtocolError;
 
 /// Client → server: begin authentication for `username`.
@@ -47,6 +48,54 @@ pub struct AuthResult {
     pub success: bool,
     pub session_id: [u8; 16],
     pub class: u8,
+    pub message: String,
+    pub server_signature: [u8; 32],
+}
+
+/// Client → server (logged in): start changing your own password. Empty
+/// payload. Answered with `PasswordChangeChallenge`, or `Error` (guest
+/// account, throttled).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PasswordChangeBegin;
+
+/// Server → client: a fresh challenge plus the salt and Argon2id parameters
+/// of the account's *current* credential, for the proof in
+/// `PasswordChangeProof`. Clients bound the parameters exactly as for a
+/// login. Valid for one proof, until the server's change timeout.
+///
+/// Wire: same layout as `AuthChallenge` — `challenge[32] m_cost:u32
+/// t_cost:u32 p_cost:u32 salt_len:u16 salt`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PasswordChangeChallenge {
+    pub challenge: [u8; 32],
+    pub salt: Vec<u8>,
+    pub m_cost: u32,
+    pub t_cost: u32,
+    pub p_cost: u32,
+}
+
+/// Client → server: proof of the *current* password over the
+/// password-change message (`kdx_crypto::scram`: its own domain label, the
+/// login fields for the current credential, and the whole new credential),
+/// plus the new `credential`, derived locally from the new password. Neither
+/// password is sent. Answered with `PasswordChangeResult`, or `Error` (no
+/// challenge outstanding, unacceptable credential).
+///
+/// Wire: `proof[32] credential`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PasswordChangeProof {
+    pub proof: [u8; 32],
+    pub credential: Credential,
+}
+
+/// Server → client: outcome of a `PasswordChangeProof`. On success the
+/// `server_signature` is `HMAC(ServerKey, ChangeMessage)` under the *old*
+/// credential, which the client must verify; on failure it is all zeros.
+///
+/// Wire: `success:u8 message:str server_signature[32]`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PasswordChangeResult {
+    pub success: bool,
     pub message: String,
     pub server_signature: [u8; 32],
 }
@@ -150,6 +199,95 @@ impl AuthResult {
     }
 }
 
+impl PasswordChangeBegin {
+    pub fn encode(&self) -> Bytes {
+        Bytes::new()
+    }
+
+    pub fn decode(payload: &[u8]) -> Result<Self, ProtocolError> {
+        expect_end(payload, "PasswordChangeBegin")?;
+        Ok(Self)
+    }
+}
+
+impl PasswordChangeChallenge {
+    pub fn encode(&self) -> Bytes {
+        let mut buf = BytesMut::with_capacity(32 + 12 + 2 + self.salt.len());
+        buf.put_slice(&self.challenge);
+        buf.put_u32(self.m_cost);
+        buf.put_u32(self.t_cost);
+        buf.put_u32(self.p_cost);
+        super::wire::put_bytes16(&mut buf, &self.salt);
+        buf.freeze()
+    }
+
+    pub fn decode(mut payload: &[u8]) -> Result<Self, ProtocolError> {
+        if payload.remaining() < 32 + 12 {
+            return Err(ProtocolError::MalformedPayload("PasswordChangeChallenge"));
+        }
+        let mut challenge = [0u8; 32];
+        payload.copy_to_slice(&mut challenge);
+        let m_cost = payload.get_u32();
+        let t_cost = payload.get_u32();
+        let p_cost = payload.get_u32();
+        let salt = super::wire::get_bytes16(&mut payload, "PasswordChangeChallenge")?;
+        expect_end(payload, "PasswordChangeChallenge")?;
+        Ok(Self {
+            challenge,
+            salt,
+            m_cost,
+            t_cost,
+            p_cost,
+        })
+    }
+}
+
+impl PasswordChangeProof {
+    pub fn encode(&self) -> Bytes {
+        let mut buf =
+            BytesMut::with_capacity(32 + Credential::MIN_LEN + self.credential.salt.len());
+        buf.put_slice(&self.proof);
+        self.credential.put(&mut buf);
+        buf.freeze()
+    }
+
+    pub fn decode(mut payload: &[u8]) -> Result<Self, ProtocolError> {
+        if payload.remaining() < 32 {
+            return Err(ProtocolError::MalformedPayload("PasswordChangeProof"));
+        }
+        let mut proof = [0u8; 32];
+        payload.copy_to_slice(&mut proof);
+        let credential = Credential::get(&mut payload, "PasswordChangeProof")?;
+        expect_end(payload, "PasswordChangeProof")?;
+        Ok(Self { proof, credential })
+    }
+}
+
+impl PasswordChangeResult {
+    pub fn encode(&self) -> Bytes {
+        let mut buf = BytesMut::with_capacity(1 + 2 + self.message.len() + 32);
+        buf.put_u8(self.success as u8);
+        put_str(&mut buf, &self.message);
+        buf.put_slice(&self.server_signature);
+        buf.freeze()
+    }
+
+    pub fn decode(mut payload: &[u8]) -> Result<Self, ProtocolError> {
+        let success = get_bool(&mut payload, "PasswordChangeResult")?;
+        let message = get_str(&mut payload, "PasswordChangeResult")?;
+        if payload.remaining() != 32 {
+            return Err(ProtocolError::MalformedPayload("PasswordChangeResult"));
+        }
+        let mut server_signature = [0u8; 32];
+        payload.copy_to_slice(&mut server_signature);
+        Ok(Self {
+            success,
+            message,
+            server_signature,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -206,6 +344,60 @@ mod tests {
         let mut long = bytes.clone();
         long.push(0);
         assert!(AuthResult::decode(&long).is_err());
+    }
+
+    #[test]
+    fn password_change_round_trips() {
+        assert_eq!(
+            PasswordChangeBegin::decode(&PasswordChangeBegin.encode()).unwrap(),
+            PasswordChangeBegin
+        );
+        assert!(PasswordChangeBegin::decode(&[0]).is_err());
+
+        let challenge = PasswordChangeChallenge {
+            challenge: [7u8; 32],
+            salt: vec![3; 16],
+            m_cost: 19456,
+            t_cost: 2,
+            p_cost: 1,
+        };
+        let bytes = challenge.encode();
+        // Same layout as AuthChallenge.
+        let as_login = AuthChallenge::decode(&bytes).unwrap();
+        assert_eq!(as_login.salt, challenge.salt);
+        assert_eq!(PasswordChangeChallenge::decode(&bytes).unwrap(), challenge);
+
+        let proof = PasswordChangeProof {
+            proof: [9u8; 32],
+            credential: Credential {
+                m_cost: 19456,
+                t_cost: 2,
+                p_cost: 1,
+                salt: vec![4; 16],
+                stored_key: [5; 32],
+                server_key: [6; 32],
+            },
+        };
+        let bytes = proof.encode();
+        assert_eq!(PasswordChangeProof::decode(&bytes).unwrap(), proof);
+        for len in 0..bytes.len() {
+            assert!(PasswordChangeProof::decode(&bytes[..len]).is_err());
+        }
+
+        let result = PasswordChangeResult {
+            success: true,
+            message: "password changed".into(),
+            server_signature: [8u8; 32],
+        };
+        let bytes = result.encode();
+        assert_eq!(PasswordChangeResult::decode(&bytes).unwrap(), result);
+        // Canonical flag byte only.
+        let mut odd = bytes.to_vec();
+        odd[0] = 2;
+        assert!(PasswordChangeResult::decode(&odd).is_err());
+        let mut long = bytes.to_vec();
+        long.push(0);
+        assert!(PasswordChangeResult::decode(&long).is_err());
     }
 
     #[test]
