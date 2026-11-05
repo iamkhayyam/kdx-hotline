@@ -253,7 +253,7 @@
 
     <!-- ═══════════════════════════════════════════════════════ OVERVIEW -->
     <section id="overview">
-      <div class="eyebrow">Specification · v1</div>
+      <div class="eyebrow">Specification · protocol v2</div>
       <h1>KDX Technical Specification</h1>
       <p class="lead">Precise definitions for the KDX wire protocol, security model, authentication flow, file-system semantics, transfer engine, and infrastructure posture. All values are sourced directly from the implementation; this document and the code are authoritative together.</p>
 
@@ -493,7 +493,12 @@
     <section id="auth">
       <div class="eyebrow">Security</div>
       <h2>Authentication</h2>
-      <p>KDX uses a four-message <strong>challenge-response handshake</strong>. The server stores only an <strong>Argon2id</strong> PHC string; the plaintext password never crosses the wire, not even inside TLS. Each login issues a fresh 32-byte random challenge from <code>OsRng</code>, so replaying a captured transcript is useless.</p>
+      <p>KDX uses a four-message <strong>challenge-response handshake</strong> modelled on <strong>SCRAM-SHA-256</strong> (RFC&nbsp;5802), with <strong>Argon2id</strong> in place of PBKDF2 and the proof <strong>bound to the TLS session</strong>. The password never crosses the wire during login. The server stores a salt, the Argon2id parameters and two derived keys — nothing that can be presented as a login. Each login uses a fresh 32-byte challenge from <code>OsRng</code>, and the server must prove it holds the account's credential before the client accepts the result.</p>
+
+      <div class="note amber">
+        <span class="lbl">Protocol v2 replaces v1</span>
+        Protocol v1 sent <code>SHA-256(challenge ‖ Argon2id hash)</code> and stored the Argon2id PHC string, so the stored hash was password-equivalent (a database read let anyone log in as any user), and the response was not bound to the TLS channel (a malicious server could relay a victim's login to another server). v2 fixes both. A v1 peer fails the header version check; v1 databases are converted automatically at startup (see <em>Stored credential</em>).
+      </div>
 
       <h3>Handshake sequence</h3>
       <div class="seq-diagram">
@@ -503,99 +508,181 @@
           <div class="seq-h">SERVER</div>
         </div>
         <div class="seq-step">
-          <div class="seq-note left"></div>
+          <div class="seq-note left"><em>client</em>channel_binding = TLS exporter<br>(read once at connect)</div>
           <div class="seq-mid">
             <div class="msg-name">AuthRequest</div>
             <div class="msg-opcode">0x10</div>
             <div class="seq-arrow-r"></div>
             <div class="msg-fields">username</div>
           </div>
-          <div class="seq-note right"><em>server</em>lookup account<br>extract PHC → salt + params</div>
+          <div class="seq-note right"><em>server</em>throttle check · ≤ 64-byte username<br>lookup credential → salt + params<br>(unknown user → decoy salt)</div>
         </div>
         <div class="seq-step">
-          <div class="seq-note left"><em>client</em>receive challenge + KDF params</div>
+          <div class="seq-note left"><em>client</em>check KDF bounds<br>(refuse before running Argon2)</div>
           <div class="seq-mid">
             <div class="msg-name">AuthChallenge</div>
             <div class="msg-opcode">0x11</div>
             <div class="seq-arrow-l"></div>
-            <div class="msg-fields">challenge[32] · m_cost · t_cost<br>p_cost · salt</div>
+            <div class="msg-fields">challenge[32] · m_cost · t_cost<br>p_cost · salt_len · salt</div>
           </div>
-          <div class="seq-note right"><em>server</em>OsRng.fill_bytes(32)</div>
+          <div class="seq-note right"><em>server</em>challenge = OsRng 32 bytes<br>pin username · challenge · salt<br>params · channel_binding</div>
         </div>
         <div class="seq-step">
-          <div class="seq-note left"><em>client</em>verifier = Argon2id(pw, salt, params)<br>response = SHA-256(challenge ‖ verifier)</div>
+          <div class="seq-note left"><em>client</em>SaltedPassword = Argon2id(pw, salt, params)<br>proof = ClientKey ⊕ HMAC(StoredKey, AuthMessage)</div>
           <div class="seq-mid">
             <div class="msg-name">AuthResponse</div>
             <div class="msg-opcode">0x12</div>
             <div class="seq-arrow-r"></div>
-            <div class="msg-fields">response[32]</div>
+            <div class="msg-fields">proof[32]</div>
           </div>
-          <div class="seq-note right"><em>server</em>expected = SHA-256(challenge ‖ stored_verifier)<br>ok = constant_time_eq(expected, response)</div>
+          <div class="seq-note right"><em>server</em>ClientKey = proof ⊕ HMAC(StoredKey, AuthMessage)<br>ok = ct_eq(SHA-256(ClientKey), StoredKey)<br>then ban check · max_users</div>
         </div>
         <div class="seq-step">
-          <div class="seq-note left"><em>client</em>store session_id · proceed as class</div>
+          <div class="seq-note left"><em>client</em>ct_eq(server_signature, expected)<br>mismatch → fail + disconnect<br>else store session_id · class</div>
           <div class="seq-mid">
             <div class="msg-name">AuthResult</div>
             <div class="msg-opcode">0x13</div>
             <div class="seq-arrow-l"></div>
-            <div class="msg-fields">success · session_id[16] · class · message</div>
+            <div class="msg-fields">success · session_id[16] · class<br>message · server_signature[32]</div>
           </div>
-          <div class="seq-note right"></div>
+          <div class="seq-note right"><em>server</em>server_signature =<br>HMAC(ServerKey, AuthMessage)<br>(all zeros on failure)</div>
         </div>
       </div>
+
+      <h3>Message layouts</h3>
+      <p>Big-endian; <code>str</code> is a u16 length followed by UTF-8. Each decoder rejects short or trailing bytes.</p>
+      <div class="tbl-wrap">
+        <table>
+          <thead><tr><th>Opcode</th><th>Message</th><th>Payload</th><th>Notes</th></tr></thead>
+          <tbody>
+            <tr><td class="mono">0x10</td><td><code>AuthRequest</code></td><td class="mono">username:str</td><td>Usernames over 64 bytes are refused without a challenge.</td></tr>
+            <tr><td class="mono">0x11</td><td><code>AuthChallenge</code></td><td class="mono">challenge[32] m_cost:u32 t_cost:u32 p_cost:u32 salt_len:u16 salt</td><td>Exactly <code>46 + salt_len</code> bytes. Wire order puts the parameters before the salt; <code>AuthMessage</code> puts the salt first.</td></tr>
+            <tr><td class="mono">0x12</td><td><code>AuthResponse</code></td><td class="mono">proof[32]</td><td>Exactly 32 bytes: the <code>ClientProof</code>.</td></tr>
+            <tr><td class="mono">0x13</td><td><code>AuthResult</code></td><td class="mono">success:u8 session_id[16] class:u8 message:str server_signature[32]</td><td>Exactly 32 bytes follow <code>message</code>. On failure <code>session_id</code>, <code>class</code> and <code>server_signature</code> are zero. A failure may also answer <code>AuthRequest</code> directly (throttled, over-long username).</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3>Key schedule &amp; proof</h3>
+      <pre><span class="c">// RFC 5802 names. Client: every login. Server: once, when the credential is created.</span>
+<span class="g">SaltedPassword</span>  = Argon2id(password, salt, m_cost, t_cost, p_cost, v=0x13, out_len=32)
+<span class="g">ClientKey</span>       = HMAC-SHA256(SaltedPassword, "Client Key")
+<span class="g">StoredKey</span>       = SHA-256(ClientKey)                           <span class="c">// stored</span>
+<span class="g">ServerKey</span>       = HMAC-SHA256(SaltedPassword, "Server Key")    <span class="c">// stored</span>
+
+<span class="c">// Built byte-for-byte the same by both ends; integers are u32 big-endian.</span>
+<span class="g">AuthMessage</span>     = "KDX-AUTH-v2" 0x00                           <span class="c">// 12-byte label</span>
+                <span class="a">||</span> len(username) <span class="a">||</span> username                   <span class="c">// exactly as sent in AuthRequest</span>
+                <span class="a">||</span> challenge                                   <span class="c">// 32 bytes, from AuthChallenge</span>
+                <span class="a">||</span> len(salt) <span class="a">||</span> salt
+                <span class="a">||</span> m_cost <span class="a">||</span> t_cost <span class="a">||</span> p_cost
+                <span class="a">||</span> channel_binding                             <span class="c">// 32 bytes, TLS exporter</span>
+
+<span class="c">// Client → AuthResponse:</span>
+<span class="g">ClientSignature</span> = HMAC-SHA256(StoredKey, AuthMessage)
+<span class="g">ClientProof</span>     = ClientKey XOR ClientSignature                <span class="c">// 32 bytes</span>
+
+<span class="c">// Server — no Argon2 at login, only HMAC / SHA-256 over the stored keys:</span>
+<span class="g">ClientKey'</span>      = ClientProof XOR HMAC-SHA256(StoredKey, AuthMessage)
+<span class="g">ok</span>              = ct_eq(SHA-256(ClientKey'), StoredKey)        <span class="c">// subtle::ConstantTimeEq</span>
+<span class="g">ServerSignature</span> = HMAC-SHA256(ServerKey, AuthMessage)          <span class="c">// → AuthResult, only if ok</span>
+
+<span class="c">// Client, before reporting success:</span>
+<span class="g">ok</span>              = ct_eq(ServerSignature, HMAC-SHA256(ServerKey, AuthMessage))</pre>
+
+      <h3>Channel binding</h3>
+      <p>Each end reads a 32-byte value (<code>CHANNEL_BINDING_LEN</code>) from its own TLS 1.3 session with the RFC&nbsp;8446 exporter — label <code>EXPORTER-KDX-AUTH-v2</code>, no context — and mixes it into <code>AuthMessage</code>; it is never sent. Both ends of one TLS session get the same value; different sessions get unrelated ones. A malicious server <em>M</em> that relays a victim's login to a real server <em>T</em> sits on two sessions: the victim's proof is computed for the victim↔M value and <em>T</em> checks it against the M↔T value, so it fails — even if the victim accepted <em>M</em>'s certificate under TOFU. <em>M</em> can't fake a success either, because the client demands a <code>ServerSignature</code> only a holder of the account's ServerKey can produce. <code>kdxd</code> drops a connection whose exporter is unavailable, and the client aborts the connect.</p>
 
       <h3>Argon2id parameters</h3>
       <div class="stats">
         <div class="cell"><div class="k">m_cost</div><div class="v">19456 <small>KiB</small></div></div>
         <div class="cell"><div class="k">t_cost</div><div class="v">2 <small>passes</small></div></div>
-        <div class="cell"><div class="k">p_cost</div><div class="v">1 <small>thread</small></div></div>
+        <div class="cell"><div class="k">p_cost</div><div class="v">1 <small>lane</small></div></div>
+        <div class="cell"><div class="k">salt</div><div class="v">16 <small>bytes</small></div></div>
         <div class="cell"><div class="k">out_len</div><div class="v">32 <small>bytes</small></div></div>
         <div class="cell"><div class="k">challenge</div><div class="v">32 <small>bytes</small></div></div>
-        <div class="cell"><div class="k">session_id</div><div class="v">16 <small>bytes</small></div></div>
       </div>
-      <p>Parameters meet <strong>OWASP Argon2id minimum</strong> recommendations (19&thinsp;MiB memory, 2 iterations). Shipped to the client inside <code>AuthChallenge</code> so it can reproduce the exact hash stored on the server — no second round-trip needed.</p>
+      <p>Defaults are the <code>argon2</code> crate's, which meet the <strong>OWASP Argon2id minimum</strong> (19&thinsp;MiB memory, 2 iterations). Every new account and every decoy challenge uses them. The server ships salt and parameters in <code>AuthChallenge</code>, so the client enforces bounds of its own <strong>before running Argon2</strong> (on a blocking thread) and fails the login on anything outside them:</p>
+      <div class="tbl-wrap">
+        <table>
+          <thead><tr><th>Parameter</th><th>Client accepts</th><th>Why</th></tr></thead>
+          <tbody>
+            <tr><td><code>m_cost</code></td><td class="mono">19456 – 262144 KiB</td><td>Floor (19&thinsp;MiB): a malicious server can't make the proof cheap to brute-force. Ceiling (256&thinsp;MiB): it can't exhaust client memory.</td></tr>
+            <tr><td><code>t_cost</code></td><td class="mono">2 – 10</td><td>Same floor rationale; the ceiling bounds login CPU time.</td></tr>
+            <tr><td><code>p_cost</code></td><td class="mono">1 – 4</td><td>Bounds the threads a server can demand.</td></tr>
+            <tr><td>salt length</td><td class="mono">16 – 64 bytes</td><td>Rejects degenerate or oversized salts.</td></tr>
+          </tbody>
+        </table>
+      </div>
 
-      <h3>Stored credential format</h3>
-      <p>The server stores one <strong>PHC string</strong> per account — no separate password column, no separate salt column. Everything needed to verify a future login is encoded inside a single opaque token.</p>
+      <h3>Stored credential</h3>
+      <p>Each account carries one encoded credential in <code>accounts.credential</code> (binary fields in lowercase hex). Neither the password nor SaltedPassword — which would be password-equivalent — is stored. The <code>v=1</code> segment versions this encoding, not the wire protocol.</p>
       <div class="phc-strip">
-        <div class="phc-seg"><span class="phc-val">$argon2id</span><span class="phc-lbl">algorithm</span></div>
-        <div class="phc-seg"><span class="phc-val">$v=19</span><span class="phc-lbl">version</span></div>
+        <div class="phc-seg"><span class="phc-val">$kdx-scram-sha256</span><span class="phc-lbl">scheme</span></div>
+        <div class="phc-seg"><span class="phc-val">$v=1</span><span class="phc-lbl">format version</span></div>
         <div class="phc-seg"><span class="phc-val">$m=19456,t=2,p=1</span><span class="phc-lbl">kdf params</span></div>
-        <div class="phc-seg"><span class="phc-val">$&lt;base64-salt&gt;</span><span class="phc-lbl">salt</span></div>
-        <div class="phc-seg"><span class="phc-val">$&lt;base64-hash&gt;</span><span class="phc-lbl">verifier</span></div>
+        <div class="phc-seg"><span class="phc-val">$&lt;salt hex&gt;</span><span class="phc-lbl">salt</span></div>
+        <div class="phc-seg"><span class="phc-val">$&lt;StoredKey hex&gt;</span><span class="phc-lbl">SHA-256(ClientKey)</span></div>
+        <div class="phc-seg"><span class="phc-val">$&lt;ServerKey hex&gt;</span><span class="phc-lbl">signs AuthResult</span></div>
+      </div>
+      <p>A copy of the database is <strong>not enough to log in</strong>: the proof needs ClientKey, and StoredKey is a one-way hash of it. It does still allow offline password guessing at full Argon2id cost per guess (per-account random salts rule out shared precomputation), and its ServerKeys would let the holder pass the client's server-signature check for those accounts.</p>
+      <p>For an <strong>unknown username</strong> the server issues a decoy challenge: salt <code>HMAC-SHA256(key, "KDX-decoy-salt-v1" 0x00 ‖ username)[..16]</code> with the default parameters, where <code>key</code> is a 32-byte random per-server secret created on first start and kept in the <code>server_secrets</code> table (never sent). The decoy is stable across retries and restarts but unpredictable — v1 used the public <code>SHA-256(username)[..16]</code>. The proof is checked against an all-zero decoy record with the same HMAC/SHA-256 work as a real account and fails as <code>invalid credentials</code>.</p>
+
+      <div class="note amber">
+        <span class="lbl">Upgrading a v1 database</span>
+        Migration <code>0010</code> adds <code>accounts.credential</code> and <code>server_secrets</code>. A v1 PHC string's 32-byte Argon2id output <em>is</em> SaltedPassword, so <code>kdxd</code> converts every legacy row at startup, before accepting connections, with no user action: one <code>UPDATE</code> writes the credential and wipes <code>password_phc</code> to <code>''</code>, then <code>VACUUM</code> and a WAL truncate keep the old hashes from lingering in free pages. A row still unconverted at login is converted on the spot. Rows that can't be converted (not Argon2id v=19, keyed, or not a 32-byte output) are logged and cannot log in.
       </div>
 
-      <h3>Response derivation</h3>
-      <pre><span class="c">// Client:</span>
-<span class="g">verifier</span>  = Argon2id(password, salt, m_cost, t_cost, p_cost, out_len=32)
-<span class="g">response</span>  = SHA-256(challenge <span class="a">||</span> verifier)        <span class="c">// 32 bytes</span>
-
-<span class="c">// Server (never re-derives — reads verifier bytes from stored PHC):</span>
-<span class="g">verifier</span>  = extract hash bytes from PHC
-<span class="g">expected</span>  = SHA-256(challenge <span class="a">||</span> verifier)
-<span class="g">ok</span>        = constant_time_eq(expected, response)   <span class="c">// subtle::ConstantTimeEq</span></pre>
+      <h3>Login limits</h3>
+      <ul class="clean">
+        <li><strong>Throttling.</strong> A server-wide limiter counts failures per source IP (IPv6 grouped by /64, IPv4-mapped addresses as IPv4) and per (IP, username). After 5 free failures for a pair, or 20 for an IP across all usernames, each further failure blocks that key for an exponential backoff: 1&nbsp;s, doubling, capped at 15&nbsp;min. A key with no failures for 15&nbsp;min is forgotten; a success clears only its own pair. There is deliberately no per-account lockout independent of the source address, which would let anyone lock any user out.</li>
+        <li><strong>Early refusals.</strong> A throttled source gets a failed <code>AuthResult</code> ("try again in N s") straight after <code>AuthRequest</code>, without a challenge or a history entry. A username over 64 bytes gets <code>invalid credentials</code> and counts as a failure.</li>
+        <li><strong>Per-connection attempts.</strong> Three failed attempts drop the connection. Wrong passwords, unknown users, banned accounts, early refusals and <code>server is full</code> all count.</li>
+        <li><strong>Bans and capacity</strong> are checked only after the proof verifies, so ban status is never shown to someone who can't authenticate. A banned login still counts as a failure in the limiter. Once <code>max_users</code> is reached, accounts without <code>SERVER_ADMIN</code> are refused.</li>
+        <li><strong>Deadline and ordering.</strong> The whole auth phase, reads and writes, must finish within 60&nbsp;s of the handshake. After <code>AuthChallenge</code> the next frame must be <code>AuthResponse</code>, and anything else is connection-fatal. Outside a challenge round, <code>Ping</code>/<code>Pong</code> keep a login prompt alive.</li>
+      </ul>
 
       <h3>Security guarantees</h3>
       <div class="sec-guarantees">
         <div class="sec-g">
           <div class="g-tag">NO-PW</div>
-          <span class="g-title">Password never on wire</span>
-          <span class="g-desc">Not in plaintext, not inside TLS. The client sends only <code>SHA-256(challenge&thinsp;‖&thinsp;verifier)</code> — this output cannot be reversed to recover the password or the Argon2id verifier.</span>
+          <span class="g-title">Password never sent at login</span>
+          <span class="g-desc">Not in plaintext, not inside TLS: the client sends only the 32-byte <code>ClientProof</code>. The one exception is an admin's <code>AccountCreate</code>, which carries a new account's initial password inside TLS; the server derives the credential from it on receipt.</span>
         </div>
         <div class="sec-g">
           <div class="g-tag">FRESH</div>
           <span class="g-title">Replay resistance</span>
-          <span class="g-desc">Every login issues a new 32-byte challenge from <code>OsRng</code>. A captured <code>AuthResponse</code> is worthless against any subsequent challenge — the response is bound to a single session by construction.</span>
+          <span class="g-desc">Every login uses a new 32-byte challenge from <code>OsRng</code>, and the proof covers the username, challenge, salt, parameters and TLS session. A captured <code>AuthResponse</code> is useless for any other login.</span>
+        </div>
+        <div class="sec-g">
+          <div class="g-tag">BIND</div>
+          <span class="g-title">Relay / MITM resistance</span>
+          <span class="g-desc">The proof is bound to the TLS exporter value of the session it was computed on. A server that forwards it over its own connection to another server fails verification, even if the user accepted the relaying server's certificate under TOFU.</span>
+        </div>
+        <div class="sec-g">
+          <div class="g-tag">MUTUAL</div>
+          <span class="g-title">Server proves itself</span>
+          <span class="g-desc">The client accepts a successful <code>AuthResult</code> only after sending its proof, and only if <code>server_signature</code> matches (constant time). A phishing server or relay without the account's ServerKey can't produce it; the client fails the login and drops the connection.</span>
+        </div>
+        <div class="sec-g">
+          <div class="g-tag">AT-REST</div>
+          <span class="g-title">Stolen database ≠ login</span>
+          <span class="g-desc">Servers keep StoredKey and ServerKey, never ClientKey, so a database copy can't log in here, or anywhere else (salts are per-account and per-server). <em>Not</em> protected: offline guessing at Argon2id cost, and a thief holding ServerKey can pass the client's server check.</span>
+        </div>
+        <div class="sec-g">
+          <div class="g-tag">ENUM</div>
+          <span class="g-title">Username enumeration</span>
+          <span class="g-desc">Unknown users get a stable, unpredictable decoy challenge (16-byte keyed salt, default parameters) and the same <code>invalid credentials</code>. Bans are revealed only after a valid proof. Accounts whose credential uses non-default parameters remain distinguishable.</span>
         </div>
         <div class="sec-g">
           <div class="g-tag">CT-EQ</div>
           <span class="g-title">Timing-attack resistance</span>
-          <span class="g-desc">The final comparison uses <code>subtle::ConstantTimeEq</code>. Verification time is identical whether the response is correct or wrong, closing side-channel inference on the stored verifier.</span>
+          <span class="g-desc">The server's StoredKey comparison and the client's signature check use <code>subtle::ConstantTimeEq</code>. Unknown users run the same HMAC/SHA-256 work against a decoy record, and the server never runs Argon2 during a login.</span>
         </div>
         <div class="sec-g">
-          <div class="g-tag">LOCAL</div>
-          <span class="g-title">Credential isolation</span>
-          <span class="g-desc">No shared identity provider. Each KDX server holds its own PHC strings in local SQLite. A breach of one server does not expose credentials on any other server.</span>
+          <div class="g-tag">LIMIT</div>
+          <span class="g-title">Offline guessing by the verifier</span>
+          <span class="g-desc"><em>Not</em> protected: any server that receives a proof, including an impostor whose certificate was accepted on first use, can test password guesses offline at one Argon2id run per guess (amortisable across victims if it reuses one salt). The client's KDF floors stop it from lowering that cost. Use a strong, per-server password.</span>
         </div>
       </div>
 
@@ -829,7 +916,7 @@
         </div>
         <div class="card">
           <h3>No platform identity</h3>
-          <p>Users authenticate with a username and password stored in the server's own SQLite database, hashed with Argon2id. There is no OAuth, no "sign in with X", no token from an external identity provider.</p>
+          <p>Users authenticate with a username and password, checked against an Argon2id-derived credential in the server's own SQLite database (the password itself is never stored). There is no OAuth, no "sign in with X", no token from an external identity provider.</p>
         </div>
         <div class="card">
           <h3>Server-side permissions</h3>
@@ -844,7 +931,7 @@
       <h3>Operator data responsibility</h3>
       <p>Because all data is local, the operator is the sole custodian of user information:</p>
       <ul class="clean">
-        <li>Password hashes (Argon2id PHC strings) are stored only on the server's filesystem.</li>
+        <li>Login credentials (salt, Argon2id parameters, StoredKey, ServerKey — no password or password-equivalent hash) are stored only on the server's filesystem. A copy can't be used to log in, but it does allow offline password guessing at Argon2id cost, so treat the database and its backups as sensitive.</li>
         <li>Chat history is stored in <code>history</code> and <code>news</code> tables — the operator decides the retention policy.</li>
         <li>File uploads live on the server's storage. There is no CDN, no object store, no offsite mirror unless the operator sets one up.</li>
         <li>IP ban records and connection logs are local. No IP is submitted to any external threat-intelligence service.</li>
@@ -860,7 +947,7 @@
         <li>Does not phone home on startup, shutdown, or any user action.</li>
         <li>Does not send crash reports or usage statistics to any party.</li>
         <li>Does not require a valid DNS name or a public IP — works on a LAN or Tailnet.</li>
-        <li>Does not store or transmit cleartext passwords at any point.</li>
+        <li>Does not store cleartext passwords, and never sends one during login. (An admin's <code>AccountCreate</code> carries a new account's initial password, inside TLS.)</li>
         <li>Does not maintain session tokens in any external store — the 16-byte session ID exists only in server RAM for the lifetime of the connection.</li>
       </ul>
     </section>
