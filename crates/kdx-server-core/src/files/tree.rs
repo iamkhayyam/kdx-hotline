@@ -220,17 +220,11 @@ fn check_path(path: &str) -> Result<(), TreeError> {
 /// a foreign-key violation that the parent is gone. Anything else stays a
 /// (generic, logged) storage error.
 fn map_write_err(e: StorageError) -> TreeError {
-    if let StorageError::Sqlx(inner) = &e {
-        if let Some(db) = inner.as_database_error() {
-            if db.is_unique_violation() {
-                return TreeError::Exists;
-            }
-            if db.is_foreign_key_violation() {
-                return TreeError::NotFound;
-            }
-        }
+    match e {
+        StorageError::AlreadyExists => TreeError::Exists,
+        StorageError::ForeignKey => TreeError::NotFound,
+        other => TreeError::Storage(other),
     }
-    TreeError::Storage(e)
 }
 
 /// `acl::check_read` against one folder's own rules.
