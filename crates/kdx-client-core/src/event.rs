@@ -300,14 +300,23 @@ pub enum Event {
     /// `from` has invited you into `room`, a private chat. Accepting is just
     /// an ordinary `join(room)`; ignoring needs no server round-trip.
     ChatInvited { from: String, room: String },
-    /// Progress on an active transfer. `bitmap` is the LSB-first set of
-    /// completed chunks, for the chunk-grid visualization.
+    /// Progress on an active transfer: `done` of `total` chunks complete.
+    /// Throttled to at most ~10 per second per transfer, plus a final one
+    /// when the last chunk lands.
+    ///
+    /// `bitmap` is an LSB-first bitmap of `bitmap_bits` bits for the
+    /// chunk-grid visualization. When `total <= 1024` it maps one bit per
+    /// chunk (`bitmap_bits == total`); for bigger transfers it is
+    /// downsampled to at most 1024 bits, bit `i` covering chunks
+    /// `[i*g, (i+1)*g)` with `g = ceil(total / 1024)`, set only once every
+    /// chunk in that group is done.
     TransferProgress {
         id: String,
         direction: Direction,
         done: u32,
         total: u32,
         bitmap: Vec<u8>,
+        bitmap_bits: u32,
     },
     /// A transfer finished. `status` mirrors the wire TRANSFER_* codes.
     TransferComplete {
@@ -354,12 +363,14 @@ mod tests {
             done: 3,
             total: 8,
             bitmap: vec![0b0000_0111],
+            bitmap_bits: 8,
         };
         let json = serde_json::to_value(&ev).unwrap();
         assert_eq!(json["type"], "transfer_progress");
         assert_eq!(json["direction"], "download");
         assert_eq!(json["done"], 3);
         assert_eq!(json["bitmap"][0], 7);
+        assert_eq!(json["bitmap_bits"], 8);
     }
 
     #[test]

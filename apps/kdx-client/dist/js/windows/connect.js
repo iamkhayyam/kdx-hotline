@@ -1,7 +1,20 @@
-import { invoke, emitUi } from "../bridge.js";
+import { invoke, emitUi, noteGeneration } from "../bridge.js";
 import { update, getState } from "../store.js";
+import { esc, num, errorText } from "../html.js";
+import { canAutoSubmit } from "../bookmarks.js";
 
 const CLASSES = ["guest", "user", "power user", "admin"];
+// Characters of a CHANGED server key the user must type back before it
+// replaces the pinned one (the Rust `trust` command checks the same).
+const KEY_CODE_LEN = 8;
+
+/** What the user must type to accept a changed key: the start of the new
+ * fingerprint's digest (after "sha256:"). */
+function keyChangeCode(fingerprint) {
+  const fp = String(fingerprint || "");
+  const i = fp.indexOf(":");
+  return [...(i === -1 ? fp : fp.slice(i + 1))].slice(0, KEY_CODE_LEN).join("");
+}
 
 export function buildConnect() {
   const body = document.createElement("div");
@@ -27,6 +40,17 @@ export function buildConnect() {
   const status = $("#c-status");
   const tofuBox = $("#c-tofu");
   const go = $("#c-go");
+  const passEl = $("#c-pass");
+
+  // Set when the Address Book filled the form from a bookmark whose password
+  // lives in the OS keychain: an empty password field then means "use the
+  // saved one", which the Rust side reads itself (never via the webview).
+  let bookmarkId = null;
+  const forgetBookmark = () => {
+    bookmarkId = null;
+    passEl.placeholder = "";
+  };
+  for (const id of ["#c-host", "#c-port", "#c-user", "#c-pass"]) $(id).addEventListener("input", forgetBookmark);
 
   // Restore the last server/login the user connected to.
   try {
@@ -41,101 +65,173 @@ export function buildConnect() {
     status.className = "status " + (cls || "");
   }
 
+  function fields() {
+    return {
+      host: $("#c-host").value.trim(),
+      port: parseInt($("#c-port").value.trim(), 10) || 10700,
+      username: $("#c-user").value.trim(),
+      password: passEl.value,
+    };
+  }
+
   async function attempt() {
-    const host = $("#c-host").value.trim();
-    const port = parseInt($("#c-port").value.trim(), 10) || 10700;
-    const username = $("#c-user").value.trim();
-    const password = $("#c-pass").value;
-    tofuBox.innerHTML = "";
+    const { host, port, username, password } = fields();
+    tofuBox.textContent = "";
     go.disabled = true;
     update({ connection: "connecting", server: { host, port } });
     setStatus("connecting…");
 
     try {
-      await invoke("connect", { host, port });
-      await finishLogin(host, port, username, password);
+      const gen = await invoke("connect", { host, port });
+      noteGeneration(gen);
+      await finishLogin(gen, host, port, username, password);
     } catch (err) {
+      update({ connection: "offline" });
       if (err && err.kind === "untrusted_certificate") {
-        update({ connection: "offline" });
-        showTofu(err, host, port, username, password);
+        showTofu(err, host, port);
       } else {
-        update({ connection: "offline" });
-        setStatus(errMsg(err), "err");
+        setStatus(errorText(err), "err");
       }
+    } finally {
       go.disabled = false;
     }
   }
 
-  async function finishLogin(host, port, username, password) {
+  async function finishLogin(gen, host, port, username, password) {
     setStatus("authenticating…");
-    const klass = await invoke("login", { username, password });
+    const useSaved = !password && bookmarkId;
+    const klass = await invoke("login", {
+      username,
+      password,
+      bookmarkId: useSaved ? bookmarkId : null,
+    });
     try {
       localStorage.setItem("kdx.lastServer", JSON.stringify({ host, port, username }));
     } catch (_) {}
     update({ connection: "online", session: { class: klass, username }, server: { host, port } });
     setStatus(`logged in as ${username} (${CLASSES[klass] || "?"})`, "ok");
-    go.disabled = false;
-    await invoke("join_room", { room: getState().room });
+    try {
+      await invoke("join_room", { room: getState().room });
+    } catch (err) {
+      // Logged in all the same: say so, and let the other windows know.
+      setStatus(`logged in as ${username}, but couldn't join the chat: ${errorText(err)}`, "warn");
+    }
     // Tell every other window who we are (they keep their own store), and
     // let the launcher open the chat window + snapshot the roster.
-    emitUi("*", "session", { session: { username, class: klass }, server: { host, port } });
+    emitUi("*", "session", { gen, session: { username, class: klass }, server: { host, port } });
     emitUi("main", "login-success");
   }
 
-  function showTofu(err, host, port, username, password) {
-    const changed = !!err.previous;
+  function showTofu(err, host, port) {
+    if (err.previous) showChangedKey(err, host, port);
+    else showFirstContact(err, host, port);
+  }
+
+  // First contact (TOFU): one click to trust and connect.
+  function showFirstContact(err, host, port) {
     tofuBox.innerHTML = `
       <div class="tofu">
-        <h3>${changed ? "⚠ server key changed" : "unrecognized server"}</h3>
-        <div>${changed
-          ? '<span class="warn">The key for this server changed since you last trusted it. This can mean the server was reinstalled — or an impostor.</span>'
-          : "First time connecting to this server. Verify the fingerprint out-of-band before trusting it."}</div>
-        <div class="fp">${err.fingerprint}</div>
-        ${changed ? `<div>previously: <span class="fp">${err.previous}</span></div>` : ""}
+        <h3>unrecognized server</h3>
+        <div>First time connecting to this server. Verify the fingerprint out-of-band before trusting it.</div>
+        <div class="fp">${esc(err.fingerprint)}</div>
         <div class="actions">
           <button class="btn" id="t-trust">Trust &amp; connect</button>
           <button class="btn" id="t-cancel">Cancel</button>
         </div>
       </div>`;
-    tofuBox.querySelector("#t-cancel").onclick = () => {
-      tofuBox.innerHTML = "";
-      setStatus("cancelled", "err");
-    };
+    tofuBox.querySelector("#t-cancel").onclick = cancelTofu;
     tofuBox.querySelector("#t-trust").onclick = async () => {
       try {
-        await invoke("trust", { host, port, fingerprint: err.fingerprint });
-        tofuBox.innerHTML = "";
-        go.disabled = true;
-        update({ connection: "connecting" });
-        setStatus("connecting…");
-        await invoke("connect", { host, port });
-        await finishLogin(host, port, username, password);
+        await invoke("trust", { host, port });
       } catch (e) {
-        update({ connection: "offline" });
-        setStatus(errMsg(e), "err");
-        go.disabled = false;
+        setStatus(errorText(e), "err");
+        return;
       }
+      tofuBox.textContent = "";
+      attempt();
     };
   }
 
+  // A key that CHANGED since it was pinned is how a man-in-the-middle looks.
+  // No one-click path: show both keys, make the user type part of the new
+  // one, and never log in automatically afterwards.
+  function showChangedKey(err, host, port) {
+    const code = keyChangeCode(err.fingerprint);
+    tofuBox.innerHTML = `
+      <div class="tofu changed">
+        <h3>⚠ server key changed</h3>
+        <div class="warn">The key presented by ${esc(host)}:${num(port)} is not the one you trusted before.
+          This can mean the server was reinstalled — or that someone is intercepting this connection.
+          Don't continue unless the server's operator confirmed the new key to you.</div>
+        <div class="tofu-label">previously trusted</div>
+        <div class="fp old">${esc(err.previous)}</div>
+        <div class="tofu-label">presented now</div>
+        <div class="fp">${esc(err.fingerprint)}</div>
+        <label class="tofu-confirm">To replace the pinned key, type the first ${num(KEY_CODE_LEN)} characters of the new key (after “sha256:”)
+          <input id="t-code" spellcheck="false" autocomplete="off" /></label>
+        <div class="actions">
+          <button class="btn" id="t-replace" disabled>Replace pinned key</button>
+          <button class="btn" id="t-cancel">Cancel</button>
+        </div>
+      </div>`;
+    const input = tofuBox.querySelector("#t-code");
+    const replace = tofuBox.querySelector("#t-replace");
+    input.addEventListener("input", () => {
+      replace.disabled = input.value.trim() !== code;
+    });
+    tofuBox.querySelector("#t-cancel").onclick = cancelTofu;
+    replace.onclick = async () => {
+      try {
+        await invoke("trust", { host, port, confirm: input.value.trim() });
+      } catch (e) {
+        setStatus(errorText(e), "err");
+        return;
+      }
+      tofuBox.textContent = "";
+      setStatus("pinned key replaced — check the details, then Authenticate to connect", "warn");
+    };
+  }
+
+  function cancelTofu() {
+    tofuBox.textContent = "";
+    setStatus("cancelled", "err");
+  }
+
   go.addEventListener("click", attempt);
-  $("#c-pass").addEventListener("keydown", (e) => {
+  passEl.addEventListener("keydown", (e) => {
     if (e.key === "Enter") attempt();
   });
 
-  // Exposed so the Address Book can pre-fill and connect from a bookmark.
+  function askForPassword() {
+    const login = $("#c-user").value.trim();
+    setStatus(login ? `enter the password for ${login}` : "enter the password", "warn");
+    passEl.focus();
+  }
+
+  // Exposed so the Address Book / Trackers can pre-fill (and connect). A
+  // bookmark's password is never sent here — only its id.
   function fill(fields) {
     if (fields.host != null) $("#c-host").value = fields.host;
     if (fields.port != null) $("#c-port").value = fields.port;
     if (fields.login != null) $("#c-user").value = fields.login;
-    if (fields.password != null) $("#c-pass").value = fields.password;
+    passEl.value = "";
+    forgetBookmark();
+    if (fields.bookmarkId && fields.hasSecret) {
+      bookmarkId = String(fields.bookmarkId);
+      passEl.placeholder = "saved in keychain";
+    }
+    if (fields.askPassword) askForPassword();
   }
 
-  return { body, fill, submit: attempt };
-}
+  // An automatic submit (from a bookmark) never sends an empty password
+  // that has no saved one behind it: that login can only fail.
+  function submit() {
+    if (!canAutoSubmit({ password: passEl.value, bookmarkId })) {
+      askForPassword();
+      return;
+    }
+    attempt();
+  }
 
-function errMsg(err) {
-  if (!err) return "unknown error";
-  if (typeof err === "string") return err;
-  return err.message || JSON.stringify(err);
+  return { body, fill, submit };
 }

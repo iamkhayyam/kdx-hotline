@@ -1,0 +1,136 @@
+{
+  "capabilities": [
+    {
+      "identifier": "launcher-commands",
+      "description": "Button Bar: disconnect, the online-count snapshot, and moving legacy plaintext Address Book passwords into the keychain at startup.",
+      "windows": ["main"],
+      "permissions": ["allow-disconnect", "allow-list-users", "allow-save-secret"]
+    },
+    {
+      "identifier": "connect-commands",
+      "description": "Connect window: the only place that connects, pins keys and logs in.",
+      "windows": ["connect"],
+      "permissions": ["allow-connect", "allow-trust", "allow-login", "allow-join-room"]
+    },
+    {
+      "identifier": "chat-commands",
+      "description": "Public/private chat.",
+      "windows": ["chat"],
+      "permissions": [
+        "allow-join-room",
+        "allow-leave-room",
+        "allow-send-chat",
+        "allow-set-topic",
+        "allow-set-room-flags",
+        "allow-set-identity",
+        "allow-invite-to-chat"
+      ]
+    },
+    {
+      "identifier": "files-commands",
+      "description": "Files window: the only window that can move bytes between disk and server.",
+      "windows": ["files"],
+      "permissions": [
+        "allow-list-files",
+        "allow-create-folder",
+        "allow-delete-path",
+        "allow-move-path",
+        "allow-alias-path",
+        "allow-generate-catalog",
+        "allow-search-files",
+        "allow-get-file-info",
+        "allow-upload",
+        "allow-download",
+        "allow-cancel-transfer"
+      ]
+    },
+    {
+      "identifier": "transfers-commands",
+      "description": "File Transfers window: cancel the running transfer (nothing else).",
+      "windows": ["transfers"],
+      "permissions": ["allow-cancel-transfer"]
+    },
+    {
+      "identifier": "addressbook-commands",
+      "description": "Address Book: write-only access to bookmark passwords in the OS credential store.",
+      "windows": ["addressbook"],
+      "permissions": ["allow-save-secret", "allow-delete-secret"]
+    },
+    {
+      "identifier": "userlist-commands",
+      "windows": ["userlist"],
+      "permissions": ["allow-list-users"]
+    },
+    {
+      "identifier": "userinfo-commands",
+      "windows": ["userinfo"],
+      "permissions": ["allow-get-user-info"]
+    },
+    {
+      "identifier": "messages-commands",
+      "windows": ["messages"],
+      "permissions": ["allow-send-private"]
+    },
+    {
+      "identifier": "admin-commands",
+      "description": "Administration: roles and the Disconnect User panel.",
+      "windows": ["admin"],
+      "permissions": [
+        "allow-list-roles",
+        "allow-create-role",
+        "allow-update-role",
+        "allow-delete-role",
+        "allow-assign-role",
+        "allow-unassign-role",
+        "allow-account-roles",
+        "allow-disconnect-user"
+      ]
+    },
+    {
+      "identifier": "accounts-commands",
+      "windows": ["accounts"],
+      "permissions": ["allow-list-accounts", "allow-create-account", "allow-update-account"]
+    },
+    {
+      "identifier": "server-commands",
+      "windows": ["server"],
+      "permissions": [
+        "allow-get-server-settings",
+        "allow-update-server-settings",
+        "allow-broadcast",
+        "allow-shutdown-server"
+      ]
+    },
+    {
+      "identifier": "history-commands",
+      "windows": ["history"],
+      "permissions": ["allow-list-history"]
+    },
+    {
+      "identifier": "iprules-commands",
+      "windows": ["iprules"],
+      "permissions": ["allow-list-ip-rules", "allow-create-ip-rule", "allow-delete-ip-rule"]
+    },
+    {
+      "identifier": "connections-commands",
+      "windows": ["connections"],
+      "permissions": ["allow-list-connections"]
+    },
+    {
+      "identifier": "news-commands",
+      "windows": ["news"],
+      "permissions": [
+        "allow-list-newsgroups",
+        "allow-create-newsgroup",
+        "allow-list-thread",
+        "allow-create-post",
+        "allow-delete-post"
+      ]
+    },
+    {
+      "identifier": "trackers-commands",
+      "windows": ["trackers"],
+      "permissions": ["allow-list-servers"]
+    }
+  ]
+}

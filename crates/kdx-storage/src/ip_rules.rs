@@ -48,12 +48,15 @@ pub async fn create(
     Ok(id)
 }
 
-/// Delete a rule by id. A no-op if the row is already gone.
+/// Delete a rule by id. `NotFound` if no such rule exists.
 pub async fn delete(pool: &SqlitePool, id: &str) -> Result<(), StorageError> {
-    sqlx::query("DELETE FROM ip_rules WHERE id = ?")
+    let result = sqlx::query("DELETE FROM ip_rules WHERE id = ?")
         .bind(id)
         .execute(pool)
         .await?;
+    if result.rows_affected() == 0 {
+        return Err(StorageError::NotFound);
+    }
     Ok(())
 }
 
@@ -99,6 +102,7 @@ mod tests {
 
         delete(&pool, &a).await.unwrap();
         assert_eq!(list(&pool).await.unwrap().len(), 1);
+        assert!(matches!(delete(&pool, &a).await, Err(StorageError::NotFound)));
     }
 
     #[tokio::test]

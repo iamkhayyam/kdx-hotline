@@ -22,6 +22,10 @@ tracing = { workspace = true }
 thiserror = { workspace = true }
 ipnet = "2.12"
 
+[target.'cfg(unix)'.dependencies]
+# statvfs, for the free-space check before accepting an upload.
+libc = "0.2"
+
 [dev-dependencies]
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }

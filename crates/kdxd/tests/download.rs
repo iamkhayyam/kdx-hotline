@@ -9,10 +9,10 @@ use std::time::Instant;
 
 use common::{bump, connect_tls, frame, kdx_handshake, test_config, TlsClient};
 use futures_util::{SinkExt, StreamExt};
-use kdx_crypto::{client_response, hash_password, KdfParams};
+use kdx_crypto::hash_password;
 use kdx_protocol::messages::{
-    AuthChallenge, AuthRequest, AuthResponse, AuthResult, TransferAccept, TransferData,
-    TransferEnd, TransferRequest, DIRECTION_DOWNLOAD, DIRECTION_UPLOAD, TRANSFER_VERIFIED,
+    TransferAccept, TransferData, TransferEnd, TransferRequest, DIRECTION_DOWNLOAD,
+    DIRECTION_UPLOAD, TRANSFER_VERIFIED,
 };
 use kdx_protocol::{fragment, PacketFlags, PacketType, Reassembler};
 use kdx_storage::accounts;
@@ -22,40 +22,8 @@ use sha2::{Digest, Sha256};
 const CHUNK: usize = 32 * 1024; // > 16KB frame cap → server fragments each chunk
 
 async fn login(client: &mut TlsClient, seq: &mut u32, username: &str, password: &str) {
-    client
-        .send(frame(
-            PacketType::AuthRequest,
-            bump(seq),
-            AuthRequest {
-                username: username.into(),
-            }
-            .encode(),
-        ))
-        .await
-        .unwrap();
-    let challenge =
-        AuthChallenge::decode(&client.next().await.unwrap().unwrap().payload).unwrap();
-    let response = client_response(
-        password,
-        &challenge.salt,
-        &KdfParams {
-            m_cost: challenge.m_cost,
-            t_cost: challenge.t_cost,
-            p_cost: challenge.p_cost,
-        },
-        &challenge.challenge,
-    )
-    .unwrap();
-    client
-        .send(frame(
-            PacketType::AuthResponse,
-            bump(seq),
-            AuthResponse { response }.encode(),
-        ))
-        .await
-        .unwrap();
-    let result = AuthResult::decode(&client.next().await.unwrap().unwrap().payload).unwrap();
-    assert!(result.success, "{}", result.message);
+    // Channel-bound SCRAM login (protocol v2); see tests/common.
+    common::login(client, seq, username, password).await;
 }
 
 async fn send_fragmented(
@@ -197,7 +165,7 @@ async fn download_is_byte_identical() {
     let server = serve(test_config(&dir)).await.unwrap();
     let pool = kdx_storage::connect(&dir.path().join("kdx.db")).await.unwrap();
     let phc = hash_password("pw").unwrap();
-    accounts::create(&pool, "user", &phc, 2).await.unwrap();
+    accounts::create(&pool, "user", &phc, 2, 0, 0).await.unwrap();
 
     let mut client = connect_tls(server.local_addr).await;
     let mut seq = 0u32;
@@ -227,7 +195,7 @@ async fn download_resumes_after_disconnect() {
     let server = serve(test_config(&dir)).await.unwrap();
     let pool = kdx_storage::connect(&dir.path().join("kdx.db")).await.unwrap();
     let phc = hash_password("pw").unwrap();
-    accounts::create(&pool, "user", &phc, 2).await.unwrap();
+    accounts::create(&pool, "user", &phc, 2, 0, 0).await.unwrap();
 
     let data = test_blob(CHUNK * 4);
 
@@ -272,7 +240,7 @@ async fn dropbox_download_is_refused() {
     // Seed a dropbox and a file inside it before the server loads its tree.
     let pool = kdx_storage::connect(&dir.path().join("kdx.db")).await.unwrap();
     let phc = hash_password("pw").unwrap();
-    accounts::create(&pool, "user", &phc, 2).await.unwrap();
+    accounts::create(&pool, "user", &phc, 2, 0, 0).await.unwrap();
     kdx_storage::file_tree::create_folder(&pool, kdx_storage::file_tree::ROOT_ID, "drop", 2, 0, 1, None)
         .await
         .unwrap();
@@ -316,7 +284,7 @@ async fn download_throttle_caps_rate() {
     let server = serve(config).await.unwrap();
     let pool = kdx_storage::connect(&dir.path().join("kdx.db")).await.unwrap();
     let phc = hash_password("pw").unwrap();
-    accounts::create(&pool, "user", &phc, 2).await.unwrap();
+    accounts::create(&pool, "user", &phc, 2, 0, 0).await.unwrap();
 
     let mut client = connect_tls(server.local_addr).await;
     let mut seq = 0u32;
@@ -337,6 +305,93 @@ async fn download_throttle_caps_rate() {
         "download not throttled: {elapsed:?}"
     );
     assert_eq!(buf, data);
+
+    server.handle.abort();
+}
+
+// XFER-6 / PROTO-6: a file over ~4 GiB is downloadable. The accept for a
+// fresh download carries no bitmap (it used to carry one bit per chunk and
+// overflow the frame), and when the requested chunk size would need more
+// chunks than a bitmap can describe the server picks a bigger one.
+#[tokio::test]
+async fn huge_file_download_is_accepted() {
+    const SIZE: u64 = 5 << 30;
+    let dir = tempfile::tempdir().unwrap();
+    let pool = kdx_storage::connect(&dir.path().join("kdx.db")).await.unwrap();
+    let phc = hash_password("pw").unwrap();
+    accounts::create(&pool, "user", &phc, 2, 0, 0).await.unwrap();
+    // A sparse 5 GiB blob, filed before the server loads its tree.
+    let files = dir.path().join("files");
+    std::fs::create_dir_all(&files).unwrap();
+    let blob = files.join("big-iso-blob");
+    std::fs::File::create(&blob).unwrap().set_len(SIZE).unwrap();
+    kdx_storage::file_tree::create_file(
+        &pool,
+        kdx_storage::file_tree::ROOT_ID,
+        "big.iso",
+        SIZE as i64,
+        &[0u8; 32],
+        &blob.display().to_string(),
+    )
+    .await
+    .unwrap();
+    let server = serve(test_config(&dir)).await.unwrap();
+
+    // Stock 32 KiB chunks: 163,840 of them, no bitmap echoed.
+    {
+        let mut client = connect_tls(server.local_addr).await;
+        let mut seq = 0u32;
+        kdx_handshake(&mut client, &mut seq).await;
+        login(&mut client, &mut seq, "user", "pw").await;
+        let accept = request_download(&mut client, &mut seq, "/", "big.iso", vec![]).await;
+        assert_eq!(accept.size, SIZE);
+        assert_eq!(accept.chunk_size, CHUNK as u32);
+        assert_eq!(accept.total_chunks, 163_840);
+        assert!(accept.have_bitmap.is_empty());
+    } // dropped mid-stream
+
+    // 4 KiB chunks would need 1.3M: the server serves 16 KiB ones instead,
+    // and the data that follows really uses them.
+    let mut client = connect_tls(server.local_addr).await;
+    let mut seq = 0u32;
+    kdx_handshake(&mut client, &mut seq).await;
+    login(&mut client, &mut seq, "user", "pw").await;
+    let request = TransferRequest {
+        direction: DIRECTION_DOWNLOAD,
+        path: "/".into(),
+        name: "big.iso".into(),
+        size: 0,
+        chunk_size: 4096,
+        sha256: [0u8; 32],
+        resume_id: [0u8; 16],
+        have_bitmap: vec![],
+    };
+    client
+        .send(frame(PacketType::FileTransferStart, bump(&mut seq), request.encode()))
+        .await
+        .unwrap();
+    let reply = client.next().await.unwrap().unwrap();
+    assert_eq!(
+        reply.header.packet_type,
+        PacketType::FileTransferStart,
+        "{}",
+        String::from_utf8_lossy(&reply.payload)
+    );
+    let accept = TransferAccept::decode(&reply.payload).unwrap();
+    assert_eq!(accept.chunk_size, 16 * 1024);
+    assert_eq!(accept.total_chunks, 327_680);
+    let mut reasm = Reassembler::default();
+    let first = loop {
+        let raw = client.next().await.unwrap().unwrap();
+        if let Some(frame) = reasm.push(raw, 4 * 1024 * 1024).unwrap() {
+            break frame;
+        }
+    };
+    assert_eq!(first.header.packet_type, PacketType::FileTransferData);
+    let data = TransferData::decode(&first.payload).unwrap();
+    assert_eq!(data.chunk_index, 0);
+    assert_eq!(data.data.len(), 16 * 1024);
+    drop(client);
 
     server.handle.abort();
 }

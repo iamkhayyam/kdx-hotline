@@ -5,6 +5,8 @@
 
 import { invoke } from "../bridge.js";
 import { open } from "../wm.js";
+import { esc, num, errorText } from "../html.js";
+import { askConfirm, confirmThen } from "../confirm.js";
 
 export function buildServerAdmin() {
   const body = document.createElement("div");
@@ -60,12 +62,12 @@ export function buildServerAdmin() {
       $("#srv-greeting").value = s.greeting;
       $("#srv-max-users").value = s.max_users;
       $("#srv-readonly").innerHTML =
-        `port <b>${s.port}</b> · ` +
-        `upload ${s.max_upload_bytes_per_sec ? fmtRate(s.max_upload_bytes_per_sec) : "unlimited"} · ` +
-        `download ${s.max_download_bytes_per_sec ? fmtRate(s.max_download_bytes_per_sec) : "unlimited"} ` +
+        `port <b>${num(s.port)}</b> · ` +
+        `upload ${esc(s.max_upload_bytes_per_sec ? fmtRate(s.max_upload_bytes_per_sec) : "unlimited")} · ` +
+        `download ${esc(s.max_download_bytes_per_sec ? fmtRate(s.max_download_bytes_per_sec) : "unlimited")} ` +
         `<span class="srv-note">(fixed at server start)</span>`;
     } catch (err) {
-      settingsResult.textContent = esc(err.message || String(err));
+      settingsResult.textContent = errorText(err);
     }
   }
 
@@ -95,7 +97,7 @@ export function buildServerAdmin() {
       $("#srv-max-users").value = s.max_users;
       settingsResult.textContent = "saved";
     } catch (err) {
-      settingsResult.textContent = esc(err.message || String(err));
+      settingsResult.textContent = errorText(err);
     }
   });
   $("#srv-refresh").addEventListener("click", refresh);
@@ -113,22 +115,28 @@ export function buildServerAdmin() {
       result.textContent = "sent — awaiting server ack…";
       $("#srv-broadcast-text").value = "";
     } catch (err) {
-      result.textContent = esc(err.message || String(err));
+      result.textContent = errorText(err);
     }
   });
 
   $("#srv-shutdown-btn").addEventListener("click", async () => {
     const message = $("#srv-shutdown-message").value.trim();
-    if (!confirm("Shut down the server? Every connected user, including you, will be disconnected.")) {
-      return;
-    }
     const result = $("#srv-shutdown-result");
-    try {
-      await invoke("shutdown_server", { message });
-      result.textContent = "shutdown requested…";
-    } catch (err) {
-      result.textContent = esc(err.message || String(err));
-    }
+    await confirmThen(
+      () =>
+        askConfirm("Shut down the server? Every connected user, including you, will be disconnected.", {
+          confirmLabel: "Shut Down",
+          danger: true,
+        }),
+      async () => {
+        try {
+          await invoke("shutdown_server", { message });
+          result.textContent = "shutdown requested…";
+        } catch (err) {
+          result.textContent = errorText(err);
+        }
+      }
+    );
   });
 
   return { body, refresh };
@@ -138,7 +146,4 @@ function fmtRate(bytesPerSec) {
   if (bytesPerSec >= 1024 * 1024) return (bytesPerSec / 1024 / 1024).toFixed(1) + " MB/s";
   if (bytesPerSec >= 1024) return (bytesPerSec / 1024).toFixed(1) + " KB/s";
   return bytesPerSec + " B/s";
-}
-function esc(s) {
-  return String(s).replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" })[c]);
 }

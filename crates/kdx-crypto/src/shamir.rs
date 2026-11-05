@@ -13,7 +13,8 @@
 
 use rand::RngCore;
 use sha2::{Digest, Sha256};
-use zeroize::Zeroize;
+use subtle::ConstantTimeEq;
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::CryptoError;
 
@@ -23,8 +24,8 @@ pub const MAX_SHARES: u8 = 250;
 
 /// One share: the point `(index, f(index))` on the degree `t-1` polynomial.
 /// `index` is 1-based and doubles as the x-coordinate; `data[j]` is the y-value
-/// for byte column `j` of the secret.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// for byte column `j` of the secret. Wiped from memory on drop.
+#[derive(Debug, Clone, PartialEq, Eq, Zeroize, ZeroizeOnDrop)]
 pub struct Share {
     pub index: u8,
     pub data: Vec<u8>,
@@ -39,11 +40,13 @@ pub struct SplitResult {
 }
 
 /// One step of a Merkle proof: the sibling digest and which side the current
-/// digest sits on, so verification can fold without knowing the tree size.
+/// digest sits on.
 #[derive(Debug, Clone)]
 pub struct ProofStep {
     pub sibling: [u8; 32],
     /// True when the accumulated digest is the *left* child of the parent.
+    /// Informational only: [`verify_share`] derives each step's side from the
+    /// share's index and never trusts this flag.
     pub current_is_left: bool,
 }
 
@@ -60,6 +63,8 @@ pub struct Commitments {
     root: [u8; 32],
     tree: Vec<[u8; 32]>,
     leaf_count: usize,
+    /// Number of real (unpadded) shares committed to.
+    share_count: usize,
 }
 
 /// Split `secret` into `shares` shares, any `threshold` of which reconstruct it.
@@ -88,13 +93,13 @@ pub fn split(secret: &[u8], threshold: u8, shares: u8) -> Result<SplitResult, Cr
     let mut rng = rand::rngs::OsRng;
     let mut holder: Vec<Vec<u8>> = vec![Vec::with_capacity(secret.len()); n];
 
-    for col in 0..secret.len() {
+    for &secret_byte in secret {
         // One random degree-(t-1) polynomial per byte column, constant term = secret byte.
         let mut coeffs = vec![0u8; t - 1];
         rng.fill_bytes(&mut coeffs);
         for (pos, data) in holder.iter_mut().enumerate() {
             let x = (pos + 1) as u8;
-            let mut acc = secret[col];
+            let mut acc = secret_byte;
             let mut xp = x;
             for &c in &coeffs {
                 acc ^= gf_mul(c, xp);
@@ -135,6 +140,16 @@ pub fn combine(shares: &[Share], threshold: u8) -> Result<Vec<u8>, CryptoError> 
         });
     }
 
+    // x = 0 is where the secret lives: a share claiming index 0 would get
+    // Lagrange weight 1 and every other share weight 0, so its data would be
+    // returned verbatim. Indices above MAX_SHARES are never dealt either.
+    if let Some(bad) = shares.iter().find(|s| s.index == 0 || s.index > MAX_SHARES) {
+        return Err(CryptoError::ShamirParams(format!(
+            "share index {} out of range 1..={MAX_SHARES}",
+            bad.index
+        )));
+    }
+
     let mut chosen: Vec<&Share> = shares.iter().collect();
     chosen.sort_by_key(|s| s.index);
     chosen.dedup_by_key(|s| s.index);
@@ -152,7 +167,7 @@ pub fn combine(shares: &[Share], threshold: u8) -> Result<Vec<u8>, CryptoError> 
     }
 
     let mut out = vec![0u8; len];
-    for col in 0..len {
+    for (col, out_byte) in out.iter_mut().enumerate() {
         // Lagrange interpolation at x = 0: f(0) = Σ yᵢ · Lᵢ(0).
         let mut acc = 0u8;
         for (i, si) in chosen.iter().enumerate() {
@@ -167,26 +182,47 @@ pub fn combine(shares: &[Share], threshold: u8) -> Result<Vec<u8>, CryptoError> 
                 num = gf_mul(num, xj);
                 den = gf_mul(den, xj ^ xi);
             }
-            let li = gf_mul(num, gf_inv(den));
+            let mut li = gf_mul(num, gf_inv(den));
             acc ^= gf_mul(si.data[col], li);
+            li.zeroize();
         }
-        out[col] = acc;
+        *out_byte = acc;
+        acc.zeroize();
     }
     Ok(out)
 }
 
-/// Verify one share against a commitment root and its proof. Fails on a
-/// modified share, a proof from a different tree, or a mismatched index.
-pub fn verify_share(share: &Share, root: &[u8; 32], proof: &MerkleProof) -> bool {
+/// Verify one share against a commitment root and its proof. `share_count`
+/// is the number of shares the dealer committed to (published alongside the
+/// root); it fixes the tree depth, so the proof must have exactly that many
+/// steps, and each step's left/right side is derived from the share's index
+/// rather than taken from the proof. Fails on a modified share, a proof from
+/// a different tree, a mismatched or out-of-range index, or a proof of the
+/// wrong length.
+pub fn verify_share(
+    share: &Share,
+    root: &[u8; 32],
+    proof: &MerkleProof,
+    share_count: usize,
+) -> bool {
+    if share.index == 0 || share.index as usize > share_count {
+        return false;
+    }
+    let depth = share_count.next_power_of_two().trailing_zeros() as usize;
+    if proof.steps.len() != depth {
+        return false;
+    }
+    let mut position = share.index as usize - 1;
     let mut digest = leaf_digest(share);
     for step in &proof.steps {
-        digest = if step.current_is_left {
+        digest = if position & 1 == 0 {
             node_digest(&digest, &step.sibling)
         } else {
             node_digest(&step.sibling, &digest)
         };
+        position >>= 1;
     }
-    digest == *root
+    digest.ct_eq(root).into()
 }
 
 impl Commitments {
@@ -205,6 +241,7 @@ impl Commitments {
             root: tree[1],
             tree,
             leaf_count,
+            share_count: shares.len(),
         }
     }
 
@@ -213,13 +250,19 @@ impl Commitments {
         &self.root
     }
 
+    /// Number of shares committed to; publish it with the root so verifiers
+    /// can pass it to [`verify_share`].
+    pub fn share_count(&self) -> usize {
+        self.share_count
+    }
+
     /// Merkle proof for the share with 1-based `share_index`, if present.
     pub fn proof(&self, share_index: u8) -> Option<MerkleProof> {
         if share_index == 0 {
             return None;
         }
         let leaf = share_index as usize - 1;
-        if leaf >= self.leaf_count {
+        if leaf >= self.share_count {
             return None;
         }
         let mut idx = self.leaf_count + leaf;
@@ -237,7 +280,7 @@ impl Commitments {
     /// Convenience: verify `share` against this tree's own root.
     pub fn verify_share(&self, share: &Share) -> bool {
         match self.proof(share.index) {
-            Some(proof) => verify_share(share, &self.root, &proof),
+            Some(proof) => verify_share(share, &self.root, &proof, self.share_count),
             None => false,
         }
     }
@@ -245,17 +288,15 @@ impl Commitments {
 
 // --- GF(2⁸) arithmetic, modulo x⁸ + x⁴ + x³ + x + 1 (0x11b) ---
 
+/// Branch-free (constant-time) multiplication: always eight rounds, with
+/// masks instead of data-dependent branches, since both operands can be
+/// secret (share bytes, coefficients).
 fn gf_mul(mut a: u8, mut b: u8) -> u8 {
     let mut p = 0u8;
-    while b != 0 {
-        if b & 1 == 1 {
-            p ^= a;
-        }
-        let carry = a & 0x80 != 0;
-        a <<= 1;
-        if carry {
-            a ^= 0x1B;
-        }
+    for _ in 0..8 {
+        p ^= a & 0u8.wrapping_sub(b & 1);
+        let carry = 0u8.wrapping_sub(a >> 7);
+        a = (a << 1) ^ (0x1B & carry);
         b >>= 1;
     }
     p
@@ -279,15 +320,22 @@ fn gf_inv(a: u8) -> u8 {
     gf_pow(a, 254)
 }
 
+/// Domain-separation prefixes (RFC 6962 style): a leaf can never hash to the
+/// same value as an internal node, so a share can't be forged from the
+/// concatenation of two child digests.
+const LEAF_PREFIX: u8 = 0x00;
+const NODE_PREFIX: u8 = 0x01;
+
 fn leaf_digest(share: &Share) -> [u8; 32] {
     let mut h = Sha256::new();
-    h.update([share.index]);
+    h.update([LEAF_PREFIX, share.index]);
     h.update(&share.data);
     h.finalize().into()
 }
 
 fn node_digest(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
     let mut h = Sha256::new();
+    h.update([NODE_PREFIX]);
     h.update(left);
     h.update(right);
     h.finalize().into()
@@ -374,6 +422,111 @@ mod tests {
         for share in &r.shares {
             assert!(share.index >= 1 && share.index <= 6);
             assert!(seen.insert(share.index));
+        }
+    }
+
+    #[test]
+    fn combine_rejects_index_zero_and_out_of_range() {
+        let r = split(b"secret", 2, 3).unwrap();
+        let evil = Share {
+            index: 0,
+            data: b"attack".to_vec(),
+        };
+        let err = combine(&[r.shares[0].clone(), evil], 2).unwrap_err();
+        assert!(matches!(err, CryptoError::ShamirParams(_)), "{err}");
+
+        let too_big = Share {
+            index: MAX_SHARES + 1,
+            data: r.shares[1].data.clone(),
+        };
+        assert!(combine(&[r.shares[0].clone(), too_big], 2).is_err());
+    }
+
+    #[test]
+    fn concatenated_child_digests_cannot_pose_as_a_share() {
+        // 4-leaf tree: tree[4..8] are leaves, tree[2] = node(tree[4], tree[5]).
+        // Without domain separation, a 63-byte "share" whose index||data is
+        // tree[4]||tree[5] hashed to tree[2] and verified with a one-step
+        // proof. Both the prefixes and the fixed proof length now stop it.
+        let r = split(b"merkle", 2, 4).unwrap();
+        let c = &r.commitments;
+        let mut data = c.tree[4][1..].to_vec();
+        data.extend_from_slice(&c.tree[5]);
+        let forged = Share {
+            index: c.tree[4][0],
+            data,
+        };
+        let one_step = MerkleProof {
+            steps: vec![ProofStep {
+                sibling: c.tree[3],
+                current_is_left: true,
+            }],
+        };
+        assert!(!verify_share(&forged, c.root(), &one_step, 4));
+        assert!(!verify_share(&forged, c.root(), &one_step, 2));
+        assert!(!c.verify_share(&forged));
+    }
+
+    #[test]
+    fn proof_length_and_position_are_enforced() {
+        let r = split(b"positions", 2, 4).unwrap();
+        let c = &r.commitments;
+        let share = r.shares[1].clone();
+        let proof = c.proof(share.index).unwrap();
+        assert!(verify_share(&share, c.root(), &proof, c.share_count()));
+
+        // Truncated or padded proofs fail.
+        let mut short = proof.clone();
+        short.steps.pop();
+        assert!(!verify_share(&share, c.root(), &short, c.share_count()));
+        let mut long = proof.clone();
+        long.steps.push(ProofStep {
+            sibling: [0u8; 32],
+            current_is_left: true,
+        });
+        assert!(!verify_share(&share, c.root(), &long, c.share_count()));
+
+        // Lying about the side doesn't matter: it's derived from the index.
+        let mut flipped = proof.clone();
+        for step in &mut flipped.steps {
+            step.current_is_left = !step.current_is_left;
+        }
+        assert!(verify_share(&share, c.root(), &flipped, c.share_count()));
+
+        // Claiming another index with the same data/proof fails.
+        let mut moved = share.clone();
+        moved.index = 1;
+        assert!(!verify_share(&moved, c.root(), &proof, c.share_count()));
+        // Index beyond the committed count fails.
+        let mut beyond = share.clone();
+        beyond.index = 5;
+        assert!(!verify_share(&beyond, c.root(), &proof, c.share_count()));
+    }
+
+    #[test]
+    fn gf_mul_matches_reference() {
+        fn reference(mut a: u8, mut b: u8) -> u8 {
+            let mut p = 0u8;
+            while b != 0 {
+                if b & 1 == 1 {
+                    p ^= a;
+                }
+                let carry = a & 0x80 != 0;
+                a <<= 1;
+                if carry {
+                    a ^= 0x1B;
+                }
+                b >>= 1;
+            }
+            p
+        }
+        for a in 0..=255u8 {
+            for b in 0..=255u8 {
+                assert_eq!(gf_mul(a, b), reference(a, b));
+            }
+        }
+        for a in 1..=255u8 {
+            assert_eq!(gf_mul(a, gf_inv(a)), 1);
         }
     }
 

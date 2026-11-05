@@ -59,18 +59,23 @@ function emitChange() {
   for (const fn of changeListeners) fn();
 }
 
-/** Open (creating if needed), restore if minimized, and focus. */
-export async function open(id) {
+/** Open (creating if needed), restore if minimized, and focus. With
+ * `{ focus: false }` (server-triggered opens: an incoming PM or invite) an
+ * already-open window is left alone and a new one opens without taking
+ * keyboard focus, so a message flood can't yank the user out of Chat. */
+export async function open(id, { focus: takeFocus = true } = {}) {
   const opts = registry.get(id);
   if (!opts) return;
-  if (isOpen(id)) return focus(id);
+  if (isOpen(id)) return takeFocus ? focus(id) : getWindow(id);
   if (!inTauri) return previewOpen(opts);
 
   let w = await getWindow(id);
   if (w) {
     try { await w.unminimize(); } catch (_) {}
     try { await w.show(); } catch (_) {}
-    try { await w.setFocus(); } catch (_) {}
+    if (takeFocus) {
+      try { await w.setFocus(); } catch (_) {}
+    }
   } else {
     const saved = loadRect(id);
     const rect = saved || opts.rect;
@@ -90,6 +95,7 @@ export async function open(id) {
       resizable: true,
       decorations: false,
       shadow: true,
+      focus: takeFocus,
     });
     emitUi("main", "window-opened", { label: id });
   }

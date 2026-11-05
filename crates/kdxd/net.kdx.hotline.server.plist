@@ -1,6 +1,24 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
   "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  launchd job for kdxd. It runs as the unprivileged role account _kdx, never
+  as root. One-time setup (pick a free id below 500 instead of 397 if taken):
+
+    sudo dscl . -create /Groups/_kdx PrimaryGroupID 397
+    sudo dscl . -create /Users/_kdx UniqueID 397
+    sudo dscl . -create /Users/_kdx PrimaryGroupID 397
+    sudo dscl . -create /Users/_kdx UserShell /usr/bin/false
+    sudo dscl . -create /Users/_kdx NFSHomeDirectory /var/kdx
+    sudo install -d -o _kdx -g _kdx -m 0700 /var/kdx
+
+  In /etc/kdx/kdxd.toml use absolute state paths:
+    database   = "/var/kdx/kdx.db"
+    files_root = "/var/kdx/files"
+  then:
+    sudo cp net.kdx.hotline.server.plist /Library/LaunchDaemons/
+    sudo launchctl bootstrap system /Library/LaunchDaemons/net.kdx.hotline.server.plist
+-->
 <plist version="1.0">
 <dict>
   <key>Label</key>
@@ -10,6 +28,12 @@
     <string>/usr/local/bin/kdxd</string>
     <string>/etc/kdx/kdxd.toml</string>
   </array>
+  <key>UserName</key>
+  <string>_kdx</string>
+  <key>GroupName</key>
+  <string>_kdx</string>
+  <key>Umask</key>
+  <string>077</string>
   <key>WorkingDirectory</key>
   <string>/var/kdx</string>
   <key>RunAtLoad</key>
@@ -18,6 +42,17 @@
   <true/>
   <key>ProcessType</key>
   <string>Interactive</string>
+  <!-- launchd's default of 256 descriptors is too few for a server. -->
+  <key>SoftResourceLimits</key>
+  <dict>
+    <key>NumberOfFiles</key>
+    <integer>8192</integer>
+  </dict>
+  <key>HardResourceLimits</key>
+  <dict>
+    <key>NumberOfFiles</key>
+    <integer>8192</integer>
+  </dict>
   <key>StandardOutPath</key>
   <string>/var/kdx/kdxd.log</string>
   <key>StandardErrorPath</key>

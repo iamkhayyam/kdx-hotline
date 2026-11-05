@@ -7,10 +7,10 @@ mod common;
 use bytes::Bytes;
 use common::{bump, connect_tls, frame, kdx_handshake, test_config, TlsClient};
 use futures_util::{SinkExt, StreamExt};
-use kdx_crypto::{client_response, hash_password, KdfParams};
+use kdx_crypto::hash_password;
 use kdx_protocol::messages::{
-    AuthChallenge, AuthRequest, AuthResponse, AuthResult, FileListRequest, FileListResponse,
-    TransferAccept, TransferData, TransferEnd, TransferRequest, KIND_FILE, TRANSFER_VERIFIED,
+    FileListRequest, FileListResponse, TransferAccept, TransferData, TransferEnd, TransferRequest,
+    KIND_FILE, TRANSFER_VERIFIED,
 };
 use kdx_protocol::{fragment, PacketFlags, PacketType};
 use kdx_storage::{accounts, file_tree};
@@ -20,42 +20,8 @@ use sha2::{Digest, Sha256};
 const CHUNK: usize = 32 * 1024; // larger than the 16 KiB frame cap → exercises fragmentation
 
 async fn login(client: &mut TlsClient, seq: &mut u32, username: &str, password: &str) {
-    client
-        .send(frame(
-            PacketType::AuthRequest,
-            bump(seq),
-            AuthRequest {
-                username: username.into(),
-            }
-            .encode(),
-        ))
-        .await
-        .unwrap();
-    let challenge = AuthChallenge::decode(
-        &client.next().await.unwrap().unwrap().payload,
-    )
-    .unwrap();
-    let response = client_response(
-        password,
-        &challenge.salt,
-        &KdfParams {
-            m_cost: challenge.m_cost,
-            t_cost: challenge.t_cost,
-            p_cost: challenge.p_cost,
-        },
-        &challenge.challenge,
-    )
-    .unwrap();
-    client
-        .send(frame(
-            PacketType::AuthResponse,
-            bump(seq),
-            AuthResponse { response }.encode(),
-        ))
-        .await
-        .unwrap();
-    let result = AuthResult::decode(&client.next().await.unwrap().unwrap().payload).unwrap();
-    assert!(result.success, "{}", result.message);
+    // Channel-bound SCRAM login (protocol v2); see tests/common.
+    common::login(client, seq, username, password).await;
 }
 
 /// Send a payload, fragmenting when it exceeds the frame cap.
@@ -134,7 +100,7 @@ async fn multi_chunk_upload_end_to_end() {
     let server = serve(test_config(&dir)).await.unwrap();
     let pool = kdx_storage::connect(&dir.path().join("kdx.db")).await.unwrap();
     let phc = hash_password("pw").unwrap();
-    accounts::create(&pool, "uploader", &phc, 2).await.unwrap();
+    accounts::create(&pool, "uploader", &phc, 2, 0, 0).await.unwrap();
 
     let mut client = connect_tls(server.local_addr).await;
     let mut seq = 0u32;
@@ -179,7 +145,7 @@ async fn dropbox_accepts_upload_but_refuses_listing() {
     let server = serve(test_config(&dir)).await.unwrap();
     let pool = kdx_storage::connect(&dir.path().join("kdx.db")).await.unwrap();
     let phc = hash_password("pw").unwrap();
-    accounts::create(&pool, "dropper", &phc, 1).await.unwrap(); // plain User
+    accounts::create(&pool, "dropper", &phc, 1, 0, 0).await.unwrap(); // plain User
     // DropBox writable by class User(1); kind 2 = dropbox.
     file_tree::create_folder(&pool, file_tree::ROOT_ID, "dropbox", 2, 0, 1, None)
         .await
@@ -228,7 +194,7 @@ async fn disconnect_mid_transfer_then_resume() {
     let server = serve(test_config(&dir)).await.unwrap();
     let pool = kdx_storage::connect(&dir.path().join("kdx.db")).await.unwrap();
     let phc = hash_password("pw").unwrap();
-    accounts::create(&pool, "uploader", &phc, 2).await.unwrap();
+    accounts::create(&pool, "uploader", &phc, 2, 0, 0).await.unwrap();
 
     let data = test_blob(CHUNK * 4); // 4 chunks
     let chunks = chunk_frames(&data, [0u8; 16]); // ids fixed up below
@@ -283,6 +249,235 @@ async fn disconnect_mid_transfer_then_resume() {
         .unwrap();
     let list = FileListResponse::decode(&client.next().await.unwrap().unwrap().payload).unwrap();
     assert_eq!(list.entries[0].size, data.len() as u64);
+
+    server.handle.abort();
+}
+
+/// Log a fresh connection in as `username`.
+async fn logged_in(server: &kdxd::Server, username: &str) -> (TlsClient, u32) {
+    let mut client = connect_tls(server.local_addr).await;
+    let mut seq = 0u32;
+    kdx_handshake(&mut client, &mut seq).await;
+    login(&mut client, &mut seq, username, "pw").await;
+    (client, seq)
+}
+
+/// Round-trip a listing so everything the server had queued for `client`
+/// (presence broadcasts etc.) is drained and its earlier requests handled.
+async fn sync(client: &mut TlsClient, seq: &mut u32) {
+    client
+        .send(frame(
+            PacketType::FileListRequest,
+            bump(seq),
+            FileListRequest { path: "/".into() }.encode(),
+        ))
+        .await
+        .unwrap();
+    while client.next().await.unwrap().unwrap().header.packet_type != PacketType::FileListResponse {}
+}
+
+/// Send an upload request that is expected to be refused; return the error text.
+async fn refused_upload(
+    client: &mut TlsClient,
+    seq: &mut u32,
+    name: &str,
+    data: &[u8],
+    resume_id: [u8; 16],
+) -> String {
+    let request = TransferRequest {
+        direction: kdx_protocol::messages::DIRECTION_UPLOAD,
+        path: "/".into(),
+        name: name.into(),
+        size: data.len() as u64,
+        chunk_size: CHUNK as u32,
+        sha256: Sha256::digest(data).into(),
+        resume_id,
+        have_bitmap: vec![],
+    };
+    client
+        .send(frame(PacketType::FileTransferStart, bump(seq), request.encode()))
+        .await
+        .unwrap();
+    let reply = client.next().await.unwrap().unwrap();
+    assert_eq!(reply.header.packet_type, PacketType::Error);
+    String::from_utf8_lossy(&reply.payload).into_owned()
+}
+
+async fn send_chunks(client: &mut TlsClient, seq: &mut u32, data: &[u8], id: [u8; 16], skip: &[u32]) {
+    for (i, payload) in chunk_frames(data, id) {
+        if !skip.contains(&i) {
+            send_fragmented(client, seq, PacketType::FileTransferData, payload).await;
+        }
+    }
+}
+
+async fn expect_end(client: &mut TlsClient) -> TransferEnd {
+    let frame = tokio::time::timeout(std::time::Duration::from_secs(5), client.next())
+        .await
+        .expect("no TransferEnd")
+        .unwrap()
+        .unwrap();
+    assert_eq!(frame.header.packet_type, PacketType::FileTransferEnd);
+    TransferEnd::decode(&frame.payload).unwrap()
+}
+
+/// Files in `files_root`: (finished blobs, partials).
+fn stored(dir: &tempfile::TempDir) -> (usize, usize) {
+    let names: Vec<String> = std::fs::read_dir(dir.path().join("files"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    let parts = names.iter().filter(|n| n.ends_with(".part")).count();
+    (names.len() - parts, parts)
+}
+
+// XFER-4 / XFER-8: competing uploads of one name end with exactly one blob,
+// no partials and no leftover resume state — and nobody is disconnected.
+#[tokio::test]
+async fn same_name_uploads_leave_exactly_one_blob() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = serve(test_config(&dir)).await.unwrap();
+    let pool = kdx_storage::connect(&dir.path().join("kdx.db")).await.unwrap();
+    let phc = hash_password("pw").unwrap();
+    accounts::create(&pool, "alice", &phc, 2, 0, 0).await.unwrap();
+    accounts::create(&pool, "bob", &phc, 2, 0, 0).await.unwrap();
+    let (mut alice, mut aseq) = logged_in(&server, "alice").await;
+    let (mut bob, mut bseq) = logged_in(&server, "bob").await;
+    sync(&mut alice, &mut aseq).await; // bob's arrival
+    sync(&mut bob, &mut bseq).await;
+    let data = test_blob(CHUNK * 2 + 10);
+
+    // While alice's upload of dup.bin is live, the name is reserved.
+    let accept = start_upload(&mut alice, &mut aseq, "/", "dup.bin", &data, [0u8; 16]).await;
+    let err = refused_upload(&mut bob, &mut bseq, "dup.bin", &data, [0u8; 16]).await;
+    assert!(err.contains("already exists"), "{err}");
+    send_chunks(&mut alice, &mut aseq, &data, accept.transfer_id, &[]).await;
+    assert_eq!(expect_end(&mut alice).await.status, TRANSFER_VERIFIED);
+
+    // Bob starts other.bin and gives up partway (keeping it resumable);
+    // alice then files other.bin first. Bob's resume is refused and his
+    // partial upload discarded.
+    let bob_accept = start_upload(&mut bob, &mut bseq, "/", "other.bin", &data, [0u8; 16]).await;
+    send_chunks(&mut bob, &mut bseq, &data, bob_accept.transfer_id, &[1, 2]).await;
+    let abort = TransferEnd {
+        transfer_id: bob_accept.transfer_id,
+        status: kdx_protocol::messages::TRANSFER_ABORTED,
+        message: "cancelled".into(),
+    };
+    bob.send(frame(PacketType::FileTransferEnd, bump(&mut bseq), abort.encode()))
+        .await
+        .unwrap();
+    // A round trip on bob's connection: his TransferEnd has been handled.
+    sync(&mut bob, &mut bseq).await;
+    let accept = start_upload(&mut alice, &mut aseq, "/", "other.bin", &data, [0u8; 16]).await;
+    send_chunks(&mut alice, &mut aseq, &data, accept.transfer_id, &[]).await;
+    assert_eq!(expect_end(&mut alice).await.status, TRANSFER_VERIFIED);
+    let err = refused_upload(&mut bob, &mut bseq, "other.bin", &data, bob_accept.transfer_id).await;
+    assert!(err.contains("already exists"), "{err}");
+
+    assert_eq!(stored(&dir), (2, 0), "expected two blobs and no partials");
+    assert!(kdx_storage::transfer_state::list_stale(&pool, 0).await.unwrap().is_empty());
+
+    // Both connections are still usable.
+    for (client, seq) in [(&mut alice, &mut aseq), (&mut bob, &mut bseq)] {
+        client
+            .send(frame(
+                PacketType::FileListRequest,
+                bump(seq),
+                FileListRequest { path: "/".into() }.encode(),
+            ))
+            .await
+            .unwrap();
+        let list = FileListResponse::decode(&client.next().await.unwrap().unwrap().payload).unwrap();
+        assert_eq!(list.entries.len(), 2);
+    }
+
+    // OPS-2: blobs and their folder are private to the server's user.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let files = dir.path().join("files");
+        let mode = std::fs::metadata(&files).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
+        for entry in std::fs::read_dir(&files).unwrap() {
+            let mode = entry.unwrap().metadata().unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+    }
+
+    server.handle.abort();
+}
+
+// XFER-7 / CLIENT-10: an empty upload finishes without the client sending
+// any chunk, and doesn't wedge the connection's upload slot.
+#[tokio::test]
+async fn empty_upload_completes() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = serve(test_config(&dir)).await.unwrap();
+    let pool = kdx_storage::connect(&dir.path().join("kdx.db")).await.unwrap();
+    let phc = hash_password("pw").unwrap();
+    accounts::create(&pool, "uploader", &phc, 2, 0, 0).await.unwrap();
+    let (mut client, mut seq) = logged_in(&server, "uploader").await;
+
+    let accept = start_upload(&mut client, &mut seq, "/", "empty.txt", &[], [0u8; 16]).await;
+    assert_eq!(accept.total_chunks, 0);
+    let end = expect_end(&mut client).await;
+    assert_eq!(end.status, TRANSFER_VERIFIED, "{}", end.message);
+
+    // The slot is free again.
+    let data = test_blob(100);
+    let accept = start_upload(&mut client, &mut seq, "/", "next.bin", &data, [0u8; 16]).await;
+    send_chunks(&mut client, &mut seq, &data, accept.transfer_id, &[]).await;
+    assert_eq!(expect_end(&mut client).await.status, TRANSFER_VERIFIED);
+
+    client
+        .send(frame(
+            PacketType::FileListRequest,
+            bump(&mut seq),
+            FileListRequest { path: "/".into() }.encode(),
+        ))
+        .await
+        .unwrap();
+    let list = FileListResponse::decode(&client.next().await.unwrap().unwrap().payload).unwrap();
+    let empty = list.entries.iter().find(|e| e.name == "empty.txt").unwrap();
+    assert_eq!(empty.size, 0);
+
+    server.handle.abort();
+}
+
+// XFER-7: a client TransferEnd frees the slot but keeps the upload
+// resumable from where it stopped.
+#[tokio::test]
+async fn client_abort_frees_slot_and_keeps_progress() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = serve(test_config(&dir)).await.unwrap();
+    let pool = kdx_storage::connect(&dir.path().join("kdx.db")).await.unwrap();
+    let phc = hash_password("pw").unwrap();
+    accounts::create(&pool, "uploader", &phc, 2, 0, 0).await.unwrap();
+    let (mut client, mut seq) = logged_in(&server, "uploader").await;
+
+    let data = test_blob(CHUNK * 4);
+    let accept = start_upload(&mut client, &mut seq, "/", "paused.bin", &data, [0u8; 16]).await;
+    let id = accept.transfer_id;
+    send_chunks(&mut client, &mut seq, &data, id, &[2, 3]).await;
+    let abort = TransferEnd {
+        transfer_id: id,
+        status: kdx_protocol::messages::TRANSFER_ABORTED,
+        message: String::new(),
+    };
+    client
+        .send(frame(PacketType::FileTransferEnd, bump(&mut seq), abort.encode()))
+        .await
+        .unwrap();
+
+    // Same connection, resume at once: two chunks are already held.
+    let accept = start_upload(&mut client, &mut seq, "/", "paused.bin", &data, id).await;
+    let held: Vec<u32> = (0..accept.total_chunks)
+        .filter(|i| accept.have_bitmap[*i as usize / 8] & (1 << (i % 8)) != 0)
+        .collect();
+    assert_eq!(held, vec![0, 1]);
+    send_chunks(&mut client, &mut seq, &data, id, &held).await;
+    assert_eq!(expect_end(&mut client).await.status, TRANSFER_VERIFIED);
 
     server.handle.abort();
 }

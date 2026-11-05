@@ -1,6 +1,8 @@
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
 
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 
 use kdx_protocol::messages::{FileInfoResponse, FileListResponse};
 
@@ -17,13 +19,33 @@ pub struct Session {
     pub class: u8,
 }
 
+/// A login password on its way to the connection actor: wiped from memory
+/// when dropped, and never shown by `Debug`.
+pub(crate) struct Password(zeroize::Zeroizing<String>);
+
+impl Password {
+    pub(crate) fn new(password: &str) -> Self {
+        Self(zeroize::Zeroizing::new(password.to_owned()))
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for Password {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Password(<redacted>)")
+    }
+}
+
 /// Commands sent from a `ClientHandle` into the connection actor. Each
 /// carries a `oneshot` for its result where the operation has one.
 #[derive(Debug)]
 pub(crate) enum Command {
     Login {
         username: String,
-        password: String,
+        password: Password,
         reply: oneshot::Sender<Result<Session, ClientError>>,
     },
     Join {
@@ -151,7 +173,7 @@ pub(crate) enum Command {
     },
     InviteToChat {
         to: String,
-        reply: oneshot::Sender<Result<(), ClientError>>,
+        reply: oneshot::Sender<Result<String, ClientError>>,
     },
     Upload {
         local: PathBuf,
@@ -161,7 +183,12 @@ pub(crate) enum Command {
     Download {
         remote_path: String,
         local: PathBuf,
+        expected_size: Option<u64>,
         reply: oneshot::Sender<Result<(), ClientError>>,
+    },
+    /// Abort the active transfer, if any; replies whether one was active.
+    CancelTransfer {
+        reply: oneshot::Sender<Result<bool, ClientError>>,
     },
     ListRoles {
         reply: oneshot::Sender<Result<Vec<RoleInfo>, ClientError>>,
@@ -248,14 +275,40 @@ pub(crate) enum Command {
         post_id: String,
         reply: oneshot::Sender<Result<Vec<NewsPost>, ClientError>>,
     },
-    Disconnect,
 }
 
 /// Handle to a connected KDX client. Cloneable; every method round-trips a
 /// command into the single connection actor.
+///
+/// Every request is bounded by `ClientConfig::request_timeout` (default
+/// 30 s) and fails with `ClientError::Timeout` if the server doesn't answer
+/// in time; uploads and downloads are exempt (they can legitimately run for
+/// a long time) and instead fail if the connection goes quiet. Strings that
+/// can't be encoded on the wire (over 65,535 bytes) fail that call with
+/// `ClientError::InvalidInput` instead of corrupting the session.
 #[derive(Clone, Debug)]
 pub struct ClientHandle {
     pub(crate) tx: mpsc::Sender<Command>,
+    /// Out-of-band disconnect signal: works even when the command queue is
+    /// full or the actor is blocked writing to a stalled server.
+    pub(crate) shutdown: Arc<watch::Sender<bool>>,
+    pub(crate) request_timeout: Duration,
+}
+
+/// Longest string the wire's u16 length prefix can carry.
+const MAX_WIRE_STR: usize = u16::MAX as usize;
+
+/// Copy a caller's string for the wire, refusing ones that would overflow
+/// the u16 length prefix (the encoder would silently truncate the prefix
+/// and the server would drop the connection on the malformed payload).
+fn wire(s: &str) -> Result<String, ClientError> {
+    if s.len() > MAX_WIRE_STR {
+        return Err(ClientError::InvalidInput(format!(
+            "text is too long ({} bytes; the limit is {MAX_WIRE_STR})",
+            s.len()
+        )));
+    }
+    Ok(s.to_owned())
 }
 
 impl ClientHandle {
@@ -263,87 +316,98 @@ impl ClientHandle {
         &self,
         make: impl FnOnce(oneshot::Sender<Result<T, ClientError>>) -> Command,
     ) -> Result<T, ClientError> {
-        let (reply, rx) = oneshot::channel();
-        self.tx
-            .send(make(reply))
-            .await
-            .map_err(|_| ClientError::Disconnected)?;
-        rx.await.map_err(|_| ClientError::Disconnected)?
+        self.send_with_timeout(make, Some(self.request_timeout)).await
     }
 
+    async fn send_with_timeout<T>(
+        &self,
+        make: impl FnOnce(oneshot::Sender<Result<T, ClientError>>) -> Command,
+        limit: Option<Duration>,
+    ) -> Result<T, ClientError> {
+        let (reply, rx) = oneshot::channel();
+        let round_trip = async {
+            self.tx
+                .send(make(reply))
+                .await
+                .map_err(|_| ClientError::Disconnected)?;
+            rx.await.map_err(|_| ClientError::Disconnected)?
+        };
+        match limit {
+            // Dropping `rx` on timeout is safe: the actor keeps the request
+            // queued and discards the late reply when it arrives.
+            Some(limit) => tokio::time::timeout(limit, round_trip)
+                .await
+                .map_err(|_| ClientError::Timeout("no reply from the server".into()))?,
+            None => round_trip.await,
+        }
+    }
+
+    /// Log in. A connection logs in once: after a successful login this
+    /// fails at once with `ClientError::InvalidInput` (reconnect to change
+    /// accounts). A failed login may be retried.
     pub async fn login(&self, username: &str, password: &str) -> Result<Session, ClientError> {
         self.send(|reply| Command::Login {
             username: username.to_owned(),
-            password: password.to_owned(),
+            password: Password::new(password),
             reply,
         })
         .await
     }
 
+    /// Join a chat room. Resolves once the server has answered: `Ok` means
+    /// you are in the room; `Err(ClientError::Server)` means it refused
+    /// (not invited to a private room, joining too fast, too many rooms,
+    /// class gate), in which case you are still in whatever rooms you were
+    /// in before. The refusal is also emitted as `Event::ServerError`.
     pub async fn join(&self, room: &str) -> Result<(), ClientError> {
-        self.send(|reply| Command::Join {
-            room: room.to_owned(),
-            reply,
-        })
-        .await
+        let room = wire(room)?;
+        self.send(|reply| Command::Join { room, reply }).await
     }
 
     pub async fn leave(&self, room: &str) -> Result<(), ClientError> {
-        self.send(|reply| Command::Leave {
-            room: room.to_owned(),
-            reply,
-        })
-        .await
+        let room = wire(room)?;
+        self.send(|reply| Command::Leave { room, reply }).await
     }
 
     /// Send a chat message. `flags` may include `kdx_protocol::messages::CHAT_ACTION`.
     pub async fn send_chat(&self, room: &str, flags: u8, text: &str) -> Result<(), ClientError> {
+        let (room, text) = (wire(room)?, wire(text)?);
         self.send(|reply| Command::SendChat {
-            room: room.to_owned(),
+            room,
             flags,
-            text: text.to_owned(),
+            text,
             reply,
         })
         .await
     }
 
     pub async fn set_topic(&self, room: &str, topic: &str) -> Result<(), ClientError> {
-        self.send(|reply| Command::SetTopic {
-            room: room.to_owned(),
-            topic: topic.to_owned(),
-            reply,
-        })
-        .await
+        let (room, topic) = (wire(room)?, wire(topic)?);
+        self.send(|reply| Command::SetTopic { room, topic, reply })
+            .await
     }
 
     pub async fn list_files(&self, path: &str) -> Result<FileListResponse, ClientError> {
-        self.send(|reply| Command::ListFiles {
-            path: path.to_owned(),
-            reply,
-        })
-        .await
+        let path = wire(path)?;
+        self.send(|reply| Command::ListFiles { path, reply }).await
     }
 
     /// Fetch node metadata for the Files "Get Info" verb. Requires read
     /// access to the node; aliases resolve to their target.
     pub async fn get_file_info(&self, path: &str) -> Result<FileInfoResponse, ClientError> {
-        self.send(|reply| Command::GetFileInfo {
-            path: path.to_owned(),
-            reply,
-        })
-        .await
+        let path = wire(path)?;
+        self.send(|reply| Command::GetFileInfo { path, reply }).await
     }
 
     /// Set your own display name / description (`/name`, `/desc`). The
     /// server rebroadcasts presence so everyone sees the change live.
     /// Fire-and-forget: the server applies it without a reply.
     pub async fn set_identity(&self, name: &str, description: &str) -> Result<(), ClientError> {
-        self.tx
-            .send(Command::SetIdentity {
-                name: name.to_owned(),
-                description: description.to_owned(),
-            })
+        let (name, description) = (wire(name)?, wire(description)?);
+        let send = self.tx.send(Command::SetIdentity { name, description });
+        tokio::time::timeout(self.request_timeout, send)
             .await
+            .map_err(|_| ClientError::Timeout("client is busy".into()))?
             .map_err(|_| ClientError::Disconnected)
     }
 
@@ -359,13 +423,15 @@ impl ClientHandle {
         min_write_class: u8,
         owner: Option<&str>,
     ) -> Result<FileListResponse, ClientError> {
+        let (path, name) = (wire(path)?, wire(name)?);
+        let owner = owner.map(wire).transpose()?;
         self.send(|reply| Command::CreateFolder {
-            path: path.to_owned(),
-            name: name.to_owned(),
+            path,
+            name,
             kind,
             min_read_class,
             min_write_class,
-            owner: owner.map(str::to_owned),
+            owner,
             reply,
         })
         .await
@@ -374,11 +440,8 @@ impl ClientHandle {
     /// Delete a node (recursively, for folders). Requires FILE_MANAGE_TREE.
     /// Resolves with the updated listing of the deleted node's parent.
     pub async fn delete_path(&self, path: &str) -> Result<FileListResponse, ClientError> {
-        self.send(|reply| Command::DeletePath {
-            path: path.to_owned(),
-            reply,
-        })
-        .await
+        let path = wire(path)?;
+        self.send(|reply| Command::DeletePath { path, reply }).await
     }
 
     /// Move a node into a different folder (Select-for-Move → Move-into),
@@ -390,9 +453,10 @@ impl ClientHandle {
         path: &str,
         dest_path: &str,
     ) -> Result<FileListResponse, ClientError> {
+        let (path, dest_path) = (wire(path)?, wire(dest_path)?);
         self.send(|reply| Command::MovePath {
-            path: path.to_owned(),
-            dest_path: dest_path.to_owned(),
+            path,
+            dest_path,
             reply,
         })
         .await
@@ -408,9 +472,10 @@ impl ClientHandle {
         source_path: &str,
         dest_path: &str,
     ) -> Result<FileListResponse, ClientError> {
+        let (source_path, dest_path) = (wire(source_path)?, wire(dest_path)?);
         self.send(|reply| Command::AliasPath {
-            source_path: source_path.to_owned(),
-            dest_path: dest_path.to_owned(),
+            source_path,
+            dest_path,
             reply,
         })
         .await
@@ -427,11 +492,8 @@ impl ClientHandle {
     /// visible to the caller's class. Errors if no catalog has been
     /// generated yet.
     pub async fn search_files(&self, query: &str) -> Result<Vec<FileSearchEntry>, ClientError> {
-        self.send(|reply| Command::SearchFiles {
-            query: query.to_owned(),
-            reply,
-        })
-        .await
+        let query = wire(query)?;
+        self.send(|reply| Command::SearchFiles { query, reply }).await
     }
 
     /// Fetch the server-wide roster of currently online users (the global
@@ -443,11 +505,8 @@ impl ClientHandle {
     /// Fetch the tracker directory of live servers (the Tracker window),
     /// optionally filtered by a case-insensitive name substring (empty = all).
     pub async fn list_servers(&self, filter: &str) -> Result<Vec<TrackerServer>, ClientError> {
-        self.send(|reply| Command::ListServers {
-            filter: filter.to_owned(),
-            reply,
-        })
-        .await
+        let filter = wire(filter)?;
+        self.send(|reply| Command::ListServers { filter, reply }).await
     }
 
     /// Fetch the live server settings (the Server Settings window). Requires
@@ -466,10 +525,11 @@ impl ClientHandle {
         greeting: &str,
         max_users: u32,
     ) -> Result<ServerSettings, ClientError> {
+        let (name, description, greeting) = (wire(name)?, wire(description)?, wire(greeting)?);
         self.send(|reply| Command::UpdateServerSettings {
-            name: name.to_owned(),
-            description: description.to_owned(),
-            greeting: greeting.to_owned(),
+            name,
+            description,
+            greeting,
             max_users,
             reply,
         })
@@ -481,22 +541,17 @@ impl ClientHandle {
     /// written; the server's ack (or refusal) arrives as `Event::ServerInfo`
     /// (or `Event::ServerError`).
     pub async fn broadcast(&self, text: &str) -> Result<(), ClientError> {
-        self.send(|reply| Command::Broadcast {
-            text: text.to_owned(),
-            reply,
-        })
-        .await
+        let text = wire(text)?;
+        self.send(|reply| Command::Broadcast { text, reply }).await
     }
 
     /// Gracefully shut down the server: broadcast `message`, disconnect every
     /// session (including this one), and stop accepting new connections.
     /// Requires `SERVER_ADMIN`. "Exit" only — never touches the host OS.
     pub async fn shutdown_server(&self, message: &str) -> Result<(), ClientError> {
-        self.send(|reply| Command::ShutdownServer {
-            message: message.to_owned(),
-            reply,
-        })
-        .await
+        let message = wire(message)?;
+        self.send(|reply| Command::ShutdownServer { message, reply })
+            .await
     }
 
     /// Fetch the most recent audit-log entries (the Server History window),
@@ -524,11 +579,12 @@ impl ClientHandle {
         cidr: &str,
         note: &str,
     ) -> Result<Vec<IpRule>, ClientError> {
+        let (action, cidr, note) = (wire(action)?, wire(cidr)?, wire(note)?);
         self.send(|reply| Command::CreateIpRule {
             position,
-            action: action.to_owned(),
-            cidr: cidr.to_owned(),
-            note: note.to_owned(),
+            action,
+            cidr,
+            note,
             reply,
         })
         .await
@@ -537,11 +593,8 @@ impl ClientHandle {
     /// Delete an IP rule by id. Resolves with the server's full, updated rule
     /// list. Requires `SERVER_ADMIN`.
     pub async fn delete_ip_rule(&self, id: &str) -> Result<Vec<IpRule>, ClientError> {
-        self.send(|reply| Command::DeleteIpRule {
-            id: id.to_owned(),
-            reply,
-        })
-        .await
+        let id = wire(id)?;
+        self.send(|reply| Command::DeleteIpRule { id, reply }).await
     }
 
     /// Fetch the live connection roster (Connection Monitor). Returns the same
@@ -565,8 +618,9 @@ impl ClientHandle {
         min_class_join: u8,
         interview_mode: bool,
     ) -> Result<(), ClientError> {
+        let room = wire(room)?;
         self.send(|reply| Command::SetRoomFlags {
-            room: room.to_owned(),
+            room,
             min_class_join,
             interview_mode,
             reply,
@@ -577,11 +631,9 @@ impl ClientHandle {
     /// Fetch one user's detail (login/idle time, address) for the User Info
     /// window. Errors if the user isn't currently online.
     pub async fn get_user_info(&self, username: &str) -> Result<PresenceUser, ClientError> {
-        self.send(|reply| Command::GetUserInfo {
-            username: username.to_owned(),
-            reply,
-        })
-        .await
+        let username = wire(username)?;
+        self.send(|reply| Command::GetUserInfo { username, reply })
+            .await
     }
 
     /// Send a private (direct) message to `to`. Resolves once the send frame
@@ -589,48 +641,96 @@ impl ClientHandle {
     /// `Event::PrivateMessage`. Errors surface via `Event::ServerError` (e.g.
     /// the recipient is offline).
     pub async fn send_private(&self, to: &str, text: &str) -> Result<(), ClientError> {
-        self.send(|reply| Command::SendPrivate {
-            to: to.to_owned(),
-            text: text.to_owned(),
-            reply,
-        })
-        .await
+        let (to, text) = (wire(to)?, wire(text)?);
+        self.send(|reply| Command::SendPrivate { to, text, reply })
+            .await
     }
 
-    /// Invite `to` into a fresh private chat. Resolves once the request is
-    /// written; you're joined to the new room immediately (see
-    /// `Event::UserList`/`Event::Topic` for it), and the invitee — if
-    /// online — gets `Event::ChatInvited`. Errors (offline, missing
-    /// `CHAT_PRIVATE`) surface via `Event::ServerError`.
-    pub async fn invite_to_chat(&self, to: &str) -> Result<(), ClientError> {
-        self.send(|reply| Command::InviteToChat {
-            to: to.to_owned(),
-            reply,
-        })
-        .await
+    /// Invite `to` into a fresh private chat and return the new room's id
+    /// (`priv-<uuid>`). The server joins you to that room straight away, so
+    /// switch the UI to it (send with `send_chat(&room, ..)`); the invitee —
+    /// if online — gets `Event::ChatInvited` for the same room.
+    ///
+    /// Resolves only once the server has answered: `Err(ClientError::Server)`
+    /// if it refused (invitee offline, inviting yourself, missing
+    /// `CHAT_PRIVATE`) — the refusal is also emitted as `Event::ServerError`
+    /// as before. The room id is learned from the room's first member list
+    /// (`Event::UserList` for a `priv-*` room this client didn't join
+    /// itself), since the wire ack doesn't carry it.
+    pub async fn invite_to_chat(&self, to: &str) -> Result<String, ClientError> {
+        let to = wire(to)?;
+        self.send(|reply| Command::InviteToChat { to, reply }).await
     }
 
     /// Upload a local file into `remote_dir`; the remote name is the local
-    /// file's basename. Resolves when the transfer verifies (or fails);
-    /// `Event::TransferProgress` is emitted throughout.
+    /// file's basename. The file must be a regular file of at most 16 GiB;
+    /// it is hashed and then streamed from disk (never read whole into
+    /// memory), and the upload fails if the file changes meanwhile.
+    /// Resolves when the transfer verifies (or fails);
+    /// `Event::TransferProgress` is emitted throughout. Other commands keep
+    /// working while it runs; `cancel_transfer` or `disconnect` abort it.
     pub async fn upload(&self, local: PathBuf, remote_dir: &str) -> Result<(), ClientError> {
-        self.send(|reply| Command::Upload {
-            local,
-            remote_dir: remote_dir.to_owned(),
-            reply,
-        })
+        let remote_dir = wire(remote_dir)?;
+        self.send_with_timeout(
+            |reply| Command::Upload {
+                local,
+                remote_dir,
+                reply,
+            },
+            None,
+        )
         .await
     }
 
     /// Download `remote_path` (a `/dir/file` path) to `local`, resuming from a
-    /// `.kdxpart` sidecar if one is present. Resolves on completion.
+    /// `.kdxpart` sidecar if one matches this server and remote file. The
+    /// bytes accumulate in `<local>.kdxdata` and are renamed to `local` only
+    /// after the whole-file hash verifies. Resolves on completion.
+    ///
+    /// `local` is used verbatim: derive its file name from server-supplied
+    /// names only via [`crate::safe_local_file_name`].
     pub async fn download(&self, remote_path: &str, local: PathBuf) -> Result<(), ClientError> {
-        self.send(|reply| Command::Download {
-            remote_path: remote_path.to_owned(),
-            local,
-            reply,
-        })
+        self.download_inner(remote_path, local, None).await
+    }
+
+    /// Like [`download`](Self::download), but refuse the transfer unless the
+    /// server's announced size equals `expected_size` (e.g. the size shown
+    /// in the listing the user picked the file from).
+    pub async fn download_expecting(
+        &self,
+        remote_path: &str,
+        local: PathBuf,
+        expected_size: u64,
+    ) -> Result<(), ClientError> {
+        self.download_inner(remote_path, local, Some(expected_size))
+            .await
+    }
+
+    async fn download_inner(
+        &self,
+        remote_path: &str,
+        local: PathBuf,
+        expected_size: Option<u64>,
+    ) -> Result<(), ClientError> {
+        let remote_path = wire(remote_path)?;
+        self.send_with_timeout(
+            |reply| Command::Download {
+                remote_path,
+                local,
+                expected_size,
+                reply,
+            },
+            None,
+        )
         .await
+    }
+
+    /// Abort the active upload or download, if any. Its `upload`/`download`
+    /// call resolves with `ClientError::Transfer("cancelled")`; a cancelled
+    /// download keeps its resume state. Returns whether a transfer was
+    /// active.
+    pub async fn cancel_transfer(&self) -> Result<bool, ClientError> {
+        self.send(|reply| Command::CancelTransfer { reply }).await
     }
 
     /// Fetch every custom role defined on the server (the Roles window's
@@ -649,11 +749,12 @@ impl ClientHandle {
         rank: i32,
         color: &str,
     ) -> Result<Vec<RoleInfo>, ClientError> {
+        let (name, color) = (wire(name)?, wire(color)?);
         self.send(|reply| Command::CreateRole {
-            name: name.to_owned(),
+            name,
             privileges,
             rank,
-            color: color.to_owned(),
+            color,
             reply,
         })
         .await
@@ -669,12 +770,13 @@ impl ClientHandle {
         rank: i32,
         color: &str,
     ) -> Result<Vec<RoleInfo>, ClientError> {
+        let (id, name, color) = (wire(id)?, wire(name)?, wire(color)?);
         self.send(|reply| Command::UpdateRole {
-            id: id.to_owned(),
-            name: name.to_owned(),
+            id,
+            name,
             privileges,
             rank,
-            color: color.to_owned(),
+            color,
             reply,
         })
         .await
@@ -682,19 +784,17 @@ impl ClientHandle {
 
     /// Delete a role outright. Requires `USER_ADMIN`.
     pub async fn delete_role(&self, id: &str) -> Result<Vec<RoleInfo>, ClientError> {
-        self.send(|reply| Command::DeleteRole {
-            id: id.to_owned(),
-            reply,
-        })
-        .await
+        let id = wire(id)?;
+        self.send(|reply| Command::DeleteRole { id, reply }).await
     }
 
     /// Attach a role to an account by username. Requires `USER_ADMIN`.
     /// Idempotent server-side.
     pub async fn assign_role(&self, username: &str, role_id: &str) -> Result<Vec<RoleInfo>, ClientError> {
+        let (username, role_id) = (wire(username)?, wire(role_id)?);
         self.send(|reply| Command::AssignRole {
-            username: username.to_owned(),
-            role_id: role_id.to_owned(),
+            username,
+            role_id,
             reply,
         })
         .await
@@ -702,9 +802,10 @@ impl ClientHandle {
 
     /// Detach a role from an account by username. Requires `USER_ADMIN`.
     pub async fn unassign_role(&self, username: &str, role_id: &str) -> Result<Vec<RoleInfo>, ClientError> {
+        let (username, role_id) = (wire(username)?, wire(role_id)?);
         self.send(|reply| Command::UnassignRole {
-            username: username.to_owned(),
-            role_id: role_id.to_owned(),
+            username,
+            role_id,
             reply,
         })
         .await
@@ -713,11 +814,9 @@ impl ClientHandle {
     /// Which roles does `username` currently hold? Requires `USER_ADMIN`.
     /// Returns role ids (UUID strings, matching `RoleInfo::id`).
     pub async fn account_roles(&self, username: &str) -> Result<Vec<String>, ClientError> {
-        self.send(|reply| Command::AccountRoles {
-            username: username.to_owned(),
-            reply,
-        })
-        .await
+        let username = wire(username)?;
+        self.send(|reply| Command::AccountRoles { username, reply })
+            .await
     }
 
     /// Forcibly disconnect another user by username. Requires `USER_KICK`; a
@@ -731,9 +830,10 @@ impl ClientHandle {
         reason: &str,
         ban_secs: u32,
     ) -> Result<(), ClientError> {
+        let (username, reason) = (wire(username)?, wire(reason)?);
         self.send(|reply| Command::DisconnectUser {
-            username: username.to_owned(),
-            reason: reason.to_owned(),
+            username,
+            reason,
             ban_secs,
             reply,
         })
@@ -757,9 +857,10 @@ impl ClientHandle {
         granted: u32,
         revoked: u32,
     ) -> Result<Vec<AccountSummary>, ClientError> {
+        let (username, password) = (wire(username)?, wire(password)?);
         self.send(|reply| Command::CreateAccount {
-            username: username.to_owned(),
-            password: password.to_owned(),
+            username,
+            password,
             base_class,
             granted,
             revoked,
@@ -777,8 +878,9 @@ impl ClientHandle {
         granted: u32,
         revoked: u32,
     ) -> Result<Vec<AccountSummary>, ClientError> {
+        let username = wire(username)?;
         self.send(|reply| Command::UpdateAccount {
-            username: username.to_owned(),
+            username,
             base_class,
             granted,
             revoked,
@@ -801,9 +903,10 @@ impl ClientHandle {
         min_read_class: u8,
         min_post_class: u8,
     ) -> Result<Vec<NewsgroupInfo>, ClientError> {
+        let (name, description) = (wire(name)?, wire(description)?);
         self.send(|reply| Command::CreateNewsgroup {
-            name: name.to_owned(),
-            description: description.to_owned(),
+            name,
+            description,
             min_read_class,
             min_post_class,
             reply,
@@ -814,8 +917,9 @@ impl ClientHandle {
     /// Every post in a newsgroup, oldest first; the caller builds the thread
     /// tree from each post's `parent_id`.
     pub async fn list_thread(&self, newsgroup_id: &str) -> Result<Vec<NewsPost>, ClientError> {
+        let newsgroup_id = wire(newsgroup_id)?;
         self.send(|reply| Command::ListThread {
-            newsgroup_id: newsgroup_id.to_owned(),
+            newsgroup_id,
             reply,
         })
         .await
@@ -830,11 +934,13 @@ impl ClientHandle {
         subject: &str,
         body: &str,
     ) -> Result<Vec<NewsPost>, ClientError> {
+        let (newsgroup_id, parent_id) = (wire(newsgroup_id)?, wire(parent_id)?);
+        let (subject, body) = (wire(subject)?, wire(body)?);
         self.send(|reply| Command::CreatePost {
-            newsgroup_id: newsgroup_id.to_owned(),
-            parent_id: parent_id.to_owned(),
-            subject: subject.to_owned(),
-            body: body.to_owned(),
+            newsgroup_id,
+            parent_id,
+            subject,
+            body,
             reply,
         })
         .await
@@ -843,15 +949,14 @@ impl ClientHandle {
     /// Delete a post you authored (admins may delete any). Resolves with the
     /// newsgroup's updated post list.
     pub async fn delete_post(&self, post_id: &str) -> Result<Vec<NewsPost>, ClientError> {
-        self.send(|reply| Command::DeletePost {
-            post_id: post_id.to_owned(),
-            reply,
-        })
-        .await
+        let post_id = wire(post_id)?;
+        self.send(|reply| Command::DeletePost { post_id, reply }).await
     }
 
-    /// Ask the actor to close the connection. Best-effort.
+    /// Ask the actor to close the connection. Takes effect promptly even if
+    /// the actor is mid-transfer, its command queue is full, or the server
+    /// has stopped reading; never blocks. `Event::Disconnected` follows.
     pub async fn disconnect(&self) {
-        let _ = self.tx.send(Command::Disconnect).await;
+        self.shutdown.send_replace(true);
     }
 }

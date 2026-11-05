@@ -1,30 +1,75 @@
-//! Challenge-response authentication.
+//! Login challenge and the Argon2id cost parameters shipped with it.
 //!
-//! The server stores only an Argon2id PHC string. To log in, the client
-//! receives a random 32-byte challenge plus the account's Argon2 salt and
-//! parameters, recomputes the Argon2 output (the "verifier") from the
-//! password locally, and answers with `SHA-256(challenge || verifier)`.
-//! The server compares that against the same digest computed from its stored
-//! verifier, in constant time. The password itself never crosses the wire —
-//! not even inside TLS — and a transcript replay is useless because each
-//! login gets a fresh challenge.
+//! The proof a client sends back is computed in [`crate::scram`]; this module
+//! only holds the pieces both sides share: the fresh random challenge and the
+//! [`KdfParams`] (plus the bounds a client enforces before it spends any
+//! memory or CPU on a server-chosen KDF).
 
-use argon2::password_hash::PasswordHash;
-use argon2::{Algorithm, Argon2, Params, Version};
+use argon2::Params;
 use rand::RngCore;
-use sha2::{Digest, Sha256};
-use subtle::ConstantTimeEq;
-use zeroize::Zeroizing;
 
 use crate::CryptoError;
 
-/// Argon2id cost parameters shipped to the client so it can recompute the
-/// verifier. Mirrors what's encoded in the stored PHC string.
+/// Smallest Argon2 memory cost (KiB) a client accepts. Equal to the argon2
+/// crate's default (19 MiB, the OWASP minimum): anything cheaper would let a
+/// malicious server make the client's proof cheap to brute-force offline.
+pub const MIN_M_COST: u32 = 19_456;
+/// Largest Argon2 memory cost (KiB) a client accepts (256 MiB). Above this a
+/// malicious server could abort or OOM-kill the client.
+pub const MAX_M_COST: u32 = 262_144;
+/// Smallest Argon2 time cost (passes) a client accepts.
+pub const MIN_T_COST: u32 = 2;
+/// Largest Argon2 time cost a client accepts; bounds login CPU time.
+pub const MAX_T_COST: u32 = 10;
+/// Smallest Argon2 parallelism a client accepts.
+pub const MIN_P_COST: u32 = 1;
+/// Largest Argon2 parallelism a client accepts.
+pub const MAX_P_COST: u32 = 4;
+/// Shortest salt a client accepts (bytes).
+pub const MIN_SALT_LEN: usize = 16;
+/// Longest salt a client accepts (bytes).
+pub const MAX_SALT_LEN: usize = 64;
+/// Length of every salt this crate generates (and of the server's decoy salts).
+pub const SALT_LEN: usize = 16;
+
+/// Argon2id cost parameters shipped to the client so it can recompute its
+/// salted password.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KdfParams {
     pub m_cost: u32,
     pub t_cost: u32,
     pub p_cost: u32,
+}
+
+impl KdfParams {
+    /// The parameters new credentials are derived with: the argon2 crate's
+    /// defaults (m = 19 MiB, t = 2, p = 1). The server's decoy challenges for
+    /// unknown usernames use exactly these too.
+    pub const DEFAULT: KdfParams = KdfParams {
+        m_cost: Params::DEFAULT_M_COST,
+        t_cost: Params::DEFAULT_T_COST,
+        p_cost: Params::DEFAULT_P_COST,
+    };
+
+    /// Check server-supplied parameters (and salt length) against the
+    /// client-side floors and ceilings before deriving anything. A malicious
+    /// server must not be able to make the client allocate terabytes, spin
+    /// for hours, or produce a cheaply crackable proof.
+    pub fn check_bounds(&self, salt_len: usize) -> Result<(), CryptoError> {
+        if !(MIN_M_COST..=MAX_M_COST).contains(&self.m_cost) {
+            return Err(CryptoError::UnacceptableKdf("memory cost out of range"));
+        }
+        if !(MIN_T_COST..=MAX_T_COST).contains(&self.t_cost) {
+            return Err(CryptoError::UnacceptableKdf("time cost out of range"));
+        }
+        if !(MIN_P_COST..=MAX_P_COST).contains(&self.p_cost) {
+            return Err(CryptoError::UnacceptableKdf("parallelism out of range"));
+        }
+        if !(MIN_SALT_LEN..=MAX_SALT_LEN).contains(&salt_len) {
+            return Err(CryptoError::UnacceptableKdf("salt length out of range"));
+        }
+        Ok(())
+    }
 }
 
 /// A fresh random 32-byte login challenge.
@@ -34,104 +79,59 @@ pub fn generate_challenge() -> [u8; 32] {
     challenge
 }
 
-/// Extract the salt and cost parameters from a stored PHC string, for
-/// inclusion in the `AuthChallenge` sent to the client.
-pub fn extract_kdf(stored_phc: &str) -> Result<(Vec<u8>, KdfParams), CryptoError> {
-    let parsed = PasswordHash::new(stored_phc).map_err(CryptoError::Hash)?;
-    let salt = parsed.salt.ok_or(CryptoError::MissingSalt)?;
-    let mut salt_buf = [0u8; 64];
-    let salt_bytes = salt.decode_b64(&mut salt_buf).map_err(CryptoError::Hash)?;
-    let params = Params::try_from(&parsed).map_err(CryptoError::Hash)?;
-    Ok((
-        salt_bytes.to_vec(),
-        KdfParams {
-            m_cost: params.m_cost(),
-            t_cost: params.t_cost(),
-            p_cost: params.p_cost(),
-        },
-    ))
-}
-
-/// Client side: derive the verifier from the password and answer the
-/// challenge. `salt` and `params` come from the server's `AuthChallenge`.
-pub fn client_response(
-    password: &str,
-    salt: &[u8],
-    params: &KdfParams,
-    challenge: &[u8; 32],
-) -> Result<[u8; 32], CryptoError> {
-    let argon_params = Params::new(params.m_cost, params.t_cost, params.p_cost, Some(32))
-        .map_err(CryptoError::Params)?;
-    let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, argon_params);
-    let mut verifier = Zeroizing::new([0u8; 32]);
-    argon
-        .hash_password_into(password.as_bytes(), salt, verifier.as_mut())
-        .map_err(CryptoError::Params)?;
-    Ok(digest(challenge, verifier.as_ref()))
-}
-
-/// Server side: the response a correct client would produce, computed from
-/// the stored PHC string's embedded verifier.
-pub fn expected_response(stored_phc: &str, challenge: &[u8; 32]) -> Result<[u8; 32], CryptoError> {
-    let parsed = PasswordHash::new(stored_phc).map_err(CryptoError::Hash)?;
-    let verifier = parsed.hash.ok_or(CryptoError::MissingSalt)?;
-    Ok(digest(challenge, verifier.as_bytes()))
-}
-
-/// Constant-time comparison of the client's response with the expected one.
-pub fn verify_response(expected: &[u8; 32], got: &[u8; 32]) -> bool {
-    expected.ct_eq(got).into()
-}
-
-fn digest(challenge: &[u8; 32], verifier: &[u8]) -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    hasher.update(challenge);
-    hasher.update(verifier);
-    hasher.finalize().into()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::password::hash_password;
-
-    #[test]
-    fn correct_password_authenticates() {
-        let phc = hash_password("open sesame").unwrap();
-        let (salt, params) = extract_kdf(&phc).unwrap();
-        let challenge = generate_challenge();
-
-        let response = client_response("open sesame", &salt, &params, &challenge).unwrap();
-        let expected = expected_response(&phc, &challenge).unwrap();
-        assert!(verify_response(&expected, &response));
-    }
-
-    #[test]
-    fn wrong_password_fails() {
-        let phc = hash_password("open sesame").unwrap();
-        let (salt, params) = extract_kdf(&phc).unwrap();
-        let challenge = generate_challenge();
-
-        let response = client_response("open salami", &salt, &params, &challenge).unwrap();
-        let expected = expected_response(&phc, &challenge).unwrap();
-        assert!(!verify_response(&expected, &response));
-    }
-
-    #[test]
-    fn replayed_response_fails_on_new_challenge() {
-        let phc = hash_password("open sesame").unwrap();
-        let (salt, params) = extract_kdf(&phc).unwrap();
-
-        let first = generate_challenge();
-        let replay = client_response("open sesame", &salt, &params, &first).unwrap();
-
-        let second = generate_challenge();
-        let expected = expected_response(&phc, &second).unwrap();
-        assert!(!verify_response(&expected, &replay));
-    }
 
     #[test]
     fn challenges_are_unique() {
         assert_ne!(generate_challenge(), generate_challenge());
+    }
+
+    #[test]
+    fn default_params_are_within_client_bounds() {
+        assert_eq!(KdfParams::DEFAULT.m_cost, 19_456);
+        assert_eq!(KdfParams::DEFAULT.t_cost, 2);
+        assert_eq!(KdfParams::DEFAULT.p_cost, 1);
+        KdfParams::DEFAULT.check_bounds(SALT_LEN).unwrap();
+    }
+
+    #[test]
+    fn hostile_params_are_rejected() {
+        let ok = KdfParams::DEFAULT;
+        let cases = [
+            KdfParams {
+                m_cost: u32::MAX,
+                ..ok
+            },
+            KdfParams { m_cost: 8, ..ok },
+            KdfParams {
+                m_cost: MAX_M_COST + 1,
+                ..ok
+            },
+            KdfParams {
+                t_cost: u32::MAX,
+                ..ok
+            },
+            KdfParams { t_cost: 1, ..ok },
+            KdfParams { p_cost: 0, ..ok },
+            KdfParams {
+                p_cost: 0xFF_FFFF,
+                ..ok
+            },
+        ];
+        for params in cases {
+            assert!(
+                matches!(
+                    params.check_bounds(SALT_LEN),
+                    Err(CryptoError::UnacceptableKdf(_))
+                ),
+                "{params:?} accepted"
+            );
+        }
+        assert!(ok.check_bounds(8).is_err());
+        assert!(ok.check_bounds(65).is_err());
+        assert!(ok.check_bounds(MIN_SALT_LEN).is_ok());
+        assert!(ok.check_bounds(MAX_SALT_LEN).is_ok());
     }
 }

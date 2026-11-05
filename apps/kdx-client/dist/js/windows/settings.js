@@ -2,6 +2,8 @@
 // Panels mirror KDX (Identity / General / Appearance), pared to what the
 // client actually supports today.
 
+import { esc } from "../html.js";
+
 const KEY = "kdx.settings";
 
 const THEMES = {
@@ -41,19 +43,21 @@ export function applySettings(s) {
   document.body.classList.toggle("no-timestamps", !s.timestamps);
 }
 
+function themeOptionsHtml(selected) {
+  return Object.entries(THEMES)
+    .map(([id, t]) => `<option value="${esc(id)}"${id === selected ? " selected" : ""}>${esc(t.name)}</option>`)
+    .join("");
+}
+
 export function buildSettings() {
   const body = document.createElement("div");
   body.className = "settings";
   const s = loadSettings();
 
-  const themeOpts = Object.entries(THEMES)
-    .map(([id, t]) => `<option value="${id}"${id === s.theme ? " selected" : ""}>${t.name}</option>`)
-    .join("");
-
   body.innerHTML = `
     <div class="set-panel">
       <h3>Appearance</h3>
-      <label class="set-row">Theme <select id="set-theme">${themeOpts}</select></label>
+      <label class="set-row">Theme <select id="set-theme">${themeOptionsHtml(s.theme)}</select></label>
       <label class="set-row"><input type="checkbox" id="set-ts"${s.timestamps ? " checked" : ""}/> Show timestamps in chat</label>
     </div>
     <div class="set-panel">
@@ -86,8 +90,4 @@ export function buildSettings() {
   });
 
   return { body };
-}
-
-function esc(s) {
-  return String(s || "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
 }

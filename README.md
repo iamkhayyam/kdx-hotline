@@ -16,7 +16,7 @@ and the machinery behind each feature — lives in
 ```
 crates/
   kdx-protocol      wire format: 20-byte framed packets, codec, fragmentation, typed messages
-  kdx-crypto        Argon2id password hashing + challenge-response
+  kdx-crypto        Argon2id + channel-bound SCRAM-style login proofs
   kdx-server-core   connection state machine, auth, chat rooms, file tree, transfers, tracker
   kdx-storage       sqlx/SQLite persistence
   kdx-client-core   async client library (zero UI deps), TOFU trust, transfer engines
@@ -29,24 +29,44 @@ apps/
 
 ```sh
 cargo build --workspace
-cargo test  --workspace     # 243 tests, no external services needed
+cargo test  --workspace     # ~600 tests, no external services needed
+```
+
+The Tauri client crate (`apps/kdx-client/src-tauri`) needs the platform
+webview SDK to build — on Linux the GTK/WebKit dev packages
+(`libwebkit2gtk-4.1-dev libgtk-3-dev`); add `--exclude kdx-client` to build
+and test only the server, protocol and client library. The webview's JS has
+its own checks:
+
+```sh
+node apps/kdx-client/scripts/check-escaping.mjs
+node --test apps/kdx-client/tests/*.test.mjs
 ```
 
 ## Run the server
 
 ```sh
-# Create an account (guest | user | power | admin; default user):
-cargo run -p kdxd -- useradd phraq s3cret power
+# Create an account (guest | user | power | admin; default user). The
+# password is prompted for without echo; scripts can pipe it in instead
+# with --password-stdin:
+cargo run -p kdxd -- useradd phraq --prompt power
+printf '%s\n' "$PASS" | cargo run -p kdxd -- useradd phraq --password-stdin power
 
 # Start the server (defaults to 0.0.0.0:10700 with a self-signed dev cert):
 cargo run -p kdxd
 ```
 
 Both commands default to a `kdx.db` SQLite file and a `files/` directory in
-the working directory. Pass a TOML config path to either to override — see
+the working directory (`useradd` prints the database it wrote to). Pass a
+TOML config path to either to override — relative paths in it are resolved
+against the config file's directory. (Upgrading: earlier versions resolved a
+relative `database` / `files_root` against the working directory instead. If
+such a path now points at nothing while the old location holds data, kdxd
+refuses to start and names both paths; make the setting absolute.) See
 `crates/kdxd/kdxd.example.toml` for every field with its default value, or
-`Config` in `crates/kdxd/src/config.rs` for the definitions (bind address,
-TLS cert paths, session TTL, upload/download throttles).
+`Config` in `crates/kdxd/src/config.rs` for the definitions (bind address, TLS cert
+paths, session TTL, upload/download throttles, connection limits,
+`public_host`). kdxd refuses to run as root unless given `--allow-root`.
 
 ## Run the client
 
@@ -61,8 +81,10 @@ desktop, resize from any edge (look for the corner triangle), minimize to
 the Dock, or close it independently. In the **Connect** window enter the
 server host (`127.0.0.1`), port (`10700`), and your account. On first contact
 you'll get a **trust-on-first-use** prompt showing the server's certificate
-fingerprint — this is expected against a self-signed dev server; the
-fingerprint changes each time the dev server restarts. Trust it to continue.
+fingerprint — this is expected against a self-signed dev server. The dev
+certificate is cached next to the database (`dev-cert.der` / `dev-key.der`),
+so the fingerprint stays the same across restarts until you delete those
+files. Trust it to continue.
 After login you're placed in `#lobby`; use the **Files** window to browse,
 upload, and download, and the **Transfers** window shows a live per-chunk
 bitmap.
@@ -110,10 +132,17 @@ and the matching service file (`net.kdx.hotline.server.plist` on macOS,
 `kdxd.service` on Linux). Install:
 
 - **macOS**: `sudo cp kdxd /usr/local/bin/` — run manually
-  (`kdxd kdxd.toml`) or as a launchd agent with the included plist.
+  (`kdxd kdxd.toml`) or as a launchd daemon with the included plist, which
+  runs it as the `_kdx` role account (the comment at the top of the plist
+  has the one-time account and `/var/kdx` setup).
 - **Linux**: `sudo cp kdxd /usr/local/bin/` + the systemd unit
-  (`sudo cp kdxd.service /etc/systemd/system/`), create the `kdx` user and
-  `/etc/kdx/kdxd.toml` from the example, then `systemctl enable --now kdxd`.
+  (`sudo cp kdxd.service /etc/systemd/system/`), create the `kdx` user
+  (`useradd --system --home-dir /var/lib/kdx --no-create-home --shell
+  /usr/sbin/nologin kdx`; systemd creates `/var/lib/kdx` itself, mode 0700)
+  and `/etc/kdx/kdxd.toml` from the example with `database =
+  "/var/lib/kdx/kdx.db"` and `files_root = "/var/lib/kdx/files"`, then
+  `systemctl enable --now kdxd`. Add accounts as the service user:
+  `sudo -u kdx kdxd useradd NAME --prompt admin /etc/kdx/kdxd.toml`.
 - **Windows**: copy `kdxd.exe` anywhere; run `kdxd kdxd.toml` (the example
   config documents every option).
 
@@ -123,13 +152,24 @@ Local server build: `cargo build -p kdxd --release` → `target/release/kdxd`.
 
 ## Security notes
 
-- Transport is TLS 1.3 (rustls). The client pins server certificates
-  trust-on-first-use, warning loudly if a previously-trusted key changes.
-- Passwords are stored as Argon2id hashes. Login is challenge-response: the
-  client answers `SHA-256(challenge ‖ argon2id-verifier)`, so the plaintext
-  password never crosses the wire.
+- Transport is TLS 1.3 only (rustls, ALPN `kdx/1`). The client pins each
+  server's public key trust-on-first-use; a changed key needs explicit,
+  typed confirmation and never logs in automatically.
+- Login (protocol v2) is a SCRAM-SHA-256-style proof over an Argon2id-salted
+  password, bound to the TLS session with a TLS exporter value. The password
+  never crosses the wire, a relayed proof fails on any other connection, and
+  the client verifies a server signature before trusting the login. The
+  server stores only the salt, KDF parameters, `StoredKey` and `ServerKey`:
+  a copy of the database is not enough to log in (it still permits offline
+  guessing at Argon2id cost, so keep it private — kdxd creates it `0600`).
+  Failed logins are throttled per address and per address+username.
+- The server bounds every client-controlled size and rate (frame and
+  reassembly caps, input lengths, per-connection pacing, connection caps,
+  handshake/idle/write timeouts, room and transfer limits) and runs as an
+  unprivileged user (it refuses to start as root without `--allow-root`).
 - The self-signed dev certificate is for local testing only; supply real
-  certificates via config for any real deployment.
+  certificates via config for any real deployment. The cached dev key is
+  written `0600` and refused if its permissions are loosened.
 
 ## Status
 

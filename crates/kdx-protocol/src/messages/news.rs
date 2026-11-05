@@ -1,6 +1,6 @@
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
-use super::wire::{expect_end, get_str, put_str};
+use super::wire::{expect_end, get_str, list_capacity, put_count32, put_str};
 use crate::ProtocolError;
 
 /// A newsgroup as seen over the wire. `min_read_class` / `min_post_class` are
@@ -99,8 +99,8 @@ impl NewsgroupListRequest {
 impl NewsgroupListResponse {
     pub fn encode(&self) -> Bytes {
         let mut buf = BytesMut::new();
-        buf.put_u32(self.groups.len() as u32);
-        for g in &self.groups {
+        let n = put_count32(&mut buf, self.groups.len());
+        for g in &self.groups[..n] {
             buf.put_slice(&g.id);
             put_str(&mut buf, &g.name);
             put_str(&mut buf, &g.description);
@@ -114,7 +114,9 @@ impl NewsgroupListResponse {
             return Err(ProtocolError::MalformedPayload("NewsgroupListResponse"));
         }
         let count = payload.get_u32() as usize;
-        let mut groups = Vec::with_capacity(count.min(4096));
+        // Minimum entry: id + name prefix + description prefix + 2 classes.
+        let min_entry = 16 + 2 + 2 + 1 + 1;
+        let mut groups = Vec::with_capacity(list_capacity(count, payload.remaining(), min_entry));
         for _ in 0..count {
             let id = get_id(&mut payload, "NewsgroupListResponse")?;
             let name = get_str(&mut payload, "NewsgroupListResponse")?;
@@ -158,6 +160,10 @@ fn encode_post(buf: &mut BytesMut, p: &NewsPost) {
     buf.put_u64(p.timestamp);
 }
 
+/// Smallest wire encoding of a [`NewsPost`]: three ids, three empty strings
+/// and the timestamp.
+const MIN_POST_LEN: usize = 16 * 3 + 2 * 3 + 8;
+
 fn decode_post(payload: &mut &[u8]) -> Result<NewsPost, ProtocolError> {
     let id = get_id(payload, "NewsPost")?;
     let newsgroup_id = get_id(payload, "NewsPost")?;
@@ -184,8 +190,8 @@ impl NewsThreadListResponse {
     pub fn encode(&self) -> Bytes {
         let mut buf = BytesMut::new();
         buf.put_slice(&self.newsgroup_id);
-        buf.put_u32(self.posts.len() as u32);
-        for p in &self.posts {
+        let n = put_count32(&mut buf, self.posts.len());
+        for p in &self.posts[..n] {
             encode_post(&mut buf, p);
         }
         buf.freeze()
@@ -196,7 +202,7 @@ impl NewsThreadListResponse {
             return Err(ProtocolError::MalformedPayload("NewsThreadListResponse"));
         }
         let count = payload.get_u32() as usize;
-        let mut posts = Vec::with_capacity(count.min(65536));
+        let mut posts = Vec::with_capacity(list_capacity(count, payload.remaining(), MIN_POST_LEN));
         for _ in 0..count {
             posts.push(decode_post(&mut payload)?);
         }

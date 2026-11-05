@@ -3,12 +3,20 @@
 //! A role's privilege bits are unioned into the class's set at login (see
 //! [`super::manager::AuthManager::complete`]); per-account grant/revoke
 //! overrides still apply on top and revokes still win.
+//!
+//! `RoleManager` also answers the stored-privilege questions the admin
+//! policy ([`super::policy`]) needs — an account's current class and
+//! effective privileges, who holds a role, how many administrators remain —
+//! records ranked bans, and owns the lock that serializes privilege
+//! mutations so those checks can't race each other.
 
 use kdx_storage::roles as storage;
 use kdx_storage::SqlitePool;
+use tokio::sync::{Mutex, MutexGuard};
 use uuid::Uuid;
 
-use super::classes::Privileges;
+use super::classes::{BaseClass, Privileges};
+use super::policy::{AccountState, ADMIN_CORE};
 
 #[derive(Debug, thiserror::Error)]
 pub enum RoleError {
@@ -39,13 +47,109 @@ fn from_row(row: storage::RoleRow) -> Result<Role, RoleError> {
     })
 }
 
+/// A stored class value as a `BaseClass`. Out-of-range values (which can't
+/// log in anyway) read as Admin, the conservative choice for rank checks.
+fn class_from_stored(value: i64) -> BaseClass {
+    BaseClass::try_from(value.clamp(0, 3) as u8).unwrap_or(BaseClass::Admin)
+}
+
 pub struct RoleManager {
     pool: SqlitePool,
+    /// Held across check-then-write for every account/role/ban mutation.
+    mutations: Mutex<()>,
 }
 
 impl RoleManager {
     pub fn new(pool: SqlitePool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            mutations: Mutex::new(()),
+        }
+    }
+
+    /// Serialize a privilege mutation: hold the guard from the policy checks
+    /// through the write, so two admins can't each pass a check (say, "not
+    /// the last admin") that their combined changes violate.
+    pub async fn lock_mutations(&self) -> MutexGuard<'_, ()> {
+        self.mutations.lock().await
+    }
+
+    /// One role by id, or `None`.
+    pub async fn get(&self, id: Uuid) -> Result<Option<Role>, RoleError> {
+        storage::by_id(&self.pool, &id.to_string())
+            .await?
+            .map(from_row)
+            .transpose()
+    }
+
+    async fn account_state_from_row(
+        &self,
+        row: storage::AccountPrivilegeRow,
+    ) -> Result<AccountState, RoleError> {
+        let role_privileges = storage::for_account(&self.pool, &row.id)
+            .await?
+            .iter()
+            .fold(Privileges::empty(), |acc, r| {
+                acc | Privileges::from_bits_truncate(r.privileges as u32)
+            });
+        Ok(AccountState {
+            account_id: row.id,
+            username: row.username,
+            class: class_from_stored(row.base_class),
+            granted: row.granted as u32,
+            revoked: row.revoked as u32,
+            role_privileges,
+        })
+    }
+
+    /// An account's stored class, overrides and role privileges, or `None`
+    /// if there's no such account.
+    pub async fn account_state(&self, username: &str) -> Result<Option<AccountState>, RoleError> {
+        match storage::account_privileges(&self.pool, username).await? {
+            Some(row) => Ok(Some(self.account_state_from_row(row).await?)),
+            None => Ok(None),
+        }
+    }
+
+    /// The current state of every account holding a role.
+    pub async fn holders(&self, role_id: Uuid) -> Result<Vec<AccountState>, RoleError> {
+        let rows = storage::holders(&self.pool, &role_id.to_string()).await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            out.push(self.account_state_from_row(row).await?);
+        }
+        Ok(out)
+    }
+
+    /// How many accounts other than `username` can still administer the
+    /// server (Admin class with neither USER_ADMIN nor SERVER_ADMIN revoked).
+    pub async fn other_administrators(&self, username: &str) -> Result<i64, RoleError> {
+        Ok(storage::count_administrators(&self.pool, ADMIN_CORE.bits() as i64, username).await?)
+    }
+
+    /// Record a ban set by an account of class `banned_by`, keeping any
+    /// longer ban a higher rank already set (see
+    /// [`kdx_storage::bans::set_ranked`]). Returns the expiry now in force.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn set_ban(
+        &self,
+        account_id: &str,
+        until: i64,
+        reason: &str,
+        banned_by: &str,
+        banned_by_class: BaseClass,
+        now: i64,
+    ) -> Result<i64, RoleError> {
+        Ok(kdx_storage::bans::set_ranked(
+            &self.pool,
+            account_id,
+            until,
+            reason,
+            banned_by,
+            banned_by_class as i64,
+            now,
+        )
+        .await?)
     }
 
     pub async fn create(
@@ -126,7 +230,7 @@ mod tests {
     #[tokio::test]
     async fn create_assign_and_read_back_privileges() {
         let (pool, _dir) = pool().await;
-        let account = kdx_storage::accounts::create(&pool, "phraq", "phc", 1)
+        let account = kdx_storage::accounts::create(&pool, "phraq", "phc", 1, 0, 0)
             .await
             .unwrap();
         let mgr = RoleManager::new(pool);
@@ -162,7 +266,7 @@ mod tests {
     #[tokio::test]
     async fn unassign_removes_role_from_account() {
         let (pool, _dir) = pool().await;
-        let account = kdx_storage::accounts::create(&pool, "acidburn", "phc", 1)
+        let account = kdx_storage::accounts::create(&pool, "acidburn", "phc", 1, 0, 0)
             .await
             .unwrap();
         let mgr = RoleManager::new(pool);

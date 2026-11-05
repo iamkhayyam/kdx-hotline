@@ -4,6 +4,14 @@
 *.db-wal
 .DS_Store
 
+# kdxd runtime state when run from the repo root: the cached dev TLS
+# identity (dev-key.der is a private key) and uploaded files.
+dev-cert.der
+dev-key.der
+.dev-cert.der.tmp
+.dev-key.der.tmp
+/files/
+
 # Tauri build artifacts
 apps/kdx-client/src-tauri/gen/
 

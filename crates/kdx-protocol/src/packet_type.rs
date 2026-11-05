@@ -117,7 +117,9 @@ pub enum PacketType {
 }
 
 impl PacketType {
-    pub const ALL: [PacketType; 76] = [
+    /// Every defined packet type, in declaration order. The tests below check
+    /// this against `TryFrom<u8>` so the two cannot drift apart.
+    pub const ALL: [PacketType; 79] = [
         PacketType::HandshakeInit,
         PacketType::HandshakeResp,
         PacketType::Ping,
@@ -140,11 +142,14 @@ impl PacketType {
         PacketType::FileSearchResponse,
         PacketType::FileMove,
         PacketType::FileAlias,
+        PacketType::FileInfoRequest,
+        PacketType::FileInfoResponse,
         PacketType::ChatMessage,
         PacketType::ChatJoin,
         PacketType::ChatLeave,
         PacketType::ChatUserList,
         PacketType::ChatTopicSet,
+        PacketType::SetIdentity,
         PacketType::PresenceListRequest,
         PacketType::PresenceListResponse,
         PacketType::PresenceChange,
@@ -284,5 +289,34 @@ impl TryFrom<u8> for PacketType {
             0xF2 => Info,
             other => return Err(crate::ProtocolError::UnknownPacketType(other)),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn all_matches_try_from_exactly() {
+        let mut accepted = 0;
+        for b in 0..=255u8 {
+            if let Ok(t) = PacketType::try_from(b) {
+                accepted += 1;
+                assert_eq!(t as u8, b, "try_from(0x{b:02X}) returned {t:?}");
+                assert!(
+                    PacketType::ALL.contains(&t),
+                    "{t:?} (0x{b:02X}) is accepted by try_from but missing from ALL"
+                );
+            }
+        }
+        assert_eq!(accepted, PacketType::ALL.len());
+    }
+
+    #[test]
+    fn all_has_no_duplicates_and_round_trips() {
+        for (i, t) in PacketType::ALL.iter().enumerate() {
+            assert!(!PacketType::ALL[..i].contains(t), "{t:?} listed twice");
+            assert_eq!(PacketType::try_from(*t as u8).unwrap(), *t);
+        }
     }
 }

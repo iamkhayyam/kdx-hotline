@@ -6,20 +6,50 @@ Wants=network-online.target
 [Service]
 Type=simple
 # Runs as a dedicated system user. Create it with:
-#   useradd --system --home /var/lib/kdx --shell /usr/sbin/nologin kdx
+#   useradd --system --home-dir /var/lib/kdx --no-create-home --shell /usr/sbin/nologin kdx
+# systemd creates /var/lib/kdx (StateDirectory below), owned by kdx, mode 0700.
+# In /etc/kdx/kdxd.toml use absolute state paths (relative paths resolve
+# against /etc/kdx, which is read-only to the service):
+#   database   = "/var/lib/kdx/kdx.db"
+#   files_root = "/var/lib/kdx/files"
 User=kdx
 Group=kdx
+StateDirectory=kdx
+StateDirectoryMode=0700
 WorkingDirectory=/var/lib/kdx
 ExecStart=/usr/local/bin/kdxd /etc/kdx/kdxd.toml
 Restart=on-failure
 RestartSec=3
+# Everything the server creates (database, uploads, dev key) is owner-only.
+UMask=0077
+LimitNOFILE=65536
+
 # Hardening
 NoNewPrivileges=true
 PrivateTmp=true
+PrivateDevices=true
 ProtectSystem=strict
 ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
 ReadWritePaths=/var/lib/kdx
-LimitNOFILE=65536
+# Port 10700 is unprivileged: no capabilities at all.
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
 
 [Install]
 WantedBy=multi-user.target

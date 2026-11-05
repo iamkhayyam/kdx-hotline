@@ -5,6 +5,7 @@
 
 import { getCurrentWindow, inTauri, windowLabel, emitUi, logicalSize } from "./bridge.js";
 import { showMenu } from "./menu.js";
+import { esc } from "./html.js";
 
 /**
  * Mount the classic chrome around `body` into `root`.
@@ -21,7 +22,7 @@ export function mountChrome(root, opts) {
     '<div class="titlebar">' +
     '<button class="tb-btn tb-close" title="Close">✕</button>' +
     '<button class="tb-btn tb-menu" title="Window Menu"></button>' +
-    `<h2>${opts.title}</h2>` +
+    `<h2>${esc(opts.title)}</h2>` +
     '<span class="tag"></span>' +
     '<button class="tb-btn tb-max" title="Maximize">+</button>' +
     "</div>" +

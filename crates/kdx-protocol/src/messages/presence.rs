@@ -1,6 +1,6 @@
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
-use super::wire::{expect_end, get_str, put_str};
+use super::wire::{expect_end, get_bool, get_str, list_capacity, put_count16, put_str};
 use crate::ProtocolError;
 
 /// One user's presence snapshot, as seen in the server-wide roster.
@@ -80,6 +80,10 @@ fn encode_entry(buf: &mut BytesMut, e: &PresenceEntry) {
     put_str(buf, &e.description);
 }
 
+/// Smallest wire encoding of a [`PresenceEntry`]: four empty strings plus
+/// class, login time and idle seconds.
+pub(super) const MIN_ENTRY_LEN: usize = 2 * 4 + 1 + 8 + 4;
+
 fn decode_entry(payload: &mut &[u8]) -> Result<PresenceEntry, ProtocolError> {
     let username = get_str(payload, "PresenceEntry")?;
     if payload.remaining() < 1 + 8 + 4 {
@@ -116,8 +120,8 @@ impl PresenceListRequest {
 impl PresenceListResponse {
     pub fn encode(&self) -> Bytes {
         let mut buf = BytesMut::new();
-        buf.put_u16(self.users.len() as u16);
-        for entry in &self.users {
+        let n = put_count16(&mut buf, self.users.len());
+        for entry in &self.users[..n] {
             encode_entry(&mut buf, entry);
         }
         buf.freeze()
@@ -128,7 +132,8 @@ impl PresenceListResponse {
             return Err(ProtocolError::MalformedPayload("PresenceListResponse"));
         }
         let count = payload.get_u16() as usize;
-        let mut users = Vec::with_capacity(count.min(1024));
+        let mut users =
+            Vec::with_capacity(list_capacity(count, payload.remaining(), MIN_ENTRY_LEN));
         for _ in 0..count {
             users.push(decode_entry(&mut payload)?);
         }
@@ -146,10 +151,7 @@ impl PresenceChange {
     }
 
     pub fn decode(mut payload: &[u8]) -> Result<Self, ProtocolError> {
-        if payload.remaining() < 1 {
-            return Err(ProtocolError::MalformedPayload("PresenceChange"));
-        }
-        let online = payload.get_u8() != 0;
+        let online = get_bool(&mut payload, "PresenceChange")?;
         let entry = decode_entry(&mut payload)?;
         expect_end(payload, "PresenceChange")?;
         Ok(Self { entry, online })
@@ -248,6 +250,15 @@ mod tests {
     fn rejects_malformed() {
         assert!(PresenceListResponse::decode(&[0]).is_err());
         assert!(PresenceChange::decode(&[1]).is_err());
+        // `online` is a strict 0/1 boolean.
+        let mut b = PresenceChange {
+            entry: sample_entry(),
+            online: true,
+        }
+        .encode()
+        .to_vec();
+        b[0] = 2;
+        assert!(PresenceChange::decode(&b).is_err());
         assert!(UserInfoRequest::decode(&[0, 5]).is_err());
     }
 }

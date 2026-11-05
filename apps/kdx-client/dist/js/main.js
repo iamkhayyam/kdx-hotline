@@ -4,10 +4,11 @@
 //   (none)     ->  the launcher: a small floating KDX control strip that
 //                  opens every other window. Closing it quits the app.
 //
-// Server events ("kdx") are broadcast to every window by the Rust forwarder;
-// window-to-window UI commands ride the "kdx-ui" channel. Each window keeps
-// its own copy of store.js — shared facts (session, server, presence) arrive
-// via the session broadcast / kdx events.
+// Server events ("kdx") come from the Rust forwarder; window-to-window UI
+// commands ride the "kdx-ui" channel. Each window keeps its own copy of
+// store.js — shared facts (session, server, presence) arrive via the session
+// broadcast / get_session / kdx events. The launcher also brokers commands
+// for windows that are still opening (see delivery.js).
 
 import {
   invoke,
@@ -16,15 +17,19 @@ import {
   getCurrentWindow,
   onKdxEvent,
   onUi,
+  emitUi,
   logicalPosition,
   logicalSize,
 } from "./bridge.js";
-import { initDesktop, open, toggle, hide, show, onChange } from "./wm.js";
-import { getState, subscribe, update, updateTransfer } from "./store.js";
+import { initDesktop, open, toggle, hide, show, onChange, isOpen } from "./wm.js";
+import { getState, subscribe, update, trackTransfers } from "./store.js";
 import { buildButtonBar } from "./buttonbar.js";
 import { mountFeature, registerAll, FEATURES } from "./windows/registry.js";
 import { showMenu } from "./menu.js";
 import { applySettings, loadSettings } from "./windows/settings.js";
+import { createDeliveryQueue } from "./delivery.js";
+import { applySession, hydrateSession } from "./session.js";
+import { migrateAddressBook } from "./windows/addressbook.js";
 
 const desktop = document.getElementById("desktop");
 
@@ -43,6 +48,14 @@ function mountLauncher() {
   initDesktop(desktop);
   registerAll();
   applySettings(loadSettings());
+  // Old builds kept Address Book passwords in plaintext localStorage: move
+  // them into the OS keychain (or drop them) before anything else runs.
+  migrateAddressBook({ toKeychain: true });
+  // Connection generations restart with the app; drop the previous run's
+  // remembered chat room (see chat.js).
+  try {
+    localStorage.removeItem("kdx.chat.room");
+  } catch (_) {}
 
   const buttonBar = buildButtonBar(desktop, {
     onAction: (name, at) => {
@@ -90,7 +103,7 @@ function mountLauncher() {
     const win = getCurrentWindow();
     win
       .outerPosition()
-      .then((p) => {
+      .then(() => {
         const saved = loadLauncherPos();
         if (saved) {
           win.setPosition(logicalPosition(saved.x, saved.y));
@@ -112,20 +125,41 @@ function mountLauncher() {
     win.onResized(savePos);
   }
 
+  // ---- command delivery to windows that may still be opening ----
+  const queue = createDeliveryQueue();
+
+  /** Open `target` and hand it a UI command once it's listening. */
+  function deliverTo(target, cmd, args, { focus = true } = {}) {
+    if (typeof target !== "string" || !FEATURES.some((f) => f.id === target)) return;
+    if (queue.isReady(target)) {
+      emitUi(target, cmd, args);
+      if (focus) open(target);
+    } else {
+      queue.enqueue(target, cmd, args);
+      open(target, { focus });
+    }
+  }
+
   // Server events the launcher cares about: unread/LED, auto-open windows,
   // presence count, transfer count, disconnect handling.
   const online = new Set();
-  let unread = 0;
 
   onKdxEvent((ev) => {
     switch (ev.type) {
-      case "private_message":
-        unread += 1;
-        buttonBar.setLed(true);
-        open("messages");
+      case "private_message": {
+        const me = getState().session && getState().session.username;
+        if (ev.from === me) break; // our own echo; Messages is already open
+        // A PM for a Messages window that isn't listening yet is queued for
+        // it (it used to be lost). Never steal focus: the LED blinks, and an
+        // already-open Messages window handles the event itself.
+        if (!queue.isReady("messages")) {
+          buttonBar.setLed(true);
+          deliverTo("messages", "kdx-replay", { ev }, { focus: false });
+        }
         break;
+      }
       case "chat_invited":
-        open("chat");
+        if (!queue.isReady("chat")) deliverTo("chat", "kdx-replay", { ev }, { focus: false });
         break;
       case "presence":
         if (ev.online) online.add(ev.user.username);
@@ -133,14 +167,15 @@ function mountLauncher() {
         update({ presenceCount: online.size });
         break;
       case "transfer_progress":
-        updateTransfer(ev.id, { direction: ev.direction, done: ev.done, total: ev.total });
-        break;
       case "transfer_complete":
-        updateTransfer(ev.id, { status: ev.status });
+        trackTransfers(ev);
         break;
       case "disconnected":
-        unread = 0;
         online.clear();
+        buttonBar.setLed(false);
+        // A transfer cut off by the disconnect never gets its own abort
+        // event through: stop counting it.
+        trackTransfers(ev);
         update({ connection: "offline", session: null, presenceCount: 0 });
         open("connect");
         break;
@@ -152,10 +187,9 @@ function mountLauncher() {
     if (msg.to !== "main" && msg.to !== "*") return;
     switch (msg.action) {
       case "session":
-        update({ connection: "online", session: msg.session, server: msg.server });
+        applySession(msg);
         break;
       case "login-success":
-        unread = 0;
         buttonBar.setLed(false);
         open("chat");
         invoke("list_users")
@@ -165,6 +199,12 @@ function mountLauncher() {
             update({ presenceCount: online.size });
           })
           .catch(() => {});
+        break;
+      case "deliver":
+        deliverTo(msg.target, msg.cmd, msg.args);
+        break;
+      case "ready":
+        for (const item of queue.markReady(msg.label)) emitUi(msg.label, item.cmd, item.args);
         break;
       case "set-led":
         buttonBar.setLed(msg.unread > 0);
@@ -180,6 +220,7 @@ function mountLauncher() {
         break;
       case "window-closed":
         hidden.delete(msg.label);
+        queue.markClosed(msg.label);
         break;
       case "windows-menu":
         openWindowsMenu(null);
@@ -194,6 +235,8 @@ function mountLauncher() {
       openWindowsMenu(null);
     }
   });
+
+  hydrateSession();
 
   // Open the Connect window on start.
   open("connect");

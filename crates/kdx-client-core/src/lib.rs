@@ -14,20 +14,30 @@ mod config;
 mod error;
 mod event;
 mod handle;
+mod local_name;
+#[cfg(test)]
+mod login_tests;
 mod tls;
 mod transfer;
 
+use std::future::Future;
 use std::sync::Arc;
+use std::time::Duration;
 
 use futures_util::SinkExt;
 use kdx_protocol::messages::{HandshakeInit, HandshakeResp};
 use kdx_protocol::{KdxCodec, KdxFrame, PacketFlags, PacketHeader, PacketType, PROTOCOL_VERSION};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
+use tokio::time::Instant;
 use tokio_rustls::TlsConnector;
 use tokio_util::codec::Framed;
+use tracing::warn;
 
-pub use config::{ClientConfig, TrustPolicy};
+pub use config::{
+    ClientConfig, TrustPolicy, DEFAULT_CONNECT_TIMEOUT, DEFAULT_KEEPALIVE, DEFAULT_REQUEST_TIMEOUT,
+    DEFAULT_WRITE_TIMEOUT,
+};
 pub use error::ClientError;
 pub use event::{
     AccountSummary, Direction, Event, FileSearchEntry, HistoryEntry, IpRule, NewsPost,
@@ -37,67 +47,141 @@ pub use handle::{ClientHandle, Session};
 // Re-exported so consumers (the Tauri app) can name the file-listing shape
 // returned by list_files / create_folder / delete_path.
 pub use kdx_protocol::messages::{FileInfoResponse, FileListResponse};
+pub use local_name::safe_local_file_name;
 pub use tls::{spki_fingerprint, KnownHosts};
 
-use actor::Actor;
+use actor::{Actor, ActorOptions};
 use futures_util::StreamExt;
 
 /// Depth of the command and event channels.
 const CHANNEL_DEPTH: usize = 256;
 
+/// ALPN protocol id offered during the TLS handshake (servers that don't
+/// speak ALPN simply ignore it).
+const KDX_ALPN: &[u8] = b"kdx/1";
+
 /// Connect to a KDX server: TCP + TLS (per the trust policy) + KDX version
-/// handshake. On success returns a handle and an event stream, and emits an
-/// initial [`Event::Connected`].
+/// handshake, all within `config.connect_timeout`. On success returns a
+/// handle and an event stream, and emits an initial [`Event::Connected`]
+/// carrying the SPKI fingerprint of the certificate actually verified.
+///
+/// Fails with `ClientError::UntrustedCertificate` only when the TOFU check
+/// itself refused the server's key (`previous` is the pin it was compared
+/// with); any other handshake failure is `ClientError::Tls`. A
+/// `known_hosts.toml` that can't be read is `ClientError::KnownHosts`.
 pub async fn connect(
     config: ClientConfig,
 ) -> Result<(ClientHandle, mpsc::Receiver<Event>), ClientError> {
     let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
     let known_hosts = KnownHosts::new(&config.data_dir);
 
-    // Build the rustls verifier per policy; keep a slot to read the presented
-    // fingerprint after the handshake (or after a TOFU rejection).
-    let (tls_config, seen_slot) = build_tls_config(&provider, &config, &known_hosts)?;
+    // Build the rustls verifier per policy; keep a slot to read what the
+    // verifier saw and decided.
+    let (tls_config, outcome_slot, expected) = build_tls_config(&provider, &config, &known_hosts)?;
     let connector = TlsConnector::from(Arc::new(tls_config));
 
     let server_name = rustls::pki_types::ServerName::try_from(config.host.clone())
         .map_err(|_| ClientError::InvalidServerName(config.host.clone()))?;
-    let tcp = TcpStream::connect((config.host.as_str(), config.port)).await?;
+    let deadline = Instant::now() + bounded(config.connect_timeout, Duration::ZERO);
+    let tcp = within(
+        deadline,
+        "connect",
+        TcpStream::connect((config.host.as_str(), config.port)),
+    )
+    .await??;
 
-    let tls = match connector.connect(server_name, tcp).await {
+    let tls = match within(deadline, "TLS handshake", connector.connect(server_name, tcp)).await? {
         Ok(tls) => tls,
         Err(e) => {
-            // A TOFU rejection surfaces here; translate it using the observed
-            // fingerprint and any previously pinned value.
-            if let Some(seen) = seen_slot.and_then(|s| s.lock().unwrap().clone()) {
-                let previous = known_hosts.get(&config.host, config.port);
-                return Err(ClientError::UntrustedCertificate {
-                    host: config.host.clone(),
-                    fingerprint: seen,
-                    previous,
-                });
+            // Only the verifier's own refusal is a trust decision; anything
+            // else (a reset, a bad signature, a protocol error) is plain TLS
+            // failure and must not be reported as "the key changed".
+            if let Some(outcome) = outcome_slot.as_ref().map(tls::read_outcome) {
+                if let (true, Some(seen)) = (outcome.rejected, outcome.seen) {
+                    return Err(ClientError::UntrustedCertificate {
+                        host: config.host.clone(),
+                        fingerprint: seen,
+                        previous: expected,
+                    });
+                }
             }
             return Err(ClientError::Tls(e.to_string()));
         }
     };
 
-    let fingerprint = known_hosts
-        .get(&config.host, config.port)
-        .unwrap_or_default();
+    // The fingerprint of the certificate this session actually verified.
+    let fingerprint = match outcome_slot.as_ref().map(tls::read_outcome) {
+        Some(outcome) => {
+            let seen = outcome.seen.unwrap_or_default();
+            if outcome.legacy_match {
+                // Upgrade a whole-certificate pin to the SPKI form.
+                if let Err(e) = known_hosts.pin(&config.host, config.port, &seen) {
+                    warn!("could not migrate the pinned fingerprint: {e}");
+                }
+            }
+            seen
+        }
+        None => tls
+            .get_ref()
+            .1
+            .peer_certificates()
+            .and_then(|certs| certs.first())
+            .map(spki_fingerprint)
+            .unwrap_or_default(),
+    };
+
+    // Login proofs are bound to this TLS session, so a server can't relay
+    // our login to another server (see kdx_crypto::scram).
+    let channel_binding = tls
+        .get_ref()
+        .1
+        .export_keying_material(
+            [0u8; kdx_crypto::CHANNEL_BINDING_LEN],
+            kdx_crypto::TLS_EXPORTER_LABEL,
+            None,
+        )
+        .map_err(|e| ClientError::Tls(e.to_string()))?;
 
     let mut framed = Framed::new(tls, KdxCodec::default());
-    kdx_handshake(&mut framed).await?;
+    within(deadline, "KDX handshake", kdx_handshake(&mut framed)).await??;
 
     let (cmd_tx, cmd_rx) = mpsc::channel(CHANNEL_DEPTH);
     let (event_tx, event_rx) = mpsc::channel(CHANNEL_DEPTH);
 
-    let actor = Actor::new(framed, cmd_rx, event_tx.clone());
-    tokio::spawn(actor.run());
-
     let _ = event_tx.send(Event::Connected { fingerprint }).await;
-    Ok((ClientHandle { tx: cmd_tx }, event_rx))
+    let options = ActorOptions {
+        keepalive: bounded(config.keepalive, Duration::from_secs(1)),
+        request_timeout: bounded(config.request_timeout, Duration::ZERO),
+        write_timeout: bounded(config.write_timeout, Duration::ZERO),
+        server_id: format!("{}:{}", config.host, config.port),
+    };
+    let actor = Actor::new(framed, cmd_rx, event_tx.clone())
+        .with_options(options)
+        .with_channel_binding(channel_binding);
+    let handle = actor.spawn(cmd_tx);
+    Ok((handle, event_rx))
+}
+
+/// Keep a configured duration within `[min, 1 day]` so deadline arithmetic
+/// can't overflow (and a zero keepalive can't spin).
+fn bounded(d: Duration, min: Duration) -> Duration {
+    d.clamp(min, Duration::from_secs(24 * 60 * 60))
+}
+
+/// Run `future` unless `deadline` passes first.
+async fn within<F: Future>(
+    deadline: Instant,
+    what: &str,
+    future: F,
+) -> Result<F::Output, ClientError> {
+    tokio::time::timeout_at(deadline, future)
+        .await
+        .map_err(|_| ClientError::Timeout(format!("{what} timed out")))
 }
 
 /// Pin a server's fingerprint so a subsequent TOFU connect will trust it.
+/// `host` must be a valid DNS name or IP address and `fingerprint` a
+/// `sha256:<base64>` value as reported by `ClientError::UntrustedCertificate`.
 pub fn trust_server(
     data_dir: &std::path::Path,
     host: &str,
@@ -107,45 +191,49 @@ pub fn trust_server(
     KnownHosts::new(data_dir).pin(host, port, fingerprint)
 }
 
-type SeenSlot = Option<Arc<std::sync::Mutex<Option<String>>>>;
+type BuiltTls = (rustls::ClientConfig, Option<tls::OutcomeSlot>, Option<String>);
 
 fn build_tls_config(
     provider: &Arc<rustls::crypto::CryptoProvider>,
     config: &ClientConfig,
     known_hosts: &KnownHosts,
-) -> Result<(rustls::ClientConfig, SeenSlot), ClientError> {
+) -> Result<BuiltTls, ClientError> {
+    // TLS 1.3 only.
     let builder = rustls::ClientConfig::builder_with_provider(provider.clone())
-        .with_safe_default_protocol_versions()
+        .with_protocol_versions(&[&rustls::version::TLS13])
         .map_err(|e| ClientError::Tls(e.to_string()))?;
 
-    match &config.trust {
+    let (mut cfg, slot, expected) = match &config.trust {
         TrustPolicy::Tofu => {
-            let expected = known_hosts.get(&config.host, config.port);
-            let verifier = tls::TofuVerifier::new(provider.clone(), expected);
-            let slot = verifier.seen_slot();
+            // An unreadable pin file refuses the connect (never "unpinned").
+            let expected = known_hosts.get(&config.host, config.port)?;
+            let verifier = tls::TofuVerifier::new(provider.clone(), expected.clone());
+            let slot = verifier.outcome_slot();
             let cfg = builder
                 .dangerous()
                 .with_custom_certificate_verifier(Arc::new(verifier))
                 .with_no_client_auth();
-            Ok((cfg, Some(slot)))
+            (cfg, Some(slot), expected)
         }
         TrustPolicy::System => {
             let mut roots = rustls::RootCertStore::empty();
             roots.extend(webpki_roots_or_empty());
             let cfg = builder.with_root_certificates(roots).with_no_client_auth();
-            Ok((cfg, None))
+            (cfg, None, None)
         }
         #[cfg(feature = "dangerous")]
         TrustPolicy::InsecureAcceptAny => {
             let verifier = tls::AcceptAnyVerifier::new(provider.clone());
-            let slot = verifier.seen_slot();
+            let slot = verifier.outcome_slot();
             let cfg = builder
                 .dangerous()
                 .with_custom_certificate_verifier(Arc::new(verifier))
                 .with_no_client_auth();
-            Ok((cfg, Some(slot)))
+            (cfg, Some(slot), None)
         }
-    }
+    };
+    cfg.alpn_protocols = vec![KDX_ALPN.to_vec()];
+    Ok((cfg, slot, expected))
 }
 
 /// System policy without the `webpki-roots` crate has no bundled roots; the

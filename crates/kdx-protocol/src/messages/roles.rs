@@ -1,6 +1,6 @@
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
-use super::wire::{expect_end, get_str, put_str};
+use super::wire::{expect_end, get_str, list_capacity, put_count16, put_str};
 use crate::ProtocolError;
 
 /// One role as seen over the wire: a named, colorable bundle of privilege
@@ -133,8 +133,8 @@ impl RoleListRequest {
 impl RoleListResponse {
     pub fn encode(&self) -> Bytes {
         let mut buf = BytesMut::new();
-        buf.put_u16(self.roles.len() as u16);
-        for role in &self.roles {
+        let n = put_count16(&mut buf, self.roles.len());
+        for role in &self.roles[..n] {
             encode_role(&mut buf, role);
         }
         buf.freeze()
@@ -145,7 +145,9 @@ impl RoleListResponse {
             return Err(ProtocolError::MalformedPayload("RoleListResponse"));
         }
         let count = payload.get_u16() as usize;
-        let mut roles = Vec::with_capacity(count.min(1024));
+        // Minimum entry: id + name prefix + privileges + rank + color prefix.
+        let min_entry = 16 + 2 + 4 + 4 + 2;
+        let mut roles = Vec::with_capacity(list_capacity(count, payload.remaining(), min_entry));
         for _ in 0..count {
             roles.push(decode_role(&mut payload)?);
         }
@@ -276,8 +278,8 @@ impl AccountRolesResponse {
     pub fn encode(&self) -> Bytes {
         let mut buf = BytesMut::new();
         put_str(&mut buf, &self.username);
-        buf.put_u16(self.role_ids.len() as u16);
-        for id in &self.role_ids {
+        let n = put_count16(&mut buf, self.role_ids.len());
+        for id in &self.role_ids[..n] {
             buf.put_slice(id);
         }
         buf.freeze()
@@ -289,7 +291,7 @@ impl AccountRolesResponse {
             return Err(ProtocolError::MalformedPayload("AccountRolesResponse"));
         }
         let count = payload.get_u16() as usize;
-        let mut role_ids = Vec::with_capacity(count.min(1024));
+        let mut role_ids = Vec::with_capacity(list_capacity(count, payload.remaining(), 16));
         for _ in 0..count {
             role_ids.push(get_id(&mut payload, "AccountRolesResponse")?);
         }
@@ -388,6 +390,24 @@ mod tests {
         assert!(RoleListResponse::decode(&[0]).is_err());
         assert!(RoleDelete::decode(&[0u8; 15]).is_err());
         assert!(RoleAssign::decode(&[0, 5]).is_err());
+    }
+
+    #[test]
+    fn oversized_role_ids_clamp_to_u16_count() {
+        use crate::messages::wire::test_support::allow_oversize;
+
+        let resp = AccountRolesResponse {
+            username: "u".into(),
+            role_ids: (0..70_000u32)
+                .map(|i| {
+                    let mut id = [0u8; 16];
+                    id[..4].copy_from_slice(&i.to_be_bytes());
+                    id
+                })
+                .collect(),
+        };
+        let back = AccountRolesResponse::decode(&allow_oversize(|| resp.encode())).unwrap();
+        assert_eq!(back.role_ids[..], resp.role_ids[..u16::MAX as usize]);
     }
 
     #[test]

@@ -180,7 +180,8 @@ async fn global_roster_tracks_presence_live() {
     // Get Info on bob shows his detail.
     let info = alice.get_user_info("bob").await.unwrap();
     assert_eq!(info.class, 2);
-    assert!(!info.address.is_empty());
+    // Alice (no USER_KICK) doesn't get to see peer addresses.
+    assert!(info.address.is_empty());
     // Unknown user errors.
     assert!(alice.get_user_info("nobody").await.is_err());
 
@@ -733,7 +734,22 @@ async fn plain_user_cannot_generate_catalog() {
 
 #[tokio::test]
 async fn tracker_lists_the_self_registered_server() {
-    let ts = TestServer::start().await;
+    // kdxd lists itself only under a configured `public_host`.
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("kdx.db");
+    let config = kdxd::Config {
+        bind: "127.0.0.1:0".parse().unwrap(),
+        database: db_path.clone(),
+        files_root: dir.path().join("files"),
+        public_host: Some("127.0.0.1".into()),
+        ..kdxd::Config::default()
+    };
+    let server = kdxd::serve(config).await.unwrap();
+    let ts = TestServer {
+        server,
+        dir,
+        db_path,
+    };
     ts.seed_account("phraq", "pw", 1).await;
 
     let (client, mut events, _dd) = ts.connect_client().await;
@@ -957,7 +973,9 @@ async fn invite_delivers_and_both_parties_share_a_private_room() {
     next_event(&mut eb).await;
     bob.login("bob", "pw").await.unwrap();
 
-    alice.invite_to_chat("bob").await.unwrap();
+    // The call returns the new private room's id.
+    let alice_room = alice.invite_to_chat("bob").await.unwrap();
+    assert!(alice_room.starts_with("priv-"));
 
     // Alice gets an ack naming bob.
     let mut saw_ack = false;
@@ -981,6 +999,7 @@ async fn invite_delivers_and_both_parties_share_a_private_room() {
         }
     }
     let room = room.expect("bob should be invited");
+    assert_eq!(room, alice_room, "invite_to_chat returned the invitee's room");
     bob.join(&room).await.unwrap();
 
     // Alice's chat in that room reaches bob — they're sharing the same
@@ -1002,7 +1021,9 @@ async fn invite_to_an_offline_user_is_refused() {
     next_event(&mut ea).await;
     alice.login("alice", "pw").await.unwrap();
 
-    alice.invite_to_chat("ghost").await.unwrap();
+    // The refusal now fails the call itself (and is still an event).
+    let err = alice.invite_to_chat("ghost").await.unwrap_err();
+    assert!(matches!(err, ClientError::Server(ref t) if t.contains("not online")), "{err:?}");
     let mut saw_err = false;
     for _ in 0..10 {
         if let Event::ServerError { text } = next_event(&mut ea).await {
@@ -1026,7 +1047,8 @@ async fn guest_cannot_invite_to_chat() {
     next_event(&mut e1).await;
     guest1.login("guest1", "pw").await.unwrap();
 
-    guest1.invite_to_chat("guest2").await.unwrap(); // the send itself succeeds...
+    let err = guest1.invite_to_chat("guest2").await.unwrap_err();
+    assert!(matches!(err, ClientError::Server(ref t) if t.contains("CHAT_PRIVATE")), "{err:?}");
     let mut refused = false;
     for _ in 0..10 {
         if let Event::ServerError { text } = next_event(&mut e1).await {
@@ -1049,7 +1071,8 @@ async fn cannot_invite_yourself() {
     next_event(&mut ea).await;
     alice.login("alice", "pw").await.unwrap();
 
-    alice.invite_to_chat("alice").await.unwrap();
+    let err = alice.invite_to_chat("alice").await.unwrap_err();
+    assert!(matches!(err, ClientError::Server(ref t) if t.contains("yourself")), "{err:?}");
     let mut refused = false;
     for _ in 0..10 {
         if let Event::ServerError { text } = next_event(&mut ea).await {
@@ -1429,6 +1452,42 @@ async fn get_file_info_returns_metadata() {
     ts.stop();
 }
 
+/// CLIENT-8: a failed Get Info must fail that call (not hang it) and must
+/// not shift every later answer by one; an Error for one request must not
+/// fail another that happens to be pending.
+#[tokio::test]
+async fn get_file_info_errors_are_correlated_with_their_request() {
+    let ts = TestServer::start().await;
+    ts.seed_account("sysop", "pw", 3).await;
+
+    let (sysop, mut es, dd) = ts.connect_client().await;
+    next_event(&mut es).await;
+    sysop.login("sysop", "pw").await.unwrap();
+
+    let err = tokio::time::timeout(Duration::from_secs(5), sysop.get_file_info("/nope"))
+        .await
+        .expect("a failed Get Info must not hang")
+        .unwrap_err();
+    assert!(matches!(err, ClientError::Server(_)), "{err:?}");
+
+    let up = dd.path().join("a");
+    std::fs::write(&up, b"x").unwrap();
+    sysop.upload(up, "/").await.unwrap();
+    let info = sysop.get_file_info("/a").await.unwrap();
+    assert_eq!(info.name, "a");
+
+    // Concurrent requests: the Error answers Get Info only.
+    let (listing, missing) = tokio::join!(sysop.list_files("/"), sysop.get_file_info("/nope"));
+    assert!(listing.unwrap().entries.iter().any(|e| e.name == "a"));
+    assert!(missing.is_err());
+    // And a fire-and-forget error before a request doesn't fail the request.
+    let (pm, listing) = tokio::join!(sysop.send_private("ghost", "hi"), sysop.list_files("/"));
+    pm.unwrap();
+    assert!(listing.is_ok());
+
+    ts.stop();
+}
+
 #[tokio::test]
 async fn plain_user_cannot_open_connection_monitor() {
     let ts = TestServer::start().await;
@@ -1460,19 +1519,27 @@ async fn interview_mode_mutes_non_panelists_and_toggles_off() {
     next_event(&mut e_att).await;
     attendee.login("attendee", "pw").await.unwrap();
 
-    // Both join the lobby.
-    panel.join("lobby").await.unwrap();
-    attendee.join("lobby").await.unwrap();
+    // The panelist founds a room (only a server admin may mute the lobby),
+    // and the attendee joins once it exists.
+    panel.join("stage").await.unwrap();
+    loop {
+        if let Event::UserList { room, .. } = next_event(&mut e_panel).await {
+            if room == "stage" {
+                break;
+            }
+        }
+    }
+    attendee.join("stage").await.unwrap();
 
     // Panelist turns interview mode on.
-    panel.set_room_flags("lobby", 0, true).await.unwrap();
+    panel.set_room_flags("stage", 0, true).await.unwrap();
 
     // Attendee's send is silently dropped (they get an Info notice; the
     // panel does NOT see the attendee's line).
-    attendee.send_chat("lobby", 0, "am I allowed to speak?").await.unwrap();
+    attendee.send_chat("stage", 0, "am I allowed to speak?").await.unwrap();
 
     // Panel's send goes through fine.
-    panel.send_chat("lobby", 0, "welcome").await.unwrap();
+    panel.send_chat("stage", 0, "welcome").await.unwrap();
 
     // Wait for the panel's own line to appear on their own transcript —
     // the attendee's must NOT be seen among the panel's chat events.
@@ -1492,8 +1559,8 @@ async fn interview_mode_mutes_non_panelists_and_toggles_off() {
     assert!(saw_panel, "panel's own line should reach the room");
 
     // Toggle interview mode off — attendee can speak again.
-    panel.set_room_flags("lobby", 0, false).await.unwrap();
-    attendee.send_chat("lobby", 0, "thanks").await.unwrap();
+    panel.set_room_flags("stage", 0, false).await.unwrap();
+    attendee.send_chat("stage", 0, "thanks").await.unwrap();
     let mut saw_attendee = false;
     for _ in 0..30 {
         let ev = next_event(&mut e_panel).await;
@@ -1530,8 +1597,10 @@ async fn min_class_join_gate_refuses_below_threshold() {
     let (user, mut e_user, _d2) = ts.connect_client().await;
     next_event(&mut e_user).await;
     user.login("user", "pw").await.unwrap();
-    user.join("green-room").await.unwrap();
-    // The refusal comes back as a ServerError.
+    // The join itself reports the refusal…
+    let err = user.join("green-room").await.unwrap_err();
+    assert!(matches!(err, ClientError::Server(ref t) if t.contains("class")), "{err:?}");
+    // …which also still comes back as a ServerError.
     let mut saw_err = false;
     for _ in 0..10 {
         if let Event::ServerError { text } = next_event(&mut e_user).await {
@@ -1566,6 +1635,83 @@ async fn plain_member_cannot_change_room_flags() {
         }
     }
     assert!(saw_err, "non-privileged member should get a privilege error");
+
+    ts.stop();
+}
+
+/// C-2: a join the server refuses fails the call (it used to resolve Ok as
+/// soon as it was written). Here B accepts an invitation after the inviter
+/// left, so the private room is gone; B must still be in the lobby.
+#[tokio::test]
+async fn joining_a_vanished_private_room_is_refused_and_keeps_the_lobby() {
+    let ts = TestServer::start().await;
+    ts.seed_account("alice", "pw", 1).await;
+    ts.seed_account("bob", "pw", 1).await;
+
+    let (alice, mut ea, _d1) = ts.connect_client().await;
+    next_event(&mut ea).await;
+    alice.login("alice", "pw").await.unwrap();
+    alice.join("lobby").await.unwrap();
+    let (bob, mut eb, _d2) = ts.connect_client().await;
+    next_event(&mut eb).await;
+    bob.login("bob", "pw").await.unwrap();
+    bob.join("lobby").await.unwrap();
+
+    let room = alice.invite_to_chat("bob").await.unwrap();
+    // Alice goes "Back to Lobby": the private room's last member leaves and
+    // the room is dropped (a round trip makes sure the server got there).
+    alice.leave(&room).await.unwrap();
+    alice.list_users().await.unwrap();
+
+    let err = bob.join(&room).await.unwrap_err();
+    assert!(matches!(err, ClientError::Server(ref t) if t.contains("invited")), "{err:?}");
+
+    // Bob is still in the lobby.
+    alice.send_chat("lobby", 0, "still here?").await.unwrap();
+    let (sender, text, _) = wait_chat(&mut eb, false).await;
+    assert_eq!((sender.as_str(), text.as_str()), ("alice", "still here?"));
+
+    ts.stop();
+}
+
+/// P-2: a request over the server's per-type reassembly cap (64 KiB for
+/// control messages) is refused locally instead of getting the session
+/// dropped as a protocol violation.
+#[tokio::test]
+async fn an_oversized_chat_line_fails_alone() {
+    let ts = TestServer::start().await;
+    ts.seed_account("user", "pw", 1).await;
+    let (client, mut events, _dd) = ts.connect_client().await;
+    next_event(&mut events).await;
+    client.login("user", "pw").await.unwrap();
+    client.join("lobby").await.unwrap();
+
+    let err = client.send_chat("lobby", 0, &"x".repeat(65_530)).await.unwrap_err();
+    assert!(matches!(err, ClientError::InvalidInput(_)), "{err:?}");
+    // The session survived.
+    client.list_users().await.unwrap();
+    client.send_chat("lobby", 0, "short").await.unwrap();
+    let (_, text, _) = wait_chat(&mut events, false).await;
+    assert_eq!(text, "short");
+
+    ts.stop();
+}
+
+/// P-3: logging in twice on one connection is refused at once and leaves
+/// the session working.
+#[tokio::test]
+async fn a_second_login_is_refused_at_once() {
+    let ts = TestServer::start().await;
+    ts.seed_account("user", "pw", 1).await;
+    let (client, mut events, _dd) = ts.connect_client().await;
+    next_event(&mut events).await;
+    client.login("user", "pw").await.unwrap();
+
+    let again = tokio::time::timeout(Duration::from_secs(5), client.login("user", "pw"))
+        .await
+        .expect("refused at once");
+    assert!(matches!(again, Err(ClientError::InvalidInput(_))), "{again:?}");
+    client.list_users().await.unwrap();
 
     ts.stop();
 }

@@ -5,6 +5,9 @@
 
 import { invoke } from "../bridge.js";
 import { open } from "../wm.js";
+import { esc, num, safeColor, errorText } from "../html.js";
+
+const DEFAULT_SWATCH = "#6b5555";
 
 const PRIVILEGES = [
   { bit: 1 << 0, name: "CHAT_SEND", label: "Chat: send" },
@@ -95,7 +98,7 @@ export function buildRoles() {
   let editingId = null;
 
   privsEl.innerHTML = PRIVILEGES.map(
-    (p) => `<label class="rl-priv"><input type="checkbox" data-bit="${p.bit}" />${p.label}</label>`
+    (p) => `<label class="rl-priv"><input type="checkbox" data-bit="${num(p.bit)}" />${esc(p.label)}</label>`
   ).join("");
 
   async function refresh() {
@@ -105,14 +108,18 @@ export function buildRoles() {
       roles.sort((a, b) => b.rank - a.rank);
       render();
     } catch (err) {
-      listEl.innerHTML = `<div class="empty">${err.message || err}</div>`;
+      // Server error text: shown as text, never parsed as markup.
+      const empty = document.createElement("div");
+      empty.className = "empty";
+      empty.textContent = errorText(err);
+      listEl.replaceChildren(empty);
     }
   }
 
   function render() {
     const needle = filter.value.trim().toLowerCase();
     const shown = roles.filter((r) => !needle || r.name.toLowerCase().includes(needle));
-    roleSelect.innerHTML = roles.map((r) => `<option value="${r.id}">${esc(r.name)}</option>`).join("");
+    roleSelect.innerHTML = roles.map((r) => `<option value="${esc(r.id)}">${esc(r.name)}</option>`).join("");
     if (!shown.length) {
       listEl.innerHTML = '<div class="empty">no roles — New Role to define one</div>';
       return;
@@ -125,15 +132,18 @@ export function buildRoles() {
     for (const r of shown) {
       const tr = document.createElement("tr");
       tr.innerHTML =
-        `<td><span class="rl-swatch" style="background:${esc(r.color || "#6b5555")}"></span></td>` +
+        `<td><span class="rl-swatch"></span></td>` +
         `<td class="fname">${esc(r.name)}</td>` +
-        `<td class="fsize">${r.rank}</td>` +
-        `<td class="fmeta">${countBits(r.privileges)} granted</td>`;
+        `<td class="fsize">${num(r.rank)}</td>` +
+        `<td class="fmeta">${num(countBits(r.privileges))} granted</td>`;
+      // The color is server data: only a plain hex color, applied via CSSOM
+      // (an inline style= would be blocked by the CSP anyway).
+      tr.querySelector(".rl-swatch").style.background = safeColor(r.color, DEFAULT_SWATCH);
       tr.addEventListener("click", () => openEditor(r));
       tb.appendChild(tr);
     }
     table.appendChild(tb);
-    listEl.appendChild(table);
+    listEl.replaceChildren(table);
   }
 
   function openEditor(role) {
@@ -189,7 +199,7 @@ export function buildRoles() {
       closeEditor();
       render();
     } catch (err) {
-      assignResult.textContent = err.message || String(err);
+      assignResult.textContent = errorText(err);
     }
   });
 
@@ -200,7 +210,7 @@ export function buildRoles() {
       closeEditor();
       render();
     } catch (err) {
-      assignResult.textContent = err.message || String(err);
+      assignResult.textContent = errorText(err);
     }
   });
 
@@ -215,7 +225,7 @@ export function buildRoles() {
       await invoke(cmd, { username, roleId });
       assignResult.textContent = `ok: ${cmd === "assign_role" ? "assigned" : "unassigned"} for ${username}`;
     } catch (err) {
-      assignResult.textContent = err.message || String(err);
+      assignResult.textContent = errorText(err);
     }
   }
 
@@ -227,7 +237,7 @@ export function buildRoles() {
       const names = ids.map((id) => roles.find((r) => r.id === id)?.name || id);
       assignResult.textContent = names.length ? `${username}: ${names.join(", ")}` : `${username}: no roles`;
     } catch (err) {
-      assignResult.textContent = err.message || String(err);
+      assignResult.textContent = errorText(err);
     }
   });
 
@@ -245,7 +255,7 @@ export function buildRoles() {
         ? `requested disconnect + ban of ${username}`
         : `requested disconnect of ${username}`;
     } catch (err) {
-      kickResult.textContent = err.message || String(err);
+      kickResult.textContent = errorText(err);
     }
   });
 
@@ -268,7 +278,4 @@ function countBits(n) {
     v >>>= 1;
   }
   return count;
-}
-function esc(s) {
-  return String(s).replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" })[c]);
 }

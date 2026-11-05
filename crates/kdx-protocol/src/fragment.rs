@@ -15,6 +15,10 @@ use crate::{KdxFrame, PacketFlags, PacketHeader, PacketType, ProtocolError, PROT
 /// `next_sequence` supplies consecutive sequence numbers (one per frame),
 /// mirroring how a connection's monotonic counter is consumed. A payload
 /// that fits in one frame is returned unfragmented.
+///
+/// # Panics
+///
+/// If `max_payload` is zero (no non-empty payload could ever be split).
 pub fn fragment(
     packet_type: PacketType,
     flags: PacketFlags,
@@ -22,6 +26,7 @@ pub fn fragment(
     max_payload: u32,
     mut next_sequence: impl FnMut() -> u32,
 ) -> Vec<KdxFrame> {
+    assert!(max_payload > 0, "fragment: max_payload must be non-zero");
     let max = max_payload as usize;
     if payload.len() <= max {
         return vec![KdxFrame {
@@ -219,6 +224,18 @@ mod tests {
         assert_eq!(&whole.payload[..], &payload[..]);
         assert_eq!(whole.header.length as usize, payload.len());
         assert!(!whole.header.flags.contains(PacketFlags::FRAGMENTED));
+    }
+
+    #[test]
+    #[should_panic(expected = "max_payload must be non-zero")]
+    fn zero_max_payload_panics_instead_of_looping() {
+        fragment(
+            PacketType::ChatMessage,
+            PacketFlags::empty(),
+            Bytes::from_static(b"x"),
+            0,
+            seq_counter(),
+        );
     }
 
     #[test]

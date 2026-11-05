@@ -60,6 +60,14 @@ pub enum AclError {
     PrivilegeRequired(&'static str),
     #[error("only the folder owner or an admin may do that")]
     OwnerOnly,
+    #[error("only an account admin may make another user a folder's owner")]
+    ForeignOwner,
+}
+
+/// Is a folder of `kind` with `item` a drop box (write-only to everyone but
+/// its owner and admins)? Either the DropBox kind or a `[db]` name suffix.
+pub fn is_drop_box(kind: NodeKind, item: AccessItem) -> bool {
+    kind == NodeKind::DropBox || item == AccessItem::DropBox
 }
 
 /// May `user` list/read the contents of a folder of `kind` with `item`
@@ -74,11 +82,11 @@ pub fn check_read(
     user: &str,
 ) -> Result<(), AclError> {
     // Drop boxes are write-only structurally: kind DropBox or a [DB] folder.
-    if kind == NodeKind::DropBox || item == AccessItem::DropBox {
+    if is_drop_box(kind, item) {
         if class >= BaseClass::Admin {
             return Ok(()); // admins see everything
         }
-        if owner.map_or(false, |o| o == user) {
+        if owner == Some(user) {
             return Ok(()); // the owner may read their own drop box
         }
         return Err(AclError::DropBoxIsWriteOnly);
@@ -107,28 +115,31 @@ pub fn check_write(
     Ok(())
 }
 
-/// May `user` delete a node in a folder with `item` semantics? `[ul]` limits
-/// deletion to admins; `[db]` to the owner or an admin.
+/// May `user` remove an entry from a folder of `kind` with `item` semantics
+/// (delete it, or move it away)? Pass the *containing* folder's kind, item,
+/// write class and owner. `[ul]` / UploadFolder limits removal to admins;
+/// `[db]` / DropBox to the owner or an admin.
 pub fn check_delete(
     kind: NodeKind,
     item: AccessItem,
     min_write: BaseClass,
     class: BaseClass,
-    privs: Privileges,
+    _privs: Privileges,
     owner: Option<&str>,
     user: &str,
 ) -> Result<(), AclError> {
-    if kind == NodeKind::DropBox || item == AccessItem::DropBox {
+    if is_drop_box(kind, item) {
         // owner or an admin-class account may delete inside a drop box
         if class >= BaseClass::Admin {
             return Ok(());
         }
-        if owner.map_or(false, |o| o == user) {
+        if owner == Some(user) {
             return Ok(());
         }
         return Err(AclError::OwnerOnly);
     }
-    if item == AccessItem::Upload && class < BaseClass::Admin {
+    let upload_folder = kind == NodeKind::UploadFolder || item == AccessItem::Upload;
+    if upload_folder && class < BaseClass::Admin {
         // [UL]: "only admin delete" — the admin class specifically, not
         // merely the FILE_MANAGE_TREE privilege (power users hold that too).
         return Err(AclError::ClassTooLow);
@@ -306,5 +317,33 @@ mod tests {
             ),
             Err(AclError::PrivilegeRequired("upload"))
         );
+    }
+
+    #[test]
+    fn upload_folder_kind_deletes_like_ul_item() {
+        // A kind=UploadFolder folder without a `[ul]` suffix still limits
+        // removal to the admin class.
+        assert_eq!(
+            check_delete(
+                NodeKind::UploadFolder,
+                AccessItem::Default,
+                BaseClass::Guest,
+                BaseClass::PowerUser,
+                Privileges::all(),
+                None,
+                "alice"
+            ),
+            Err(AclError::ClassTooLow)
+        );
+        assert!(check_delete(
+            NodeKind::UploadFolder,
+            AccessItem::Default,
+            BaseClass::Guest,
+            BaseClass::Admin,
+            Privileges::all(),
+            None,
+            "alice"
+        )
+        .is_ok());
     }
 }

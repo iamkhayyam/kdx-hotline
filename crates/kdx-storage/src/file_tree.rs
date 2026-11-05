@@ -165,6 +165,23 @@ pub async fn delete(pool: &SqlitePool, id: &str) -> Result<(), StorageError> {
     Ok(())
 }
 
+/// Delete a set of nodes in ONE transaction: all of them go, or (on any
+/// error, e.g. a foreign-key failure because some row still has a child that
+/// isn't in `ids`) none do. `ids` must list children before their parents
+/// (post-order), since the `parent_id` self-reference is checked per
+/// statement. A row that is already gone is skipped, not an error.
+pub async fn delete_many(pool: &SqlitePool, ids: &[String]) -> Result<(), StorageError> {
+    let mut tx = pool.begin().await?;
+    for id in ids {
+        sqlx::query("DELETE FROM file_nodes WHERE id = ?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
 /// Re-parent a node (a virtual move — the name stays the same, only
 /// `parent_id` changes). The caller has already checked for a name collision
 /// under the new parent; the table's `UNIQUE(parent_id, name)` constraint is
@@ -179,4 +196,39 @@ pub async fn reparent(pool: &SqlitePool, id: &str, new_parent_id: &str) -> Resul
         return Err(StorageError::NotFound);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn pool() -> (SqlitePool, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = crate::connect(&dir.path().join("t.db")).await.unwrap();
+        (pool, dir)
+    }
+
+    #[tokio::test]
+    async fn delete_many_is_all_or_nothing() {
+        let (pool, _dir) = pool().await;
+        let a = create_folder(&pool, ROOT_ID, "a", 0, 0, 2, None)
+            .await
+            .unwrap();
+        let f = create_file(&pool, &a.id, "f", 1, &[0u8; 32], "/x")
+            .await
+            .unwrap();
+        // A child of `a` the caller doesn't know about makes deleting `a`
+        // fail; the already-deleted `f` must come back with the rollback.
+        let hidden = create_folder(&pool, &a.id, "hidden", 0, 0, 2, None)
+            .await
+            .unwrap();
+        let partial = [f.id.clone(), a.id.clone()];
+        assert!(delete_many(&pool, &partial).await.is_err());
+        assert_eq!(all(&pool).await.unwrap().len(), 4); // root, a, f, hidden
+
+        // With the full post-order set it succeeds; a vanished id is skipped.
+        let ids = [hidden.id, f.id, "gone".to_owned(), a.id];
+        delete_many(&pool, &ids).await.unwrap();
+        assert_eq!(all(&pool).await.unwrap().len(), 1); // just the root
+    }
 }
