@@ -342,6 +342,9 @@ impl ClientHandle {
         }
     }
 
+    /// Log in. A connection logs in once: after a successful login this
+    /// fails at once with `ClientError::InvalidInput` (reconnect to change
+    /// accounts). A failed login may be retried.
     pub async fn login(&self, username: &str, password: &str) -> Result<Session, ClientError> {
         self.send(|reply| Command::Login {
             username: username.to_owned(),
@@ -351,6 +354,11 @@ impl ClientHandle {
         .await
     }
 
+    /// Join a chat room. Resolves once the server has answered: `Ok` means
+    /// you are in the room; `Err(ClientError::Server)` means it refused
+    /// (not invited to a private room, joining too fast, too many rooms,
+    /// class gate), in which case you are still in whatever rooms you were
+    /// in before. The refusal is also emitted as `Event::ServerError`.
     pub async fn join(&self, room: &str) -> Result<(), ClientError> {
         let room = wire(room)?;
         self.send(|reply| Command::Join { room, reply }).await

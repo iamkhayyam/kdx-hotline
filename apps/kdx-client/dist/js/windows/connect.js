@@ -1,6 +1,7 @@
 import { invoke, emitUi, noteGeneration } from "../bridge.js";
 import { update, getState } from "../store.js";
 import { esc, num, errorText } from "../html.js";
+import { canAutoSubmit } from "../bookmarks.js";
 
 const CLASSES = ["guest", "user", "power user", "admin"];
 // Characters of a CHANGED server key the user must type back before it
@@ -109,7 +110,12 @@ export function buildConnect() {
     } catch (_) {}
     update({ connection: "online", session: { class: klass, username }, server: { host, port } });
     setStatus(`logged in as ${username} (${CLASSES[klass] || "?"})`, "ok");
-    await invoke("join_room", { room: getState().room });
+    try {
+      await invoke("join_room", { room: getState().room });
+    } catch (err) {
+      // Logged in all the same: say so, and let the other windows know.
+      setStatus(`logged in as ${username}, but couldn't join the chat: ${errorText(err)}`, "warn");
+    }
     // Tell every other window who we are (they keep their own store), and
     // let the launcher open the chat window + snapshot the roster.
     emitUi("*", "session", { gen, session: { username, class: klass }, server: { host, port } });
@@ -196,6 +202,12 @@ export function buildConnect() {
     if (e.key === "Enter") attempt();
   });
 
+  function askForPassword() {
+    const login = $("#c-user").value.trim();
+    setStatus(login ? `enter the password for ${login}` : "enter the password", "warn");
+    passEl.focus();
+  }
+
   // Exposed so the Address Book / Trackers can pre-fill (and connect). A
   // bookmark's password is never sent here — only its id.
   function fill(fields) {
@@ -208,7 +220,18 @@ export function buildConnect() {
       bookmarkId = String(fields.bookmarkId);
       passEl.placeholder = "saved in keychain";
     }
+    if (fields.askPassword) askForPassword();
   }
 
-  return { body, fill, submit: attempt };
+  // An automatic submit (from a bookmark) never sends an empty password
+  // that has no saved one behind it: that login can only fail.
+  function submit() {
+    if (!canAutoSubmit({ password: passEl.value, bookmarkId })) {
+      askForPassword();
+      return;
+    }
+    attempt();
+  }
+
+  return { body, fill, submit };
 }

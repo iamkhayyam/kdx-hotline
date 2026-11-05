@@ -5,6 +5,7 @@
 
 import { invoke } from "../bridge.js";
 import { esc, num, errorText } from "../html.js";
+import { askConfirm, confirmThen } from "../confirm.js";
 
 export function buildIpRules() {
   const body = document.createElement("div");
@@ -15,6 +16,7 @@ export function buildIpRules() {
       <button class="mini" id="ipr-new">New Rule</button>
       <button class="mini" id="ipr-refresh">Refresh</button>
     </div>
+    <div class="rl-assign-result ipr-status" id="ipr-status"></div>
     <div class="win-body" id="ipr-list"></div>
     <form class="ab-editor hidden" id="ipr-editor">
       <div class="ab-grid">
@@ -41,9 +43,11 @@ export function buildIpRules() {
   const filter = $("#ipr-filter");
   const editor = $("#ipr-editor");
   const result = $("#ipr-result");
+  const status = $("#ipr-status");
   let rules = [];
 
   async function refresh() {
+    status.textContent = "";
     listEl.innerHTML = '<div class="empty">loading…</div>';
     try {
       rules = await invoke("list_ip_rules");
@@ -82,13 +86,19 @@ export function buildIpRules() {
       const btn = tr.querySelector("button");
       btn.addEventListener("click", async (e) => {
         e.stopPropagation();
-        if (!confirm(`Delete this rule?\n${r.action} ${r.cidr}`)) return;
-        try {
-          rules = await invoke("delete_ip_rule", { id: r.id });
-          render();
-        } catch (err) {
-          alert(errorText(err));
-        }
+        status.textContent = "";
+        await confirmThen(
+          () => askConfirm(`Delete this rule?\n${r.action} ${r.cidr}`, { confirmLabel: "Delete", danger: true }),
+          async () => {
+            try {
+              rules = await invoke("delete_ip_rule", { id: r.id });
+              render();
+            } catch (err) {
+              // Inline, like every other window (no native alert boxes).
+              status.textContent = errorText(err);
+            }
+          }
+        );
       });
       tb.appendChild(tr);
     }

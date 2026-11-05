@@ -99,6 +99,7 @@ fn app_builder<R: Runtime>(builder: tauri::Builder<R>) -> tauri::Builder<R> {
             commands::invite_to_chat,
             commands::upload,
             commands::download,
+            commands::cancel_transfer,
             commands::disconnect,
             commands::list_roles,
             commands::create_role,
@@ -195,9 +196,10 @@ mod acl_tests {
                 "get_file_info",
                 "upload",
                 "download",
+                "cancel_transfer",
             ],
         ),
-        ("transfers", &[]),
+        ("transfers", &["cancel_transfer"]),
         ("addressbook", &["save_secret", "delete_secret"]),
         ("settings", &[]),
         ("about", &[]),
@@ -300,7 +302,15 @@ mod acl_tests {
         let w = WebviewWindowBuilder::new(&app, "evil", WebviewUrl::App("index.html".into()))
             .build()
             .unwrap();
-        for cmd in ["get_session", "download", "upload", "trust", "connect", "shutdown_server"] {
+        for cmd in [
+            "get_session",
+            "download",
+            "upload",
+            "cancel_transfer",
+            "trust",
+            "connect",
+            "shutdown_server",
+        ] {
             assert!(acl_denied(&w, cmd), "{cmd} must be denied to an unknown window");
         }
     }

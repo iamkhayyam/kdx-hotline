@@ -1,6 +1,7 @@
 import { invoke } from "../bridge.js";
 import { showMenu } from "../menu.js";
 import { esc, num, plainText, errorText } from "../html.js";
+import { askConfirm, confirmThen } from "../confirm.js";
 
 const KINDS = { 0: "[DIR]", 1: "[FILE]", 2: "[DROP]", 3: "[UP]", 4: "[→]" };
 const KIND_NAME = { 0: "folder", 1: "file", 2: "drop box", 3: "upload folder", 4: "alias" };
@@ -48,6 +49,7 @@ export function buildFiles() {
       <div class="f-mk-result" id="f-mk-result"></div>
     </form>
     <div class="f-info hidden" id="f-info"></div>
+    <div class="f-xfer hidden" id="f-xfer"><span id="f-xfer-text"></span><button class="mini" id="f-xfer-cancel">Cancel</button></div>
     <div class="f-move-banner hidden" id="f-move-banner"></div>
     <div class="win-body grow" id="f-list"></div>`;
 
@@ -59,6 +61,9 @@ export function buildFiles() {
   const searchbar = body.querySelector("#f-searchbar");
   const searchStatus = body.querySelector("#f-search-status");
   const moveBanner = body.querySelector("#f-move-banner");
+  const xferEl = body.querySelector("#f-xfer");
+  const xferText = body.querySelector("#f-xfer-text");
+  const xferCancel = body.querySelector("#f-xfer-cancel");
   let cwd = "/";
   let entries = [];
   let searchHits = null; // non-null while showing search results instead of a folder listing
@@ -206,12 +211,34 @@ export function buildFiles() {
   // server's name reduced to a safe basename, and the webview never names a
   // local path. Progress shows in File Transfers.
   async function downloadEntryAt(remotePath) {
+    await runTransfer(`↓ ${plainText(remotePath.split("/").pop())}`, () => invoke("download", { remotePath }));
+  }
+
+  // One transfer at a time per connection: while one runs (after the
+  // native file dialog), the strip offers to cancel it.
+  let xferRunning = 0;
+  async function runTransfer(label, start) {
+    xferRunning++;
+    xferText.textContent = `${label} — progress in File Transfers`;
+    xferCancel.disabled = false;
+    xferEl.classList.remove("hidden");
     try {
-      await invoke("download", { remotePath });
+      await start();
     } catch (err) {
       showError(err);
+    } finally {
+      if (--xferRunning === 0) xferEl.classList.add("hidden");
     }
   }
+  xferCancel.onclick = async () => {
+    xferCancel.disabled = true;
+    try {
+      await invoke("cancel_transfer");
+    } catch (err) {
+      showError(err);
+      xferCancel.disabled = false;
+    }
+  };
 
   /** Show an error in the info strip (as text, never markup). */
   function showError(err) {
@@ -259,18 +286,23 @@ export function buildFiles() {
 
   async function deleteEntry(e) {
     const kind = KIND_NAME[e.kind] || "item";
-    if (!confirm(`Delete ${kind} “${plainText(e.name)}”${e.kind !== KIND_FILE ? " and everything in it" : ""}?`)) {
-      return;
-    }
-    try {
-      const res = await invoke("delete_path", { path: joinPath(cwd, e.name) });
-      entries = res.entries;
-      searchHits = null; // defensive: this response is a folder listing, not search results
-      infoEl.classList.add("hidden");
-      render();
-    } catch (err) {
-      showError(err);
-    }
+    const path = joinPath(cwd, e.name);
+    const question =
+      `Delete ${kind} “${plainText(e.name)}”${e.kind !== KIND_FILE ? " and everything in it" : ""}?`;
+    await confirmThen(
+      () => askConfirm(question, { confirmLabel: "Delete", danger: true }),
+      async () => {
+        try {
+          const res = await invoke("delete_path", { path });
+          entries = res.entries;
+          searchHits = null; // defensive: this response is a folder listing, not search results
+          infoEl.classList.add("hidden");
+          render();
+        } catch (err) {
+          showError(err);
+        }
+      }
+    );
   }
 
   // Select-for-Move / Select-for-Alias → navigate elsewhere → "Do Here" (a
@@ -330,11 +362,8 @@ export function buildFiles() {
   body.querySelector("#f-refresh").onclick = refresh;
   // The Open dialog runs on the Rust side too.
   body.querySelector("#f-upload").onclick = async () => {
-    try {
-      await invoke("upload", { remoteDir: cwd });
-    } catch (err) {
-      showError(err);
-    }
+    const remoteDir = cwd;
+    await runTransfer(`↑ into ${plainText(remoteDir)}`, () => invoke("upload", { remoteDir }));
   };
 
   // Search — a catalog-wide lookup, distinct from the type-to-filter box

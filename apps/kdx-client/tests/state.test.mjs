@@ -1,13 +1,21 @@
 // Pure-logic modules behind the window plumbing:
-// eventfilter (UI-6), delivery (UI-8), convos (UI-11), rooms (UI-2),
-// transfers' grid (UI-10).
+// eventfilter (UI-6), delivery (UI-8), convos (UI-11), rooms (UI-2, C-2),
+// transfers' grid (UI-10), transfer bookkeeping (C-5), bookmarks (C-3).
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createKdxFilter } from "../dist/js/eventfilter.js";
 import { createDeliveryQueue } from "../dist/js/delivery.js";
 import { createConversations } from "../dist/js/convos.js";
-import { isPrivateRoom, inCurrentRoom, shouldAdoptRoom } from "../dist/js/rooms.js";
-import { cellsFor, MAX_CELLS } from "../dist/js/windows/transfers.js";
+import {
+  isPrivateRoom,
+  inCurrentRoom,
+  shouldAdoptRoom,
+  createJoinTracker,
+  MAX_EARLY_LINES,
+} from "../dist/js/rooms.js";
+import { cellsFor, MAX_CELLS, unfinishedIds } from "../dist/js/windows/transfers.js";
+import { getState, trackTransfers, activeTransferCount, TRANSFER_ABORTED } from "../dist/js/store.js";
+import { bookmarkConnectCommands, canAutoSubmit } from "../dist/js/bookmarks.js";
 
 test("events from a replaced connection are dropped", () => {
   const f = createKdxFilter();
@@ -91,4 +99,87 @@ test("transfer grid is capped whatever total the server claims", () => {
   assert.equal(huge.length, MAX_CELLS);
   assert.equal(huge[0], 1);
   assert.ok(Date.now() - start < 1000);
+});
+
+test("a room being joined keeps its early events until the join is confirmed", () => {
+  const j = createJoinTracker();
+  assert.equal(j.room, null);
+  assert.ok(!j.offer({ type: "user_list", room: "priv-x", users: ["a"] }), "nothing being joined");
+
+  j.begin("priv-x");
+  assert.equal(j.room, "priv-x");
+  assert.ok(j.offer({ type: "user_list", room: "priv-x", users: ["alice", "bob"] }));
+  assert.ok(j.offer({ type: "topic", room: "priv-x", topic: "hi" }));
+  for (let i = 0; i < MAX_EARLY_LINES + 5; i++) assert.ok(j.offer({ type: "chat", room: "priv-x", text: String(i) }));
+  assert.ok(!j.offer({ type: "chat", room: "lobby", text: "other room" }));
+  assert.ok(!j.offer({ type: "server_info", text: "no room" }));
+
+  assert.equal(j.finish("lobby"), null, "a different room's confirmation");
+  const early = j.finish("priv-x");
+  assert.deepEqual(early.users, ["alice", "bob"]);
+  assert.equal(early.topic, "hi");
+  assert.equal(early.lines.length, MAX_EARLY_LINES);
+  assert.equal(early.lines.at(-1).text, String(MAX_EARLY_LINES + 4));
+  assert.equal(j.room, null);
+
+  // A refused join drops what it kept.
+  j.begin("priv-gone");
+  j.offer({ type: "topic", room: "priv-gone", topic: "x" });
+  j.abort("priv-gone");
+  assert.equal(j.room, null);
+  assert.equal(j.finish("priv-gone"), null);
+});
+
+test("a disconnect mid-transfer clears the running-transfer counter", () => {
+  const before = activeTransferCount();
+  trackTransfers({ type: "transfer_progress", id: "t-done", direction: "upload", done: 4, total: 4 });
+  trackTransfers({ type: "transfer_complete", id: "t-done", status: 0 });
+  trackTransfers({ type: "transfer_progress", id: "t-cut", direction: "download", done: 1, total: 9 });
+  trackTransfers({ type: "transfer_progress", id: "t-cut", direction: "download", done: 3, total: 9 });
+  assert.equal(activeTransferCount(), before + 1, "the Button Bar shows [1]");
+
+  trackTransfers({ type: "disconnected", reason: "disconnected" });
+  assert.equal(activeTransferCount(), 0);
+  assert.equal(getState().transfers["t-cut"].status, TRANSFER_ABORTED);
+  assert.equal(getState().transfers["t-done"].status, 0, "a finished one keeps its outcome");
+  // Unrelated events change nothing.
+  trackTransfers({ type: "chat", room: "lobby" });
+  trackTransfers(null);
+  assert.equal(activeTransferCount(), 0);
+  // Resumed later under the same id: running again, then finished.
+  trackTransfers({ type: "transfer_progress", id: "t-cut", direction: "download", done: 4, total: 9 });
+  assert.equal(activeTransferCount(), 1);
+  trackTransfers({ type: "transfer_complete", id: "t-cut", status: 0 });
+  assert.equal(activeTransferCount(), 0);
+});
+
+test("the Transfers window knows which cards are still running", () => {
+  const cards = new Map([
+    ["a", { done: true }],
+    ["b", { done: false }],
+    ["c", { done: false }],
+  ]);
+  assert.deepEqual(unfinishedIds(cards), ["b", "c"]);
+});
+
+test("a bookmark without a saved password is not submitted blind", () => {
+  const b = { id: "bm1", host: "h", port: 10700, login: "phraq" };
+  const blind = bookmarkConnectCommands({ ...b, hasSecret: false });
+  assert.deepEqual(
+    blind.map(([action]) => action),
+    ["fill"],
+    "no submit, so no login with an empty password"
+  );
+  assert.equal(blind[0][1].askPassword, true);
+  assert.equal(blind[0][1].hasSecret, false);
+
+  const saved = bookmarkConnectCommands({ ...b, hasSecret: true });
+  assert.deepEqual(saved.map(([action]) => action), ["fill", "submit"]);
+  assert.equal(saved[0][1].bookmarkId, "bm1");
+  assert.ok(!("password" in saved[0][1]), "only the id travels");
+
+  // The Connect window's own guard for an automatic submit.
+  assert.ok(!canAutoSubmit({ password: "", bookmarkId: null }));
+  assert.ok(canAutoSubmit({ password: "", bookmarkId: "bm1" }));
+  assert.ok(canAutoSubmit({ password: "pw", bookmarkId: null }));
 });

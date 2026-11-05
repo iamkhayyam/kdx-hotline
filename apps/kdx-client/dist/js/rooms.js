@@ -33,3 +33,47 @@ export function shouldAdoptRoom(room, currentRoom, pending, now = Date.now()) {
     isPrivateRoom(room)
   );
 }
+
+/** Most chat lines kept for a room whose join isn't confirmed yet. */
+export const MAX_EARLY_LINES = 50;
+
+/**
+ * A room join in flight. The server confirms a join only after the room's
+ * first events (its member list, topic, the join notice) may already have
+ * arrived — while the view still shows the old room, which is left only
+ * once the join is confirmed. Those events are kept here and applied when
+ * the view switches.
+ */
+export function createJoinTracker() {
+  let pending = null; // { room, users, topic, lines }
+  return {
+    begin(room) {
+      pending = { room, users: null, topic: null, lines: [] };
+    },
+    /** Keep `ev` if it belongs to the room being joined; true if kept. */
+    offer(ev) {
+      if (!pending || !ev || ev.room !== pending.room) return false;
+      if (ev.type === "user_list") pending.users = ev.users;
+      else if (ev.type === "topic") pending.topic = ev.topic;
+      else if (ev.type === "chat") {
+        pending.lines.push(ev);
+        if (pending.lines.length > MAX_EARLY_LINES) pending.lines.shift();
+      } else return false;
+      return true;
+    },
+    /** The join of `room` was confirmed: what arrived for it meanwhile
+     * (null if another join replaced it). */
+    finish(room) {
+      const p = pending && pending.room === room ? pending : null;
+      if (p) pending = null;
+      return p;
+    },
+    /** The join of `room` failed: drop what was kept for it. */
+    abort(room) {
+      if (pending && pending.room === room) pending = null;
+    },
+    get room() {
+      return pending ? pending.room : null;
+    },
+  };
+}

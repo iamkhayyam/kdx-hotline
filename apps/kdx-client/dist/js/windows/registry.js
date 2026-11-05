@@ -6,6 +6,7 @@
 
 import {
   inTauri,
+  invoke,
   getCurrentWindow,
   onKdxEvent,
   onUi,
@@ -16,9 +17,10 @@ import {
   listenersReady,
 } from "../bridge.js";
 import { register } from "../wm.js";
-import { update, updateTransfer } from "../store.js";
+import { update, trackTransfers } from "../store.js";
 import { mountChrome } from "../chrome.js";
 import { applySession, hydrateSession } from "../session.js";
+import { errorText } from "../html.js";
 import { applySettings, loadSettings } from "./settings.js";
 
 import { buildConnect } from "./connect.js";
@@ -139,7 +141,7 @@ function mountConnect(tagRef) {
 }
 
 function mountChat(tagRef) {
-  const api = buildChat();
+  const api = buildChat({ onUserCount: (n) => tagRef.set && tagRef.set(userCountTag(n)) });
   onKdxEvent((ev) => {
     switch (ev.type) {
       case "chat":
@@ -147,8 +149,9 @@ function mountChat(tagRef) {
         break;
       case "user_list":
         // Only the room on screen (or a private room we just created by
-        // inviting someone) — see rooms.js.
-        if (api.onUserList(ev) && tagRef.set) tagRef.set(userCountTag(ev.users.length));
+        // inviting someone, or one we're joining) — see rooms.js. The
+        // titlebar's member count follows (onUserCount).
+        api.onUserList(ev);
         break;
       case "topic":
         api.onTopic(ev);
@@ -194,15 +197,21 @@ function mountFiles(tagRef) {
 }
 
 function mountTransfers(tagRef) {
-  const api = buildTransfers();
+  const api = buildTransfers({
+    onCancel: (id) => {
+      // The transfer's own abort event updates the card.
+      invoke("cancel_transfer")
+        .then((wasActive) => {
+          if (!wasActive) api.onCancelFailed(id, "not running");
+        })
+        .catch((err) => api.onCancelFailed(id, errorText(err)));
+    },
+  });
   onKdxEvent((ev) => {
-    if (ev.type === "transfer_progress") {
-      api.onProgress(ev);
-      updateTransfer(ev.id, { done: ev.done, total: ev.total });
-    } else if (ev.type === "transfer_complete") {
-      api.onComplete(ev);
-      updateTransfer(ev.id, { status: ev.status });
-    }
+    if (ev.type === "transfer_progress") api.onProgress(ev);
+    else if (ev.type === "transfer_complete") api.onComplete(ev);
+    else if (ev.type === "disconnected") api.onDisconnected(ev.reason);
+    trackTransfers(ev);
   });
   return { body: api.body };
 }

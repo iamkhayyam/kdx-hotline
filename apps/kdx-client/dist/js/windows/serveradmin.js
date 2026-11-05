@@ -6,6 +6,7 @@
 import { invoke } from "../bridge.js";
 import { open } from "../wm.js";
 import { esc, num, errorText } from "../html.js";
+import { askConfirm, confirmThen } from "../confirm.js";
 
 export function buildServerAdmin() {
   const body = document.createElement("div");
@@ -120,16 +121,22 @@ export function buildServerAdmin() {
 
   $("#srv-shutdown-btn").addEventListener("click", async () => {
     const message = $("#srv-shutdown-message").value.trim();
-    if (!confirm("Shut down the server? Every connected user, including you, will be disconnected.")) {
-      return;
-    }
     const result = $("#srv-shutdown-result");
-    try {
-      await invoke("shutdown_server", { message });
-      result.textContent = "shutdown requested…";
-    } catch (err) {
-      result.textContent = errorText(err);
-    }
+    await confirmThen(
+      () =>
+        askConfirm("Shut down the server? Every connected user, including you, will be disconnected.", {
+          confirmLabel: "Shut Down",
+          danger: true,
+        }),
+      async () => {
+        try {
+          await invoke("shutdown_server", { message });
+          result.textContent = "shutdown requested…";
+        } catch (err) {
+          result.textContent = errorText(err);
+        }
+      }
+    );
   });
 
   return { body, refresh };

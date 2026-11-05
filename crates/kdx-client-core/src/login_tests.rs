@@ -141,6 +141,38 @@ async fn login_succeeds_against_an_honest_server() {
     assert_eq!(session.class, 2);
 }
 
+/// P-3: a second login on a logged-in connection is refused locally. It
+/// used to send another AuthRequest (which the server has no answer for)
+/// and leave the actor "mid-login" for good, so keepalives stopped and the
+/// idle watchdog killed the session.
+#[tokio::test]
+async fn a_second_login_is_refused_and_keepalives_continue() {
+    let credential = StoredCredential::derive("s3cret").unwrap();
+    let mut h = harness();
+    let login = start_login(&h.client, "s3cret");
+    h.expect(PacketType::AuthRequest).await;
+    let challenge = challenge_for(&credential);
+    h.send_challenge(&challenge).await;
+    let response = h.expect(PacketType::AuthResponse).await;
+    let proof = AuthResponse::decode(&response.payload).unwrap().response;
+    let signature = credential
+        .verify_proof("phraq", &challenge.challenge, &BINDING, &proof)
+        .unwrap();
+    h.send_result(true, "welcome", signature).await;
+    finish(login).await.unwrap();
+
+    // Argon2 above ran on the blocking pool in real time; from here on the
+    // clock is paused so the keepalive interval passes instantly.
+    tokio::time::pause();
+    let again = tokio::time::timeout(Duration::from_secs(1), h.client.login("phraq", "s3cret"))
+        .await
+        .expect("refused at once, not after a timeout");
+    assert!(matches!(again, Err(ClientError::InvalidInput(_))), "{again:?}");
+    // Nothing was sent for it, and the session keeps pinging.
+    let next = h.server.next().await.unwrap().unwrap();
+    assert_eq!(next.header.packet_type, PacketType::Ping);
+}
+
 /// CLIENT-2 / AUTH-2: a server that can't produce the ServerSignature (a
 /// phishing server that "accepts" anything, or a relay) is not trusted, and
 /// the connection is dropped.
