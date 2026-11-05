@@ -3,8 +3,8 @@
 // type-to-filter box. "Connect" pre-fills the Connect window with a server's
 // address so the user can authenticate to it.
 
-import { invoke, emitUi } from "../bridge.js";
-import { open } from "../wm.js";
+import { invoke, deliver } from "../bridge.js";
+import { esc, num, errorText } from "../html.js";
 
 export function buildTrackers() {
   const body = document.createElement("div");
@@ -27,7 +27,7 @@ export function buildTrackers() {
       servers = await invoke("list_servers", { filter: "" });
       render();
     } catch (err) {
-      listEl.innerHTML = `<div class="empty">${esc(err.message || String(err))}</div>`;
+      listEl.innerHTML = `<div class="empty">${esc(errorText(err))}</div>`;
     }
   }
 
@@ -48,14 +48,13 @@ export function buildTrackers() {
       row.innerHTML =
         `<div class="trk-main">` +
         `<span class="trk-name">${esc(s.name)}</span>` +
-        `<span class="trk-pop${full ? " full" : ""}">${s.users}/${s.max_users}</span>` +
+        `<span class="trk-pop${full ? " full" : ""}">${num(s.users)}/${num(s.max_users)}</span>` +
         `</div>` +
         `<div class="trk-sub">${esc(s.description || "—")}</div>` +
-        `<div class="trk-addr">${esc(s.host)}:${s.port}` +
-        `<button class="mini" data-host="${esc(s.host)}" data-port="${s.port}">Connect</button></div>`;
+        `<div class="trk-addr">${esc(s.host)}:${num(s.port)}` +
+        `<button class="mini">Connect</button></div>`;
       row.querySelector("button").addEventListener("click", () => {
-        open("connect");
-        emitUi("connect", "fill", { host: s.host, port: s.port });
+        deliver("connect", "fill", { host: s.host, port: s.port });
       });
       listEl.appendChild(row);
     }
@@ -65,8 +64,4 @@ export function buildTrackers() {
   $("#trk-refresh").addEventListener("click", refresh);
 
   return { body, refresh };
-}
-
-function esc(s) {
-  return String(s).replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" })[c]);
 }

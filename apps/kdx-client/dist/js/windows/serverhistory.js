@@ -4,6 +4,7 @@
 // errors otherwise. Newest first.
 
 import { invoke } from "../bridge.js";
+import { esc, errorText } from "../html.js";
 
 const HISTORY_LIMIT = 500;
 
@@ -48,7 +49,7 @@ export function buildServerHistory() {
       entries = await invoke("list_history", { limit: HISTORY_LIMIT });
       render();
     } catch (err) {
-      listEl.innerHTML = `<div class="empty">${esc(err.message || String(err))}</div>`;
+      listEl.innerHTML = `<div class="empty">${esc(errorText(err))}</div>`;
     }
   }
 
@@ -95,7 +96,4 @@ function actionLabel(action) {
 }
 function fmtTime(unixSecs) {
   return new Date(unixSecs * 1000).toLocaleString();
-}
-function esc(s) {
-  return String(s).replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" })[c]);
 }

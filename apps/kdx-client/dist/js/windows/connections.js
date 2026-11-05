@@ -4,6 +4,7 @@
 // the window is visible; the timer stops when it's hidden or closed.
 
 import { invoke } from "../bridge.js";
+import { esc, num, errorText } from "../html.js";
 
 const CLASS_NAME = ["guest", "user", "power user", "admin"];
 const REFRESH_MS = 5000;
@@ -29,7 +30,7 @@ export function buildConnections() {
       rows = await invoke("list_connections");
       render();
     } catch (err) {
-      listEl.innerHTML = `<div class="empty">${esc(err.message || String(err))}</div>`;
+      listEl.innerHTML = `<div class="empty">${esc(errorText(err))}</div>`;
       // Stop the auto-refresh if the server rejects us — no point spamming
       // a permissions error. A manual Refresh click can re-try.
       stop();
@@ -57,7 +58,7 @@ export function buildConnections() {
     for (const r of shown) {
       const tr = document.createElement("tr");
       tr.innerHTML =
-        `<td><span class="classbar" data-class="${r.class}"></span></td>` +
+        `<td><span class="classbar" data-class="${num(r.class)}"></span></td>` +
         `<td class="fname">${esc(r.username)}</td>` +
         `<td class="fsize">${esc(CLASS_NAME[r.class] || "?")}</td>` +
         `<td class="fmeta">${esc(r.address)}</td>` +
@@ -93,7 +94,4 @@ function fmtIdle(secs) {
   if (secs < 60) return `${secs}s`;
   if (secs < 3600) return `${Math.floor(secs / 60)}m`;
   return `${Math.floor(secs / 3600)}h`;
-}
-function esc(s) {
-  return String(s).replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" })[c]);
 }

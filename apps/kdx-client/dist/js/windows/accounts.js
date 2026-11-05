@@ -6,6 +6,7 @@
 // bitmasks the account row carries.
 
 import { invoke } from "../bridge.js";
+import { esc, num, errorText } from "../html.js";
 
 const CLASS_NAME = ["guest", "user", "power user", "admin"];
 
@@ -68,8 +69,8 @@ export function buildAccounts() {
 
   overridesEl.innerHTML = PRIVILEGES.map(
     (p) =>
-      `<label class="ac-override"><span>${p.label}</span>` +
-      `<select data-bit="${p.bit}">` +
+      `<label class="ac-override"><span>${esc(p.label)}</span>` +
+      `<select data-bit="${num(p.bit)}">` +
       `<option value="inherit">Inherit</option>` +
       `<option value="grant">Grant</option>` +
       `<option value="revoke">Revoke</option>` +
@@ -82,7 +83,7 @@ export function buildAccounts() {
       accounts = await invoke("list_accounts");
       render();
     } catch (err) {
-      listEl.innerHTML = `<div class="empty">${esc(err.message || String(err))}</div>`;
+      listEl.innerHTML = `<div class="empty">${esc(errorText(err))}</div>`;
     }
   }
 
@@ -101,10 +102,10 @@ export function buildAccounts() {
     for (const a of shown) {
       const tr = document.createElement("tr");
       tr.innerHTML =
-        `<td><span class="classbar" data-class="${a.base_class}"></span></td>` +
+        `<td><span class="classbar" data-class="${num(a.base_class)}"></span></td>` +
         `<td class="fname">${esc(a.username)}</td>` +
-        `<td class="fsize">${CLASS_NAME[a.base_class] || "?"}</td>` +
-        `<td class="fmeta">${overrideSummary(a)}</td>`;
+        `<td class="fsize">${esc(CLASS_NAME[a.base_class] || "?")}</td>` +
+        `<td class="fmeta">${esc(overrideSummary(a))}</td>`;
       tr.addEventListener("click", () => openEditor(a));
       tb.appendChild(tr);
     }
@@ -184,7 +185,7 @@ export function buildAccounts() {
       closeEditor();
       render();
     } catch (err) {
-      result.textContent = esc(err.message || String(err));
+      result.textContent = errorText(err);
     }
   });
 
@@ -199,7 +200,4 @@ function countBits(n) {
     v >>>= 1;
   }
   return count;
-}
-function esc(s) {
-  return String(s).replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" })[c]);
 }

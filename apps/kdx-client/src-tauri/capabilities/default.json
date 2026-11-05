@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Capabilities for every KDX window (launcher + floating feature windows). Feature windows are created at runtime, so they must be listed here or they get zero core permissions.",
+  "description": "Window-management and event permissions for every KDX window (launcher + floating feature windows). Feature windows are created at runtime, so they must be listed here or they get zero core permissions. App commands are granted per window in commands.json; local files are only reached through native dialogs opened by the Rust side, so no dialog permission is granted to the webview.",
   "windows": [
     "main",
     "connect",
@@ -42,6 +42,6 @@
     "core:window:allow-set-size",
     "core:window:allow-set-resizable",
     "core:window:allow-start-dragging",
-    "dialog:default"
+    "allow-get-session"
   ]
 }

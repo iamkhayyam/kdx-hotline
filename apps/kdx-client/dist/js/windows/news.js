@@ -6,6 +6,7 @@
 
 import { invoke } from "../bridge.js";
 import { getState } from "../store.js";
+import { esc, num, errorText } from "../html.js";
 
 const CLASS_NAME = ["guest", "user", "power user", "admin"];
 
@@ -41,10 +42,10 @@ export function buildNews() {
         <div class="ab-grid">
           <label>Name<input id="ng-name" spellcheck="false" autocomplete="off" /></label>
           <label>Read class
-            <select id="ng-read">${classOptions(0)}</select>
+            <select id="ng-read">${classOptionsHtml(0)}</select>
           </label>
           <label>Post class
-            <select id="ng-post">${classOptions(1)}</select>
+            <select id="ng-post">${classOptionsHtml(1)}</select>
           </label>
         </div>
         <input id="ng-desc" placeholder="description" spellcheck="false" autocomplete="off" />
@@ -76,7 +77,7 @@ export function buildNews() {
       renderGroups();
       if (group) await openGroup(group.id);
     } catch (err) {
-      groupsEl.innerHTML = `<div class="empty">${esc(err.message || String(err))}</div>`;
+      groupsEl.innerHTML = `<div class="empty">${esc(errorText(err))}</div>`;
     }
   }
 
@@ -90,7 +91,7 @@ export function buildNews() {
       const d = document.createElement("div");
       d.className = "news-group" + (group && group.id === g.id ? " active" : "");
       d.innerHTML = `<span class="news-group-name">${esc(g.name)}</span>` +
-        `<span class="news-group-meta">${CLASS_NAME[g.min_post_class] || "?"}+</span>`;
+        `<span class="news-group-meta">${esc(CLASS_NAME[g.min_post_class] || "?")}+</span>`;
       d.title = g.description || g.name;
       d.addEventListener("click", () => openGroup(g.id));
       groupsEl.appendChild(d);
@@ -111,7 +112,7 @@ export function buildNews() {
       posts = await invoke("list_thread", { newsgroupId: id });
       renderThreads();
     } catch (err) {
-      threadsEl.innerHTML = `<div class="empty">${esc(err.message || String(err))}</div>`;
+      threadsEl.innerHTML = `<div class="empty">${esc(errorText(err))}</div>`;
     }
   }
 
@@ -147,7 +148,7 @@ export function buildNews() {
       row.style.paddingLeft = `${8 + depth * 16}px`;
       row.innerHTML =
         `<span class="news-thread-subj">${depth ? "↳ " : ""}${esc(post.subject)}</span>` +
-        `<span class="news-thread-meta">${esc(post.author)} · ${fmtTime(post.timestamp)}</span>`;
+        `<span class="news-thread-meta">${esc(post.author)} · ${esc(fmtTime(post.timestamp))}</span>`;
       row.addEventListener("click", () => selectPost(post));
       threadsEl.appendChild(row);
     }
@@ -160,7 +161,7 @@ export function buildNews() {
     readingEl.innerHTML = `
       <div class="news-read-head">
         <span class="news-read-subj">${esc(post.subject)}</span>
-        <span class="news-read-by">${esc(post.author)} · ${fmtTime(post.timestamp)}</span>
+        <span class="news-read-by">${esc(post.author)} · ${esc(fmtTime(post.timestamp))}</span>
       </div>
       <div class="news-read-body">${esc(post.body)}</div>
       <div class="news-read-actions">
@@ -192,7 +193,7 @@ export function buildNews() {
       readingEl.innerHTML = "";
       renderThreads();
     } catch (err) {
-      readingEl.innerHTML = `<div class="empty">${esc(err.message || String(err))}</div>`;
+      readingEl.innerHTML = `<div class="empty">${esc(errorText(err))}</div>`;
     }
   }
 
@@ -219,7 +220,7 @@ export function buildNews() {
       composer.classList.add("hidden");
       renderThreads();
     } catch (err) {
-      $("#news-compose-result").textContent = esc(err.message || String(err));
+      $("#news-compose-result").textContent = errorText(err);
     }
   });
 
@@ -247,7 +248,7 @@ export function buildNews() {
       newgroupForm.classList.add("hidden");
       renderGroups();
     } catch (err) {
-      $("#ng-result").textContent = esc(err.message || String(err));
+      $("#ng-result").textContent = errorText(err);
     }
   });
 
@@ -257,15 +258,12 @@ export function buildNews() {
 function replySubject(s) {
   return /^re:/i.test(s) ? s : `re: ${s}`;
 }
-function classOptions(selected) {
+function classOptionsHtml(selected) {
   return CLASS_NAME.map(
-    (name, i) => `<option value="${i}"${i === selected ? " selected" : ""}>${name}</option>`
+    (name, i) => `<option value="${num(i)}"${i === selected ? " selected" : ""}>${esc(name)}</option>`
   ).join("");
 }
 function fmtTime(unixSecs) {
   const d = new Date(unixSecs * 1000);
   return d.toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
-}
-function esc(s) {
-  return String(s).replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" })[c]);
 }

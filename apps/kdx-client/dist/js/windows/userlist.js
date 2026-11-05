@@ -1,9 +1,9 @@
 // User List — the server-wide roster (distinct from a chat room's member
 // list). Class color bars per row, type-to-filter, right-click "Get Info".
 
-import { invoke, emitUi } from "../bridge.js";
-import { open } from "../wm.js";
+import { invoke, deliver } from "../bridge.js";
 import { showMenu } from "../menu.js";
+import { esc, num, errorText } from "../html.js";
 
 const CLASS_NAME = ["guest", "user", "power user", "admin"];
 
@@ -29,7 +29,7 @@ export function buildUserList() {
       users = await invoke("list_users");
       render();
     } catch (err) {
-      listEl.innerHTML = `<div class="empty">${err.message || err}</div>`;
+      listEl.innerHTML = `<div class="empty">${esc(errorText(err))}</div>`;
     }
   }
 
@@ -45,39 +45,20 @@ export function buildUserList() {
       const row = document.createElement("div");
       row.className = "ul-row";
       row.innerHTML =
-        `<span class="classbar" data-class="${u.class}"></span>` +
+        `<span class="classbar" data-class="${num(u.class)}"></span>` +
         `<span class="ul-name">${esc(u.name && u.name.trim() ? u.name + " (" + u.username + ")" : u.username)}</span>` +
-        `<span class="ul-meta">${CLASS_NAME[u.class] || "?"} · idle ${fmtIdle(u.idle_secs)}${u.description && u.description.trim() ? " · " + esc(u.description) : ""}</span>`;
-      row.addEventListener("click", () => {
-        open("userinfo");
-        emitUi("userinfo", "show", { user: u.username });
-      });
+        `<span class="ul-meta">${esc(CLASS_NAME[u.class] || "?")} · idle ${esc(fmtIdle(u.idle_secs))}${u.description && u.description.trim() ? " · " + esc(u.description) : ""}</span>`;
+      row.addEventListener("click", () => deliver("userinfo", "show", { user: u.username }));
       row.addEventListener("contextmenu", (e) => {
         e.preventDefault();
         const items = [
-          {
-            label: "Send Message",
-            fn: () => {
-              open("messages");
-              emitUi("messages", "open-with", { user: u.username });
-            },
-          },
-          {
-            label: "Get Info",
-            fn: () => {
-              open("userinfo");
-              emitUi("userinfo", "show", { user: u.username });
-            },
-          },
+          { label: "Send Message", fn: () => deliver("messages", "open-with", { user: u.username }) },
+          { label: "Get Info", fn: () => deliver("userinfo", "show", { user: u.username }) },
         ];
-        items.push({ label: "Invite to Chat…", fn: () => invoke("invite_to_chat", { to: u.username }).catch(() => {}) });
-        items.push({
-          label: "Disconnect…",
-          fn: () => {
-            open("admin");
-            emitUi("admin", "open-disconnect", { user: u.username });
-          },
-        });
+        // The Chat window sends the invite, so it can follow the inviter
+        // into the private room the server creates.
+        items.push({ label: "Invite to Chat…", fn: () => deliver("chat", "invite", { user: u.username }) });
+        items.push({ label: "Disconnect…", fn: () => deliver("admin", "open-disconnect", { user: u.username }) });
         showMenu(e.clientX, e.clientY, items);
       });
       listEl.appendChild(row);
@@ -101,7 +82,4 @@ function fmtIdle(secs) {
   if (secs < 60) return `${secs}s`;
   if (secs < 3600) return `${Math.floor(secs / 60)}m`;
   return `${Math.floor(secs / 3600)}h`;
-}
-function esc(s) {
-  return String(s).replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" })[c]);
 }
