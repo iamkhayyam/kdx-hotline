@@ -24,12 +24,23 @@
 //! a resume of an upload whose entry is already filed goes on to finish it,
 //! and at startup (before the sweeper runs) entries whose bytes are still a
 //! partial file get them moved into place.
+//!
+//! Blobs no entry references (left by crashes before that repair existed,
+//! or by a rename that outlived a database rollback) are moved into a
+//! quarantine directory, [`QUARANTINE_DIR`], at startup — after the repair —
+//! and daily; they are deleted once they have sat there for
+//! [`TransferLimits::orphan_retention`].
+//!
+//! An upload into a folder its sender can't list (a drop box they don't
+//! own) never learns whether its name was taken: it is stored under a free
+//! variant of the name instead (see [`UploadDest::blind`]).
 
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsStr;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bitvec::prelude::*;
 use kdx_storage::file_tree;
@@ -44,8 +55,8 @@ use uuid::Uuid;
 
 use super::throttle::{reserve_shared, wait_until, SharedBucket, TokenBucket};
 use crate::auth::Session;
-use crate::files::tree::locate_blob;
-use crate::files::{FileTree, Node, NodeKind, TreeError};
+use crate::files::tree::{free_name, locate_blob};
+use crate::files::{FileTree, Node, NodeKind, TreeError, UploadDest};
 
 /// Chunk sizes a client may request.
 pub const MIN_CHUNK: u32 = 4 * 1024;
@@ -60,6 +71,15 @@ pub const MAX_TOTAL_CHUNKS: u32 = 524_280;
 
 /// How often the background sweeper looks for abandoned uploads.
 const SWEEP_INTERVAL: Duration = Duration::from_secs(10 * 60);
+
+/// Every this many sweeps (once a day) the sweeper also looks for orphaned
+/// blobs.
+const ORPHAN_SWEEP_EVERY: u32 = 144;
+
+/// Directory inside `files_root` that orphaned blobs are moved into, as
+/// `<uuid>.<unix seconds when quarantined>`. To restore one, move it back
+/// to `files_root/<uuid>`.
+pub const QUARANTINE_DIR: &str = ".orphaned";
 
 const MIB: u64 = 1024 * 1024;
 const GIB: u64 = 1024 * MIB;
@@ -160,7 +180,14 @@ pub struct TransferLimits {
     pub bitmap_flush_chunks: u32,
     /// ...or once this long has passed since the last save.
     pub bitmap_flush_interval: Duration,
+    /// A blob moved into [`QUARANTINE_DIR`] is deleted by a later sweep
+    /// once it has been there this long. `None` keeps quarantined blobs
+    /// until someone removes them.
+    pub orphan_retention: Option<Duration>,
 }
+
+/// Default for [`TransferLimits::orphan_retention`]: 30 days.
+pub const DEFAULT_ORPHAN_RETENTION: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
 impl Default for TransferLimits {
     fn default() -> Self {
@@ -174,8 +201,18 @@ impl Default for TransferLimits {
             stale_after: Duration::from_secs(24 * 60 * 60),
             bitmap_flush_chunks: 256,
             bitmap_flush_interval: Duration::from_secs(1),
+            orphan_retention: Some(DEFAULT_ORPHAN_RETENTION),
         }
     }
+}
+
+/// What one orphan-blob sweep did (see [`TransferManager::sweep_orphan_blobs`]).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct OrphanSweep {
+    /// Blobs moved into quarantine.
+    pub quarantined: usize,
+    /// Quarantined blobs deleted after their retention period.
+    pub purged: usize,
 }
 
 pub struct TransferManager {
@@ -199,8 +236,8 @@ struct Live {
     /// Transfer ids held right now: by a live upload, or by the sweeper while
     /// it deletes one. Anyone else asking for a held id gets `Busy`.
     held: HashSet<Uuid>,
-    /// Destinations (parent id, name) claimed by live uploads.
-    destinations: HashSet<(String, String)>,
+    /// Names claimed by live uploads, per destination folder id.
+    destinations: HashMap<String, HashSet<String>>,
     /// Live (uploads, downloads) per account id.
     per_account: HashMap<String, (usize, usize)>,
     /// Live uploads plus downloads.
@@ -217,7 +254,9 @@ enum ClaimKind {
     Upload {
         account_id: String,
         id: Uuid,
-        destination: (String, String),
+        /// (folder id, name) reserved for this upload; `None` for an upload
+        /// already filed, whose entry holds the name.
+        destination: Option<(String, String)>,
         bytes: u64,
     },
     Download {
@@ -244,7 +283,9 @@ impl Drop for Claim {
                 bytes,
             } => {
                 live.held.remove(id);
-                live.destinations.remove(destination);
+                if let Some((parent, name)) = destination {
+                    live.release_name(parent, name);
+                }
                 live.reserved_bytes = live.reserved_bytes.saturating_sub(*bytes);
                 live.release_slot(account_id, |counts| &mut counts.0);
             }
@@ -259,6 +300,28 @@ impl Drop for Claim {
 }
 
 impl Live {
+    fn is_reserved(&self, parent_id: &str, name: &str) -> bool {
+        self.destinations
+            .get(parent_id)
+            .is_some_and(|names| names.contains(name))
+    }
+
+    fn reserve_name(&mut self, parent_id: &str, name: &str) {
+        self.destinations
+            .entry(parent_id.to_owned())
+            .or_default()
+            .insert(name.to_owned());
+    }
+
+    fn release_name(&mut self, parent_id: &str, name: &str) {
+        if let Some(names) = self.destinations.get_mut(parent_id) {
+            names.remove(name);
+            if names.is_empty() {
+                self.destinations.remove(parent_id);
+            }
+        }
+    }
+
     fn release_slot(
         &mut self,
         account_id: &str,
@@ -294,6 +357,11 @@ pub struct ActiveUpload {
     account_id: String,
     parent_id: String,
     name: String,
+    /// The sender can't list the destination folder, so a taken name must
+    /// never be refused (see [`UploadDest::blind`]): `name` is a free
+    /// variant of the requested one, and `finish` picks another should it
+    /// be taken by then.
+    blind: bool,
     size: u64,
     chunk_size: u32,
     total_chunks: u32,
@@ -321,6 +389,23 @@ pub struct AcceptInfo {
     pub size: u64,
     pub sha256: [u8; 32],
     pub have_bitmap: Vec<u8>,
+}
+
+/// Which name a new upload claim reserves in its destination folder.
+enum Destination<'a> {
+    /// Exactly `name`: `Exists` if another live upload holds it.
+    Exact { parent: &'a str, name: &'a str },
+    /// The first variant of `name` (see [`free_name`]), at most `budget`
+    /// bytes long, that neither the tree (`taken`) nor another live upload
+    /// holds.
+    Free {
+        parent: &'a str,
+        name: &'a str,
+        budget: usize,
+        taken: &'a dyn Fn(&str) -> bool,
+    },
+    /// Nothing: the upload is already filed, and its entry holds the name.
+    Filed,
 }
 
 /// Chunk count for `size` bytes, in u64 so absurd sizes can't wrap before
@@ -374,8 +459,23 @@ impl TransferManager {
         if removed > 0 {
             info!(removed, "discarded abandoned uploads");
         }
+        // Blobs no entry references, last: the repair above has put back
+        // whatever an interrupted finish left, so none of it looks orphaned.
+        shared.sweep_orphan_blobs(SystemTime::now()).await.log();
         tokio::spawn(sweep_periodically(Arc::downgrade(&shared)));
         Ok(Self { shared })
+    }
+
+    /// Move blobs in `files_root` that no file entry references and no
+    /// upload owns into [`QUARANTINE_DIR`], and delete quarantined blobs
+    /// older than [`TransferLimits::orphan_retention`]. Runs on its own at
+    /// startup and once a day. Conservative: only regular files named
+    /// exactly like a blob (a lowercase hyphenated UUID) are candidates,
+    /// symlinks are never followed, nothing outside `files_root` is
+    /// touched, and if the file tree or the upload state can't be read
+    /// nothing is moved.
+    pub async fn sweep_orphan_blobs(&self) -> OrphanSweep {
+        self.shared.sweep_orphan_blobs(SystemTime::now()).await
     }
 
     /// Configured download throttle in bytes/sec (0 = unlimited).
@@ -429,27 +529,27 @@ impl TransferManager {
         }
 
         let chunks = check_upload_shape(size, chunk_size)?;
-        let parent = tree.prepare_upload(path, name, session).await?;
+        let dest = tree.prepare_upload(path, name, session).await?;
 
         let id = Uuid::new_v4();
         // Claim before touching the disk: the caps apply, the name is
         // reserved against other uploads, and the sweeper won't mistake the
-        // new `.part` for an orphan.
-        let (claim, throttle) = self.shared.claim_upload(
-            &session.account_id,
-            id,
-            (parent.id.clone(), name.to_owned()),
-            size,
-        )?;
+        // new `.part` for an orphan. A blind upload whose name is taken (or
+        // reserved) gets a free variant of it here, and the reply below
+        // is the same either way.
+        let (claim, throttle, name) = self
+            .claim_into(tree, &session.account_id, id, &dest, name, size)
+            .await?;
         self.shared.make_room_for(&session.account_id).await?;
 
         let temp_path = self.shared.files_root.join(format!("{id}.part"));
         let file = create_part(&temp_path, size).await?;
+        let parent = dest.parent;
         let row = TransferRow {
             id: id.to_string(),
             account_id: session.account_id.clone(),
             parent_id: parent.id.clone(),
-            name: name.to_owned(),
+            name: name.clone(),
             size: size as i64,
             chunk_size: i64::from(chunk_size),
             sha256: sha256.to_vec(),
@@ -461,7 +561,7 @@ impl TransferManager {
             remove_quietly(&temp_path).await;
             return Err(e.into());
         }
-        debug!(%id, name, size, "upload started");
+        debug!(%id, %name, size, blind = dest.blind, "upload started");
 
         let accept = AcceptInfo {
             transfer_id: *id.as_bytes(),
@@ -475,7 +575,8 @@ impl TransferManager {
             id,
             account_id: session.account_id.clone(),
             parent_id: parent.id,
-            name: name.to_owned(),
+            name,
+            blind: dest.blind,
             size,
             chunk_size,
             total_chunks: chunks,
@@ -531,31 +632,58 @@ impl TransferManager {
         let received = bitmap.count_ones() as u32;
         let remaining = size.saturating_sub(u64::from(received) * u64::from(chunk_size));
 
-        // Claim first: if another connection holds this transfer, leave it
-        // (and its row) alone.
-        let (claim, throttle) = self.shared.claim_upload(
-            &session.account_id,
-            resume_id,
-            (row.parent_id.clone(), row.name.clone()),
-            remaining,
-        )?;
-
         // An upload whose entry an interrupted `finish` already filed (the
         // bytes are still the partial file) resumes straight into finishing:
         // it passed every check when it was filed. Anything else
-        // re-validates its destination exactly as a fresh upload would:
-        // since the upload began the account may have lost write access, or
-        // the folder may be gone or the name taken. Such an upload can
-        // never be filed, so it is discarded.
+        // re-validates its destination exactly as a fresh upload would,
+        // wherever that folder is now: since the upload began the account
+        // may have lost write access, or the folder may be gone or the name
+        // taken. Such an upload can never be filed, so it is discarded. (A
+        // blind upload's name is never "taken": it moves on to a free
+        // variant instead.)
         let filed = tree
-            .child(&row.parent_id, &row.name)
+            .find_child(&row.parent_id, |node| is_filed_upload(node, &row.id, &row.sha256))
             .await
-            .is_some_and(|node| is_filed_upload(&node, &row.id, &row.sha256));
-        if !filed {
-            if let Err(e) = check_destination(tree, session, &row).await {
-                debug!(id = %resume_id, error = %e, "resume refused; discarding upload");
-                self.shared.discard(&row.id, &row.temp_path).await;
-                return Err(e);
+            .is_some();
+        let dest = if filed {
+            None
+        } else {
+            match tree.prepare_upload_into(&row.parent_id, &row.name, session).await {
+                Ok(dest) => Some(dest),
+                Err(e) => {
+                    // Hold it first: if another connection has this
+                    // transfer, leave it (and its row) alone.
+                    let Some(_hold) = self.shared.hold(resume_id) else {
+                        return Err(TransferError::Busy);
+                    };
+                    debug!(id = %resume_id, error = %e, "resume refused; discarding upload");
+                    self.shared.discard(&row.id, &row.temp_path).await;
+                    return Err(e.into());
+                }
+            }
+        };
+        // `Busy` if another connection holds this transfer.
+        let (claim, throttle, name) = match &dest {
+            Some(dest) => {
+                self.claim_into(tree, &session.account_id, resume_id, dest, &row.name, remaining)
+                    .await?
+            }
+            None => {
+                let (claim, throttle, _) = self.shared.claim_upload(
+                    &session.account_id,
+                    resume_id,
+                    Destination::Filed,
+                    remaining,
+                )?;
+                (claim, throttle, row.name.clone())
+            }
+        };
+        if name != row.name {
+            // A blind upload's name was taken while it was paused: it is now
+            // headed for a free variant, which the row records too.
+            debug!(id = %resume_id, from = %row.name, to = %name, "resumed upload renamed");
+            if let Err(e) = transfer_state::set_name(&self.shared.pool, &row.id, &name).await {
+                warn!(id = %resume_id, error = %e, "could not record a resumed upload's new name");
             }
         }
 
@@ -585,7 +713,8 @@ impl TransferManager {
             id: resume_id,
             account_id: row.account_id,
             parent_id: row.parent_id,
-            name: row.name,
+            name,
+            blind: dest.as_ref().is_some_and(|dest| dest.blind),
             size,
             chunk_size,
             total_chunks: chunks,
@@ -601,6 +730,40 @@ impl TransferManager {
             claim: Some(claim),
         };
         Ok((upload, accept))
+    }
+
+    /// Claim an upload slot for transfer `id` headed for `name` in `dest`'s
+    /// folder, reserving the name against other uploads: exactly `name`
+    /// (`Exists` if another upload holds it), or for a blind upload the
+    /// first free variant of it — picked and reserved in one step, while
+    /// nothing can be filed in the folder, so concurrent blind uploads of
+    /// one name get distinct names. Returns the name reserved.
+    async fn claim_into(
+        &self,
+        tree: &FileTree,
+        account_id: &str,
+        id: Uuid,
+        dest: &UploadDest,
+        name: &str,
+        bytes: u64,
+    ) -> Result<(Claim, SharedBucket, String), TransferError> {
+        let parent = dest.parent.id.as_str();
+        let (claim, throttle, reserved) = if dest.blind {
+            tree.with_entry_names(parent, |taken| {
+                let destination = Destination::Free {
+                    parent,
+                    name,
+                    budget: dest.name_budget,
+                    taken,
+                };
+                self.shared.claim_upload(account_id, id, destination, bytes)
+            })
+            .await?
+        } else {
+            let destination = Destination::Exact { parent, name };
+            self.shared.claim_upload(account_id, id, destination, bytes)?
+        };
+        Ok((claim, throttle, reserved.unwrap_or_else(|| name.to_owned())))
     }
 
     /// Accept one chunk: throttle, verify its hash, write it at its offset,
@@ -690,32 +853,34 @@ impl TransferManager {
 
         // File it in the tree first: a name taken or a folder deleted since
         // the upload began is caught here, while the bytes are still a
-        // disposable partial rather than an unreferenced blob.
+        // disposable partial rather than an unreferenced blob. (A blind
+        // upload whose name was taken is filed under a free variant.)
         let final_path = self.shared.files_root.join(id.to_string());
-        let added = tree
-            .add_file(
-                &upload.parent_id,
-                &upload.name,
-                upload.size,
-                &upload.expected_sha256,
-                &final_path.display().to_string(),
-            )
-            .await;
+        let stored = final_path.display().to_string();
+        let id_str = id.to_string();
+        let sha = upload.expected_sha256;
+        let added = match tree
+            .find_child(&upload.parent_id, |node| is_filed_upload(node, &id_str, &sha))
+            .await
+        {
+            // Filed by an earlier `finish` of this very upload that never
+            // got to move the bytes (a crash, or a failed rename whose undo
+            // failed too): complete that job. Nobody else files this blob:
+            // this upload's id is held until it is done.
+            Some(node) => Ok(node),
+            None if upload.blind => {
+                let parent = upload.parent_id.as_str();
+                let reserved = |name: &str| self.shared.live().is_reserved(parent, name);
+                tree.add_file_renaming(parent, &upload.name, upload.size, &sha, &stored, &reserved)
+                    .await
+            }
+            None => {
+                tree.add_file(&upload.parent_id, &upload.name, upload.size, &sha, &stored)
+                    .await
+            }
+        };
         let node = match added {
             Ok(node) => node,
-            Err(TreeError::Exists) => match tree.child(&upload.parent_id, &upload.name).await {
-                // Filed by an earlier `finish` of this very upload that never
-                // got to move the bytes (a crash, or a failed rename whose
-                // undo failed too): complete that job.
-                Some(node) if is_filed_upload(&node, &id.to_string(), &upload.expected_sha256) => {
-                    node
-                }
-                _ => {
-                    debug!(%id, "verified upload's name was taken; discarding it");
-                    self.discard_upload(&mut upload).await;
-                    return Err(TreeError::Exists.into());
-                }
-            },
             Err(e @ TreeError::Storage(_)) => {
                 // The database is busy or unreachable: nothing about the
                 // upload is wrong, so keep it (verified, every chunk
@@ -752,7 +917,7 @@ impl TransferManager {
             // Harmless: the sweeper drops the stale row later.
             warn!(%id, error = %e, "could not delete finished upload's state");
         }
-        debug!(%id, name = %upload.name, "upload verified and filed");
+        debug!(%id, name = %node.name, "upload verified and filed");
         Ok(())
     }
 
@@ -800,13 +965,16 @@ impl Shared {
         self.live.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
+    /// Claim an upload slot for transfer `id`, reserving the name
+    /// `destination` calls for. Returns the claim, the account's upload
+    /// throttle, and the name reserved (`None` for [`Destination::Filed`]).
     fn claim_upload(
         self: &Arc<Self>,
         account_id: &str,
         id: Uuid,
-        destination: (String, String),
+        destination: Destination<'_>,
         bytes: u64,
-    ) -> Result<(Claim, SharedBucket), TransferError> {
+    ) -> Result<(Claim, SharedBucket, Option<String>), TransferError> {
         let available = available_space(&self.files_root);
         let mut live = self.live();
         if live.held.contains(&id) {
@@ -819,10 +987,27 @@ impl Shared {
         if live.total >= self.limits.max_concurrent_transfers {
             return Err(TransferError::ServerBusy);
         }
-        if live.destinations.contains(&destination) {
-            // Another upload is already headed for this name.
-            return Err(TransferError::Tree(TreeError::Exists));
-        }
+        let destination = match destination {
+            Destination::Exact { parent, name } => {
+                if live.is_reserved(parent, name) {
+                    // Another upload is already headed for this name.
+                    return Err(TransferError::Tree(TreeError::Exists));
+                }
+                Some((parent.to_owned(), name.to_owned()))
+            }
+            Destination::Free {
+                parent,
+                name,
+                budget,
+                taken,
+            } => {
+                let free = free_name(name, budget, |c| taken(c) || live.is_reserved(parent, c))
+                    // Unreachable for a budget `prepare_upload` accepts.
+                    .ok_or(TransferError::Tree(TreeError::InvalidPath("path is too long")))?;
+                Some((parent.to_owned(), free))
+            }
+            Destination::Filed => None,
+        };
         let reserved = live.reserved_bytes.saturating_add(bytes);
         if reserved > self.limits.max_reserved_bytes {
             return Err(TransferError::InsufficientSpace);
@@ -834,7 +1019,9 @@ impl Shared {
         }
 
         live.held.insert(id);
-        live.destinations.insert(destination.clone());
+        if let Some((parent, name)) = &destination {
+            live.reserve_name(parent, name);
+        }
         live.reserved_bytes = reserved;
         live.per_account.entry(account_id.to_owned()).or_default().0 += 1;
         live.total += 1;
@@ -842,6 +1029,7 @@ impl Shared {
             .buckets_for(account_id, self.upload_rate, self.download_rate)
             .0
             .clone();
+        let name = destination.as_ref().map(|(_, name)| name.clone());
         let claim = Claim {
             shared: self.clone(),
             kind: ClaimKind::Upload {
@@ -851,7 +1039,7 @@ impl Shared {
                 bytes,
             },
         };
-        Ok((claim, bucket))
+        Ok((claim, bucket, name))
     }
 
     fn claim_download(
@@ -1127,12 +1315,280 @@ impl Shared {
         }
         removed
     }
+
+    /// See [`TransferManager::sweep_orphan_blobs`]; `now` dates the
+    /// quarantine and measures retention.
+    async fn sweep_orphan_blobs(self: &Arc<Self>, now: SystemTime) -> OrphanSweep {
+        let now = now.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
+        let quarantined = self.quarantine_orphan_blobs(now).await;
+        let purged = match self.limits.orphan_retention {
+            Some(retention) => self.purge_quarantine(now, retention).await,
+            None => 0,
+        };
+        OrphanSweep {
+            quarantined,
+            purged,
+        }
+    }
+
+    /// Move every blob in `files_root` that no file entry references and
+    /// no upload owns into the quarantine directory, stamped with `now`
+    /// (unix seconds). Returns how many were moved.
+    async fn quarantine_orphan_blobs(self: &Arc<Self>, now: u64) -> usize {
+        // Candidates: regular files (a symlink is judged as itself, never
+        // followed) named exactly like a blob. Anything else isn't ours.
+        let mut dir = match tokio::fs::read_dir(&self.files_root).await {
+            Ok(dir) => dir,
+            Err(e) => {
+                warn!(error = %e, "orphan sweep: cannot list files_root");
+                return 0;
+            }
+        };
+        let mut candidates = Vec::new();
+        loop {
+            let entry = match dir.next_entry().await {
+                Ok(Some(entry)) => entry,
+                Ok(None) => break,
+                Err(e) => {
+                    warn!(error = %e, "orphan sweep: cannot list files_root");
+                    return 0;
+                }
+            };
+            let Some(id) = blob_id(&entry.file_name()) else {
+                continue;
+            };
+            if entry.file_type().await.is_ok_and(|t| t.is_file()) {
+                candidates.push(id);
+            }
+        }
+        if candidates.is_empty() {
+            return 0;
+        }
+
+        // Hold each id: one held already belongs to a live upload (perhaps
+        // being filed right now) and is left alone, and none of the others
+        // can be filed until the sweep is done. Only then read what the
+        // tree references — so an upload filed after the listing above is
+        // seen — and which uploads are unfinished.
+        let mut holds = Vec::with_capacity(candidates.len());
+        candidates.retain(|id| match self.hold(*id) {
+            Some(hold) => {
+                holds.push(hold);
+                true
+            }
+            None => false,
+        });
+        let Some(referenced) = self.referenced_blobs().await else {
+            return 0;
+        };
+        let unfinished: HashSet<String> = match transfer_state::all_ids(&self.pool).await {
+            Ok(ids) => ids.into_iter().collect(),
+            Err(e) => {
+                warn!(error = %e, "orphan sweep: cannot list unfinished uploads");
+                return 0;
+            }
+        };
+        let orphans: Vec<String> = candidates
+            .iter()
+            .map(Uuid::to_string)
+            .filter(|name| !referenced.contains(name) && !unfinished.contains(name))
+            .collect();
+        if orphans.is_empty() {
+            return 0;
+        }
+
+        let Some(quarantine) = self.quarantine_dir(true).await else {
+            return 0;
+        };
+        let mut moved = 0;
+        for name in orphans {
+            let from = self.files_root.join(&name);
+            // Still a regular file right before the move.
+            if !tokio::fs::symlink_metadata(&from)
+                .await
+                .is_ok_and(|meta| meta.file_type().is_file())
+            {
+                continue;
+            }
+            let to = quarantine.join(format!("{name}.{now}"));
+            if tokio::fs::symlink_metadata(&to).await.is_ok() {
+                warn!(blob = %name, to = %to.display(), "orphan sweep: quarantine name in use; leaving the blob in place");
+                continue;
+            }
+            match tokio::fs::rename(&from, &to).await {
+                Ok(()) => {
+                    warn!(
+                        blob = %name,
+                        to = %to.display(),
+                        "quarantined a blob that no file entry references"
+                    );
+                    moved += 1;
+                }
+                Err(e) => {
+                    warn!(blob = %name, error = %e, "orphan sweep: could not quarantine a blob");
+                }
+            }
+        }
+        if moved > 0 {
+            sync_dir(&self.files_root).await;
+            sync_dir(&quarantine).await;
+        }
+        drop(holds);
+        moved
+    }
+
+    /// The blob names file entries refer to: the last component of every
+    /// stored path (downloads fall back to `files_root/<that name>`, see
+    /// [`locate_blob`]), plus, for a stored path elsewhere that resolves
+    /// into `files_root` (through a symlink, say), the name it resolves
+    /// to. `None` if the tree can't be read.
+    async fn referenced_blobs(&self) -> Option<HashSet<String>> {
+        let nodes = match file_tree::all(&self.pool).await {
+            Ok(nodes) => nodes,
+            Err(e) => {
+                warn!(error = %e, "orphan sweep: cannot read the file tree");
+                return None;
+            }
+        };
+        let mut names = HashSet::new();
+        let file_name = |path: &Path| path.file_name()?.to_str().map(str::to_owned);
+        for stored in nodes.into_iter().filter_map(|node| node.storage_path) {
+            let path = Path::new(&stored);
+            names.extend(file_name(path));
+            if path.parent() == Some(self.files_root.as_path()) {
+                continue;
+            }
+            if let Ok(real) = tokio::fs::canonicalize(path).await {
+                if real.parent() == Some(self.files_root.as_path()) {
+                    names.extend(file_name(&real));
+                }
+            }
+        }
+        Some(names)
+    }
+
+    /// Delete quarantined blobs stamped at least `retention` before `now`
+    /// (unix seconds). Entries not named like a quarantined blob, and
+    /// anything but regular files, are left alone. Returns how many went.
+    async fn purge_quarantine(&self, now: u64, retention: Duration) -> usize {
+        let Some(quarantine) = self.quarantine_dir(false).await else {
+            return 0;
+        };
+        let mut dir = match tokio::fs::read_dir(&quarantine).await {
+            Ok(dir) => dir,
+            Err(e) => {
+                warn!(error = %e, "orphan sweep: cannot list the quarantine");
+                return 0;
+            }
+        };
+        let mut purged = 0;
+        loop {
+            let entry = match dir.next_entry().await {
+                Ok(Some(entry)) => entry,
+                Ok(None) => break,
+                Err(e) => {
+                    warn!(error = %e, "orphan sweep: cannot list the quarantine");
+                    break;
+                }
+            };
+            let Some(stamp) = quarantined_at(&entry.file_name()) else {
+                continue;
+            };
+            if now.saturating_sub(stamp) < retention.as_secs() {
+                continue;
+            }
+            if !entry.file_type().await.is_ok_and(|t| t.is_file()) {
+                continue;
+            }
+            let path = entry.path();
+            match tokio::fs::remove_file(&path).await {
+                Ok(()) => {
+                    info!(path = %path.display(), "deleted a quarantined orphan blob past its retention");
+                    purged += 1;
+                }
+                Err(e) => {
+                    warn!(path = %path.display(), error = %e, "orphan sweep: could not delete a quarantined blob");
+                }
+            }
+        }
+        purged
+    }
+
+    /// `files_root/QUARANTINE_DIR`, if it is a real directory (not a
+    /// symlink); created (owner-only on Unix) when `create` and missing.
+    async fn quarantine_dir(&self, create: bool) -> Option<PathBuf> {
+        let dir = self.files_root.join(QUARANTINE_DIR);
+        let is_real_dir = |meta: &std::fs::Metadata| meta.file_type().is_dir();
+        match tokio::fs::symlink_metadata(&dir).await {
+            Ok(meta) if is_real_dir(&meta) => return Some(dir),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if !create {
+                    return None;
+                }
+            }
+            Ok(_) => {
+                warn!(path = %dir.display(), "orphan sweep: the quarantine is not a directory; leaving orphans in place");
+                return None;
+            }
+            Err(e) => {
+                warn!(path = %dir.display(), error = %e, "orphan sweep: cannot inspect the quarantine");
+                return None;
+            }
+        }
+        let mut builder = tokio::fs::DirBuilder::new();
+        #[cfg(unix)]
+        builder.mode(0o700);
+        match builder.create(&dir).await {
+            Ok(()) => Some(dir),
+            // Created meanwhile: use it only if it's a real directory.
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                let meta = tokio::fs::symlink_metadata(&dir).await.ok()?;
+                is_real_dir(&meta).then_some(dir)
+            }
+            Err(e) => {
+                warn!(path = %dir.display(), error = %e, "orphan sweep: cannot create the quarantine");
+                None
+            }
+        }
+    }
+}
+
+impl OrphanSweep {
+    fn log(self) {
+        if self.quarantined > 0 || self.purged > 0 {
+            info!(
+                quarantined = self.quarantined,
+                purged = self.purged,
+                quarantine = QUARANTINE_DIR,
+                "swept orphaned blobs"
+            );
+        }
+    }
+}
+
+/// The upload id a blob in `files_root` is named after: `name` must be
+/// exactly a lowercase hyphenated UUID, the only names `finish` gives blobs.
+fn blob_id(name: &OsStr) -> Option<Uuid> {
+    let name = name.to_str()?;
+    let id = Uuid::parse_str(name).ok()?;
+    (id.to_string() == name).then_some(id)
+}
+
+/// When a quarantined blob, named `<uuid>.<unix seconds>`, was quarantined.
+fn quarantined_at(name: &OsStr) -> Option<u64> {
+    let (blob, stamp) = name.to_str()?.rsplit_once('.')?;
+    blob_id(OsStr::new(blob))?;
+    if stamp.is_empty() || !stamp.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    stamp.parse().ok()
 }
 
 async fn sweep_periodically(shared: Weak<Shared>) {
     let mut ticker = tokio::time::interval(SWEEP_INTERVAL);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     ticker.tick().await; // immediate; startup already swept
+    let mut sweeps = 0u32;
     loop {
         ticker.tick().await;
         let Some(shared) = shared.upgrade() else {
@@ -1142,20 +1598,11 @@ async fn sweep_periodically(shared: Weak<Shared>) {
         if removed > 0 {
             info!(removed, "discarded abandoned uploads");
         }
+        sweeps = sweeps.wrapping_add(1);
+        if sweeps.is_multiple_of(ORPHAN_SWEEP_EVERY) {
+            shared.sweep_orphan_blobs(SystemTime::now()).await.log();
+        }
     }
-}
-
-/// Re-check that `session` may still upload `row`'s file into `row`'s
-/// folder, as `prepare_upload` would for a fresh upload — wherever that
-/// folder is now (one atomic check, so a concurrent move can't make it look
-/// gone).
-async fn check_destination(
-    tree: &FileTree,
-    session: &Session,
-    row: &TransferRow,
-) -> Result<(), TransferError> {
-    tree.prepare_upload_into(&row.parent_id, &row.name, session).await?;
-    Ok(())
 }
 
 /// Is `node` the entry upload `id` was filed as? Blobs are named after the
@@ -2245,6 +2692,9 @@ mod tests {
         // Rename kept but the entry rolled back: a blob nothing names.
         let unfiled = fully_received(&f, "unfiled.bin", &data).await;
         std::fs::rename(part_of(&f, unfiled), blob_of(&f, unfiled)).unwrap();
+        // Both rolled back (no entry, no row): an orphan.
+        let orphan = Uuid::new_v4();
+        std::fs::write(blob_of(&f, orphan), b"orphan").unwrap();
 
         // Restart.
         let manager = TransferManager::new(
@@ -2262,6 +2712,12 @@ mod tests {
             assert!(!part_of(&f, id).exists(), "{id}");
             assert!(transfer_state::get(&f.pool, &id.to_string()).await.unwrap().is_none());
         }
+        // The orphan sweep ran after the repair: only the true orphan went
+        // into quarantine.
+        assert!(!blob_of(&f, orphan).exists());
+        let quarantined = quarantined(&f);
+        assert_eq!(quarantined.len(), 1, "{quarantined:?}");
+        assert!(quarantined[0].starts_with(&format!("{orphan}.")), "{quarantined:?}");
         // The unfiled upload is resumable again, and resuming files it.
         assert!(part_of(&f, unfiled).exists());
         assert!(!blob_of(&f, unfiled).exists());
@@ -2422,5 +2878,409 @@ mod tests {
         assert!(Path::new(&blob).is_absolute(), "{blob}");
         let blob_mode = std::fs::metadata(&blob).unwrap().permissions().mode();
         assert_eq!(blob_mode & 0o777, 0o600);
+    }
+
+    // ---- drop-box name oracle (round 3, G3) ---------------------------------
+
+    /// A User-class session for `username`, on its own account.
+    fn user(username: &str) -> Session {
+        Session {
+            id: Uuid::new_v4(),
+            account_id: format!("acct-{username}"),
+            username: username.into(),
+            class: BaseClass::User,
+            privileges: BaseClass::User.privileges() | Privileges::FILE_UPLOAD,
+            expires_at: Instant::now() + Duration::from_secs(600),
+        }
+    }
+
+    /// `/drop`: a drop box owned by bob that Users may upload into.
+    async fn drop_box(f: &Fixture) -> Node {
+        f.tree
+            .create_folder("/", "drop", NodeKind::DropBox, BaseClass::Guest, BaseClass::User, Some("bob"), &sess(BaseClass::Admin))
+            .await
+            .unwrap();
+        f.tree.resolve("/drop").await.unwrap()
+    }
+
+    async fn begin(
+        f: &Fixture,
+        session: &Session,
+        path: &str,
+        name: &str,
+        data: &[u8],
+    ) -> Result<(ActiveUpload, AcceptInfo), TransferError> {
+        let sha: [u8; 32] = Sha256::digest(data).into();
+        f.manager
+            .begin_upload(&f.tree, session, path, name, data.len() as u64, 4096, sha, None)
+            .await
+    }
+
+    async fn resume(f: &Fixture, session: &Session, id: Uuid, data: &[u8]) -> (ActiveUpload, AcceptInfo) {
+        let sha: [u8; 32] = Sha256::digest(data).into();
+        f.manager
+            .begin_upload(&f.tree, session, "/ignored", "ignored", data.len() as u64, 4096, sha, Some(id))
+            .await
+            .unwrap()
+    }
+
+    /// Send whatever chunks of `data` `upload` lacks, then finish it.
+    async fn complete(f: &Fixture, mut upload: ActiveUpload, data: &[u8]) -> Result<(), TransferError> {
+        for (i, hash, chunk) in chunked(data, upload.chunk_size as usize) {
+            if !upload.bitmap[i as usize] {
+                f.manager.write_chunk(&mut upload, i, &hash, chunk).await.unwrap();
+            }
+        }
+        f.manager.finish(&f.tree, upload).await
+    }
+
+    /// The name upload `id`'s row says it is headed for.
+    async fn row_name(f: &Fixture, id: Uuid) -> String {
+        transfer_state::get(&f.pool, &id.to_string()).await.unwrap().expect("row present").name
+    }
+
+    /// (name, size) of every entry in `path`, as an admin sees them.
+    async fn listing(f: &Fixture, path: &str) -> Vec<(String, u64)> {
+        f.tree
+            .list(path, &sess(BaseClass::Admin))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|e| (e.name, e.size))
+            .collect()
+    }
+
+    fn entry(name: &str, size: usize) -> (String, u64) {
+        (name.to_string(), size as u64)
+    }
+
+    // A non-owner's upload into a drop box is answered the same whether
+    // or not its name is taken; a taken one is stored under a variant.
+    #[tokio::test]
+    async fn blind_upload_with_a_taken_name_is_stored_as_a_variant_and_answered_alike() {
+        let f = fixture(0).await;
+        let inbox = drop_box(&f).await;
+        f.tree.add_file(&inbox.id, "report.pdf", 1, &[0u8; 32], "/elsewhere/r").await.unwrap();
+        let alice = user("alice");
+        let data = vec![4u8; 9000];
+
+        let (taken, taken_accept) = begin(&f, &alice, "/drop", "report.pdf", &data).await.unwrap();
+        let (fresh, fresh_accept) = begin(&f, &alice, "/drop", "fresh.pdf", &data).await.unwrap();
+        // Everything in the reply but the (random) transfer id is the same.
+        assert_ne!(taken_accept.transfer_id, fresh_accept.transfer_id);
+        let shape = |a: &AcceptInfo| (a.chunk_size, a.total_chunks, a.size, a.sha256, a.have_bitmap.clone());
+        assert_eq!(shape(&taken_accept), shape(&fresh_accept));
+        assert_eq!(row_name(&f, taken.id()).await, "report (2).pdf");
+        assert_eq!(row_name(&f, fresh.id()).await, "fresh.pdf");
+        complete(&f, taken, &data).await.unwrap();
+        complete(&f, fresh, &data).await.unwrap();
+        assert_eq!(
+            listing(&f, "/drop").await,
+            [entry("fresh.pdf", 9000), entry("report (2).pdf", 9000), entry("report.pdf", 1)]
+        );
+        // The next one gets the next free variant.
+        let (again, _) = begin(&f, &alice, "/drop", "report.pdf", &data).await.unwrap();
+        assert_eq!(row_name(&f, again.id()).await, "report (3).pdf");
+        complete(&f, again, &data).await.unwrap();
+        assert!(f.tree.resolve("/drop/report (3).pdf").await.is_ok());
+    }
+
+    // Uploads racing for one name in a drop box each get their own: the
+    // pick and the reservation are one step, and a name taken behind an
+    // upload's back by the time it finishes is passed over too.
+    #[tokio::test]
+    async fn concurrent_blind_uploads_of_one_name_get_distinct_names() {
+        let f = fixture(0).await;
+        let inbox = drop_box(&f).await;
+        f.tree.add_file(&inbox.id, "x.bin", 1, &[0u8; 32], "/elsewhere/x").await.unwrap();
+        let (alice, carol, dave) = (user("alice"), user("carol"), user("dave"));
+        let data = vec![5u8; 5000];
+
+        let (a1, _) = begin(&f, &alice, "/drop", "x.bin", &data).await.unwrap();
+        let (c1, _) = begin(&f, &carol, "/drop", "x.bin", &data).await.unwrap();
+        let (a2, _) = begin(&f, &alice, "/drop", "x.bin", &data).await.unwrap();
+        assert_eq!(row_name(&f, a1.id()).await, "x (2).bin");
+        assert_eq!(row_name(&f, c1.id()).await, "x (3).bin");
+        assert_eq!(row_name(&f, a2.id()).await, "x (4).bin");
+        // A name merely reserved by a live upload is passed over as well.
+        let (y1, _) = begin(&f, &carol, "/drop", "y.bin", &data).await.unwrap();
+        let (y2, _) = begin(&f, &dave, "/drop", "y.bin", &data).await.unwrap();
+        assert_eq!(row_name(&f, y1.id()).await, "y.bin");
+        assert_eq!(row_name(&f, y2.id()).await, "y (2).bin");
+
+        // The owner files "x (3).bin" directly while carol's upload is
+        // headed there: carol's lands on the first name neither filed nor
+        // reserved.
+        f.tree.add_file(&inbox.id, "x (3).bin", 1, &[0u8; 32], "/elsewhere/x3").await.unwrap();
+        complete(&f, c1, &data).await.unwrap();
+        for upload in [a1, a2, y1, y2] {
+            complete(&f, upload, &data).await.unwrap();
+        }
+        assert_eq!(
+            listing(&f, "/drop").await,
+            [
+                entry("x (2).bin", 5000),
+                entry("x (3).bin", 1),
+                entry("x (4).bin", 5000),
+                entry("x (5).bin", 5000),
+                entry("x.bin", 1),
+                entry("y (2).bin", 5000),
+                entry("y.bin", 5000),
+            ]
+        );
+        assert!(transfer_state::list_stale(&f.pool, 0).await.unwrap().is_empty());
+    }
+
+    // Owners and admins can list the box, so they keep the explicit answer.
+    #[tokio::test]
+    async fn owner_and_admin_uploads_still_report_a_taken_name() {
+        let f = fixture(0).await;
+        let inbox = drop_box(&f).await;
+        f.tree.add_file(&inbox.id, "a.txt", 1, &[0u8; 32], "/elsewhere/a").await.unwrap();
+        let data = vec![6u8; 100];
+        let bob = user("bob");
+        let mut root = user("root");
+        root.class = BaseClass::Admin;
+        root.privileges = BaseClass::Admin.privileges();
+        for session in [&bob, &root] {
+            let result = begin(&f, session, "/drop", "a.txt", &data).await;
+            assert!(matches!(result, Err(TransferError::Tree(TreeError::Exists))), "{}", session.username);
+        }
+        // A non-owner's reservation is no secret from the owner...
+        let alice = user("alice");
+        let (held, _) = begin(&f, &alice, "/drop", "new.bin", &data).await.unwrap();
+        let result = begin(&f, &bob, "/drop", "new.bin", &data).await;
+        assert!(matches!(result, Err(TransferError::Tree(TreeError::Exists))));
+        // ...but the owner's is from the non-owner.
+        let (bobs, _) = begin(&f, &bob, "/drop", "other.bin", &data).await.unwrap();
+        let (alices, _) = begin(&f, &alice, "/drop", "other.bin", &data).await.unwrap();
+        assert_eq!(row_name(&f, bobs.id()).await, "other.bin");
+        assert_eq!(row_name(&f, alices.id()).await, "other (2).bin");
+        drop((held, bobs, alices));
+    }
+
+    // A renamed upload resumes into the name its row carries; one whose
+    // name was taken while it was paused moves on, row and all, unseen.
+    #[tokio::test]
+    async fn resume_of_a_renamed_blind_upload_follows_its_stored_name() {
+        let f = fixture(0).await;
+        let inbox = drop_box(&f).await;
+        f.tree.add_file(&inbox.id, "a.txt", 1, &[0u8; 32], "/elsewhere/a").await.unwrap();
+        let alice = user("alice");
+        let data: Vec<u8> = (0..12_000u32).map(|i| (i % 251) as u8).collect();
+
+        let (mut upload, _) = begin(&f, &alice, "/drop", "a.txt", &data).await.unwrap();
+        let first = upload.id();
+        let (i, hash, chunk) = chunked(&data, 4096)[0];
+        f.manager.write_chunk(&mut upload, i, &hash, chunk).await.unwrap();
+        drop(upload);
+        wait_released(&f, first).await;
+        assert_eq!(row_name(&f, first).await, "a (2).txt");
+        let (upload, accept) = resume(&f, &alice, first, &data).await;
+        assert_eq!(BitVec::<u8, Lsb0>::from_vec(accept.have_bitmap).count_ones(), 1);
+        complete(&f, upload, &data).await.unwrap();
+
+        let (upload, _) = begin(&f, &alice, "/drop", "a.txt", &data).await.unwrap();
+        let second = upload.id();
+        assert_eq!(row_name(&f, second).await, "a (3).txt");
+        f.manager.release(upload).await;
+        f.tree.add_file(&inbox.id, "a (3).txt", 1, &[0u8; 32], "/elsewhere/a3").await.unwrap();
+        let (upload, accept) = resume(&f, &alice, second, &data).await;
+        assert_eq!(accept.transfer_id, *second.as_bytes());
+        assert_eq!(row_name(&f, second).await, "a (4).txt");
+        complete(&f, upload, &data).await.unwrap();
+
+        assert_eq!(
+            listing(&f, "/drop").await,
+            [entry("a (2).txt", 12_000), entry("a (3).txt", 1), entry("a (4).txt", 12_000), entry("a.txt", 1)]
+        );
+        assert!(transfer_state::list_stale(&f.pool, 0).await.unwrap().is_empty());
+    }
+
+    // A blind upload's finish filed it under a re-picked name, then the
+    // server died before moving the bytes: the resume completes that entry
+    // instead of filing a second one.
+    #[tokio::test]
+    async fn blind_resume_after_a_crash_mid_finish_files_it_once() {
+        let f = fixture(0).await;
+        let inbox = drop_box(&f).await;
+        f.tree.add_file(&inbox.id, "c.bin", 1, &[0u8; 32], "/elsewhere/c").await.unwrap();
+        let alice = user("alice");
+        let data: Vec<u8> = (0..9000u32).map(|i| (i % 239) as u8).collect();
+        let sha: [u8; 32] = Sha256::digest(&data).into();
+        let (mut upload, _) = begin(&f, &alice, "/drop", "c.bin", &data).await.unwrap();
+        let id = upload.id();
+        for (i, hash, chunk) in chunked(&data, 4096) {
+            f.manager.write_chunk(&mut upload, i, &hash, chunk).await.unwrap();
+        }
+        f.manager.release(upload).await;
+        let blob = blob_of(&f, id).display().to_string();
+        f.tree.add_file(&inbox.id, "c (7).bin", data.len() as u64, &sha, &blob).await.unwrap();
+
+        let (upload, _) = resume(&f, &alice, id, &data).await;
+        assert!(upload.is_complete());
+        f.manager.finish(&f.tree, upload).await.unwrap();
+        assert_eq!(listing(&f, "/drop").await, [entry("c (7).bin", 9000), entry("c.bin", 1)]);
+        assert_eq!(std::fs::read(blob_of(&f, id)).unwrap(), data);
+        assert!(!part_of(&f, id).exists());
+    }
+
+    // ---- orphan blob sweep (round 3, G3) -------------------------------------
+
+    const T0: u64 = 1_800_000_000;
+    const DAY: u64 = 24 * 60 * 60;
+
+    fn at(secs: u64) -> SystemTime {
+        UNIX_EPOCH + Duration::from_secs(secs)
+    }
+
+    /// Names in the quarantine, sorted (none if it doesn't exist).
+    fn quarantined(f: &Fixture) -> Vec<String> {
+        let Ok(entries) = std::fs::read_dir(f.manager.files_root().join(QUARANTINE_DIR)) else {
+            return Vec::new();
+        };
+        let mut names: Vec<String> =
+            entries.map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
+        names.sort();
+        names
+    }
+
+    #[tokio::test]
+    async fn orphan_blob_is_quarantined_then_purged_after_retention() {
+        let f = fixture(0).await;
+        let orphan = Uuid::new_v4();
+        std::fs::write(blob_of(&f, orphan), b"lost bytes").unwrap();
+        let swept = f.manager.shared.sweep_orphan_blobs(at(T0)).await;
+        assert_eq!(swept, OrphanSweep { quarantined: 1, purged: 0 });
+        assert!(!blob_of(&f, orphan).exists());
+        let quarantine = f.manager.files_root().join(QUARANTINE_DIR);
+        let kept = quarantine.join(format!("{orphan}.{T0}"));
+        assert_eq!(std::fs::read(&kept).unwrap(), b"lost bytes");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&quarantine).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o700);
+        }
+        // What isn't named like a quarantined blob is never purged.
+        let other = Uuid::new_v4();
+        for name in [
+            "README".to_string(),
+            other.to_string(),
+            format!("{other}.12x"),
+            format!("{}.5", other.simple()),
+        ] {
+            std::fs::write(quarantine.join(name), b"x").unwrap();
+        }
+        std::fs::create_dir(quarantine.join(format!("{other}.5"))).unwrap();
+
+        // A second short of the retention: kept.
+        let swept = f.manager.shared.sweep_orphan_blobs(at(T0 + 30 * DAY - 1)).await;
+        assert_eq!(swept, OrphanSweep::default());
+        assert!(kept.exists());
+        let swept = f.manager.shared.sweep_orphan_blobs(at(T0 + 30 * DAY)).await;
+        assert_eq!(swept, OrphanSweep { quarantined: 0, purged: 1 });
+        assert!(!kept.exists());
+        assert_eq!(quarantined(&f).len(), 5);
+    }
+
+    #[tokio::test]
+    async fn quarantine_is_kept_without_a_retention() {
+        let limits = TransferLimits {
+            orphan_retention: None,
+            ..TransferLimits::default()
+        };
+        let f = fixture_with(0, limits).await;
+        let orphan = Uuid::new_v4();
+        std::fs::write(blob_of(&f, orphan), b"x").unwrap();
+        assert_eq!(f.manager.shared.sweep_orphan_blobs(at(T0)).await.quarantined, 1);
+        assert_eq!(f.manager.shared.sweep_orphan_blobs(at(T0 + 3650 * DAY)).await.purged, 0);
+        assert_eq!(quarantined(&f), [format!("{orphan}.{T0}")]);
+    }
+
+    #[tokio::test]
+    async fn orphan_sweep_leaves_referenced_unfinished_live_and_foreign_files_alone() {
+        let f = fixture(0).await;
+        let data = vec![7u8; 5000];
+        let sha: [u8; 32] = Sha256::digest(&data).into();
+        // A finished upload's blob.
+        let (upload, _) = begin(&f, &f.session, "/", "done.bin", &data).await.unwrap();
+        complete(&f, upload, &data).await.unwrap();
+        // A blob an entry names under a stale path (found by name, the way
+        // downloads find it).
+        let stale = Uuid::new_v4();
+        std::fs::write(blob_of(&f, stale), b"x").unwrap();
+        f.tree
+            .add_file(file_tree_root(), "old.bin", 1, &sha, &format!("gone-dir/{stale}"))
+            .await
+            .unwrap();
+        // A blob an entry reaches through a symlink elsewhere.
+        #[cfg(unix)]
+        {
+            let linked = Uuid::new_v4();
+            std::fs::write(blob_of(&f, linked), b"x").unwrap();
+            let legacy = f._dir.path().join("legacy");
+            std::fs::create_dir(&legacy).unwrap();
+            std::os::unix::fs::symlink(blob_of(&f, linked), legacy.join("a.bin")).unwrap();
+            let stored = legacy.join("a.bin").display().to_string();
+            f.tree.add_file(file_tree_root(), "linked.bin", 1, &sha, &stored).await.unwrap();
+        }
+        // An unfinished upload: its partial, and a blob under its id (a
+        // finish rolled back whose startup repair failed).
+        let (upload, _) = begin(&f, &f.session, "/", "paused.bin", &data).await.unwrap();
+        let paused = upload.id();
+        f.manager.release(upload).await;
+        std::fs::write(blob_of(&f, paused), b"x").unwrap();
+        // A live upload, with a blob under its id.
+        let (live, _) = begin(&f, &f.session, "/", "live.bin", &data).await.unwrap();
+        std::fs::write(blob_of(&f, live.id()), b"x").unwrap();
+        // Things not named like a blob, and a directory that is.
+        for name in [
+            "notes.txt".to_string(),
+            Uuid::new_v4().to_string().to_uppercase(),
+            Uuid::new_v4().simple().to_string(),
+            format!("{}.bak", Uuid::new_v4()),
+        ] {
+            std::fs::write(f.manager.files_root().join(name), b"x").unwrap();
+        }
+        std::fs::create_dir(blob_of(&f, Uuid::new_v4())).unwrap();
+
+        let before = stored_files(&f);
+        assert_eq!(f.manager.sweep_orphan_blobs().await, OrphanSweep::default());
+        assert_eq!(stored_files(&f), before);
+        assert!(!f.manager.files_root().join(QUARANTINE_DIR).exists());
+        assert!(f.manager.is_live(live.id()));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn orphan_sweep_never_follows_symlinks() {
+        use std::os::unix::fs::symlink;
+        let f = fixture(0).await;
+        let outside = f._dir.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        let victim = outside.join("victim");
+        std::fs::write(&victim, b"keep").unwrap();
+        // A symlink named like a blob is not a blob: neither it nor its
+        // target is moved.
+        let link = blob_of(&f, Uuid::new_v4());
+        symlink(&victim, &link).unwrap();
+        assert_eq!(f.manager.sweep_orphan_blobs().await, OrphanSweep::default());
+        assert!(link.symlink_metadata().unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read(&victim).unwrap(), b"keep");
+
+        // A quarantine that is a symlink to elsewhere isn't used: orphans
+        // stay put, and nothing over there is purged.
+        let elsewhere = f._dir.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        let old = elsewhere.join(format!("{}.1", Uuid::new_v4()));
+        std::fs::write(&old, b"old").unwrap();
+        symlink(&elsewhere, f.manager.files_root().join(QUARANTINE_DIR)).unwrap();
+        let orphan = blob_of(&f, Uuid::new_v4());
+        std::fs::write(&orphan, b"x").unwrap();
+        assert_eq!(f.manager.shared.sweep_orphan_blobs(at(T0)).await, OrphanSweep::default());
+        assert!(orphan.exists());
+        assert!(old.exists());
+        assert_eq!(std::fs::read_dir(&elsewhere).unwrap().count(), 1);
     }
 }

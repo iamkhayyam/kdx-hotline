@@ -770,7 +770,7 @@
             <tr>
               <td class="mono">2</td>
               <td><span class="pill amber">Drop Box</span></td>
-              <td>Upload-only to everyone. The designated <code>owner</code> (and admins) may read and delete inside. All other users can upload but not list or download.</td>
+              <td>Upload-only to everyone. The designated <code>owner</code> (and admins) may read and delete inside. All other users can upload but not list or download — and their uploads never reveal which names are taken (see <a class="inline" href="#upload-names">Upload names</a>). A folder whose name ends in <code>[db]</code> behaves the same.</td>
             </tr>
             <tr>
               <td class="mono">3</td>
@@ -865,6 +865,12 @@
 
       <h3>Upload path</h3>
       <p>Uploads follow the same opcode sequence in reverse: the client sends <code>FileTransferStart</code> targeting a writable node, streams <code>FileTransferData</code> chunks, and closes with <code>FileTransferEnd</code>. The server writes each chunk to a staging path and atomically renames on completion, then inserts the resulting file node row (kind=1) with the confirmed size and SHA-256.</p>
+
+      <h3 id="upload-names">Upload names</h3>
+      <p>An upload into a folder the uploader can list is refused with <code>name already exists</code> when an entry — or another upload in progress — already has that name. An upload into a folder the uploader can <em>not</em> list (a drop box they neither own nor administer, or a folder whose read class is above theirs) must not answer differently for a taken name, or it would let them probe the folder's contents. Such an upload is accepted exactly as one with a fresh name — the <code>TransferAccept</code> and the final <code>FileTransferEnd</code> are identical — and is stored under the first free variant of the requested name: <code>report.pdf</code>, then <code>report (2).pdf</code>, <code>report (3).pdf</code>, … (a name already ending in <code>(n)</code> counts on from <em>n</em>; a variant longer than the name or path caps keeps its counter and extension and loses the end of its stem). The variant is picked and reserved in one step, so concurrent uploads of one name get distinct names; if the name is taken by the time the upload finishes, it is filed under the next free one. A resumed upload keeps the name it was given. The owner and admins see the box's contents and keep the explicit refusal.</p>
+
+      <h3>Stored bytes</h3>
+      <p>Finished files live in <code>files_root</code> as <code>&lt;uuid&gt;</code> blobs (named after the upload that produced them), partial uploads as <code>&lt;uuid&gt;.part</code>. At startup, after repairing whatever a crash left mid-finish, and then once a day, the server looks for blobs that no file entry references (by stored path, or by name inside <code>files_root</code>, the way downloads find them) and that no unfinished upload owns. They are not deleted but <strong>moved</strong> to <code>files_root/.orphaned/&lt;uuid&gt;.&lt;unix-seconds&gt;</code> and logged; move one back to <code>files_root/&lt;uuid&gt;</code> to restore it. Quarantined blobs are deleted after <code>orphan_retention_days</code> (default 30; 0 keeps them). Only regular files named exactly like a blob are considered: symlinks are never followed, anything else is left alone, and nothing outside <code>files_root</code> is touched.</p>
     </section>
 
     <!-- ═══════════════════════════════════════════════════════ TRACKER -->

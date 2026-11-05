@@ -4,7 +4,7 @@ pub mod throttle;
 
 pub use download::{ActiveDownload, DownloadAccept, DownloadChunk};
 pub use manager::{
-    resume_id_from_wire, AcceptInfo, ActiveUpload, TransferConfig, TransferError, TransferLimits,
-    TransferManager, MAX_TOTAL_CHUNKS,
+    resume_id_from_wire, AcceptInfo, ActiveUpload, OrphanSweep, TransferConfig, TransferError,
+    TransferLimits, TransferManager, DEFAULT_ORPHAN_RETENTION, MAX_TOTAL_CHUNKS, QUARANTINE_DIR,
 };
 pub use throttle::TokenBucket;
