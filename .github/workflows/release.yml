@@ -192,12 +192,31 @@ jobs:
         working-directory: apps/kdx-client/src-tauri
         run: cargo tauri build
 
-      - name: Create macOS dmg (workaround for create-dmg arg parsing)
+      # `--bundles app` above builds only KDX.app, so there is no Tauri dmg
+      # folder (or bundle_dmg.sh) to reuse: build the dmg with hdiutil, which
+      # ships with macOS. Classic layout: the app next to an /Applications
+      # shortcut to drag it onto. Named like Tauri's: KDX_<version>_<arch>.dmg.
+      - name: Create macOS dmg
         if: runner.os == 'macOS'
-        working-directory: target/release/bundle/dmg
         run: |
-          sh bundle_dmg.sh --volname "KDX" KDX_0.1.0_aarch64.dmg ../macos/KDX.app || \
-          sh bundle_dmg.sh --volname "KDX" KDX_0.1.0_x64.dmg ../macos/KDX.app
+          set -euo pipefail
+          version=$(python3 -c 'import json; print(json.load(open("apps/kdx-client/src-tauri/tauri.conf.json"))["version"])')
+          case "$(uname -m)" in
+            arm64) arch=aarch64 ;;
+            x86_64) arch=x64 ;;
+            *) arch=$(uname -m) ;;
+          esac
+          staging="$RUNNER_TEMP/dmg-staging"
+          rm -rf "$staging" && mkdir -p "$staging"
+          # ditto keeps the bundle's signature, extended attributes and symlinks intact.
+          ditto target/release/bundle/macos/KDX.app "$staging/KDX.app"
+          ln -s /Applications "$staging/Applications"
+          mkdir -p target/release/bundle/dmg
+          dmg="target/release/bundle/dmg/KDX_${version}_${arch}.dmg"
+          hdiutil create -volname KDX -srcfolder "$staging" -fs HFS+ -format UDZO -ov "$dmg"
+          hdiutil verify "$dmg"
+          rm -rf "$staging"
+          echo "built $dmg"
 
       # ---- Package the server per-OS: binary + example config + service ----
       # On macOS kdxd is signed like the app (Developer ID + hardened runtime,
