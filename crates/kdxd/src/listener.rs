@@ -146,6 +146,9 @@ pub async fn serve(config: Config) -> Result<Server, ServeError> {
     )
     .await
     .map_err(|e| ServeError::Init(e.to_string()))?;
+    // Deletes find a file's bytes the way downloads do, even when its
+    // stored path predates the current files_root.
+    let tree = tree.with_files_root(transfers.files_root());
     let ip_rules = IpRuleManager::load(pool.clone())
         .await
         .map_err(|e| ServeError::Init(e.to_string()))?;

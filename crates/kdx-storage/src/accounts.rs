@@ -40,8 +40,8 @@ impl fmt::Debug for AccountRow {
 /// Create an account with its credential and privilege overrides in a single
 /// INSERT, so a failure can never leave a live account missing its
 /// revocations. `credential` is an encoded SCRAM credential (see
-/// `kdx_crypto::hash_password`). A duplicate username fails with the
-/// database's UNIQUE violation (`StorageError::Sqlx`).
+/// `kdx_crypto::hash_password`). A duplicate username fails with
+/// `StorageError::AlreadyExists` (the table's UNIQUE constraint).
 pub async fn create(
     pool: &SqlitePool,
     username: &str,

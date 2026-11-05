@@ -1097,7 +1097,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                         )
                         .await
                     {
-                        Ok(_) => self.reply_file_list(&req.path, &session).await?,
+                        Ok(_) => self.reply_tree_changed(&req.path, &session).await?,
                         Err(e) => self.send_error(&e.client_message()).await?,
                     }
                 }
@@ -1114,7 +1114,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                         Ok(_) => {
                             // Re-list the deleted node's parent directory.
                             let parent = parent_path(&req.path);
-                            self.reply_file_list(&parent, &session).await?;
+                            self.reply_tree_changed(&parent, &session).await?;
                         }
                         Err(e) => self.send_error(&e.client_message()).await?,
                     }
@@ -1127,7 +1127,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                         continue;
                     }
                     match self.ctx.tree.move_node(&req.path, &req.dest_path, &session).await {
-                        Ok(()) => self.reply_file_list(&req.dest_path, &session).await?,
+                        Ok(()) => self.reply_tree_changed(&req.dest_path, &session).await?,
                         Err(e) => self.send_error(&e.client_message()).await?,
                     }
                 }
@@ -1144,7 +1144,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                         .create_alias(&req.source_path, &req.dest_path, &session)
                         .await
                     {
-                        Ok(_) => self.reply_file_list(&req.dest_path, &session).await?,
+                        Ok(_) => self.reply_tree_changed(&req.dest_path, &session).await?,
                         Err(e) => self.send_error(&e.client_message()).await?,
                     }
                 }
@@ -2423,6 +2423,25 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
         Ok(())
     }
 
+    /// The reply to a successful tree change (new folder, move, alias,
+    /// delete): the changed folder's listing, so the Files window
+    /// re-renders. The change has happened, so the reply must not look like
+    /// a failure: where the caller may not list that folder (write-only
+    /// access, or it changed again meanwhile), an empty listing of it.
+    async fn reply_tree_changed(&mut self, path: &str, session: &Session) -> Result<(), ConnectionError> {
+        if let Err(e) = self.ctx.tree.list(path, session).await {
+            debug!(path, error = %e, "changed folder is not listable; replying with an empty listing");
+            let response = FileListResponse {
+                path: path.to_owned(),
+                entries: Vec::new(),
+            };
+            return self
+                .send(PacketType::FileListResponse, PacketFlags::empty(), response.encode())
+                .await;
+        }
+        self.reply_file_list(path, session).await
+    }
+
     /// Send the current server settings — the reply to `ServerSettingsRequest`
     /// and to a successful `ServerSettingsUpdate`.
     async fn reply_server_settings(&mut self) -> Result<(), ConnectionError> {
@@ -3547,6 +3566,88 @@ mod tests {
                 return frame;
             }
         }
+    }
+
+    // Seam review #3: a tree change into a folder the caller may write but
+    // not read succeeds, and the reply says so (an empty listing), instead
+    // of an Error that makes the client retry into "name already exists".
+    #[tokio::test]
+    async fn tree_changes_into_a_write_only_folder_are_acknowledged() {
+        let (ctx, _dir) = admin_test_ctx().await;
+        seed(&ctx, "power", 2, Privileges::empty()).await;
+        let (mut sysop, mut sseq, sysop_conn) = connect_as(&ctx, "sysop", "unknown").await;
+        for (name, read) in [("inbox", BaseClass::Admin), ("pub", BaseClass::Guest)] {
+            let create = FileCreateFolder {
+                path: "/".into(),
+                name: name.into(),
+                kind: kdx_protocol::messages::KIND_DIR,
+                min_read_class: read as u8,
+                min_write_class: BaseClass::PowerUser as u8,
+                owner: None,
+            };
+            let frame =
+                send_and_recv(&mut sysop, &mut sseq, PacketType::FileCreateFolder, create.encode()).await;
+            assert_eq!(frame.header.packet_type, PacketType::FileListResponse);
+        }
+        let pub_dir = ctx.tree.resolve("/pub").await.unwrap();
+        for name in ["x", "y"] {
+            ctx.tree.add_file(&pub_dir.id, name, 1, &[0u8; 32], "/nonexistent").await.unwrap();
+        }
+        hang_up(sysop, sseq, sysop_conn).await;
+
+        let (mut power, mut seq, conn) = connect_as(&ctx, "power", "unknown").await;
+        let changes = [
+            (
+                PacketType::FileMove,
+                FileMove { path: "/pub/x".into(), dest_path: "/inbox".into() }.encode(),
+            ),
+            (
+                PacketType::FileAlias,
+                FileAlias { source_path: "/pub/y".into(), dest_path: "/inbox".into() }.encode(),
+            ),
+            (
+                PacketType::FileCreateFolder,
+                FileCreateFolder {
+                    path: "/inbox".into(),
+                    name: "sub".into(),
+                    kind: kdx_protocol::messages::KIND_DIR,
+                    min_read_class: 0,
+                    min_write_class: 2,
+                    owner: None,
+                }
+                .encode(),
+            ),
+        ];
+        for (packet_type, payload) in changes {
+            let frame = send_and_recv(&mut power, &mut seq, packet_type, payload).await;
+            assert_eq!(
+                frame.header.packet_type,
+                PacketType::FileListResponse,
+                "{packet_type:?} succeeded but was answered with {:?}",
+                String::from_utf8_lossy(&frame.payload)
+            );
+            let listing = FileListResponse::decode(&frame.payload).unwrap();
+            assert_eq!(listing.path, "/inbox");
+            assert!(listing.entries.is_empty(), "nothing about /inbox may leak");
+        }
+        for path in ["/inbox/x", "/inbox/y", "/inbox/sub"] {
+            assert!(ctx.tree.resolve(path).await.is_ok(), "{path} was not created");
+        }
+        // Where the caller can read the folder, the reply is its listing.
+        let create = FileCreateFolder {
+            path: "/pub".into(),
+            name: "new".into(),
+            kind: kdx_protocol::messages::KIND_DIR,
+            min_read_class: 0,
+            min_write_class: 2,
+            owner: None,
+        };
+        let frame = send_and_recv(&mut power, &mut seq, PacketType::FileCreateFolder, create.encode()).await;
+        let listing = FileListResponse::decode(&frame.payload).unwrap();
+        assert_eq!(listing.path, "/pub");
+        let names: Vec<_> = listing.entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, ["new", "y"]);
+        hang_up(power, seq, conn).await;
     }
 
     #[tokio::test]

@@ -59,9 +59,12 @@ cargo run -p kdxd
 Both commands default to a `kdx.db` SQLite file and a `files/` directory in
 the working directory (`useradd` prints the database it wrote to). Pass a
 TOML config path to either to override — relative paths in it are resolved
-against the config file's directory. See `crates/kdxd/kdxd.example.toml`
-for every field with its default value, or `Config` in
-`crates/kdxd/src/config.rs` for the definitions (bind address, TLS cert
+against the config file's directory. (Upgrading: earlier versions resolved a
+relative `database` / `files_root` against the working directory instead. If
+such a path now points at nothing while the old location holds data, kdxd
+refuses to start and names both paths; make the setting absolute.) See
+`crates/kdxd/kdxd.example.toml` for every field with its default value, or
+`Config` in `crates/kdxd/src/config.rs` for the definitions (bind address, TLS cert
 paths, session TTL, upload/download throttles, connection limits,
 `public_host`). kdxd refuses to run as root unless given `--allow-root`.
 

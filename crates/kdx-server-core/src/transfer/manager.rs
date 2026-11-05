@@ -17,6 +17,13 @@
 //! claim that is released when it is dropped. A sweeper (at startup and every
 //! few minutes) deletes uploads abandoned for longer than
 //! [`TransferLimits::stale_after`] and partial files no upload owns.
+//!
+//! Finishing an upload takes three steps that can't share one transaction:
+//! file the entry in the tree, rename `<id>.part` to the blob `<id>`, delete
+//! the transfer row. Whatever prefix of that survives a crash is repaired:
+//! a resume of an upload whose entry is already filed goes on to finish it,
+//! and at startup (before the sweeper runs) entries whose bytes are still a
+//! partial file get them moved into place.
 
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Seek, SeekFrom};
@@ -25,6 +32,7 @@ use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::Duration;
 
 use bitvec::prelude::*;
+use kdx_storage::file_tree;
 use kdx_storage::transfer_state::{self, TransferRow};
 use kdx_storage::SqlitePool;
 use sha2::{Digest, Sha256};
@@ -36,7 +44,8 @@ use uuid::Uuid;
 
 use super::throttle::{reserve_shared, wait_until, SharedBucket, TokenBucket};
 use crate::auth::Session;
-use crate::files::{FileTree, TreeError};
+use crate::files::tree::locate_blob;
+use crate::files::{FileTree, Node, NodeKind, TreeError};
 
 /// Chunk sizes a client may request.
 pub const MIN_CHUNK: u32 = 4 * 1024;
@@ -357,6 +366,9 @@ impl TransferManager {
             limits,
             live: Mutex::new(Live::default()),
         });
+        // Uploads a crash interrupted mid-finish are completed first, so the
+        // sweep below doesn't mistake their partial files for orphans.
+        shared.recover_interrupted_finishes().await;
         // Nothing is live yet, so whatever is stale or orphaned goes now.
         let removed = shared.sweep(shared.limits.stale_after).await;
         if removed > 0 {
@@ -528,14 +540,23 @@ impl TransferManager {
             remaining,
         )?;
 
-        // Re-validate the destination exactly as for a fresh upload: since
-        // the upload began the account may have lost write access, or the
-        // folder may be gone or the name taken. Such an upload can never be
-        // filed, so it is discarded.
-        if let Err(e) = check_destination(tree, session, &row).await {
-            debug!(id = %resume_id, error = %e, "resume refused; discarding upload");
-            self.shared.discard(&row.id, &row.temp_path).await;
-            return Err(e);
+        // An upload whose entry an interrupted `finish` already filed (the
+        // bytes are still the partial file) resumes straight into finishing:
+        // it passed every check when it was filed. Anything else
+        // re-validates its destination exactly as a fresh upload would:
+        // since the upload began the account may have lost write access, or
+        // the folder may be gone or the name taken. Such an upload can
+        // never be filed, so it is discarded.
+        let filed = tree
+            .child(&row.parent_id, &row.name)
+            .await
+            .is_some_and(|node| is_filed_upload(&node, &row.id, &row.sha256));
+        if !filed {
+            if let Err(e) = check_destination(tree, session, &row).await {
+                debug!(id = %resume_id, error = %e, "resume refused; discarding upload");
+                self.shared.discard(&row.id, &row.temp_path).await;
+                return Err(e);
+            }
         }
 
         let temp_path = self.shared.locate(&row.temp_path).await;
@@ -634,10 +655,13 @@ impl TransferManager {
     }
 
     /// Verify the whole file and promote it into the tree. Consumes the
-    /// upload. Any failure here destroys the partial state: on a hash
-    /// mismatch the client's source differs from what it announced, and if
-    /// the destination is gone or its name was taken the file has nowhere
-    /// to go — either way the client must start over.
+    /// upload. A failure about the upload itself destroys the partial
+    /// state: on a hash mismatch the client's source differs from what it
+    /// announced, and if the destination is gone or its name was taken the
+    /// file has nowhere to go — either way the client must start over. A
+    /// server-side failure after verification (the database busy, the
+    /// bytes impossible to move into place) keeps the verified upload
+    /// resumable instead; resuming it finishes it.
     pub async fn finish(
         &self,
         tree: &FileTree,
@@ -668,7 +692,7 @@ impl TransferManager {
         // the upload began is caught here, while the bytes are still a
         // disposable partial rather than an unreferenced blob.
         let final_path = self.shared.files_root.join(id.to_string());
-        if let Err(e) = tree
+        let added = tree
             .add_file(
                 &upload.parent_id,
                 &upload.name,
@@ -676,22 +700,54 @@ impl TransferManager {
                 &upload.expected_sha256,
                 &final_path.display().to_string(),
             )
-            .await
-        {
-            debug!(%id, error = %e, "verified upload could not be filed; discarding it");
-            self.discard_upload(&mut upload).await;
-            return Err(e.into());
-        }
+            .await;
+        let node = match added {
+            Ok(node) => node,
+            Err(TreeError::Exists) => match tree.child(&upload.parent_id, &upload.name).await {
+                // Filed by an earlier `finish` of this very upload that never
+                // got to move the bytes (a crash, or a failed rename whose
+                // undo failed too): complete that job.
+                Some(node) if is_filed_upload(&node, &id.to_string(), &upload.expected_sha256) => {
+                    node
+                }
+                _ => {
+                    debug!(%id, "verified upload's name was taken; discarding it");
+                    self.discard_upload(&mut upload).await;
+                    return Err(TreeError::Exists.into());
+                }
+            },
+            Err(e @ TreeError::Storage(_)) => {
+                // The database is busy or unreachable: nothing about the
+                // upload is wrong, so keep it (verified, every chunk
+                // present) for the client to resume.
+                warn!(%id, error = %e, "verified upload could not be filed yet; keeping it resumable");
+                self.release(upload).await;
+                return Err(e.into());
+            }
+            Err(e) => {
+                debug!(%id, error = %e, "verified upload could not be filed; discarding it");
+                self.discard_upload(&mut upload).await;
+                return Err(e.into());
+            }
+        };
         if let Err(e) = tokio::fs::rename(&upload.temp_path, &final_path).await {
             error!(
                 %id,
                 error = %e,
                 path = %final_path.display(),
-                "upload was filed but its bytes could not be moved into place"
+                "upload was filed but its bytes could not be moved into place; keeping it resumable"
             );
-            self.discard_upload(&mut upload).await;
+            // Withdraw the entry so the tree doesn't list a file without
+            // bytes. Should that fail too, the resume (or the next startup)
+            // moves the bytes into place instead.
+            if let Err(undo) = tree.remove_file_node(&node.id).await {
+                error!(%id, error = %undo, "could not withdraw the entry of an upload without bytes");
+            }
+            self.release(upload).await;
             return Err(e.into());
         }
+        // The entry is committed; make the rename that backs it durable too.
+        sync_dir(&self.shared.files_root).await;
         if let Err(e) = transfer_state::delete(&self.shared.pool, &id.to_string()).await {
             // Harmless: the sweeper drops the stale row later.
             warn!(%id, error = %e, "could not delete finished upload's state");
@@ -851,13 +907,130 @@ impl Shared {
     /// directory kdxd ran in back then; blobs and partials always live
     /// directly in `files_root`, so fall back to looking there by name.
     async fn locate(&self, stored: &str) -> PathBuf {
-        let path = PathBuf::from(stored);
-        if tokio::fs::try_exists(&path).await.unwrap_or(false) {
-            return path;
+        locate_blob(&self.files_root, stored).await
+    }
+
+    /// Repair what a crash or power loss in the middle of `finish` left
+    /// behind (see the module docs), before anything is swept:
+    /// - an entry is filed but its bytes are still `<id>.part` (whether or
+    ///   not the row survived): move them into place, drop the row;
+    /// - an entry is filed and its bytes are in place, but the row
+    ///   survived: drop the row;
+    /// - the entry was lost but the rename survived (a row whose partial is
+    ///   missing, a blob `<id>` no entry names): turn the blob back into the
+    ///   partial, so the client's resume files it again.
+    async fn recover_interrupted_finishes(&self) {
+        let nodes = match file_tree::all(&self.pool).await {
+            Ok(nodes) => nodes,
+            Err(e) => {
+                warn!(error = %e, "upload recovery: cannot read the file tree");
+                return;
+            }
+        };
+        // Blobs are named after the upload that produced them: upload id ->
+        // stored path of the entry it was filed as.
+        let file_kind = i64::from(NodeKind::File.as_u8());
+        let filed: HashMap<String, String> = nodes
+            .into_iter()
+            .filter(|n| n.kind == file_kind)
+            .filter_map(|n| {
+                let stored = n.storage_path?;
+                let blob = Path::new(&stored).file_name()?.to_str()?.to_owned();
+                Some((blob, stored))
+            })
+            .collect();
+        let rows = match transfer_state::list_stale(&self.pool, 0).await {
+            Ok(rows) => rows,
+            Err(e) => {
+                warn!(error = %e, "upload recovery: cannot list uploads");
+                return;
+            }
+        };
+
+        let mut with_rows = HashSet::new();
+        for row in rows {
+            let Ok(id) = Uuid::parse_str(&row.id) else {
+                continue;
+            };
+            with_rows.insert(id);
+            let part = self.locate(&row.temp_path).await;
+            if let Some(stored) = filed.get(&row.id) {
+                if self.move_into_place(id, &part, stored).await {
+                    if let Err(e) = transfer_state::delete(&self.pool, &row.id).await {
+                        warn!(%id, error = %e, "upload recovery: could not delete a finished upload's state");
+                    }
+                }
+                continue;
+            }
+            let blob = self.files_root.join(id.to_string());
+            if !exists(&part).await && exists(&blob).await {
+                match tokio::fs::rename(&blob, &part).await {
+                    Ok(()) => {
+                        sync_dir(&self.files_root).await;
+                        info!(%id, "upload recovery: an unfiled upload's bytes are resumable again");
+                    }
+                    Err(e) => error!(
+                        %id,
+                        error = %e,
+                        "upload recovery: could not restore an unfiled upload's partial file"
+                    ),
+                }
+            }
         }
-        match path.file_name() {
-            Some(name) => self.files_root.join(name),
-            None => path,
+
+        // Partial files whose row is already gone but whose entry is filed.
+        let mut dir = match tokio::fs::read_dir(&self.files_root).await {
+            Ok(dir) => dir,
+            Err(e) => {
+                warn!(error = %e, "upload recovery: cannot list files_root");
+                return;
+            }
+        };
+        while let Ok(Some(entry)) = dir.next_entry().await {
+            let name = entry.file_name();
+            let Some(id) = name
+                .to_str()
+                .and_then(|n| n.strip_suffix(".part"))
+                .and_then(|n| Uuid::parse_str(n).ok())
+            else {
+                continue;
+            };
+            if with_rows.contains(&id) {
+                continue;
+            }
+            if let Some(stored) = filed.get(&id.to_string()) {
+                self.move_into_place(id, &entry.path(), stored).await;
+            }
+        }
+    }
+
+    /// Make sure filed upload `id`'s bytes are where its entry (`stored`)
+    /// points, renaming its partial file `part` there if they are not.
+    /// Returns whether they are in place afterwards.
+    async fn move_into_place(&self, id: Uuid, part: &Path, stored: &str) -> bool {
+        let blob = self.locate(stored).await;
+        if exists(&blob).await {
+            return true; // a leftover partial, if any, is an orphan now
+        }
+        if !exists(part).await {
+            warn!(%id, path = %blob.display(), "upload recovery: a filed upload's bytes are missing");
+            return false;
+        }
+        match tokio::fs::rename(part, &blob).await {
+            Ok(()) => {
+                sync_dir(&self.files_root).await;
+                info!(%id, "upload recovery: an interrupted upload was finished");
+                true
+            }
+            Err(e) => {
+                error!(
+                    %id,
+                    error = %e,
+                    path = %blob.display(),
+                    "upload recovery: could not move a filed upload's bytes into place"
+                );
+                false
+            }
         }
     }
 
@@ -973,21 +1146,51 @@ async fn sweep_periodically(shared: Weak<Shared>) {
 }
 
 /// Re-check that `session` may still upload `row`'s file into `row`'s
-/// folder, as `prepare_upload` would for a fresh upload.
+/// folder, as `prepare_upload` would for a fresh upload — wherever that
+/// folder is now (one atomic check, so a concurrent move can't make it look
+/// gone).
 async fn check_destination(
     tree: &FileTree,
     session: &Session,
     row: &TransferRow,
 ) -> Result<(), TransferError> {
-    let parent_path = tree
-        .path_of(&row.parent_id)
-        .await
-        .ok_or(TransferError::Tree(TreeError::NotFound))?;
-    let parent = tree.prepare_upload(&parent_path, &row.name, session).await?;
-    if parent.id != row.parent_id {
-        return Err(TransferError::Tree(TreeError::NotFound));
-    }
+    tree.prepare_upload_into(&row.parent_id, &row.name, session).await?;
     Ok(())
+}
+
+/// Is `node` the entry upload `id` was filed as? Blobs are named after the
+/// upload that produced them, so only `finish` of that upload writes an
+/// entry whose bytes are `<files_root>/<id>`; the hash must match too.
+fn is_filed_upload(node: &Node, id: &str, sha256: &[u8]) -> bool {
+    node.kind == NodeKind::File
+        && node.sha256.as_deref() == Some(sha256)
+        && node
+            .storage_path
+            .as_deref()
+            .and_then(|stored| Path::new(stored).file_name())
+            .is_some_and(|blob| blob == id)
+}
+
+async fn exists(path: &Path) -> bool {
+    tokio::fs::try_exists(path).await.unwrap_or(false)
+}
+
+/// Make a rename inside `dir` durable (on Unix, fsync the directory).
+/// Failures are only logged: the rename itself has happened.
+async fn sync_dir(dir: &Path) {
+    #[cfg(unix)]
+    {
+        let dir = dir.to_path_buf();
+        let synced = tokio::task::spawn_blocking(move || std::fs::File::open(&dir)?.sync_all())
+            .await
+            .map_err(std::io::Error::other)
+            .and_then(|result| result);
+        if let Err(e) = synced {
+            warn!(error = %e, "could not sync files_root after a rename");
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = dir;
 }
 
 /// Create `files_root` (owner-only on Unix) and return its absolute path.
@@ -1217,6 +1420,8 @@ mod tests {
         )
         .await
         .unwrap();
+        // As kdxd wires it: deletes find blobs the way downloads do.
+        let tree = tree.with_files_root(manager.files_root());
         // PowerUser: the root folder's default write ACL is min class 2.
         let session = Session {
             id: Uuid::new_v4(),
@@ -1891,6 +2096,279 @@ mod tests {
             .unwrap();
         assert!(upload.is_complete());
         f.manager.finish(&f.tree, upload).await.unwrap();
+    }
+
+    /// Begin `name` in `/`, send every chunk of `data`, and let go of it
+    /// with its progress saved — the state a crash during `finish` leaves.
+    async fn fully_received(f: &Fixture, name: &str, data: &[u8]) -> Uuid {
+        let sha: [u8; 32] = Sha256::digest(data).into();
+        let (mut upload, _) = f
+            .manager
+            .begin_upload(&f.tree, &f.session, "/", name, data.len() as u64, 4096, sha, None)
+            .await
+            .unwrap();
+        for (i, hash, chunk) in chunked(data, 4096) {
+            f.manager.write_chunk(&mut upload, i, &hash, chunk).await.unwrap();
+        }
+        let id = upload.id();
+        f.manager.release(upload).await;
+        assert!(!f.manager.is_live(id));
+        id
+    }
+
+    fn part_of(f: &Fixture, id: Uuid) -> PathBuf {
+        f.manager.files_root().join(format!("{id}.part"))
+    }
+
+    fn blob_of(f: &Fixture, id: Uuid) -> PathBuf {
+        f.manager.files_root().join(id.to_string())
+    }
+
+    /// File upload `id` as `/name` the way `finish` does, without moving
+    /// its bytes (a crash right after the entry was committed).
+    async fn file_entry(f: &Fixture, id: Uuid, name: &str, data: &[u8]) {
+        let sha: [u8; 32] = Sha256::digest(data).into();
+        f.tree
+            .add_file(
+                file_tree_root(),
+                name,
+                data.len() as u64,
+                &sha,
+                &blob_of(f, id).display().to_string(),
+            )
+            .await
+            .unwrap();
+    }
+
+    // Seam review #1: when the bytes can't be moved into place, the entry
+    // is withdrawn (no file without bytes) and the verified upload stays
+    // resumable; resuming it once the obstacle is gone files it.
+    #[tokio::test]
+    async fn failed_rename_withdraws_the_entry_and_keeps_the_upload() {
+        let f = fixture(0).await;
+        let data: Vec<u8> = (0..9000u32).map(|i| (i % 253) as u8).collect();
+        let sha: [u8; 32] = Sha256::digest(&data).into();
+        let (mut upload, _) = f
+            .manager
+            .begin_upload(&f.tree, &f.session, "/", "r.bin", data.len() as u64, 4096, sha, None)
+            .await
+            .unwrap();
+        let id = upload.id();
+        for (i, hash, chunk) in chunked(&data, 4096) {
+            f.manager.write_chunk(&mut upload, i, &hash, chunk).await.unwrap();
+        }
+        // Something occupies the blob's name, so the rename fails.
+        let blocker = blob_of(&f, id);
+        std::fs::create_dir(&blocker).unwrap();
+        std::fs::write(blocker.join("x"), b"x").unwrap();
+        let err = f.manager.finish(&f.tree, upload).await.unwrap_err();
+        assert!(err.is_internal(), "{err}");
+        assert!(matches!(f.tree.resolve("/r.bin").await, Err(TreeError::NotFound)));
+        assert!(transfer_state::get(&f.pool, &id.to_string()).await.unwrap().is_some());
+        assert!(part_of(&f, id).exists(), "verified bytes were thrown away");
+        assert!(!f.manager.is_live(id));
+
+        std::fs::remove_dir_all(&blocker).unwrap();
+        let (upload, accept) = f
+            .manager
+            .begin_upload(&f.tree, &f.session, "/", "r.bin", data.len() as u64, 4096, sha, Some(id))
+            .await
+            .unwrap();
+        assert_eq!(BitVec::<u8, Lsb0>::from_vec(accept.have_bitmap).count_ones(), 3);
+        assert!(upload.is_complete());
+        f.manager.finish(&f.tree, upload).await.unwrap();
+        let node = f.tree.resolve("/r.bin").await.unwrap();
+        assert_eq!(std::fs::read(node.storage_path.unwrap()).unwrap(), data);
+        assert!(transfer_state::get(&f.pool, &id.to_string()).await.unwrap().is_none());
+        assert_eq!(stored_files(&f), vec![id.to_string()]);
+    }
+
+    // Seam review #1: a crash between filing the entry and moving the
+    // bytes used to make the resume discard the verified partial (its name
+    // was "taken" — by itself). Now the resume finishes the job.
+    #[tokio::test]
+    async fn resume_after_a_crash_mid_finish_files_the_bytes() {
+        let f = fixture(0).await;
+        let data: Vec<u8> = (0..10_000u32).map(|i| (i % 249) as u8).collect();
+        let id = fully_received(&f, "c.bin", &data).await;
+        file_entry(&f, id, "c.bin", &data).await;
+
+        let sha: [u8; 32] = Sha256::digest(&data).into();
+        let (upload, _) = f
+            .manager
+            .begin_upload(&f.tree, &f.session, "/", "c.bin", data.len() as u64, 4096, sha, Some(id))
+            .await
+            .unwrap();
+        assert!(upload.is_complete());
+        f.manager.finish(&f.tree, upload).await.unwrap();
+        assert_eq!(std::fs::read(blob_of(&f, id)).unwrap(), data);
+        assert!(transfer_state::get(&f.pool, &id.to_string()).await.unwrap().is_none());
+        assert_eq!(stored_files(&f), vec![id.to_string()]);
+        let (mut download, _) = f
+            .manager
+            .begin_download(&f.tree, &f.session, "/c.bin", 4096, &[])
+            .await
+            .unwrap();
+        assert!(download.next_chunk().await.unwrap().is_some());
+
+        // Someone else's file under that name is still "taken", though.
+        let other = fully_received(&f, "d.bin", &data).await;
+        f.tree
+            .add_file(file_tree_root(), "d.bin", 1, &sha, "/elsewhere/d.bin")
+            .await
+            .unwrap();
+        let resumed = f
+            .manager
+            .begin_upload(&f.tree, &f.session, "/", "d.bin", data.len() as u64, 4096, sha, Some(other))
+            .await;
+        assert!(matches!(resumed, Err(TransferError::Tree(TreeError::Exists))));
+        assert!(!part_of(&f, other).exists());
+    }
+
+    // Seam review #1: startup repairs whatever prefix of a finish (entry,
+    // rename, row delete) reached the disk before the sweep runs.
+    #[tokio::test]
+    async fn startup_completes_finishes_a_crash_interrupted() {
+        let f = fixture(0).await;
+        let data: Vec<u8> = (0..9000u32).map(|i| (i % 241) as u8).collect();
+        // Entry filed, rename lost: row and partial still there.
+        let filed = fully_received(&f, "filed.bin", &data).await;
+        file_entry(&f, filed, "filed.bin", &data).await;
+        // Entry filed and row deleted, rename lost: a partial with no row.
+        let rowless = fully_received(&f, "rowless.bin", &data).await;
+        file_entry(&f, rowless, "rowless.bin", &data).await;
+        transfer_state::delete(&f.pool, &rowless.to_string()).await.unwrap();
+        // Entry filed and bytes moved, row delete lost.
+        let done = fully_received(&f, "done.bin", &data).await;
+        file_entry(&f, done, "done.bin", &data).await;
+        std::fs::rename(part_of(&f, done), blob_of(&f, done)).unwrap();
+        // Rename kept but the entry rolled back: a blob nothing names.
+        let unfiled = fully_received(&f, "unfiled.bin", &data).await;
+        std::fs::rename(part_of(&f, unfiled), blob_of(&f, unfiled)).unwrap();
+
+        // Restart.
+        let manager = TransferManager::new(
+            f.pool.clone(),
+            TransferConfig {
+                files_root: f.manager.files_root().to_path_buf(),
+                max_upload_bytes_per_sec: 0,
+                max_download_bytes_per_sec: 0,
+            },
+        )
+        .await
+        .unwrap();
+        for id in [filed, rowless, done] {
+            assert_eq!(std::fs::read(blob_of(&f, id)).unwrap(), data, "{id}");
+            assert!(!part_of(&f, id).exists(), "{id}");
+            assert!(transfer_state::get(&f.pool, &id.to_string()).await.unwrap().is_none());
+        }
+        // The unfiled upload is resumable again, and resuming files it.
+        assert!(part_of(&f, unfiled).exists());
+        assert!(!blob_of(&f, unfiled).exists());
+        let sha: [u8; 32] = Sha256::digest(&data).into();
+        let (upload, _) = manager
+            .begin_upload(&f.tree, &f.session, "/", "unfiled.bin", data.len() as u64, 4096, sha, Some(unfiled))
+            .await
+            .unwrap();
+        assert!(upload.is_complete());
+        manager.finish(&f.tree, upload).await.unwrap();
+        let node = f.tree.resolve("/unfiled.bin").await.unwrap();
+        assert_eq!(std::fs::read(node.storage_path.unwrap()).unwrap(), data);
+    }
+
+    // Seam review #1: a database failure while filing a verified upload
+    // keeps it resumable instead of throwing it away.
+    #[tokio::test]
+    async fn storage_failure_while_filing_keeps_the_upload() {
+        let f = fixture(0).await;
+        let data = vec![5u8; 9000];
+        let sha: [u8; 32] = Sha256::digest(&data).into();
+        let (mut upload, _) = f
+            .manager
+            .begin_upload(&f.tree, &f.session, "/", "s.bin", data.len() as u64, 4096, sha, None)
+            .await
+            .unwrap();
+        let id = upload.id();
+        for (i, hash, chunk) in chunked(&data, 4096) {
+            f.manager.write_chunk(&mut upload, i, &hash, chunk).await.unwrap();
+        }
+        // A tree whose database connection is gone: filing the entry fails
+        // with a storage error.
+        let lost = kdx_storage::connect(&f._dir.path().join("t.db")).await.unwrap();
+        let unreachable = FileTree::load(lost.clone()).await.unwrap();
+        lost.close().await;
+        let err = f.manager.finish(&unreachable, upload).await.unwrap_err();
+        assert!(matches!(err, TransferError::Tree(TreeError::Storage(_))), "{err:?}");
+        assert!(err.is_internal());
+        assert!(transfer_state::get(&f.pool, &id.to_string()).await.unwrap().is_some());
+        assert!(part_of(&f, id).exists());
+        assert!(!f.manager.is_live(id));
+
+        let (upload, _) = f
+            .manager
+            .begin_upload(&f.tree, &f.session, "/", "s.bin", data.len() as u64, 4096, sha, Some(id))
+            .await
+            .unwrap();
+        f.manager.finish(&f.tree, upload).await.unwrap();
+        assert!(f.tree.resolve("/s.bin").await.is_ok());
+    }
+
+    // Seam review #2: deleting a file finds its bytes the way a download
+    // does, even under a stale stored path, instead of leaking them.
+    #[tokio::test]
+    async fn delete_removes_bytes_under_a_stale_stored_path() {
+        let f = fixture(0).await;
+        let blob_name = Uuid::new_v4().to_string();
+        let blob = f.manager.files_root().join(&blob_name);
+        std::fs::write(&blob, b"hello").unwrap();
+        let sha: [u8; 32] = Sha256::digest(b"hello").into();
+        f.tree
+            .add_file(file_tree_root(), "old.txt", 5, &sha, &format!("nonexistent-dir/{blob_name}"))
+            .await
+            .unwrap();
+        let (download, _) = f
+            .manager
+            .begin_download(&f.tree, &f.session, "/old.txt", 4096, &[])
+            .await
+            .unwrap();
+        drop(download);
+        f.tree.delete("/old.txt", &f.session).await.unwrap();
+        assert!(!blob.exists(), "deleted file's bytes leaked");
+    }
+
+    // Seam review #4: a resume finds its destination by id, wherever the
+    // folder has moved since.
+    #[tokio::test]
+    async fn resume_into_a_moved_folder_files_it_there() {
+        let f = fixture(0).await;
+        let admin = sess(BaseClass::Admin);
+        for (parent, name) in [("/", "a"), ("/a", "b"), ("/", "c")] {
+            f.tree
+                .create_folder(parent, name, NodeKind::Directory, BaseClass::Guest, BaseClass::User, None, &admin)
+                .await
+                .unwrap();
+        }
+        let data = vec![6u8; 9000];
+        let sha: [u8; 32] = Sha256::digest(&data).into();
+        let (upload, _) = f
+            .manager
+            .begin_upload(&f.tree, &f.session, "/a/b", "m.bin", data.len() as u64, 4096, sha, None)
+            .await
+            .unwrap();
+        let id = upload.id();
+        f.manager.release(upload).await;
+        f.tree.move_node("/a", "/c", &admin).await.unwrap();
+
+        let (mut upload, _) = f
+            .manager
+            .begin_upload(&f.tree, &f.session, "/", "ignored", data.len() as u64, 4096, sha, Some(id))
+            .await
+            .unwrap();
+        for (i, hash, chunk) in chunked(&data, 4096) {
+            f.manager.write_chunk(&mut upload, i, &hash, chunk).await.unwrap();
+        }
+        f.manager.finish(&f.tree, upload).await.unwrap();
+        assert!(f.tree.resolve("/c/a/b/m.bin").await.is_ok());
     }
 
     // XFER-10 / OPS-2: files_root is made absolute (so stored paths survive

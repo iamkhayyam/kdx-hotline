@@ -8,7 +8,10 @@ use serde::Deserialize;
 ///
 /// Relative paths in a config file (`database`, `files_root`, `[tls]`) are
 /// resolved against the directory that contains the file, so the server and
-/// `kdxd useradd` agree on them whatever the working directory is.
+/// `kdxd useradd` agree on them whatever the working directory is. Earlier
+/// versions resolved them against the working directory instead; loading
+/// refuses a config whose data would silently be left behind by that change
+/// (see [`Config::load`]).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -140,11 +143,28 @@ impl Default for Config {
 impl Config {
     /// Read, parse and validate a config file, resolving its relative paths
     /// against the file's own directory.
+    ///
+    /// Upgrade guard: earlier versions resolved a relative `database` or
+    /// `files_root` against the working directory (e.g. a service's
+    /// `WorkingDirectory=/var/lib/kdx` with `database = "kdx.db"` in
+    /// `/etc/kdx/kdxd.toml`). If the path now resolves to nothing while the
+    /// same relative path under the working directory holds data, starting
+    /// would quietly begin on a new, empty database (every account gone) or
+    /// an empty files directory, so this fails with a message naming both
+    /// paths instead.
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
+        let cwd = std::env::current_dir().ok();
+        Self::load_from(path, cwd.as_deref())
+    }
+
+    /// [`Config::load`], with the working directory to compare against
+    /// (`None` skips the upgrade guard).
+    fn load_from(path: &Path, cwd: Option<&Path>) -> Result<Self, ConfigError> {
         let raw = std::fs::read_to_string(path)
             .map_err(|e| ConfigError::Read(path.to_owned(), e))?;
         let mut config: Config =
             toml::from_str(&raw).map_err(|e| ConfigError::Parse(path.to_owned(), e))?;
+        let written = (config.database.clone(), config.files_root.clone());
         let absolute =
             std::path::absolute(path).map_err(|e| ConfigError::Read(path.to_owned(), e))?;
         if let Some(base) = absolute.parent() {
@@ -153,6 +173,19 @@ impl Config {
         config
             .validate()
             .map_err(|e| ConfigError::Invalid(path.to_owned(), e))?;
+        if let Some(cwd) = cwd {
+            check_data_location("database", &written.0, &config.database, cwd, Path::is_file)
+                .and_then(|()| {
+                    check_data_location(
+                        "files_root",
+                        &written.1,
+                        &config.files_root,
+                        cwd,
+                        is_non_empty_dir,
+                    )
+                })
+                .map_err(|e| ConfigError::Invalid(path.to_owned(), e))?;
+        }
         Ok(config)
     }
 
@@ -243,6 +276,41 @@ impl Config {
     }
 }
 
+/// The upgrade guard behind [`Config::load`] for one setting: `written` is
+/// the path as the config file spells it, `resolved` where it points now.
+/// Refuses when `written` is relative, `resolved` does not exist, and the
+/// same relative path under the working directory `cwd` (where earlier
+/// versions looked) passes `has_data`.
+fn check_data_location(
+    key: &str,
+    written: &Path,
+    resolved: &Path,
+    cwd: &Path,
+    has_data: fn(&Path) -> bool,
+) -> Result<(), String> {
+    if !written.is_relative() {
+        return Ok(());
+    }
+    let legacy = cwd.join(written);
+    if legacy == resolved || !matches!(resolved.try_exists(), Ok(false)) || !has_data(&legacy) {
+        return Ok(());
+    }
+    Err(format!(
+        "{key} = \"{written}\" is resolved against the config file's directory, giving {resolved}, \
+         which does not exist; but {legacy} (the same path under the working directory, where \
+         earlier versions of kdxd looked) does. Refusing to start without that data: set \
+         {key} = \"{legacy}\" in the config file (or move the data to {resolved})",
+        written = written.display(),
+        resolved = resolved.display(),
+        legacy = legacy.display(),
+    ))
+}
+
+/// A directory with at least one entry: an empty one holds nothing to lose.
+fn is_non_empty_dir(path: &Path) -> bool {
+    std::fs::read_dir(path).is_ok_and(|mut entries| entries.next().is_some())
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     #[error("cannot read config {0}: {1}")]
@@ -261,7 +329,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("kdxd.toml");
         std::fs::write(&path, toml).unwrap();
-        (Config::load(&path), dir)
+        // Run "from" the config's own directory, so whatever happens to be
+        // in the test's real working directory can't trip the upgrade guard.
+        (Config::load_from(&path, Some(dir.path())), dir)
     }
 
     fn invalid(toml: &str) -> String {
@@ -362,6 +432,62 @@ mod tests {
         assert!(invalid("public_host = \"kdx example.net\"").contains("public_host"));
         let (ok, _dir) = load_str("public_host = \"kdx.example.net\"");
         assert_eq!(ok.unwrap().public_host.as_deref(), Some("kdx.example.net"));
+    }
+
+    // Seam review #5: a config whose relative database / files_root used to
+    // mean "under the working directory" must not silently start empty.
+    #[test]
+    fn data_left_under_the_old_working_directory_blocks_startup() {
+        let etc = tempfile::tempdir().unwrap(); // holds the config file
+        let state = tempfile::tempdir().unwrap(); // the old working directory
+        let config_path = etc.path().join("kdxd.toml");
+        std::fs::write(&config_path, "database = \"kdx.db\"\nfiles_root = \"files\"\n").unwrap();
+        let load = || Config::load_from(&config_path, Some(state.path()));
+
+        // A fresh install: nothing anywhere, so nothing to protect.
+        load().unwrap();
+        // An empty files directory left behind holds nothing either.
+        std::fs::create_dir(state.path().join("files")).unwrap();
+        load().unwrap();
+
+        // The old database is under the working directory, the new path is
+        // empty: refuse, naming both paths.
+        std::fs::write(state.path().join("kdx.db"), b"SQLite format 3\0").unwrap();
+        let message = match load() {
+            Err(ConfigError::Invalid(_, message)) => message,
+            other => panic!("expected a refusal, got {other:?}"),
+        };
+        let new_db = std::path::absolute(etc.path()).unwrap().join("kdx.db");
+        assert!(message.contains(&new_db.display().to_string()), "{message}");
+        assert!(message.contains(&state.path().join("kdx.db").display().to_string()), "{message}");
+        assert!(message.starts_with("database"), "{message}");
+
+        // Once the database exists at the configured place, that's the one.
+        std::fs::write(&new_db, b"").unwrap();
+        load().unwrap();
+
+        // The same for files_root, once it holds something.
+        std::fs::write(state.path().join("files").join("blob"), b"x").unwrap();
+        let message = match load() {
+            Err(ConfigError::Invalid(_, message)) => message,
+            other => panic!("expected a refusal, got {other:?}"),
+        };
+        assert!(message.starts_with("files_root"), "{message}");
+        assert!(message.contains(&state.path().join("files").display().to_string()), "{message}");
+        std::fs::create_dir(etc.path().join("files")).unwrap();
+        load().unwrap();
+
+        // Absolute paths, or running from the config's directory, never trip it.
+        assert!(check_data_location(
+            "database",
+            &state.path().join("kdx.db"),
+            &state.path().join("kdx.db"),
+            etc.path(),
+            Path::is_file
+        )
+        .is_ok());
+        let in_place = state.path().join("kdx.db");
+        assert!(check_data_location("database", Path::new("kdx.db"), &in_place, state.path(), Path::is_file).is_ok());
     }
 
     #[test]

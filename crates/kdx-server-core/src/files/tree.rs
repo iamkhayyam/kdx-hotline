@@ -16,11 +16,12 @@
 //! can't overflow the stack.
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 use kdx_storage::file_tree::{self, FileNodeRow, ROOT_ID};
 use kdx_storage::{SqlitePool, StorageError};
 use tokio::sync::RwLock;
-use tracing::warn;
+use tracing::{debug, warn};
 
 use super::acl::{self, AccessItem, AclError};
 use crate::auth::{BaseClass, Privileges, Session};
@@ -278,6 +279,26 @@ pub struct FileTree {
     /// Deliberately not auto-built or auto-refreshed — it's an explicit,
     /// admin-triggered index, not a live search of the tree.
     catalog: RwLock<Option<Vec<CatalogEntry>>>,
+    /// Where blobs live (see [`FileTree::with_files_root`]). `None`: stored
+    /// paths are used exactly as written.
+    files_root: Option<PathBuf>,
+}
+
+/// Where a stored blob path points now. Rows written before `files_root`
+/// was made absolute hold paths relative to whatever directory kdxd ran in
+/// back then (and `files_root` itself may have moved since); blobs always
+/// live directly in `files_root`, so when the stored path doesn't exist,
+/// look there by name. Downloads, the upload sweeper and deletes all
+/// resolve paths this way.
+pub(crate) async fn locate_blob(files_root: &Path, stored: &str) -> PathBuf {
+    let path = PathBuf::from(stored);
+    if tokio::fs::try_exists(&path).await.unwrap_or(false) {
+        return path;
+    }
+    match path.file_name() {
+        Some(name) => files_root.join(name),
+        None => path,
+    }
 }
 
 fn class_from_i64(v: i64) -> BaseClass {
@@ -319,7 +340,16 @@ impl FileTree {
             pool,
             state: RwLock::new(TreeState { nodes, children }),
             catalog: RwLock::new(None),
+            files_root: None,
         })
+    }
+
+    /// Tell the tree where blobs live (the transfer manager's absolute
+    /// `files_root`), so deleting a file finds its bytes the way a download
+    /// does even when the stored path is stale (see [`locate_blob`]).
+    pub fn with_files_root(mut self, files_root: impl Into<PathBuf>) -> Self {
+        self.files_root = Some(files_root.into());
+        self
     }
 
     /// Resolve a `/`-separated virtual path to a node. Applies no ACL — for
@@ -399,6 +429,67 @@ impl FileTree {
             return Err(TreeError::Exists);
         }
         Ok(node.clone())
+    }
+
+    /// [`prepare_upload`](Self::prepare_upload) for a destination folder
+    /// known by id — a resumed upload's. Every check runs under one read
+    /// guard against the folder's current place in the tree, so a
+    /// concurrent move or rename of an ancestor can't make a destination
+    /// that still exists look gone (`NotFound` only if the folder was
+    /// deleted or is no longer attached to the root).
+    pub async fn prepare_upload_into(
+        &self,
+        parent_id: &str,
+        name: &str,
+        session: &Session,
+    ) -> Result<Node, TreeError> {
+        validate_name(name)?;
+        let state = self.state.read().await;
+        let node = state.nodes.get(parent_id).ok_or(TreeError::NotFound)?;
+        if !node.kind.is_folder() {
+            return Err(TreeError::NotAFolder);
+        }
+        // The same gates `resolve_as` + `check_place_into` apply to a path:
+        // every folder above must be readable (this also fails closed with
+        // `NotFound` when the folder is detached), and it must be writable.
+        state.check_place_into(node, session, false)?;
+        state.check_room(node, 0, 1 + name.len())?;
+        if state.name_taken(&node.id, name) {
+            return Err(TreeError::Exists);
+        }
+        Ok(node.clone())
+    }
+
+    /// The entry named `name` directly inside folder `parent_id`, if any.
+    /// Applies no ACL (server-internal).
+    pub(crate) async fn child(&self, parent_id: &str, name: &str) -> Option<Node> {
+        let state = self.state.read().await;
+        let found = state.child_nodes(parent_id).find(|n| n.name == name).cloned();
+        found
+    }
+
+    /// Take file entry `id` out of the tree without any access check: the
+    /// upload path undoing its own `add_file` when the bytes could not be
+    /// moved into place. Leaves the bytes alone, and refuses anything but a
+    /// plain file. An entry that is already gone is not an error.
+    pub(crate) async fn remove_file_node(&self, id: &str) -> Result<(), TreeError> {
+        let mut state = self.state.write().await;
+        let Some(node) = state.nodes.get(id) else {
+            return Ok(());
+        };
+        if node.kind != NodeKind::File {
+            return Err(TreeError::NotAFile);
+        }
+        let parent_id = node.parent_id.clone();
+        match file_tree::delete(&self.pool, id).await {
+            Ok(()) | Err(StorageError::NotFound) => {}
+            Err(e) => return Err(e.into()),
+        }
+        state.nodes.remove(id);
+        if let Some(siblings) = parent_id.and_then(|p| state.children.get_mut(&p)) {
+            siblings.retain(|c| c != id);
+        }
+        Ok(())
     }
 
     /// Resolve a file for download, enforcing inherited read access on its
@@ -585,8 +676,9 @@ impl FileTree {
     ///
     /// The rows go in one transaction (all or nothing), then the in-memory
     /// tree is updated, and only then — with the lock released — are the
-    /// backing files unlinked, best-effort. So a failure leaves the tree,
-    /// the DB and the bytes exactly as they were.
+    /// backing files unlinked, best-effort (found the way downloads find
+    /// them, see [`locate_blob`]; failures are logged). So a failure leaves
+    /// the tree, the DB and the bytes exactly as they were.
     ///
     /// Holds a single write-lock guard from validation to the in-memory
     /// update rather than a read lock that's dropped and later re-acquired —
@@ -632,9 +724,17 @@ impl FileTree {
         drop(state);
 
         for sp in &storage_paths {
-            if let Err(e) = tokio::fs::remove_file(sp).await {
-                if e.kind() != std::io::ErrorKind::NotFound {
-                    warn!(error = %e, "could not remove a deleted file's bytes");
+            let blob = match &self.files_root {
+                Some(root) => locate_blob(root, sp).await,
+                None => PathBuf::from(sp),
+            };
+            match tokio::fs::remove_file(&blob).await {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    debug!(path = %blob.display(), "a deleted file's bytes were already gone");
+                }
+                Err(e) => {
+                    warn!(path = %blob.display(), error = %e, "could not remove a deleted file's bytes");
                 }
             }
         }
@@ -750,27 +850,6 @@ impl FileTree {
                 .push(node.id.clone());
         }
         state.nodes.insert(node.id.clone(), node);
-    }
-
-    /// The current `/`-separated path of node `id` (`"/"` for the root), or
-    /// `None` if it is no longer in the tree. Lets a resumed upload re-check
-    /// its destination folder (stored by id) through `prepare_upload`.
-    pub async fn path_of(&self, id: &str) -> Option<String> {
-        let state = self.state.read().await;
-        let mut node = state.nodes.get(id)?;
-        let mut segments = Vec::new();
-        while let Some(parent_id) = &node.parent_id {
-            if segments.len() > state.nodes.len() {
-                return None; // cycle: fail closed
-            }
-            segments.push(node.name.as_str());
-            node = state.nodes.get(parent_id)?;
-        }
-        if node.id != ROOT_ID {
-            return None; // detached from the root
-        }
-        segments.reverse();
-        Some(format!("/{}", segments.join("/")))
     }
 }
 
@@ -2205,6 +2284,54 @@ mod tests {
             tree.create_folder("/", "ghost", NodeKind::Directory, BaseClass::Guest, BaseClass::Guest, None, &admin())
                 .await,
             Err(TreeError::Exists)
+        ));
+    }
+
+    // Seam review #4: a resumed upload's destination is checked by id, in
+    // one step, wherever the folder is now — with the same rules as a path.
+    #[tokio::test]
+    async fn prepare_upload_into_follows_the_folder_and_applies_the_upload_rules() {
+        let (tree, _dir) = tree().await;
+        for (parent, name) in [("/", "a"), ("/a", "b"), ("/", "c")] {
+            tree.create_folder(parent, name, NodeKind::Directory, BaseClass::Guest, BaseClass::User, None, &admin())
+                .await
+                .unwrap();
+        }
+        tree.create_folder("/", "vault", NodeKind::Directory, BaseClass::Admin, BaseClass::Guest, None, &admin())
+            .await
+            .unwrap();
+        let b = tree.resolve("/a/b").await.unwrap();
+        let user = sess(BaseClass::User);
+        assert_eq!(tree.prepare_upload_into(&b.id, "x.bin", &user).await.unwrap().id, b.id);
+
+        // An ancestor moved: same folder, still a valid destination.
+        tree.move_node("/a", "/c", &admin()).await.unwrap();
+        assert_eq!(tree.prepare_upload_into(&b.id, "x.bin", &user).await.unwrap().id, b.id);
+
+        // The rules of `prepare_upload`, as for the folder's path.
+        tree.add_file(&b.id, "taken.bin", 1, &[0u8; 32], "/tmp/t").await.unwrap();
+        for (name, session) in [("taken.bin", &user), ("..", &user), ("x.bin", &sess(BaseClass::Guest))] {
+            let by_path = tree.prepare_upload("/c/a/b", name, session).await.unwrap_err();
+            let by_id = tree.prepare_upload_into(&b.id, name, session).await.unwrap_err();
+            assert_eq!(by_id.to_string(), by_path.to_string(), "{name}");
+        }
+        let file = tree.resolve("/c/a/b/taken.bin").await.unwrap();
+        assert!(matches!(
+            tree.prepare_upload_into(&file.id, "x.bin", &user).await,
+            Err(TreeError::NotAFolder)
+        ));
+        // Moved under a folder the uploader can't read: refused.
+        tree.move_node("/c/a", "/vault", &admin()).await.unwrap();
+        assert!(matches!(
+            tree.prepare_upload_into(&b.id, "x.bin", &user).await,
+            Err(TreeError::Acl(_))
+        ));
+        assert!(tree.prepare_upload_into(&b.id, "x.bin", &admin()).await.is_ok());
+        // Deleted: gone.
+        tree.delete("/vault/a", &admin()).await.unwrap();
+        assert!(matches!(
+            tree.prepare_upload_into(&b.id, "x.bin", &admin()).await,
+            Err(TreeError::NotFound)
         ));
     }
 
