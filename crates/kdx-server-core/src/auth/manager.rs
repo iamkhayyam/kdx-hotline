@@ -1,6 +1,7 @@
 //! Challenge-response authentication (SCRAM-style, TLS-channel-bound; see
 //! `kdx_crypto::scram`) and the in-memory session table.
 
+use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
 use dashmap::DashMap;
@@ -38,7 +39,9 @@ pub enum AuthError {
     Internal(&'static str),
 }
 
-/// An authenticated session.
+/// An authenticated session. It stays registered for exactly as long as its
+/// connection is logged in: the connection's guards end it on every path,
+/// and the connection enforces `session_ttl` as an idle timeout.
 #[derive(Debug, Clone)]
 pub struct Session {
     pub id: Uuid,
@@ -46,6 +49,9 @@ pub struct Session {
     pub username: String,
     pub class: BaseClass,
     pub privileges: Privileges,
+    /// Login time plus `session_ttl`. Informational only: nothing expires a
+    /// live session by age (that let `max_users` stop counting long-lived
+    /// connections).
     pub expires_at: Instant,
 }
 
@@ -112,6 +118,9 @@ impl Drop for SessionGuard<'_> {
 pub struct AuthManager {
     pool: SqlitePool,
     sessions: DashMap<Uuid, Session>,
+    /// Makes the `max_users` check and the insert it guards one step (see
+    /// [`AuthManager::admit`]).
+    admission: Mutex<()>,
     session_ttl: Duration,
     /// Per-server key for unknown-user decoy salts. Initialising it also
     /// converts legacy credentials (see [`AuthManager::prepare`]).
@@ -123,6 +132,7 @@ impl AuthManager {
         Self {
             pool,
             sessions: DashMap::new(),
+            admission: Mutex::new(()),
             session_ttl,
             decoy_key: OnceCell::new(),
         }
@@ -285,6 +295,16 @@ impl AuthManager {
             return Err(AuthError::InvalidCredentials);
         };
 
+        // `account` was read when the challenge went out, up to the whole
+        // auth timeout ago. A demotion or override change since then found
+        // no live session to kick, so build the session from the row as it
+        // is now. An account deleted (or replaced) meanwhile can't log in on
+        // the old one's proof.
+        let account = match accounts::by_username(&self.pool, &pending.username).await? {
+            Some(row) if row.id == account.id => row,
+            _ => return Err(AuthError::InvalidCredentials),
+        };
+
         // Credentials check out, but an active ban still refuses the login.
         // Checked only after verification so ban status isn't observable to
         // someone who can't authenticate as the account.
@@ -332,17 +352,42 @@ impl AuthManager {
     /// else the login sends) went out — otherwise the session is removed
     /// again, so an undeliverable login can't leak one.
     pub fn activate(&self, session: &Session) -> SessionGuard<'_> {
-        self.sessions.insert(session.id, session.clone());
-        debug!(user = %session.username, class = ?session.class, "session created");
-        SessionGuard {
-            auth: self,
-            id: Some(session.id),
-        }
+        self.admit(session, None)
+            .expect("an uncapped admission always succeeds")
     }
 
-    /// Number of registered sessions (for the `max_users` cap).
+    /// [`AuthManager::activate`] under a cap: registers the session only if
+    /// fewer than `cap` sessions are registered (`None` = no cap). The check
+    /// and the insert are one step, so concurrent logins can't overshoot
+    /// the cap. `None` means the server is full.
+    pub fn admit(&self, session: &Session, cap: Option<usize>) -> Option<SessionGuard<'_>> {
+        let _admission = self
+            .admission
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if cap.is_some_and(|cap| self.sessions.len() >= cap) {
+            return None;
+        }
+        self.sessions.insert(session.id, session.clone());
+        debug!(user = %session.username, class = ?session.class, "session created");
+        Some(SessionGuard {
+            auth: self,
+            id: Some(session.id),
+        })
+    }
+
+    /// Number of registered sessions, i.e. logged-in connections: what the
+    /// `max_users` cap counts.
     pub fn live_session_count(&self) -> usize {
         self.sessions.len()
+    }
+
+    /// The ban in force on an account right now, if any: `(until, reason)`.
+    pub async fn active_ban(&self, account_id: &str) -> Result<Option<(i64, String)>, AuthError> {
+        let now = crate::presence::unix_now() as i64;
+        Ok(kdx_storage::bans::active(&self.pool, account_id, now)
+            .await?
+            .map(|ban| (ban.until, ban.reason)))
     }
 
     /// Resolve a username to its account id, for admin operations (e.g. role
@@ -442,26 +487,14 @@ impl AuthManager {
         Ok(())
     }
 
-    /// Look up a live session, evicting it if expired. Callers treat `None`
-    /// as "reauthentication required".
+    /// Look up a registered session. `None` once its connection has logged
+    /// out; callers treat that as "reauthentication required".
     pub fn validate(&self, session_id: Uuid) -> Option<Session> {
-        let entry = self.sessions.get(&session_id)?;
-        if entry.expires_at <= Instant::now() {
-            drop(entry);
-            self.sessions.remove(&session_id);
-            return None;
-        }
-        Some(entry.clone())
+        self.sessions.get(&session_id).map(|entry| entry.clone())
     }
 
     pub fn end_session(&self, session_id: Uuid) {
         self.sessions.remove(&session_id);
-    }
-
-    /// Drop all expired sessions. Run periodically from a sweep task.
-    pub fn sweep(&self) {
-        let now = Instant::now();
-        self.sessions.retain(|_, s| s.expires_at > now);
     }
 
     /// The configured idle session lifetime (`session_ttl_secs`).
@@ -765,7 +798,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_expires_and_requires_reauth() {
+    async fn live_sessions_do_not_expire_by_age() {
         let (pool, _dir) = test_pool().await;
         seed(&pool, "phraq", "s3cret", 1).await;
         let mgr = AuthManager::new(pool, Duration::from_secs(30));
@@ -776,11 +809,69 @@ mod tests {
 
         // Pause the clock only now — sqlx's pool timeouts misbehave under a
         // paused clock, but everything past this point is pure in-memory.
+        // The connection enforces `session_ttl` as an idle timeout; the
+        // registration itself lives exactly as long as the connection, so
+        // `max_users` keeps counting it.
         tokio::time::pause();
         tokio::time::advance(Duration::from_secs(31)).await;
+        assert!(mgr.validate(session.id).is_some());
+        assert_eq!(mgr.live_session_count(), 1);
+        // Logging out is what ends it.
+        mgr.end_session(session.id);
         assert!(mgr.validate(session.id).is_none());
-        // Even after a sweep the id stays invalid.
-        mgr.sweep();
-        assert!(mgr.validate(session.id).is_none());
+    }
+
+    #[tokio::test]
+    async fn admission_is_capped_and_freed_by_logouts() {
+        let (pool, _dir) = test_pool().await;
+        seed(&pool, "phraq", "s3cret", 1).await;
+        let mgr = AuthManager::new(pool, Duration::from_secs(60));
+        let first = login(&mgr, "phraq", "s3cret").await.unwrap().session;
+        let second = login(&mgr, "phraq", "s3cret").await.unwrap().session;
+
+        let held = mgr.admit(&first, Some(1)).expect("room for one");
+        assert!(mgr.admit(&second, Some(1)).is_none(), "the cap is full");
+        assert!(
+            mgr.validate(second.id).is_none(),
+            "a refused session is not registered"
+        );
+        // No cap (e.g. an admin) still gets in.
+        mgr.admit(&second, None).expect("uncapped").keep();
+        assert_eq!(mgr.live_session_count(), 2);
+
+        // Dropping the guard (the login never completed) frees the slot.
+        drop(held);
+        assert_eq!(mgr.live_session_count(), 1);
+        assert!(mgr.admit(&first, Some(2)).is_some());
+    }
+
+    #[tokio::test]
+    async fn changes_while_a_login_is_pending_apply_to_it() {
+        let (pool, _dir) = test_pool().await;
+        seed(&pool, "deputy", "s3cret", 3).await;
+        let mgr = AuthManager::new(pool.clone(), Duration::from_secs(60));
+
+        // Demoted (and a privilege revoked) between challenge and proof.
+        let (data, pending) = mgr.begin("deputy", BINDING).await.unwrap();
+        let proof = prove("deputy", &data, "s3cret");
+        mgr.update_account("deputy", 1, 0, Privileges::CHAT_SEND.bits() as i64)
+            .await
+            .unwrap();
+        let session = mgr.complete(pending, &proof.proof).await.unwrap().session;
+        assert_eq!(session.class, BaseClass::User);
+        assert!(!session.privileges.contains(Privileges::CHAT_SEND));
+        assert!(!session.privileges.contains(Privileges::SERVER_ADMIN));
+
+        // Banned between challenge and proof.
+        let (data, pending) = mgr.begin("deputy", BINDING).await.unwrap();
+        let proof = prove("deputy", &data, "s3cret");
+        let id = mgr.account_id("deputy").await.unwrap().unwrap();
+        let until = crate::presence::unix_now() as i64 + 1000;
+        mgr.set_ban(&id, until, "spam", "sysop").await.unwrap();
+        assert!(matches!(
+            mgr.complete(pending, &proof.proof).await,
+            Err(AuthError::Banned { .. })
+        ));
+        assert_eq!(mgr.active_ban(&id).await.unwrap().unwrap().1, "spam");
     }
 }

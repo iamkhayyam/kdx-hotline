@@ -7,7 +7,9 @@
 //! Each entry also carries a non-lossy kill signal: `disconnect` and
 //! `disconnect_all` fire it instead of queueing a frame on the (bounded,
 //! best-effort) outbound channel, so a kick reaches a session even when its
-//! queue is full or it has stopped reading.
+//! queue is full or it has stopped reading. Once `disconnect_all` ran (the
+//! server is shutting down), a session that joins later — a login that was
+//! in flight — has its kill signal fired as it joins.
 //!
 //! Peer addresses are only shown to sessions that may act on them (those
 //! that joined with `sees_addresses`, i.e. USER_KICK holders): broadcasts
@@ -40,6 +42,8 @@ pub enum PresenceCommand {
         sees_addresses: bool,
         tx: mpsc::Sender<Outbound>,
         kill: watch::Sender<Option<String>>,
+        /// Answered once the session is in the roster.
+        joined: oneshot::Sender<()>,
     },
     Leave {
         session_id: Uuid,
@@ -89,7 +93,8 @@ pub enum PresenceCommand {
     },
     /// Forcibly disconnect every connected session (including the caller's
     /// own, if it's among them) — the presence side of a server shutdown.
-    /// Replies with the number of sessions signalled.
+    /// Sessions joining afterwards are disconnected as they join. Replies
+    /// with the number of sessions signalled.
     DisconnectAll {
         reason: String,
         reply: oneshot::Sender<usize>,
@@ -166,9 +171,9 @@ impl Presence {
     pub fn spawn() -> Self {
         let (tx, mut rx) = mpsc::channel::<PresenceCommand>(QUEUE);
         tokio::spawn(async move {
-            let mut entries: HashMap<Uuid, Entry> = HashMap::new();
+            let mut roster = Roster::default();
             while let Some(command) = rx.recv().await {
-                handle(&mut entries, command);
+                handle(&mut roster, command);
             }
         });
         Self { tx }
@@ -176,7 +181,9 @@ impl Presence {
 
     /// Add a session to the roster. `sees_addresses` controls whether the
     /// presence broadcasts it receives carry other users' addresses. Returns
-    /// the session's kill signal, which `disconnect`/`disconnect_all` fire.
+    /// the session's kill signal, which `disconnect`/`disconnect_all` fire,
+    /// once the session is in the roster: every kick processed from then on
+    /// reaches it. (Fired already if the server is shutting down.)
     pub async fn join(
         &self,
         session_id: Uuid,
@@ -187,7 +194,8 @@ impl Presence {
         tx: mpsc::Sender<Outbound>,
     ) -> KillSignal {
         let (kill, rx) = watch::channel(None);
-        let _ = self
+        let (joined, ack) = oneshot::channel();
+        let sent = self
             .tx
             .send(PresenceCommand::Join {
                 session_id,
@@ -197,8 +205,12 @@ impl Presence {
                 sees_addresses,
                 tx,
                 kill,
+                joined,
             })
             .await;
+        if sent.is_ok() {
+            let _ = ack.await;
+        }
         KillSignal { rx }
     }
 
@@ -328,7 +340,17 @@ impl Presence {
     }
 }
 
-fn handle(entries: &mut HashMap<Uuid, Entry>, command: PresenceCommand) {
+/// The presence actor's state.
+#[derive(Default)]
+struct Roster {
+    entries: HashMap<Uuid, Entry>,
+    /// Set by `DisconnectAll` (shutdown): the reason every later join is
+    /// disconnected with.
+    closing: Option<String>,
+}
+
+fn handle(roster: &mut Roster, command: PresenceCommand) {
+    let Roster { entries, closing } = roster;
     match command {
         PresenceCommand::Join {
             session_id,
@@ -338,7 +360,13 @@ fn handle(entries: &mut HashMap<Uuid, Entry>, command: PresenceCommand) {
             sees_addresses,
             tx,
             kill,
+            joined,
         } => {
+            if let Some(reason) = closing.as_ref() {
+                // A login that was in flight when the server began shutting
+                // down: it closes as soon as its dispatch loop starts.
+                kill.send_replace(Some(reason.clone()));
+            }
             let now = Instant::now();
             let entry = Entry {
                 username,
@@ -367,6 +395,7 @@ fn handle(entries: &mut HashMap<Uuid, Entry>, command: PresenceCommand) {
                     online: true,
                 },
             );
+            let _ = joined.send(());
         }
         PresenceCommand::Leave { session_id } => {
             remove(entries, vec![session_id]);
@@ -435,6 +464,7 @@ fn handle(entries: &mut HashMap<Uuid, Entry>, command: PresenceCommand) {
         }
         PresenceCommand::DisconnectAll { reason, reply } => {
             let (reached, dead) = kill_where(entries, &reason, |_| true);
+            *closing = Some(reason);
             remove(entries, dead);
             let _ = reply.send(reached);
         }
@@ -695,6 +725,19 @@ mod tests {
         assert_eq!(reached, 2);
         assert_eq!(ka.fired().await.as_deref(), Some("server is shutting down"));
         assert_eq!(kb.fired().await.as_deref(), Some("server is shutting down"));
+    }
+
+    #[tokio::test]
+    async fn sessions_joining_after_disconnect_all_are_disconnected_at_once() {
+        let presence = Presence::spawn();
+        assert_eq!(presence.disconnect_all("server is shutting down").await, 0);
+        // A login that was in flight during the shutdown joins afterwards.
+        let (tx, _rx) = member_channel();
+        let mut late = join(&presence, Uuid::new_v4(), "late", 1, "a", tx).await;
+        let fired = tokio::time::timeout(std::time::Duration::from_secs(5), late.fired())
+            .await
+            .expect("the late joiner must be told to go");
+        assert_eq!(fired.as_deref(), Some("server is shutting down"));
     }
 
     #[tokio::test]
