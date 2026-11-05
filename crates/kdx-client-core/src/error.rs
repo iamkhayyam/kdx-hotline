@@ -34,4 +34,12 @@ pub enum ClientError {
     InvalidServerName(String),
     #[error("invalid input: {0}")]
     InvalidInput(String),
+    /// A connect step or a request's reply took longer than its configured
+    /// timeout (see `ClientConfig`).
+    #[error("timed out: {0}")]
+    Timeout(String),
+    /// `known_hosts.toml` exists but could not be read or parsed. Connecting
+    /// is refused rather than treating every server as unpinned.
+    #[error("known_hosts error: {0}")]
+    KnownHosts(String),
 }

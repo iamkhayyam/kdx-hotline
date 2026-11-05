@@ -957,7 +957,9 @@ async fn invite_delivers_and_both_parties_share_a_private_room() {
     next_event(&mut eb).await;
     bob.login("bob", "pw").await.unwrap();
 
-    alice.invite_to_chat("bob").await.unwrap();
+    // The call returns the new private room's id.
+    let alice_room = alice.invite_to_chat("bob").await.unwrap();
+    assert!(alice_room.starts_with("priv-"));
 
     // Alice gets an ack naming bob.
     let mut saw_ack = false;
@@ -981,6 +983,7 @@ async fn invite_delivers_and_both_parties_share_a_private_room() {
         }
     }
     let room = room.expect("bob should be invited");
+    assert_eq!(room, alice_room, "invite_to_chat returned the invitee's room");
     bob.join(&room).await.unwrap();
 
     // Alice's chat in that room reaches bob — they're sharing the same
@@ -1002,7 +1005,9 @@ async fn invite_to_an_offline_user_is_refused() {
     next_event(&mut ea).await;
     alice.login("alice", "pw").await.unwrap();
 
-    alice.invite_to_chat("ghost").await.unwrap();
+    // The refusal now fails the call itself (and is still an event).
+    let err = alice.invite_to_chat("ghost").await.unwrap_err();
+    assert!(matches!(err, ClientError::Server(ref t) if t.contains("not online")), "{err:?}");
     let mut saw_err = false;
     for _ in 0..10 {
         if let Event::ServerError { text } = next_event(&mut ea).await {
@@ -1026,7 +1031,8 @@ async fn guest_cannot_invite_to_chat() {
     next_event(&mut e1).await;
     guest1.login("guest1", "pw").await.unwrap();
 
-    guest1.invite_to_chat("guest2").await.unwrap(); // the send itself succeeds...
+    let err = guest1.invite_to_chat("guest2").await.unwrap_err();
+    assert!(matches!(err, ClientError::Server(ref t) if t.contains("CHAT_PRIVATE")), "{err:?}");
     let mut refused = false;
     for _ in 0..10 {
         if let Event::ServerError { text } = next_event(&mut e1).await {
@@ -1049,7 +1055,8 @@ async fn cannot_invite_yourself() {
     next_event(&mut ea).await;
     alice.login("alice", "pw").await.unwrap();
 
-    alice.invite_to_chat("alice").await.unwrap();
+    let err = alice.invite_to_chat("alice").await.unwrap_err();
+    assert!(matches!(err, ClientError::Server(ref t) if t.contains("yourself")), "{err:?}");
     let mut refused = false;
     for _ in 0..10 {
         if let Event::ServerError { text } = next_event(&mut ea).await {
@@ -1425,6 +1432,42 @@ async fn get_file_info_returns_metadata() {
     let folder = sysop.get_file_info("/pub").await.unwrap();
     assert_eq!(folder.owner.as_deref(), Some("sysop"));
     assert_eq!(folder.kind, 0);
+
+    ts.stop();
+}
+
+/// CLIENT-8: a failed Get Info must fail that call (not hang it) and must
+/// not shift every later answer by one; an Error for one request must not
+/// fail another that happens to be pending.
+#[tokio::test]
+async fn get_file_info_errors_are_correlated_with_their_request() {
+    let ts = TestServer::start().await;
+    ts.seed_account("sysop", "pw", 3).await;
+
+    let (sysop, mut es, dd) = ts.connect_client().await;
+    next_event(&mut es).await;
+    sysop.login("sysop", "pw").await.unwrap();
+
+    let err = tokio::time::timeout(Duration::from_secs(5), sysop.get_file_info("/nope"))
+        .await
+        .expect("a failed Get Info must not hang")
+        .unwrap_err();
+    assert!(matches!(err, ClientError::Server(_)), "{err:?}");
+
+    let up = dd.path().join("a");
+    std::fs::write(&up, b"x").unwrap();
+    sysop.upload(up, "/").await.unwrap();
+    let info = sysop.get_file_info("/a").await.unwrap();
+    assert_eq!(info.name, "a");
+
+    // Concurrent requests: the Error answers Get Info only.
+    let (listing, missing) = tokio::join!(sysop.list_files("/"), sysop.get_file_info("/nope"));
+    assert!(listing.unwrap().entries.iter().any(|e| e.name == "a"));
+    assert!(missing.is_err());
+    // And a fire-and-forget error before a request doesn't fail the request.
+    let (pm, listing) = tokio::join!(sysop.send_private("ghost", "hi"), sysop.list_files("/"));
+    pm.unwrap();
+    assert!(listing.is_ok());
 
     ts.stop();
 }

@@ -1910,6 +1910,7 @@ dependencies = [
  "kdx-protocol",
  "kdx-storage",
  "kdxd",
+ "rcgen",
  "rustls",
  "serde",
  "serde_json",

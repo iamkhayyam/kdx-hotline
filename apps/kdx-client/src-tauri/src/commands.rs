@@ -332,7 +332,7 @@ pub async fn send_private(state: State<'_, AppState>, to: String, text: String) 
 
 #[tauri::command]
 pub async fn invite_to_chat(state: State<'_, AppState>, to: String) -> CmdResult<()> {
-    with_client(&state, |c| async move { c.invite_to_chat(&to).await }).await
+    with_client(&state, |c| async move { c.invite_to_chat(&to).await.map(|_room| ()) }).await
 }
 
 #[tauri::command]
