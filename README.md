@@ -16,7 +16,7 @@ and the machinery behind each feature — lives in
 ```
 crates/
   kdx-protocol      wire format: 20-byte framed packets, codec, fragmentation, typed messages
-  kdx-crypto        Argon2id password hashing + challenge-response
+  kdx-crypto        Argon2id + channel-bound SCRAM-style login proofs
   kdx-server-core   connection state machine, auth, chat rooms, file tree, transfers, tracker
   kdx-storage       sqlx/SQLite persistence
   kdx-client-core   async client library (zero UI deps), TOFU trust, transfer engines
@@ -29,7 +29,18 @@ apps/
 
 ```sh
 cargo build --workspace
-cargo test  --workspace     # 243 tests, no external services needed
+cargo test  --workspace     # ~600 tests, no external services needed
+```
+
+The Tauri client crate (`apps/kdx-client/src-tauri`) needs the platform
+webview SDK to build — on Linux the GTK/WebKit dev packages
+(`libwebkit2gtk-4.1-dev libgtk-3-dev`); add `--exclude kdx-client` to build
+and test only the server, protocol and client library. The webview's JS has
+its own checks:
+
+```sh
+node apps/kdx-client/scripts/check-escaping.mjs
+node --test apps/kdx-client/tests/*.test.mjs
 ```
 
 ## Run the server
@@ -138,13 +149,24 @@ Local server build: `cargo build -p kdxd --release` → `target/release/kdxd`.
 
 ## Security notes
 
-- Transport is TLS 1.3 (rustls). The client pins server certificates
-  trust-on-first-use, warning loudly if a previously-trusted key changes.
-- Passwords are stored as Argon2id hashes. Login is challenge-response: the
-  client answers `SHA-256(challenge ‖ argon2id-verifier)`, so the plaintext
-  password never crosses the wire.
+- Transport is TLS 1.3 only (rustls, ALPN `kdx/1`). The client pins each
+  server's public key trust-on-first-use; a changed key needs explicit,
+  typed confirmation and never logs in automatically.
+- Login (protocol v2) is a SCRAM-SHA-256-style proof over an Argon2id-salted
+  password, bound to the TLS session with a TLS exporter value. The password
+  never crosses the wire, a relayed proof fails on any other connection, and
+  the client verifies a server signature before trusting the login. The
+  server stores only the salt, KDF parameters, `StoredKey` and `ServerKey`:
+  a copy of the database is not enough to log in (it still permits offline
+  guessing at Argon2id cost, so keep it private — kdxd creates it `0600`).
+  Failed logins are throttled per address and per address+username.
+- The server bounds every client-controlled size and rate (frame and
+  reassembly caps, input lengths, per-connection pacing, connection caps,
+  handshake/idle/write timeouts, room and transfer limits) and runs as an
+  unprivileged user (it refuses to start as root without `--allow-root`).
 - The self-signed dev certificate is for local testing only; supply real
-  certificates via config for any real deployment.
+  certificates via config for any real deployment. The cached dev key is
+  written `0600` and refused if its permissions are loosened.
 
 ## Status
 
