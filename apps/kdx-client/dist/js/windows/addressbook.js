@@ -7,6 +7,7 @@
 
 import { deliver, invoke } from "../bridge.js";
 import { esc, num } from "../html.js";
+import { bookmarkConnectCommands } from "../bookmarks.js";
 
 const KEY = "kdx.addressbook";
 
@@ -167,15 +168,10 @@ export function buildAddressBook() {
     b.lastConnect = Date.now();
     save(list);
     render();
-    // Only the id travels: Rust reads the password from the keychain.
-    deliver("connect", "fill", {
-      host: b.host,
-      port: b.port,
-      login: b.login,
-      bookmarkId: b.id,
-      hasSecret: !!b.hasSecret,
-    });
-    deliver("connect", "submit");
+    // Only the id travels: Rust reads the password from the keychain. With
+    // no saved password the Connect window asks for one instead of
+    // submitting an empty one.
+    for (const [action, args] of bookmarkConnectCommands(b)) deliver("connect", action, args);
   }
 
   function openEditor(idx) {

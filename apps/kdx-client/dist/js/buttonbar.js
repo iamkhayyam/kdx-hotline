@@ -8,6 +8,7 @@
 import { inTauri, getCurrentWindow } from "./bridge.js";
 import { isRegistered, isOpen, toggle } from "./wm.js";
 import { esc } from "./html.js";
+import { activeTransferCount } from "./store.js";
 
 // Order mirrors the real KDX client's left strip.
 const FEATURES = [
@@ -147,9 +148,7 @@ export function buildButtonBar(mount, handlers) {
     }
 
     const users = state.presenceCount || 0;
-    const xfer = state.transfers
-      ? Object.values(state.transfers).filter((t) => t.status === undefined).length
-      : 0;
+    const xfer = activeTransferCount(state);
     cUsers.textContent = `[${users}]`;
     cRooms.textContent = `[${connected ? 1 : 0}]`;
     cXfer.textContent = `[${xfer}]`;

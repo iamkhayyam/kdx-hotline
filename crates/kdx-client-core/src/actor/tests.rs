@@ -337,16 +337,92 @@ async fn invite_to_chat_returns_the_private_room_and_reports_refusals() {
     assert_eq!(timeout(STEP, second).await.unwrap().unwrap().unwrap(), "priv-real");
 
     // A room we joined ourselves is never mistaken for an invite's room.
-    h.client.join("priv-joined").await.unwrap();
+    // (The join resolves once its barrier comes back.)
     let client = h.client.clone();
-    let third = tokio::spawn(async move { client.invite_to_chat("carol").await });
+    let join = tokio::spawn(async move { client.join("priv-joined").await });
     h.expect(PacketType::ChatJoin).await;
     h.send(PacketType::ChatUserList, user_list("priv-joined")).await;
+    let token = h.expect_ping().await;
+    h.send(PacketType::Pong, token).await;
+    timeout(STEP, join).await.unwrap().unwrap().unwrap();
+    let client = h.client.clone();
+    let third = tokio::spawn(async move { client.invite_to_chat("carol").await });
     h.expect(PacketType::ChatInvite).await;
     let token = h.expect_ping().await;
     h.send(PacketType::Pong, token).await;
     h.send(PacketType::ChatUserList, user_list("priv-third")).await;
     assert_eq!(timeout(STEP, third).await.unwrap().unwrap().unwrap(), "priv-third");
+}
+
+// ---- joins (C-2) ------------------------------------------------------------
+
+#[tokio::test(start_paused = true)]
+async fn join_resolves_only_once_the_server_has_answered() {
+    let mut h = Harness::new();
+    let user_list = |room: &str| {
+        ChatUserList {
+            room: room.into(),
+            users: vec!["bob".into()],
+        }
+        .encode()
+    };
+
+    // Refused (e.g. a private room that no longer exists): the caller gets
+    // the server's reason, not a premature Ok.
+    let client = h.client.clone();
+    let refused = tokio::spawn(async move { client.join("priv-gone").await });
+    h.expect(PacketType::ChatJoin).await;
+    let token = h.expect_ping().await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!refused.is_finished(), "join resolved before the server answered");
+    h.error("you were not invited to that room").await;
+    h.send(PacketType::Pong, token).await;
+    let err = timeout(STEP, refused).await.unwrap().unwrap().unwrap_err();
+    assert!(
+        matches!(err, ClientError::Server(ref t) if t == "you were not invited to that room"),
+        "{err:?}"
+    );
+    // Still surfaced as an event, as before.
+    loop {
+        if let Event::ServerError { text } = h.next_event().await {
+            assert_eq!(text, "you were not invited to that room");
+            break;
+        }
+    }
+
+    // Admitted: Ok once the barrier comes back.
+    let client = h.client.clone();
+    let admitted = tokio::spawn(async move { client.join("lobby").await });
+    h.expect(PacketType::ChatJoin).await;
+    let token = h.expect_ping().await;
+    h.send(PacketType::ChatUserList, user_list("lobby")).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!admitted.is_finished());
+    h.send(PacketType::Pong, token).await;
+    timeout(STEP, admitted).await.unwrap().unwrap().unwrap();
+
+    // The refused room was not remembered as one of ours (a later invite's
+    // room list is still recognised; only a joined room is excluded).
+    let client = h.client.clone();
+    let invite = tokio::spawn(async move { client.invite_to_chat("bob").await });
+    h.expect(PacketType::ChatInvite).await;
+    let token = h.expect_ping().await;
+    h.send(PacketType::ChatUserList, user_list("priv-gone")).await;
+    h.send(PacketType::Pong, token).await;
+    assert_eq!(timeout(STEP, invite).await.unwrap().unwrap().unwrap(), "priv-gone");
+    h.assert_alive().await;
+}
+
+#[tokio::test]
+async fn a_join_cut_off_by_a_disconnect_fails() {
+    let mut h = Harness::new();
+    let client = h.client.clone();
+    let join = tokio::spawn(async move { client.join("lobby").await });
+    h.expect(PacketType::ChatJoin).await;
+    h.expect_ping().await;
+    h.client.disconnect().await;
+    let result = timeout(STEP, join).await.unwrap().unwrap();
+    assert!(matches!(result, Err(ClientError::Disconnected)), "{result:?}");
 }
 
 // ---- timeouts and liveness (CLIENT-7) -------------------------------------
@@ -862,6 +938,109 @@ async fn large_requests_are_fragmented_and_oversized_ones_fail_alone() {
     let err = h.client.send_chat("lobby", 0, &huge).await.unwrap_err();
     assert!(matches!(err, ClientError::InvalidInput(_)), "{err:?}");
     h.assert_alive().await;
+}
+
+/// P-2: the server caps reassembled control messages at 64 KiB (and drops
+/// the connection for anything bigger), well below the 4 MiB the client
+/// used to allow. A string that fits the wire's u16 length but makes the
+/// message too big is refused locally; nothing reaches the server.
+#[tokio::test]
+async fn requests_over_the_servers_per_type_cap_fail_alone() {
+    let mut h = Harness::new();
+    let text = "z".repeat(65_530);
+    let err = h.client.send_chat("lobby", 0, &text).await.unwrap_err();
+    assert!(matches!(err, ClientError::InvalidInput(_)), "{err:?}");
+    let err = h.client.send_private("bob", &text).await.unwrap_err();
+    assert!(matches!(err, ClientError::InvalidInput(_)), "{err:?}");
+    let (name, desc) = ("n".repeat(40_000), "d".repeat(40_000));
+    let err = h.client.update_server_settings(&name, &desc, "", 0).await.unwrap_err();
+    assert!(matches!(err, ClientError::InvalidInput(_)), "{err:?}");
+    // The next request is the first thing the server sees.
+    h.assert_alive().await;
+}
+
+// ---- upload aborts (P-5) -----------------------------------------------------
+
+/// Start an upload of `len` bytes and accept it as transfer `id`; returns
+/// the call, the chunk count and the barrier tokens of the chunks sent
+/// before the window filled (none of them acknowledged).
+async fn upload_with_unacked_window(
+    h: &mut Harness,
+    dir: &Path,
+    id: u8,
+    len: usize,
+) -> (JoinHandle<Result<(), ClientError>>, u32, Vec<Bytes>) {
+    let path = dir.join("big.bin");
+    std::fs::write(&path, blob(len)).unwrap();
+    let client = h.client.clone();
+    let upload = tokio::spawn(async move { client.upload(path, "/").await });
+    let req = h.expect(PacketType::FileTransferStart).await;
+    let req = TransferRequest::decode(&req.payload).unwrap();
+    let total = total_chunks(req.size, req.chunk_size);
+    h.send(
+        PacketType::FileTransferStart,
+        accept(id, req.chunk_size, total, req.size, req.sha256, vec![]),
+    )
+    .await;
+    // The client sends chunks until its in-flight window is full.
+    let window = (UPLOAD_WINDOW_BYTES / req.chunk_size as u64) as usize;
+    let mut pings = Vec::new();
+    while pings.len() < window {
+        let frame = h.recv().await;
+        if frame.header.packet_type == PacketType::Ping {
+            pings.push(frame.payload);
+        }
+    }
+    (upload, total, pings)
+}
+
+/// Count the ServerError events queued so far.
+fn server_errors(h: &mut Harness) -> usize {
+    let mut n = 0;
+    while let Ok(ev) = h.events.try_recv() {
+        if matches!(ev, Event::ServerError { .. }) {
+            n += 1;
+        }
+    }
+    n
+}
+
+#[tokio::test]
+async fn a_server_aborted_upload_does_not_flood_errors() {
+    let mut h = Harness::new();
+    let dir = tempfile::tempdir().unwrap();
+    let (upload, _, pings) = upload_with_unacked_window(&mut h, dir.path(), 21, 6 << 20).await;
+    assert!(pings.len() > 2);
+    // The server gives up on the upload, then refuses every chunk that was
+    // already on its way.
+    h.send(PacketType::FileTransferEnd, end(21, TRANSFER_ABORTED)).await;
+    for token in pings {
+        h.error("no active transfer").await;
+        h.send(PacketType::Pong, token).await;
+    }
+    let err = timeout(STEP, upload).await.unwrap().unwrap().unwrap_err();
+    assert!(matches!(err, ClientError::Transfer(_)), "{err:?}");
+    h.assert_alive().await;
+    assert_eq!(server_errors(&mut h), 0, "the abort is reported by the upload itself");
+}
+
+#[tokio::test]
+async fn refused_upload_chunks_raise_one_error() {
+    let mut h = Harness::new();
+    let dir = tempfile::tempdir().unwrap();
+    let (upload, _, pings) = upload_with_unacked_window(&mut h, dir.path(), 22, 6 << 20).await;
+    let in_flight = pings.len();
+    assert!(in_flight > 2);
+    for token in pings {
+        h.error("storage failure").await;
+        h.send(PacketType::Pong, token).await;
+    }
+    let err = timeout(STEP, upload).await.unwrap().unwrap().unwrap_err();
+    assert!(err.to_string().contains("storage failure"), "{err:?}");
+    // The client tells the server it abandoned the transfer.
+    h.expect(PacketType::FileTransferEnd).await;
+    h.assert_alive().await;
+    assert_eq!(server_errors(&mut h), 1, "{in_flight} refused chunks");
 }
 
 // ---- supervision (CLIENT-6) -------------------------------------------------

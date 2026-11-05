@@ -26,11 +26,19 @@
 //!   barrier's command, and the `Pong` retires it. Keepalive pings are
 //!   barriers with no command.
 //! - An `Error` with nothing attributable at the head is unsolicited; like
-//!   every `Error` it is also surfaced as `Event::ServerError`.
+//!   every `Error` it is also surfaced as `Event::ServerError` — except the
+//!   refusals of chunks of an upload that has already ended (one per chunk
+//!   still in flight), which only repeat the upload's own failure.
+//! - Every request is checked against the server's reassembly cap for its
+//!   type (`kdx_protocol::max_request_payload`) before it is written: the
+//!   server drops the connection over an oversized message, so it fails
+//!   only its caller here instead.
 //!
 //! Fire-and-forget calls still resolve as soon as they are written (their
-//! errors arrive as `Event::ServerError`, as before); `invite_to_chat` waits
-//! for its barrier because it needs the outcome and the new room's id.
+//! errors arrive as `Event::ServerError`, as before), except where the
+//! caller needs the outcome: `join` resolves when its barrier returns (with
+//! the server's `Error`, if it refused), and `invite_to_chat` also waits for
+//! the new room's id.
 
 use std::collections::{HashSet, VecDeque};
 use std::io;
@@ -94,9 +102,8 @@ use crate::transfer::{
 #[cfg(test)]
 mod tests;
 
-const MAX_REASSEMBLED: usize = 4 * 1024 * 1024;
-/// Largest request payload we send: the server's reassembly cap.
-const MAX_OUTBOUND_PAYLOAD: usize = 4 * 1024 * 1024;
+/// Largest server message we reassemble.
+const MAX_REASSEMBLED: usize = kdx_protocol::MAX_REASSEMBLED_PAYLOAD;
 /// How long the courtesy `Disconnect` frame may take on the way out.
 const GOODBYE_TIMEOUT: Duration = Duration::from_millis(500);
 /// At most this many progress events per second per transfer (plus a
@@ -244,11 +251,27 @@ struct Quiet {
     kind: QuietKind,
     /// The `Error` the server answered it with, if any.
     error: Option<String>,
+    /// A caller waiting for the outcome: answered when the barrier returns,
+    /// with `Ok` or the server's `Error`.
+    reply: Option<Reply<()>>,
 }
 
-#[derive(Clone, Copy)]
+impl Quiet {
+    fn new(kind: QuietKind) -> Self {
+        Self {
+            kind,
+            error: None,
+            reply: None,
+        }
+    }
+}
+
+#[derive(Clone)]
 enum QuietKind {
     Plain,
+    /// A `ChatJoin`. `forget` is the room if this join added it to
+    /// `known_rooms` (dropped again if the server refuses).
+    Join { forget: Option<String> },
     Invite(u64),
     UploadChunk { gen: u64, len: u64, index: u32 },
 }
@@ -425,6 +448,9 @@ pub(crate) struct Actor<S> {
     reasm: Reassembler,
     seq: u32,
     login: Option<PendingLogin>,
+    /// A login succeeded on this connection; another one is refused (the
+    /// server has no answer for a second `AuthRequest`).
+    authenticated: bool,
     pending: VecDeque<Pending>,
     next_token: u64,
     invites: VecDeque<InviteWait>,
@@ -464,6 +490,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
             reasm: Reassembler::default(),
             seq: 0,
             login: None,
+            authenticated: false,
             pending: VecDeque::new(),
             next_token: 0,
             invites: VecDeque::new(),
@@ -627,8 +654,15 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
             let _ = login.reply.send(Err(ClientError::Disconnected));
         }
         for pending in self.pending.drain(..) {
-            if let Pending::Reply(waiter) = pending {
-                waiter.fail(ClientError::Disconnected);
+            match pending {
+                Pending::Reply(waiter) => waiter.fail(ClientError::Disconnected),
+                Pending::Barrier {
+                    quiet: Some(Quiet {
+                        reply: Some(reply), ..
+                    }),
+                    ..
+                } => drop(reply.send(Err(ClientError::Disconnected))),
+                Pending::Barrier { .. } => {}
             }
         }
         for invite in self.invites.drain(..) {
@@ -665,6 +699,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
                     let _ = reply.send(Err(ClientError::AuthFailed("login already in progress".into())));
                     return Ok(());
                 }
+                if self.authenticated {
+                    let _ = reply.send(Err(ClientError::InvalidInput("already logged in".into())));
+                    return Ok(());
+                }
                 self.send(
                     PacketType::AuthRequest,
                     AuthRequest {
@@ -682,8 +720,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
                 });
             }
             Command::Join { room, reply } => {
-                self.known_rooms.insert(room.clone());
-                self.quiet(PacketType::ChatJoin, ChatJoin { room }.encode(), reply)
+                // The server answers a join with nothing (admitted) or an
+                // Error (refused), so the caller waits for the barrier.
+                let forget = self.known_rooms.insert(room.clone()).then(|| room.clone());
+                let quiet = Quiet {
+                    reply: Some(reply),
+                    ..Quiet::new(QuietKind::Join { forget })
+                };
+                self.send_answered(PacketType::ChatJoin, ChatJoin { room }.encode(), quiet)
                     .await?;
             }
             Command::Leave { room, reply } => {
@@ -750,10 +794,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
             }
             Command::SetIdentity { name, description } => {
                 let msg = SetIdentity { name, description };
-                match self
-                    .send_quiet(PacketType::SetIdentity, msg.encode(), QuietKind::Plain)
-                    .await
-                {
+                let quiet = Quiet::new(QuietKind::Plain);
+                match self.send_quiet(PacketType::SetIdentity, msg.encode(), quiet).await {
                     Err(SendError::Fatal(e)) => return Err(SendError::Fatal(e)),
                     Err(SendError::Rejected(e)) => warn!("identity not sent: {e}"),
                     Ok(()) => {}
@@ -1160,7 +1202,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
         payload: Bytes,
         reply: Reply<()>,
     ) -> Result<(), SendError> {
-        match self.send_quiet(packet_type, payload, QuietKind::Plain).await {
+        match self
+            .send_quiet(packet_type, payload, Quiet::new(QuietKind::Plain))
+            .await
+        {
             Ok(()) => {
                 let _ = reply.send(Ok(()));
                 Ok(())
@@ -1176,14 +1221,42 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
         }
     }
 
+    /// Send a fire-and-forget command whose caller (`quiet.reply`) waits for
+    /// the outcome: answered when its barrier returns, or now if it can't
+    /// be sent.
+    async fn send_answered(
+        &mut self,
+        packet_type: PacketType,
+        payload: Bytes,
+        mut quiet: Quiet,
+    ) -> Result<(), SendError> {
+        match self.send(packet_type, payload).await {
+            // A barrier that can't be written drops `quiet`, and with it the
+            // reply: the caller sees `Disconnected`.
+            Ok(()) => self.send_barrier(Some(quiet)).await,
+            Err(SendError::Rejected(e)) => {
+                if let Some(reply) = quiet.reply.take() {
+                    let _ = reply.send(Err(e));
+                }
+                Ok(())
+            }
+            Err(SendError::Fatal(e)) => {
+                if let Some(reply) = quiet.reply.take() {
+                    let _ = reply.send(Err(ClientError::Disconnected));
+                }
+                Err(SendError::Fatal(e))
+            }
+        }
+    }
+
     async fn send_quiet(
         &mut self,
         packet_type: PacketType,
         payload: Bytes,
-        kind: QuietKind,
+        quiet: Quiet,
     ) -> Result<(), SendError> {
         self.send(packet_type, payload).await?;
-        self.send_barrier(Some(Quiet { kind, error: None })).await
+        self.send_barrier(Some(quiet)).await
     }
 
     /// Write a `Ping(token)` and queue the barrier it stands for.
@@ -1226,11 +1299,22 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
         };
         match quiet.kind {
             QuietKind::Plain => {}
+            QuietKind::Join { forget } => {
+                if let (Some(room), Some(_)) = (forget, &quiet.error) {
+                    self.known_rooms.remove(&room);
+                }
+            }
             QuietKind::Invite(id) => self.invite_settled(id).await,
             QuietKind::UploadChunk { gen, len, index } => {
                 self.upload_chunk_acked(gen, len, index, quiet.error.is_none())
                     .await
             }
+        }
+        if let Some(reply) = quiet.reply {
+            let _ = reply.send(match quiet.error {
+                None => Ok(()),
+                Some(text) => Err(ClientError::Server(text)),
+            });
         }
         Ok(())
     }
@@ -1255,14 +1339,20 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
                 quiet: Some(quiet), ..
             }) if quiet.error.is_none() => {
                 quiet.error = Some(text.clone());
-                match quiet.kind {
-                    QuietKind::Plain => {}
+                match quiet.kind.clone() {
+                    QuietKind::Plain | QuietKind::Join { .. } => {}
                     QuietKind::Invite(id) => self.invite_refused(id, &text),
                     QuietKind::UploadChunk { gen, .. } => {
-                        if self.is_current(gen) {
-                            let err = ClientError::Transfer(text.clone());
-                            self.fail_transfer(err, Cleanup::Keep).await;
+                        if !self.is_current(gen) {
+                            // A chunk of an upload that has already ended
+                            // (server abort, earlier chunk refused, cancel):
+                            // every chunk still in flight gets the same
+                            // refusal, which says nothing new.
+                            debug!("error for a chunk of a finished upload: {text}");
+                            return Ok(());
                         }
+                        let err = ClientError::Transfer(text.clone());
+                        self.fail_transfer(err, Cleanup::Keep).await;
                     }
                 }
             }
@@ -1285,7 +1375,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
         self.next_invite += 1;
         let id = self.next_invite;
         match self
-            .send_quiet(PacketType::ChatInvite, ChatInvite { to }.encode(), QuietKind::Invite(id))
+            .send_quiet(
+                PacketType::ChatInvite,
+                ChatInvite { to }.encode(),
+                Quiet::new(QuietKind::Invite(id)),
+            )
             .await
         {
             Ok(()) => {
@@ -1609,8 +1703,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
             status: TRANSFER_ABORTED,
             message: "cancelled by client".into(),
         };
+        let quiet = Quiet::new(QuietKind::Plain);
         if let Err(SendError::Fatal(e)) = self
-            .send_quiet(PacketType::FileTransferEnd, end.encode(), QuietKind::Plain)
+            .send_quiet(PacketType::FileTransferEnd, end.encode(), quiet)
             .await
         {
             self.dead = Some(format!("write failed: {e}"));
@@ -2031,7 +2126,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
             index,
         };
         match self
-            .send_quiet(PacketType::FileTransferData, data.encode(), kind)
+            .send_quiet(PacketType::FileTransferData, data.encode(), Quiet::new(kind))
             .await
         {
             Ok(()) => {}
@@ -2501,6 +2596,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
                 .send(Err(ClientError::AuthFailed(message.clone())));
             return Err(ClientError::AuthFailed(message));
         }
+        self.authenticated = true;
         let _ = login.reply.send(Ok(Session {
             session_id: result.session_id,
             class: result.class,
@@ -2522,11 +2618,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
     }
 
     /// Send a payload, fragmenting it when it exceeds the frame cap. A
-    /// payload the server could never reassemble fails only this request.
+    /// payload over the server's reassembly cap for its type (which the
+    /// server treats as a protocol violation and drops the connection for)
+    /// fails only this request.
     async fn send(&mut self, packet_type: PacketType, payload: Bytes) -> Result<(), SendError> {
-        if payload.len() > MAX_OUTBOUND_PAYLOAD {
+        let cap = kdx_protocol::max_request_payload(packet_type);
+        if payload.len() > cap {
             return Err(SendError::Rejected(ClientError::InvalidInput(format!(
-                "request too large ({} bytes)",
+                "request too large ({} bytes; the server accepts at most {cap})",
                 payload.len()
             ))));
         }

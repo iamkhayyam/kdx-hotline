@@ -2,7 +2,7 @@ import { invoke, deliver, currentGeneration } from "../bridge.js";
 import { getState, update } from "../store.js";
 import { showMenu } from "../menu.js";
 import { esc, errorText } from "../html.js";
-import { inCurrentRoom, shouldAdoptRoom, INVITE_ADOPT_MS } from "../rooms.js";
+import { inCurrentRoom, shouldAdoptRoom, createJoinTracker, INVITE_ADOPT_MS } from "../rooms.js";
 
 const CHAT_ACTION = 1 << 0;
 const CHAT_SYSTEM = 1 << 1;
@@ -41,7 +41,8 @@ const SLASH_HELP = [
   "/help — this list",
 ];
 
-export function buildChat() {
+/** opts.onUserCount(n): the room on screen now has `n` members. */
+export function buildChat(opts = {}) {
   const body = document.createElement("div");
   body.className = "col-fill";
   body.innerHTML = `
@@ -66,6 +67,8 @@ export function buildChat() {
   // Set while an invite we sent is waiting for the server to tell us the id
   // of the private room it put us in: { to, until }.
   let pendingInvite = null;
+  // A join waiting for the server's answer, and what arrived for its room.
+  const joins = createJoinTracker();
 
   function renderRoomTag() {
     const room = getState().room;
@@ -82,7 +85,7 @@ export function buildChat() {
     update({ room, users: [], topic: "" });
     saveRoom(room);
     topicTextEl.textContent = "topic: —";
-    usersEl.textContent = "";
+    applyUsers([]);
     renderRoomTag();
     scroll.textContent = "";
     lineText("sys", banner);
@@ -100,18 +103,29 @@ export function buildChat() {
   async function switchRoom(room) {
     const previous = getState().room;
     if (previous === room) return;
+    joins.begin(room);
     try {
+      // Resolves only once the server has let us in (a refusal — e.g. a
+      // private room whose other member already left — rejects).
       await invoke("join_room", { room });
     } catch (err) {
-      lineText("err", "! " + errorText(err));
+      joins.abort(room);
+      const here = previous === DEFAULT_ROOM ? "the lobby" : "this chat";
+      lineText("err", `! couldn't join: ${errorText(err)} — still in ${here}`);
       return; // the join itself failed — we're still in the old room
     }
-    // The join succeeded, so we ARE in the new room now from the user's
-    // point of view — reflect that immediately. Leaving the old room is
-    // best-effort cleanup after the fact; if it fails, that's a stale
-    // server-side membership to warn about, not a reason to tell the user
-    // they never actually switched.
+    // The server confirmed the join, so we ARE in the new room now —
+    // reflect that, with whatever arrived for it meanwhile. Leaving the old
+    // room is best-effort cleanup after the fact; if it fails, that's a
+    // stale server-side membership to warn about, not a reason to tell the
+    // user they never actually switched.
+    const early = joins.finish(room);
     showRoom(room, `*** now in ${room === DEFAULT_ROOM ? "the lobby" : "a private chat"}`);
+    if (early) {
+      if (early.users) applyUsers(early.users);
+      if (early.topic != null) topicTextEl.textContent = "topic: " + (early.topic || "—");
+      for (const ev of early.lines) api.onChat(ev);
+    }
     await leaveBestEffort(previous);
   }
 
@@ -282,6 +296,7 @@ export function buildChat() {
 
   function applyUsers(users) {
     update({ users });
+    if (opts.onUserCount) opts.onUserCount(users.length);
     usersEl.textContent = "";
     const me = getState().session && getState().session.username;
     for (const u of users) {
@@ -309,7 +324,10 @@ export function buildChat() {
   const api = {
     body,
     onChat(ev) {
-      if (!inCurrentRoom(ev, getState().room)) return;
+      if (!inCurrentRoom(ev, getState().room)) {
+        joins.offer(ev);
+        return;
+      }
       const ts = hhmm(ev.timestamp);
       if (ev.flags & CHAT_SYSTEM) {
         addLine("sys", [["ts", ts], [null, `*** ${ev.text}`]]);
@@ -323,6 +341,8 @@ export function buildChat() {
     onUserList(ev) {
       const current = getState().room;
       if (ev.room !== current) {
+        // The room we're joining: applied once the join is confirmed.
+        if (joins.offer(ev)) return false;
         if (shouldAdoptRoom(ev.room, current, pendingInvite)) {
           adoptPrivateRoom(ev.room, ev.users);
           return true;
@@ -333,7 +353,10 @@ export function buildChat() {
       return true;
     },
     onTopic(ev) {
-      if (!inCurrentRoom(ev, getState().room)) return;
+      if (!inCurrentRoom(ev, getState().room)) {
+        joins.offer(ev);
+        return;
+      }
       topicTextEl.textContent = "topic: " + (ev.topic || "—");
     },
     onInvited: onInvited,
@@ -342,6 +365,7 @@ export function buildChat() {
      * in the lobby again. */
     onDisconnected() {
       pendingInvite = null;
+      if (joins.room) joins.abort(joins.room);
       update({ room: DEFAULT_ROOM, users: [], topic: "" });
       saveRoom(DEFAULT_ROOM);
       usersEl.textContent = "";

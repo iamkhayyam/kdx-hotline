@@ -30,6 +30,27 @@ test("flags inline style and handlers (CSP)", () => {
   assert.ok(rules('el.setAttribute("style", "color:red");').includes("inline-style"));
 });
 
+test("flags the browser's modal dialogs (C-1)", () => {
+  // The audit's sites: an async confirm() is a truthy Promise.
+  assert.ok(rules("if (!confirm(`Delete ${kind}?`)) { return; }").includes("dialog"));
+  assert.ok(rules("if (!confirm('Shut down?')) return;").includes("dialog"));
+  assert.ok(rules("try { x(); } catch (err) { alert(errorText(err)); }").includes("dialog"));
+  assert.ok(rules("const name = prompt('name?');").includes("dialog"));
+  assert.ok(rules("window.confirm('sure?');").includes("dialog"));
+  assert.ok(rules("const ask = window.confirm;").includes("dialog"));
+  assert.ok(rules("globalThis.alert?.('x');").includes("dialog"));
+  // Not a dialog: methods / properties of other objects, definitions.
+  for (const src of [
+    "await invoke('trust', { host, port, confirm: code });",
+    "opts.confirm(x); api.alert(y);",
+    "const o = { confirm(x) { return x; } };",
+    "function confirm(x) { return x; }",
+    "await confirmThen(() => askConfirm('sure?'), go);",
+  ]) {
+    assert.ok(!rules(src).includes("dialog"), src);
+  }
+});
+
 test("accepts escaped, numeric and trusted-helper interpolations", () => {
   const ok = [
     "el.innerHTML = `<div>${esc(err.message)}</div>`;",

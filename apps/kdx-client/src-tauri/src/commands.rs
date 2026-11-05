@@ -605,8 +605,19 @@ pub async fn upload<R: Runtime>(
     if !local.is_absolute() || !is_file {
         return Err(CmdError::msg("pick a regular file to upload"));
     }
-    handle.upload(local, &remote_dir).await.map_err(CmdError::msg)?;
+    handle.upload(local, &remote_dir).await.map_err(transfer_error)?;
     Ok(true)
+}
+
+/// A transfer's failure for the webview. A connection that ended mid-way
+/// (whichever side hung up) reads as such, not as "closed by server".
+fn transfer_error(e: ClientError) -> CmdError {
+    match e {
+        ClientError::Disconnected => {
+            CmdError::msg("the connection ended before the transfer finished")
+        }
+        e => CmdError::msg(e),
+    }
 }
 
 /// Download `remote_path` to a location the user picks in the native Save
@@ -640,8 +651,16 @@ pub async fn download<R: Runtime>(
     handle
         .download(&remote_path, local)
         .await
-        .map_err(CmdError::msg)?;
+        .map_err(transfer_error)?;
     Ok(true)
+}
+
+/// Abort the connection's active upload or download (one runs at a time).
+/// Its `upload`/`download` call then fails with "cancelled"; a cancelled
+/// download keeps its resume state. Resolves whether one was running.
+#[tauri::command]
+pub async fn cancel_transfer(state: State<'_, AppState>) -> CmdResult<bool> {
+    with_client(&state, |c| async move { c.cancel_transfer().await }).await
 }
 
 /// Hang up the current connection. Never holds the state lock across an
@@ -864,6 +883,24 @@ pub async fn set_identity(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn message(e: CmdError) -> String {
+        match e {
+            CmdError::Message { message } => message,
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    /// C-5: a transfer cut off by the user's own Disconnect no longer reads
+    /// "connection closed by server".
+    #[test]
+    fn a_transfer_cut_off_by_a_disconnect_says_so() {
+        let text = message(transfer_error(ClientError::Disconnected));
+        assert!(!text.contains("server"), "{text}");
+        assert!(text.contains("connection ended"), "{text}");
+        let text = message(transfer_error(ClientError::Transfer("cancelled".into())));
+        assert_eq!(text, "transfer failed: cancelled");
+    }
 
     fn pending(previous: Option<&str>) -> PendingTrust {
         PendingTrust {

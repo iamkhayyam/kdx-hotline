@@ -38,6 +38,7 @@ const COMMANDS: &[&str] = &[
     "invite_to_chat",
     "upload",
     "download",
+    "cancel_transfer",
     "disconnect",
     "list_roles",
     "create_role",

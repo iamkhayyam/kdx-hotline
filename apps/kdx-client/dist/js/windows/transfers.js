@@ -29,7 +29,17 @@ export function cellsFor(ev) {
   return out;
 }
 
-export function buildTransfers() {
+/** Transfers still running (cards without a final state), for a card map
+ * of id -> { done }. */
+export function unfinishedIds(cards) {
+  return [...cards].filter(([, c]) => !c.done).map(([id]) => id);
+}
+
+/**
+ * opts.onCancel(id): the user clicked Cancel on a running transfer's card
+ * (a connection runs one transfer at a time, so this cancels that one).
+ */
+export function buildTransfers(opts = {}) {
   const body = document.createElement("div");
   body.className = "win-body grow";
   body.innerHTML = '<div class="empty">no transfers</div>';
@@ -43,7 +53,8 @@ export function buildTransfers() {
       const el = document.createElement("div");
       el.className = "xfer";
       el.innerHTML =
-        '<div class="row1"><span class="name"></span><span class="stat"></span></div>' +
+        '<div class="row1"><span class="name"></span><span><span class="stat"></span>' +
+        '<button class="mini xfer-cancel">Cancel</button></span></div>' +
         '<div class="bitmap"></div>' +
         '<div class="row2"><span class="lbl"></span><span class="pct"></span></div>';
       body.prepend(el);
@@ -54,11 +65,28 @@ export function buildTransfers() {
         bitmap: el.querySelector(".bitmap"),
         lbl: el.querySelector(".lbl"),
         pct: el.querySelector(".pct"),
+        cancel: el.querySelector(".xfer-cancel"),
         states: [],
+        done: false,
       };
+      card.cancel.addEventListener("click", () => {
+        if (card.done || !opts.onCancel) return;
+        card.cancel.disabled = true;
+        card.lbl.textContent = "cancelling…";
+        opts.onCancel(id);
+      });
       cards.set(id, card);
     }
     return card;
+  }
+
+  /** Give a card its final state. */
+  function finish(card, verified, text) {
+    card.done = true;
+    card.el.classList.add("done");
+    card.el.classList.toggle("failed", !verified);
+    card.stat.textContent = verified ? "100%" : "failed";
+    card.lbl.textContent = text;
   }
 
   function renderCells(card, cells) {
@@ -85,6 +113,12 @@ export function buildTransfers() {
     body,
     onProgress(ev) {
       const card = ensureCard(ev.id);
+      if (card.done) {
+        // Running again (a resumed download can keep its id).
+        card.done = false;
+        card.el.classList.remove("done", "failed");
+        card.cancel.disabled = false;
+      }
       const arrow = ev.direction === "download" ? "↓" : "↑";
       card.name.textContent = `${arrow} ${shortId(ev.id)}`;
       card.stat.textContent = ev.total ? Math.floor((ev.done / ev.total) * 100) + "%" : "—";
@@ -94,10 +128,22 @@ export function buildTransfers() {
     },
     onComplete(ev) {
       const card = ensureCard(ev.id);
-      card.el.classList.add("done");
       const verified = ev.status === 0;
-      card.stat.textContent = verified ? "100%" : "failed";
-      card.lbl.textContent = verified ? "verified ✓" : ev.message;
+      finish(card, verified, verified ? "verified ✓" : ev.message);
+    },
+    /** The connection ended: transfers still running ended with it (their
+     * own abort event can't arrive any more). Returns their ids. */
+    onDisconnected(reason) {
+      const ids = unfinishedIds(cards);
+      for (const id of ids) finish(cards.get(id), false, `aborted — ${reason || "disconnected"}`);
+      return ids;
+    },
+    /** Cancelling failed (e.g. nothing was running any more). */
+    onCancelFailed(id, text) {
+      const card = cards.get(id);
+      if (!card || card.done) return;
+      card.cancel.disabled = false;
+      card.lbl.textContent = text;
     },
   };
 }

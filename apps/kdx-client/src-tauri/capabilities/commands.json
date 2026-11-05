@@ -40,8 +40,15 @@
         "allow-search-files",
         "allow-get-file-info",
         "allow-upload",
-        "allow-download"
+        "allow-download",
+        "allow-cancel-transfer"
       ]
+    },
+    {
+      "identifier": "transfers-commands",
+      "description": "File Transfers window: cancel the running transfer (nothing else).",
+      "windows": ["transfers"],
+      "permissions": ["allow-cancel-transfer"]
     },
     {
       "identifier": "addressbook-commands",

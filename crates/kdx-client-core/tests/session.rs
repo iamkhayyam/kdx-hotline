@@ -1597,8 +1597,10 @@ async fn min_class_join_gate_refuses_below_threshold() {
     let (user, mut e_user, _d2) = ts.connect_client().await;
     next_event(&mut e_user).await;
     user.login("user", "pw").await.unwrap();
-    user.join("green-room").await.unwrap();
-    // The refusal comes back as a ServerError.
+    // The join itself reports the refusal…
+    let err = user.join("green-room").await.unwrap_err();
+    assert!(matches!(err, ClientError::Server(ref t) if t.contains("class")), "{err:?}");
+    // …which also still comes back as a ServerError.
     let mut saw_err = false;
     for _ in 0..10 {
         if let Event::ServerError { text } = next_event(&mut e_user).await {
@@ -1633,6 +1635,83 @@ async fn plain_member_cannot_change_room_flags() {
         }
     }
     assert!(saw_err, "non-privileged member should get a privilege error");
+
+    ts.stop();
+}
+
+/// C-2: a join the server refuses fails the call (it used to resolve Ok as
+/// soon as it was written). Here B accepts an invitation after the inviter
+/// left, so the private room is gone; B must still be in the lobby.
+#[tokio::test]
+async fn joining_a_vanished_private_room_is_refused_and_keeps_the_lobby() {
+    let ts = TestServer::start().await;
+    ts.seed_account("alice", "pw", 1).await;
+    ts.seed_account("bob", "pw", 1).await;
+
+    let (alice, mut ea, _d1) = ts.connect_client().await;
+    next_event(&mut ea).await;
+    alice.login("alice", "pw").await.unwrap();
+    alice.join("lobby").await.unwrap();
+    let (bob, mut eb, _d2) = ts.connect_client().await;
+    next_event(&mut eb).await;
+    bob.login("bob", "pw").await.unwrap();
+    bob.join("lobby").await.unwrap();
+
+    let room = alice.invite_to_chat("bob").await.unwrap();
+    // Alice goes "Back to Lobby": the private room's last member leaves and
+    // the room is dropped (a round trip makes sure the server got there).
+    alice.leave(&room).await.unwrap();
+    alice.list_users().await.unwrap();
+
+    let err = bob.join(&room).await.unwrap_err();
+    assert!(matches!(err, ClientError::Server(ref t) if t.contains("invited")), "{err:?}");
+
+    // Bob is still in the lobby.
+    alice.send_chat("lobby", 0, "still here?").await.unwrap();
+    let (sender, text, _) = wait_chat(&mut eb, false).await;
+    assert_eq!((sender.as_str(), text.as_str()), ("alice", "still here?"));
+
+    ts.stop();
+}
+
+/// P-2: a request over the server's per-type reassembly cap (64 KiB for
+/// control messages) is refused locally instead of getting the session
+/// dropped as a protocol violation.
+#[tokio::test]
+async fn an_oversized_chat_line_fails_alone() {
+    let ts = TestServer::start().await;
+    ts.seed_account("user", "pw", 1).await;
+    let (client, mut events, _dd) = ts.connect_client().await;
+    next_event(&mut events).await;
+    client.login("user", "pw").await.unwrap();
+    client.join("lobby").await.unwrap();
+
+    let err = client.send_chat("lobby", 0, &"x".repeat(65_530)).await.unwrap_err();
+    assert!(matches!(err, ClientError::InvalidInput(_)), "{err:?}");
+    // The session survived.
+    client.list_users().await.unwrap();
+    client.send_chat("lobby", 0, "short").await.unwrap();
+    let (_, text, _) = wait_chat(&mut events, false).await;
+    assert_eq!(text, "short");
+
+    ts.stop();
+}
+
+/// P-3: logging in twice on one connection is refused at once and leaves
+/// the session working.
+#[tokio::test]
+async fn a_second_login_is_refused_at_once() {
+    let ts = TestServer::start().await;
+    ts.seed_account("user", "pw", 1).await;
+    let (client, mut events, _dd) = ts.connect_client().await;
+    next_event(&mut events).await;
+    client.login("user", "pw").await.unwrap();
+
+    let again = tokio::time::timeout(Duration::from_secs(5), client.login("user", "pw"))
+        .await
+        .expect("refused at once");
+    assert!(matches!(again, Err(ClientError::InvalidInput(_))), "{again:?}");
+    client.list_users().await.unwrap();
 
     ts.stop();
 }

@@ -23,12 +23,19 @@
 //  4. No `style=` or `on<event>=` attributes inside markup, and no
 //     `setAttribute("style"|"on…")` (CSP: style-src 'self', no inline
 //     handlers). Use classes, or set `el.style.prop` (CSSOM) instead.
+//  5. No browser modal dialogs: no `confirm(…)`, `alert(…)` or `prompt(…)`
+//     calls and no `window.confirm` etc. tauri-plugin-dialog replaces them
+//     with async stubs, so `if (!confirm(…)) return;` never stops (a Promise
+//     is truthy) and alert() silently fails. Use confirm.js's
+//     askConfirm()/confirmThen() and show errors inline.
 
 import { readFileSync, readdirSync, statSync } from "node:fs";
 import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const MARKUP = /<\/?[a-zA-Z!]/;
+const DIALOGS = new Set(["confirm", "alert", "prompt"]);
+const GLOBAL_OBJECTS = new Set(["window", "globalThis", "self", "top", "parent"]);
 const REGEX_KEYWORDS = new Set([
   "return", "typeof", "case", "do", "else", "in", "of", "new", "delete",
   "void", "throw", "instanceof", "yield", "await",
@@ -323,6 +330,24 @@ function checkStream(toks, src, flag) {
       const arg = toks[k + 2];
       if (arg && arg.type === "str" && /^["'](style|on[a-z]+)["']$/i.test(arg.value)) {
         flag(t.start, "inline-style", `setAttribute(${arg.value}, …) is blocked by CSP`);
+      }
+    }
+
+    // Rule 5: browser modal dialogs (see the header).
+    if (t.type === "ident" && DIALOGS.has(t.value)) {
+      const member = prev && prev.type === "punct" && (prev.value === "." || prev.value === "?.");
+      if (member) {
+        const obj = toks[k - 2];
+        if (obj && obj.type === "ident" && GLOBAL_OBJECTS.has(obj.value)) {
+          flag(t.start, "dialog", `${obj.value}.${t.value} is not allowed; use confirm.js / inline errors`);
+        }
+      } else if (next && next.value === "(" && !(prev && prev.value === "function")) {
+        // `name(…) {` is a method definition, not a call.
+        const close = matchClose(toks, k + 1);
+        const after = close === -1 ? null : toks[close + 1];
+        if (!(after && after.value === "{")) {
+          flag(t.start, "dialog", `${t.value}() is not allowed; use confirm.js / inline errors`);
+        }
       }
     }
 

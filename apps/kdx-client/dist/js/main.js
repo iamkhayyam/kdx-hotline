@@ -22,7 +22,7 @@ import {
   logicalSize,
 } from "./bridge.js";
 import { initDesktop, open, toggle, hide, show, onChange, isOpen } from "./wm.js";
-import { getState, subscribe, update, updateTransfer } from "./store.js";
+import { getState, subscribe, update, trackTransfers } from "./store.js";
 import { buildButtonBar } from "./buttonbar.js";
 import { mountFeature, registerAll, FEATURES } from "./windows/registry.js";
 import { showMenu } from "./menu.js";
@@ -167,14 +167,15 @@ function mountLauncher() {
         update({ presenceCount: online.size });
         break;
       case "transfer_progress":
-        updateTransfer(ev.id, { direction: ev.direction, done: ev.done, total: ev.total });
-        break;
       case "transfer_complete":
-        updateTransfer(ev.id, { status: ev.status });
+        trackTransfers(ev);
         break;
       case "disconnected":
         online.clear();
         buttonBar.setLed(false);
+        // A transfer cut off by the disconnect never gets its own abort
+        // event through: stop counting it.
+        trackTransfers(ev);
         update({ connection: "offline", session: null, presenceCount: 0 });
         open("connect");
         break;
