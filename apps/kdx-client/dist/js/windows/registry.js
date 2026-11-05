@@ -41,6 +41,7 @@ import { buildIpRules } from "./iprules.js";
 import { buildConnections } from "./connections.js";
 import { buildNews } from "./news.js";
 import { buildTrackers } from "./trackers.js";
+import { buildBans } from "./bans.js";
 
 // Each feature: { id, title, rect, resizable?, mount(tagRef) -> { body, initialTag? } }.
 // mount() builds the module, wires its event slices, and returns the body.
@@ -68,6 +69,7 @@ export const FEATURES = [
   { id: "connections", title: "Connections", rect: { x: 260, y: 60, w: 720, h: 460 }, minW: 560, minH: 300, mount: mountConnections },
   { id: "news", title: "Public News", rect: { x: 240, y: 60, w: 640, h: 460 }, minW: 480, minH: 300, mount: mountNews },
   { id: "trackers", title: "Trackers", rect: { x: 300, y: 120, w: 420, h: 360 }, minW: 340, minH: 240, mount: mountTrackers },
+  { id: "bans", title: "Bans", rect: { x: 340, y: 110, w: 600, h: 420 }, minW: 460, minH: 280, mount: mountBans },
 ];
 
 /** Register every feature window's config with the window manager. */
@@ -316,11 +318,17 @@ function mountConnections(tagRef) {
 function mountNews(tagRef) {
   const api = buildNews();
   api.refresh();
-  return { body: api.body };
+  return { body: api.body, afterHydrate: api.afterHydrate };
 }
 
 function mountTrackers(tagRef) {
   const api = buildTrackers();
   api.refresh();
   return { body: api.body };
+}
+
+function mountBans(tagRef) {
+  const api = buildBans();
+  api.refresh();
+  return { body: api.body, afterHydrate: api.afterHydrate };
 }

@@ -19,7 +19,8 @@ pub use account::{
     AccountCreate, AccountListRequest, AccountListResponse, AccountSummary, AccountUpdate,
 };
 pub use admin::{
-    AdminBroadcast, AdminDisconnect, AdminShutdown, ConnectionListRequest,
+    AdminBroadcast, AdminDisconnect, AdminShutdown, BanEntry, BanListRequest, BanListResponse,
+    BanRemove, ConnectionListRequest,
     ConnectionListResponse, HistoryEntry, HistoryListRequest, HistoryListResponse, IpRuleCreate,
     IpRuleDelete, IpRuleEntry, IpRuleListRequest, IpRuleListResponse, ServerSettingsRequest,
     ServerSettingsResponse, ServerSettingsUpdate,
@@ -40,7 +41,8 @@ pub use file::{
 pub use handshake::{HandshakeInit, HandshakeResp};
 pub use news::{
     NewsPost, NewsPostCreate, NewsPostDelete, NewsThreadListRequest, NewsThreadListResponse,
-    NewsgroupCreate, NewsgroupInfo, NewsgroupListRequest, NewsgroupListResponse,
+    NewsgroupCreate, NewsgroupDelete, NewsgroupInfo, NewsgroupListRequest, NewsgroupListResponse,
+    NewsgroupUpdate,
 };
 pub use presence::{
     PresenceChange, PresenceEntry, PresenceListRequest, PresenceListResponse, SetIdentity,

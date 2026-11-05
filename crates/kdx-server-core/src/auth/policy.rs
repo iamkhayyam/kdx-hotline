@@ -22,6 +22,12 @@
 //! - **Last admin.** No change may leave the server without an Admin-class
 //!   account that still holds both USER_ADMIN and SERVER_ADMIN.
 //!
+//! Lifting a ban (USER_BAN) follows the rule bans are placed by (see
+//! `kdx_storage::bans::set_ranked`): a ban may be lifted by any Admin, by a
+//! class strictly above the class that set it, or by its own banner at the
+//! same or a higher class — so a lower rank can never undo a higher rank's
+//! ban. As with kicks, nobody acts on an account of a higher class.
+//!
 //! The actor's authority is the login snapshot narrowed by the stored account
 //! (lower class, intersected privileges): a demotion bites these checks at
 //! once, even before the demoted session is kicked, while a promotion waits
@@ -35,7 +41,7 @@ use uuid::Uuid;
 
 use super::classes::{effective_privileges, BaseClass, Privileges};
 use super::manager::{AuthError, Session};
-use super::roles::RoleError;
+use super::roles::{BanRecord, BanRemoval, RoleError};
 use crate::connection::ServerCtx;
 use crate::limits;
 
@@ -73,6 +79,10 @@ pub enum Denied {
     SelfEscalation,
     #[error("refusing: this would leave the server without an administrator")]
     LastAdmin,
+    #[error("that ban was set by someone at or above your rank")]
+    BanOutranks,
+    #[error("cannot unban a higher-class user")]
+    UnbanOutranks,
 }
 
 /// A failed admin request, split by what the client may see.
@@ -312,6 +322,17 @@ pub fn check_role_holders(actor: &Authority, holders: &[AccountState]) -> Result
     }
 }
 
+/// Whether `actor` may lift a ban set by `banned_by` at class
+/// `banned_by_class` — the mirror of `kdx_storage::bans::set_ranked`, under
+/// which a ban is replaced outright only by a higher class or by its own
+/// banner at the same or a higher class. Admins may lift any ban.
+pub fn may_lift_ban(actor: &Actor, banned_by: &str, banned_by_class: BaseClass) -> bool {
+    let class = actor.authority.class;
+    class == BaseClass::Admin
+        || class > banned_by_class
+        || (actor.username == banned_by && class >= banned_by_class)
+}
+
 /// Whether going from `before` to `after` takes away an administrator.
 pub fn removes_administrator(before: &AccountState, after: &AccountState) -> bool {
     before.administers() && !after.administers()
@@ -454,6 +475,45 @@ pub async fn update_account(ctx: &ServerCtx, session: &Session, req: &AccountUpd
         .map_err(|e| Refusal::auth(WHAT, e, "no such account"))?;
     kick_changed(ctx, vec![target]).await;
     Ok(())
+}
+
+/// The account performing a ban-list request: anyone holding USER_BAN
+/// (checked against the stored account too, like every admin request).
+pub async fn check_ban_viewer(ctx: &ServerCtx, session: &Session) -> Result<Actor, Refusal> {
+    resolve_actor(ctx, session, Privileges::USER_BAN).await
+}
+
+/// BanRemove under the policy: lifts the ban on `username` and returns it.
+/// Refused unless the actor holds USER_BAN, the target doesn't outrank the
+/// actor, and [`may_lift_ban`] allows it; the rank check and the delete are
+/// atomic, so a concurrent higher-rank re-ban is never lifted by mistake.
+pub async fn remove_ban(ctx: &ServerCtx, session: &Session, username: &str) -> Result<BanRecord, Refusal> {
+    const WHAT: &str = "unban";
+    if username.is_empty() {
+        return Err(Refusal::denied("username is required"));
+    }
+    limits::check_len("username", username, limits::MAX_USERNAME_LEN).map_err(Refusal::denied)?;
+    // Same serialization as other privilege-checked mutations, so a
+    // demotion can't land between the actor check and the write.
+    let _guard = ctx.roles.lock_mutations().await;
+    let actor = resolve_actor(ctx, session, Privileges::USER_BAN).await?;
+    let target = existing_account(ctx, WHAT, username).await?;
+    if target.class > actor.authority.class {
+        return Err(Denied::UnbanOutranks.into());
+    }
+    let now = crate::presence::unix_now() as i64;
+    let removal = ctx
+        .roles
+        .remove_ban(&target.account_id, &target.username, now, |banned_by, class| {
+            may_lift_ban(&actor, banned_by, class)
+        })
+        .await
+        .map_err(|e| Refusal::internal(WHAT, e))?;
+    match removal {
+        BanRemoval::Removed(ban) => Ok(ban),
+        BanRemoval::NotBanned => Err(Refusal::denied(format!("{} is not banned", target.username))),
+        BanRemoval::Refused(_) => Err(Denied::BanOutranks.into()),
+    }
 }
 
 /// RoleCreate under the policy.
@@ -692,6 +752,29 @@ mod tests {
         assert!(!removes_administrator(&admin, &harmless));
         assert!(privileges_changed(&admin, &harmless));
         assert!(!privileges_changed(&admin, &admin.clone()));
+    }
+
+    #[test]
+    fn ban_lifting_mirrors_ranked_placement() {
+        let class = |c| state("x", c, Privileges::USER_BAN, Privileges::empty());
+        let actor = |name: &str, c| Actor {
+            username: name.into(),
+            authority: class(c).authority(),
+        };
+        let moderator = actor("mod", BaseClass::PowerUser);
+        // A higher rank's ban stays put; so does a peer's.
+        assert!(!may_lift_ban(&moderator, "sysop", BaseClass::Admin));
+        assert!(!may_lift_ban(&moderator, "othermod", BaseClass::PowerUser));
+        // One's own ban, or a lower rank's, can go.
+        assert!(may_lift_ban(&moderator, "mod", BaseClass::PowerUser));
+        assert!(may_lift_ban(&moderator, "helper", BaseClass::User));
+        // A banner since demoted below the ban's class can't undo it.
+        let demoted = actor("mod", BaseClass::User);
+        assert!(!may_lift_ban(&demoted, "mod", BaseClass::PowerUser));
+        // Admins lift anything, other admins' bans included.
+        let admin = actor("sysop", BaseClass::Admin);
+        assert!(may_lift_ban(&admin, "root", BaseClass::Admin));
+        assert!(may_lift_ban(&admin, "mod", BaseClass::PowerUser));
     }
 
     #[test]

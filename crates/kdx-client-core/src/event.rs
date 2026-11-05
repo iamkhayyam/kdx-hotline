@@ -234,6 +234,49 @@ impl From<kdx_protocol::messages::IpRuleEntry> for IpRule {
     }
 }
 
+/// One account ban in force (the Bans window). Mirrors
+/// `kdx_protocol::messages::BanEntry`.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct BanEntry {
+    pub username: String,
+    /// Unix seconds; the ban is in force while now < `until`.
+    pub until: u64,
+    pub reason: String,
+    pub banned_by: String,
+    /// Class (0 guest … 3 admin) of `banned_by` when the ban was set.
+    pub banned_by_class: u8,
+}
+
+impl From<kdx_protocol::messages::BanEntry> for BanEntry {
+    fn from(b: kdx_protocol::messages::BanEntry) -> Self {
+        Self {
+            username: b.username,
+            until: b.until,
+            reason: b.reason,
+            banned_by: b.banned_by,
+            banned_by_class: b.banned_by_class,
+        }
+    }
+}
+
+/// The bans in force, as the server lists them: the longest-lasting first,
+/// at most a server-side cap of them. `total` counts every ban in force, so
+/// `total > bans.len()` means the list was cut.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct BanList {
+    pub total: u32,
+    pub bans: Vec<BanEntry>,
+}
+
+impl From<kdx_protocol::messages::BanListResponse> for BanList {
+    fn from(r: kdx_protocol::messages::BanListResponse) -> Self {
+        Self {
+            total: r.total,
+            bans: r.bans.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
 /// Current server settings (the Server Settings window). Mirrors
 /// `kdx_protocol::messages::ServerSettingsResponse`. `port`,
 /// `max_upload_bytes_per_sec`, and `max_download_bytes_per_sec` are

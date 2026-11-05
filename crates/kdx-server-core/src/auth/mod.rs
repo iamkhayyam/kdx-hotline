@@ -9,4 +9,4 @@ pub use limiter::LoginLimiter;
 pub use manager::{
     AuthError, AuthManager, ChallengeData, PendingAuth, Session, SessionGuard, Verified,
 };
-pub use roles::{Role, RoleError, RoleManager};
+pub use roles::{BanRecord, BanRemoval, Role, RoleError, RoleManager};

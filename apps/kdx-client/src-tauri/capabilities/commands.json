@@ -124,13 +124,21 @@
         "allow-create-newsgroup",
         "allow-list-thread",
         "allow-create-post",
-        "allow-delete-post"
+        "allow-delete-post",
+        "allow-update-newsgroup",
+        "allow-delete-newsgroup"
       ]
     },
     {
       "identifier": "trackers-commands",
       "windows": ["trackers"],
       "permissions": ["allow-list-servers"]
+    },
+    {
+      "identifier": "bans-commands",
+      "description": "Bans window: list the bans in force and lift one (USER_BAN, server-enforced).",
+      "windows": ["bans"],
+      "permissions": ["allow-list-bans", "allow-remove-ban"]
     }
   ]
 }

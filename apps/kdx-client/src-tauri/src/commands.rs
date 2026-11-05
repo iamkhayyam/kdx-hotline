@@ -11,9 +11,9 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use kdx_client_core::{
-    connect as core_connect, trust_server, AccountSummary, ClientConfig, ClientError, ClientHandle,
-    FileInfoResponse, FileSearchEntry, HistoryEntry, IpRule, NewsPost, NewsgroupInfo,
-    PresenceUser, RoleInfo, ServerSettings, TrackerServer,
+    connect as core_connect, trust_server, AccountSummary, BanList, ClientConfig, ClientError,
+    ClientHandle, FileInfoResponse, FileSearchEntry, HistoryEntry, IpRule, NewsPost,
+    NewsgroupInfo, PresenceUser, RoleInfo, ServerSettings, TrackerServer,
 };
 use serde::Serialize;
 use tauri::{AppHandle, Manager, Runtime, State, Window};
@@ -833,6 +833,37 @@ pub async fn create_post(
 #[tauri::command]
 pub async fn delete_post(state: State<'_, AppState>, post_id: String) -> CmdResult<Vec<NewsPost>> {
     with_client(&state, |c| async move { c.delete_post(&post_id).await }).await
+}
+
+#[tauri::command]
+pub async fn update_newsgroup(
+    state: State<'_, AppState>,
+    id: String,
+    name: String,
+    description: String,
+    min_read_class: u8,
+    min_post_class: u8,
+) -> CmdResult<Vec<NewsgroupInfo>> {
+    with_client(&state, |c| async move {
+        c.update_newsgroup(&id, &name, &description, min_read_class, min_post_class)
+            .await
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn delete_newsgroup(state: State<'_, AppState>, id: String) -> CmdResult<Vec<NewsgroupInfo>> {
+    with_client(&state, |c| async move { c.delete_newsgroup(&id).await }).await
+}
+
+#[tauri::command]
+pub async fn list_bans(state: State<'_, AppState>) -> CmdResult<BanList> {
+    with_client(&state, |c| async move { c.list_bans().await }).await
+}
+
+#[tauri::command]
+pub async fn remove_ban(state: State<'_, AppState>, username: String) -> CmdResult<BanList> {
+    with_client(&state, |c| async move { c.remove_ban(&username).await }).await
 }
 
 #[derive(Serialize)]

@@ -128,6 +128,106 @@ pub async fn active(
     Ok(row)
 }
 
+/// An active ban with the banned account's username and the banner's class,
+/// as listed in the admin Bans window.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct BanListing {
+    pub username: String,
+    pub until: i64,
+    pub reason: String,
+    pub banned_by: String,
+    pub banned_by_class: i64,
+}
+
+/// The bans in force at `now`: at most `limit` of them, longest-lasting
+/// first (`until` descending, ties by username), plus how many are in force
+/// altogether. Lapsed rows are skipped, not swept (this is a read).
+pub async fn list_active(
+    pool: &SqlitePool,
+    now: i64,
+    limit: i64,
+) -> Result<(Vec<BanListing>, i64), StorageError> {
+    let mut tx = pool.begin().await?;
+    let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM bans WHERE until > ?")
+        .bind(now)
+        .fetch_one(&mut *tx)
+        .await?;
+    let rows = sqlx::query_as::<_, BanListing>(
+        "SELECT a.username, b.until, b.reason, b.banned_by, b.banned_by_class
+         FROM bans b JOIN accounts a ON a.id = b.account_id
+         WHERE b.until > ?
+         ORDER BY b.until DESC, a.username
+         LIMIT ?",
+    )
+    .bind(now)
+    .bind(limit)
+    .fetch_all(&mut *tx)
+    .await?;
+    // Read-only: rolling back on drop is the same as committing.
+    tx.commit().await?;
+    Ok((rows, total))
+}
+
+/// An active ban as [`remove_if`] hands it to the caller's rank check.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct RankedBan {
+    pub until: i64,
+    pub reason: String,
+    pub banned_by: String,
+    pub banned_by_class: i64,
+}
+
+/// What [`remove_if`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Removal {
+    /// The ban was in force and has been lifted.
+    Removed(RankedBan),
+    /// The account has no ban in force (none at all, or it had lapsed).
+    NotBanned,
+    /// The ban is in force and `allow` refused to lift it; nothing changed.
+    Refused(RankedBan),
+}
+
+/// Lift the ban on `account_id` if one is in force at `now` and `allow`
+/// (the caller's rank rule) accepts it. The check and the delete run in one
+/// write transaction (`BEGIN IMMEDIATE`), so a concurrent re-ban by a higher
+/// rank can't slip in between and be deleted by a lower one. Lapsed rows
+/// are swept first, as in [`set_ranked`].
+pub async fn remove_if<F>(
+    pool: &SqlitePool,
+    account_id: &str,
+    now: i64,
+    allow: F,
+) -> Result<Removal, StorageError>
+where
+    F: FnOnce(&RankedBan) -> bool + Send,
+{
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    sqlx::query("DELETE FROM bans WHERE until <= ?")
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+    let ban = sqlx::query_as::<_, RankedBan>(
+        "SELECT until, reason, banned_by, banned_by_class FROM bans WHERE account_id = ?",
+    )
+    .bind(account_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let outcome = match ban {
+        None => Removal::NotBanned,
+        Some(ban) if !allow(&ban) => Removal::Refused(ban),
+        Some(ban) => {
+            sqlx::query("DELETE FROM bans WHERE account_id = ?")
+                .bind(account_id)
+                .execute(&mut *tx)
+                .await?;
+            Removal::Removed(ban)
+        }
+    };
+    tx.commit().await?;
+    Ok(outcome)
+}
+
 /// Lift a ban outright (an admin "unban", or cleanup of a lapsed row).
 pub async fn clear(pool: &SqlitePool, account_id: &str) -> Result<(), StorageError> {
     sqlx::query("DELETE FROM bans WHERE account_id = ?")
@@ -222,6 +322,80 @@ mod tests {
 
         assert_eq!(sweep(&pool, 1_000).await.unwrap(), 1);
         assert!(active(&pool, &id, 0).await.unwrap().is_none());
+    }
+
+    async fn account(pool: &SqlitePool, name: &str) -> String {
+        crate::accounts::create(pool, name, "phc$placeholder", 1, 0, 0)
+            .await
+            .unwrap()
+            .id
+    }
+
+    #[tokio::test]
+    async fn list_active_is_longest_first_capped_and_skips_lapsed() {
+        let (pool, crash, _dir) = pool_with_account().await;
+        let zero = account(&pool, "zero").await;
+        let acid = account(&pool, "acid").await;
+        let lapsed = account(&pool, "lapsed").await;
+        set_ranked(&pool, &crash, 5_000, "short", "mod", 2, 100).await.unwrap();
+        set_ranked(&pool, &zero, 9_000, "long", "sysop", 3, 100).await.unwrap();
+        // Same expiry as zero: ties sort by username.
+        set_ranked(&pool, &acid, 9_000, "tie", "sysop", 3, 100).await.unwrap();
+        set(&pool, &lapsed, 150, "old", "sysop").await.unwrap();
+
+        let (rows, total) = list_active(&pool, 200, 10).await.unwrap();
+        assert_eq!(total, 3, "the lapsed ban is not counted");
+        let names: Vec<_> = rows.iter().map(|r| r.username.as_str()).collect();
+        assert_eq!(names, ["acid", "zero", "crash"]);
+        assert_eq!(rows[2].banned_by, "mod");
+        assert_eq!(rows[2].banned_by_class, 2);
+        assert_eq!(rows[2].reason, "short");
+
+        // The cap keeps the longest-lasting; `total` still counts them all.
+        let (rows, total) = list_active(&pool, 200, 2).await.unwrap();
+        assert_eq!(total, 3);
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|r| r.until == 9_000));
+
+        // Listing is a read: the lapsed row is still on disk for sweep().
+        assert_eq!(sweep(&pool, 200).await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn remove_if_lifts_only_what_the_rule_allows() {
+        let (pool, id, _dir) = pool_with_account().await;
+
+        // Nothing to lift.
+        let out = remove_if(&pool, &id, 100, |_| panic!("no ban to check")).await.unwrap();
+        assert_eq!(out, Removal::NotBanned);
+
+        set_ranked(&pool, &id, 5_000, "admin ban", "sysop", 3, 100).await.unwrap();
+        // The rule sees the ban as stored and refuses: nothing changes.
+        let out = remove_if(&pool, &id, 200, |ban| {
+            assert_eq!((ban.banned_by.as_str(), ban.banned_by_class), ("sysop", 3));
+            false
+        })
+        .await
+        .unwrap();
+        assert!(matches!(out, Removal::Refused(ref b) if b.until == 5_000));
+        assert!(active(&pool, &id, 200).await.unwrap().is_some());
+
+        // Allowed: lifted, and the removed ban is reported.
+        let out = remove_if(&pool, &id, 200, |_| true).await.unwrap();
+        assert!(matches!(out, Removal::Removed(ref b) if b.reason == "admin ban"));
+        assert!(active(&pool, &id, 200).await.unwrap().is_none());
+        assert_eq!(remove_if(&pool, &id, 200, |_| true).await.unwrap(), Removal::NotBanned);
+    }
+
+    #[tokio::test]
+    async fn remove_if_treats_a_lapsed_ban_as_none_and_sweeps_it() {
+        let (pool, id, _dir) = pool_with_account().await;
+        set(&pool, &id, 1_000, "x", "sysop").await.unwrap();
+        let out = remove_if(&pool, &id, 1_000, |_| panic!("lapsed bans are not checked"))
+            .await
+            .unwrap();
+        assert_eq!(out, Removal::NotBanned);
+        assert_eq!(sweep(&pool, 0).await.unwrap(), 0, "already swept");
     }
 
     #[tokio::test]

@@ -119,6 +119,10 @@ fn app_builder<R: Runtime>(builder: tauri::Builder<R>) -> tauri::Builder<R> {
             commands::delete_post,
             commands::get_file_info,
             commands::set_identity,
+            commands::update_newsgroup,
+            commands::delete_newsgroup,
+            commands::list_bans,
+            commands::remove_ban,
         ])
 }
 
@@ -240,9 +244,12 @@ mod acl_tests {
                 "list_thread",
                 "create_post",
                 "delete_post",
+                "update_newsgroup",
+                "delete_newsgroup",
             ],
         ),
         ("trackers", &["list_servers"]),
+        ("bans", &["list_bans", "remove_ban"]),
     ];
 
     fn mock_app() -> tauri::App<MockRuntime> {

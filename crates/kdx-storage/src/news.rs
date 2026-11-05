@@ -80,6 +80,75 @@ pub async fn group_by_id(
     Ok(row)
 }
 
+/// Rename / redescribe / re-gate a newsgroup, but only if it exists and its
+/// current read threshold is at most `reader_class` (the editor must be
+/// able to read it). The check and the write are one statement. Returns
+/// whether a row was updated; a clashing name is `AlreadyExists`.
+#[allow(clippy::too_many_arguments)]
+pub async fn update_group(
+    pool: &SqlitePool,
+    id: &str,
+    name: &str,
+    description: &str,
+    min_read_class: i64,
+    min_post_class: i64,
+    reader_class: i64,
+) -> Result<bool, StorageError> {
+    let result = sqlx::query(
+        "UPDATE newsgroups
+         SET name = ?2, description = ?3, min_read_class = ?4, min_post_class = ?5
+         WHERE id = ?1 AND min_read_class <= ?6",
+    )
+    .bind(id)
+    .bind(name)
+    .bind(description)
+    .bind(min_read_class)
+    .bind(min_post_class)
+    .bind(reader_class)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() > 0)
+}
+
+/// A newsgroup removed by [`delete_group`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeletedGroup {
+    pub name: String,
+    /// Posts (replies included) that went with it.
+    pub posts: i64,
+}
+
+/// Delete a newsgroup and, through the `news_posts` foreign key's
+/// `ON DELETE CASCADE`, every post in it — but only if its read threshold is
+/// at most `reader_class`. One write transaction (`BEGIN IMMEDIATE`), so
+/// the post count is exact and nothing can be posted into the group
+/// between the check and the delete. `None` when no such readable group.
+pub async fn delete_group(
+    pool: &SqlitePool,
+    id: &str,
+    reader_class: i64,
+) -> Result<Option<DeletedGroup>, StorageError> {
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let found: Option<(String, i64)> = sqlx::query_as(
+        "SELECT name, (SELECT COUNT(*) FROM news_posts WHERE newsgroup_id = ?1)
+         FROM newsgroups WHERE id = ?1 AND min_read_class <= ?2",
+    )
+    .bind(id)
+    .bind(reader_class)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some((name, posts)) = found else {
+        tx.commit().await?;
+        return Ok(None);
+    };
+    sqlx::query("DELETE FROM newsgroups WHERE id = ?")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(Some(DeletedGroup { name, posts }))
+}
+
 /// Insert a post. A reply's parent must exist *in the same newsgroup*;
 /// otherwise nothing is inserted and `NotFound` is returned. The check and
 /// the insert are one statement, so a racing delete can't slip between them.
@@ -293,6 +362,69 @@ mod tests {
         let recent = recent_posts_for_group(&pool, &g.id, 3).await.unwrap();
         let subjects: Vec<_> = recent.iter().map(|p| p.subject.as_str()).collect();
         assert_eq!(subjects, ["s9", "s8", "s7"]);
+    }
+
+    #[tokio::test]
+    async fn update_group_respects_reader_class_and_unique_names() {
+        let (pool, _dir) = pool().await;
+        let g = create_group(&pool, "general", "misc", 0, 1).await.unwrap();
+        let staff = create_group(&pool, "staff", "", 3, 3).await.unwrap();
+
+        assert!(update_group(&pool, &g.id, "lobby", "renamed", 1, 2, 2).await.unwrap());
+        let row = group_by_id(&pool, &g.id).await.unwrap().unwrap();
+        assert_eq!(
+            (row.name.as_str(), row.description.as_str(), row.min_read_class, row.min_post_class),
+            ("lobby", "renamed", 1, 2)
+        );
+
+        // A reader below the group's read class changes nothing...
+        assert!(!update_group(&pool, &staff.id, "hacked", "", 0, 0, 2).await.unwrap());
+        assert_eq!(group_by_id(&pool, &staff.id).await.unwrap().unwrap().name, "staff");
+        // ...nor does an id that doesn't exist.
+        assert!(!update_group(&pool, "no-such-group", "x", "", 0, 0, 3).await.unwrap());
+
+        // Renaming onto another group's name is a uniqueness error.
+        assert!(matches!(
+            update_group(&pool, &g.id, "staff", "", 0, 0, 3).await,
+            Err(StorageError::AlreadyExists)
+        ));
+        // Keeping one's own name is fine.
+        assert!(update_group(&pool, &staff.id, "staff", "mods", 3, 3, 3).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn delete_group_cascades_to_every_post_and_only_that_group() {
+        let (pool, _dir) = pool().await;
+        let g = create_group(&pool, "doomed", "", 0, 0).await.unwrap();
+        let keep = create_group(&pool, "keep", "", 0, 0).await.unwrap();
+        let root = create_post(&pool, &g.id, None, "a", "s", "b", 1).await.unwrap();
+        let reply = create_post(&pool, &g.id, Some(&root.id), "b", "re", "r", 2).await.unwrap();
+        create_post(&pool, &g.id, Some(&reply.id), "c", "re re", "r", 3).await.unwrap();
+        create_post(&pool, &g.id, None, "d", "other thread", "b", 4).await.unwrap();
+        let kept = create_post(&pool, &keep.id, None, "a", "s", "b", 5).await.unwrap();
+
+        // Not readable at class 0 once raised: refused, nothing removed.
+        assert!(update_group(&pool, &g.id, "doomed", "", 2, 2, 3).await.unwrap());
+        assert_eq!(delete_group(&pool, &g.id, 1).await.unwrap(), None);
+        assert_eq!(posts_for_group(&pool, &g.id).await.unwrap().len(), 4);
+
+        let deleted = delete_group(&pool, &g.id, 2).await.unwrap().expect("deleted");
+        assert_eq!(deleted, DeletedGroup { name: "doomed".into(), posts: 4 });
+        assert!(group_by_id(&pool, &g.id).await.unwrap().is_none());
+        let orphans: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM news_posts WHERE newsgroup_id = ?")
+            .bind(&g.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(orphans, 0, "posts cascade with their group");
+        assert_eq!(posts_for_group(&pool, &keep.id).await.unwrap(), vec![kept]);
+        // Gone is gone.
+        assert_eq!(delete_group(&pool, &g.id, 3).await.unwrap(), None);
+        // Posting into a deleted group fails on the foreign key.
+        assert!(matches!(
+            create_post(&pool, &g.id, None, "a", "late", "b", 9).await,
+            Err(StorageError::ForeignKey)
+        ));
     }
 
     #[tokio::test]

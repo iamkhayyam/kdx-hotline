@@ -8,8 +8,8 @@ use kdx_protocol::messages::{FileInfoResponse, FileListResponse};
 
 use crate::error::ClientError;
 use crate::event::{
-    AccountSummary, FileSearchEntry, HistoryEntry, IpRule, NewsPost, NewsgroupInfo, PresenceUser,
-    RoleInfo, ServerSettings, TrackerServer,
+    AccountSummary, BanList, FileSearchEntry, HistoryEntry, IpRule, NewsPost, NewsgroupInfo,
+    PresenceUser, RoleInfo, ServerSettings, TrackerServer,
 };
 
 /// A logged-in session's identity.
@@ -274,6 +274,25 @@ pub(crate) enum Command {
     DeletePost {
         post_id: String,
         reply: oneshot::Sender<Result<Vec<NewsPost>, ClientError>>,
+    },
+    ListBans {
+        reply: oneshot::Sender<Result<BanList, ClientError>>,
+    },
+    RemoveBan {
+        username: String,
+        reply: oneshot::Sender<Result<BanList, ClientError>>,
+    },
+    UpdateNewsgroup {
+        id: String,
+        name: String,
+        description: String,
+        min_read_class: u8,
+        min_post_class: u8,
+        reply: oneshot::Sender<Result<Vec<NewsgroupInfo>, ClientError>>,
+    },
+    DeleteNewsgroup {
+        id: String,
+        reply: oneshot::Sender<Result<Vec<NewsgroupInfo>, ClientError>>,
     },
 }
 
@@ -951,6 +970,51 @@ impl ClientHandle {
     pub async fn delete_post(&self, post_id: &str) -> Result<Vec<NewsPost>, ClientError> {
         let post_id = wire(post_id)?;
         self.send(|reply| Command::DeletePost { post_id, reply }).await
+    }
+
+    /// List the account bans in force (the Bans window), longest-lasting
+    /// first; `BanList::total` says whether the server cut the list.
+    /// Requires `USER_BAN`; otherwise resolves to `ClientError::Server`.
+    pub async fn list_bans(&self) -> Result<BanList, ClientError> {
+        self.send(|reply| Command::ListBans { reply }).await
+    }
+
+    /// Lift the ban on `username`. Requires `USER_BAN`, and a ban set by a
+    /// higher class can only be lifted by that class or above (or by whoever
+    /// set it, or an Admin). Resolves with the server's updated ban list.
+    pub async fn remove_ban(&self, username: &str) -> Result<BanList, ClientError> {
+        let username = wire(username)?;
+        self.send(|reply| Command::RemoveBan { username, reply }).await
+    }
+
+    /// Edit a newsgroup's name, description and class thresholds. Requires
+    /// `USER_ADMIN` and read access to the group. Resolves with the updated
+    /// newsgroup list (the ones the caller may read).
+    pub async fn update_newsgroup(
+        &self,
+        id: &str,
+        name: &str,
+        description: &str,
+        min_read_class: u8,
+        min_post_class: u8,
+    ) -> Result<Vec<NewsgroupInfo>, ClientError> {
+        let (id, name, description) = (wire(id)?, wire(name)?, wire(description)?);
+        self.send(|reply| Command::UpdateNewsgroup {
+            id,
+            name,
+            description,
+            min_read_class,
+            min_post_class,
+            reply,
+        })
+        .await
+    }
+
+    /// Delete a newsgroup and every post in it. Requires `USER_ADMIN` and read
+    /// access to the group. Resolves with the updated newsgroup list.
+    pub async fn delete_newsgroup(&self, id: &str) -> Result<Vec<NewsgroupInfo>, ClientError> {
+        let id = wire(id)?;
+        self.send(|reply| Command::DeleteNewsgroup { id, reply }).await
     }
 
     /// Ask the actor to close the connection. Takes effect promptly even if

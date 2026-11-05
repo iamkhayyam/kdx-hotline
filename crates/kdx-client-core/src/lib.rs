@@ -40,8 +40,8 @@ pub use config::{
 };
 pub use error::ClientError;
 pub use event::{
-    AccountSummary, Direction, Event, FileSearchEntry, HistoryEntry, IpRule, NewsPost,
-    NewsgroupInfo, PresenceUser, RoleInfo, ServerSettings, TrackerServer,
+    AccountSummary, BanEntry, BanList, Direction, Event, FileSearchEntry, HistoryEntry, IpRule,
+    NewsPost, NewsgroupInfo, PresenceUser, RoleInfo, ServerSettings, TrackerServer,
 };
 pub use handle::{ClientHandle, Session};
 // Re-exported so consumers (the Tauri app) can name the file-listing shape

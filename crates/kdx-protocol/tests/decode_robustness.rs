@@ -244,6 +244,43 @@ fn cases() -> Vec<(&'static str, Vec<Bytes>, Probe)> {
             canonical!(AdminDisconnect),
         ),
         (
+            "BanListRequest",
+            vec![BanListRequest.encode()],
+            canonical!(BanListRequest),
+        ),
+        (
+            "BanListResponse",
+            vec![
+                BanListResponse { total: 0, bans: vec![] }.encode(),
+                BanListResponse {
+                    total: 3,
+                    bans: vec![
+                        BanEntry {
+                            username: "lamer".into(),
+                            until: 1_900_000_000,
+                            reason: "flood".into(),
+                            banned_by: "sysop".into(),
+                            banned_by_class: 3,
+                        },
+                        BanEntry {
+                            username: "zero".into(),
+                            until: 1_800_000_000,
+                            reason: String::new(),
+                            banned_by: "mod".into(),
+                            banned_by_class: 2,
+                        },
+                    ],
+                }
+                .encode(),
+            ],
+            canonical!(BanListResponse),
+        ),
+        (
+            "BanRemove",
+            vec![BanRemove { username: "lamer".into() }.encode()],
+            canonical!(BanRemove),
+        ),
+        (
             "ServerSettingsRequest",
             vec![ServerSettingsRequest.encode()],
             canonical!(ServerSettingsRequest),
@@ -743,6 +780,23 @@ fn cases() -> Vec<(&'static str, Vec<Bytes>, Probe)> {
             }
             .encode()],
             canonical!(NewsgroupCreate),
+        ),
+        (
+            "NewsgroupUpdate",
+            vec![NewsgroupUpdate {
+                id: [4; 16],
+                name: "staff".into(),
+                description: "mods".into(),
+                min_read_class: 2,
+                min_post_class: 3,
+            }
+            .encode()],
+            canonical!(NewsgroupUpdate),
+        ),
+        (
+            "NewsgroupDelete",
+            vec![NewsgroupDelete { id: [4; 16] }.encode()],
+            canonical!(NewsgroupDelete),
         ),
         // ---- presence.rs
         (

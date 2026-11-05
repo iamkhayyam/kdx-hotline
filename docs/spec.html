@@ -335,7 +335,7 @@
     <section id="types">
       <div class="eyebrow">Protocol</div>
       <h2>Packet types</h2>
-      <p>Opcodes occupy a single byte (0x00–0xFF). The 76 defined values are grouped into functional ranges. Unknown opcodes are connection-fatal.</p>
+      <p>Opcodes occupy a single byte (0x00–0xFF). The 84 defined values are grouped into functional ranges. Unknown opcodes are connection-fatal.</p>
 
       <div class="tbl-wrap">
         <table>
@@ -364,9 +364,9 @@
               <td><code>ChatMessage</code> 0x30 &nbsp;·&nbsp; <code>ChatJoin/Leave</code> 0x31–0x32 &nbsp;·&nbsp; <code>ChatUserList</code> 0x33 &nbsp;·&nbsp; <code>ChatTopicSet</code> 0x34 &nbsp;·&nbsp; <code>PresenceListRequest/Response</code> 0x35–0x36 &nbsp;·&nbsp; <code>PresenceChange</code> 0x37 &nbsp;·&nbsp; <code>UserInfoRequest/Response</code> 0x38–0x39 &nbsp;·&nbsp; <code>SetIdentity</code> 0x3A</td>
             </tr>
             <tr>
-              <td class="mono">0x40–0x42</td>
+              <td class="mono">0x40–0x45</td>
               <td>Private messages &amp; admin</td>
-              <td><code>PrivateSend</code> 0x40 &nbsp;·&nbsp; <code>PrivateMessage</code> 0x41 &nbsp;·&nbsp; <code>AdminDisconnect</code> 0x42</td>
+              <td><code>PrivateSend</code> 0x40 &nbsp;·&nbsp; <code>PrivateMessage</code> 0x41 &nbsp;·&nbsp; <code>AdminDisconnect</code> 0x42 &nbsp;·&nbsp; <code>BanListRequest/Response</code> 0x43–0x44 &nbsp;·&nbsp; <code>BanRemove</code> 0x45</td>
             </tr>
             <tr>
               <td class="mono">0x50–0x5C</td>
@@ -374,9 +374,9 @@
               <td><code>RoleListRequest/Response</code> 0x50–0x51 &nbsp;·&nbsp; <code>RoleCreate/Update/Delete</code> 0x52–0x54 &nbsp;·&nbsp; <code>RoleAssign/Unassign</code> 0x55–0x56 &nbsp;·&nbsp; <code>AccountRolesRequest/Response</code> 0x57–0x58 &nbsp;·&nbsp; <code>AccountCreate/Update</code> 0x59–0x5A &nbsp;·&nbsp; <code>AccountListRequest/Response</code> 0x5B–0x5C</td>
             </tr>
             <tr>
-              <td class="mono">0x60–0x66</td>
+              <td class="mono">0x60–0x68</td>
               <td>News</td>
-              <td><code>NewsgroupListRequest/Response</code> 0x60–0x61 &nbsp;·&nbsp; <code>NewsThreadListRequest/Response</code> 0x62–0x63 &nbsp;·&nbsp; <code>NewsPostCreate/Delete</code> 0x64–0x65 &nbsp;·&nbsp; <code>NewsgroupCreate</code> 0x66</td>
+              <td><code>NewsgroupListRequest/Response</code> 0x60–0x61 &nbsp;·&nbsp; <code>NewsThreadListRequest/Response</code> 0x62–0x63 &nbsp;·&nbsp; <code>NewsPostCreate/Delete</code> 0x64–0x65 &nbsp;·&nbsp; <code>NewsgroupCreate</code> 0x66 &nbsp;·&nbsp; <code>NewsgroupUpdate</code> 0x67 &nbsp;·&nbsp; <code>NewsgroupDelete</code> 0x68</td>
             </tr>
             <tr>
               <td class="mono">0x70–0x81</td>
@@ -735,9 +735,28 @@
           <thead><tr><th>Opcode</th><th>Name</th><th>Required class</th><th>Effect</th></tr></thead>
           <tbody>
             <tr><td class="mono">0x42</td><td><code>AdminDisconnect</code></td><td><span class="pill red">Admin</span></td><td>Forcibly disconnects a user. May set a ban flag.</td></tr>
+            <tr><td class="mono">0x43–0x44</td><td><code>BanListRequest/Response</code></td><td><span class="pill red">USER_BAN</span></td><td>Lists the account bans in force, longest-lasting first (at most 500, with the total).</td></tr>
+            <tr><td class="mono">0x45</td><td><code>BanRemove</code></td><td><span class="pill red">USER_BAN</span></td><td>Lifts a ban, subject to the rank of whoever set it (below). Answered with the updated ban list.</td></tr>
+            <tr><td class="mono">0x66–0x68</td><td><code>NewsgroupCreate/Update/Delete</code></td><td><span class="pill red">USER_ADMIN</span></td><td>Defines, edits or deletes a newsgroup (a delete takes every post in it). Edit and delete also need read access to the group. Answered with the caller's newsgroup list.</td></tr>
             <tr><td class="mono">0x75</td><td><code>AdminBroadcast</code></td><td><span class="pill red">Admin</span></td><td>Server-wide announcement delivered to all connected users.</td></tr>
             <tr><td class="mono">0x76</td><td><code>AdminShutdown</code></td><td><span class="pill red">Admin</span></td><td>Initiates a graceful server shutdown.</td></tr>
             <tr><td class="mono">0x7B–0x7E</td><td><code>IpRule*</code></td><td><span class="pill red">Admin</span></td><td>Allow/deny rules applied at the TCP accept layer before authentication.</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3>Bans &amp; newsgroup administration</h3>
+      <p>A ban (<code>AdminDisconnect</code> with <code>ban_secs &gt; 0</code>) records who set it and their class. A later ban by a lower class can extend it but never shorten it, and lifting it follows the same rank: <code>BanRemove</code> succeeds for any Admin, for a class strictly above the one that set the ban, or for whoever set it at the same class or above — so a moderator can never undo an administrator's ban, nor a peer moderator's. Nobody lifts a ban on an account of a higher class than their own. The rank check and the delete are one transaction. Lifting a ban lets the account log in again at once and is recorded in the server history as <code>ban_removed</code>.</p>
+      <p><code>NewsgroupUpdate</code> is validated like <code>NewsgroupCreate</code> (non-blank name ≤ 64 bytes, description ≤ 1024 bytes, class thresholds 0–3, names unique). Edits and deletes are refused for a group whose read class is above the caller's, checked atomically with the write; <code>NewsgroupDelete</code> removes the group and all its posts in one transaction. Both are recorded in the server history (<code>newsgroup_updated</code>, <code>newsgroup_deleted</code>).</p>
+      <div class="tbl-wrap">
+        <table>
+          <thead><tr><th>Opcode</th><th>Message</th><th>Payload</th><th>Reply</th></tr></thead>
+          <tbody>
+            <tr><td class="mono">0x43</td><td><code>BanListRequest</code></td><td class="mono">(empty)</td><td><code>BanListResponse</code> or <code>Error</code></td></tr>
+            <tr><td class="mono">0x44</td><td><code>BanListResponse</code></td><td class="mono">total:u32 count:u32 { username:str until:u64 reason:str banned_by:str banned_by_class:u8 }*</td><td>Longest-lasting first (<code>until</code> descending, then username). <code>total</code> counts every ban in force; a list of fewer entries was cut at the server's cap, dropping the bans closest to lapsing.</td></tr>
+            <tr><td class="mono">0x45</td><td><code>BanRemove</code></td><td class="mono">username:str</td><td><code>BanListResponse</code> (updated) or <code>Error</code> (no such account, not banned, outranked)</td></tr>
+            <tr><td class="mono">0x67</td><td><code>NewsgroupUpdate</code></td><td class="mono">id[16] name:str description:str min_read_class:u8 min_post_class:u8</td><td><code>NewsgroupListResponse</code> (groups the caller may read) or <code>Error</code></td></tr>
+            <tr><td class="mono">0x68</td><td><code>NewsgroupDelete</code></td><td class="mono">id[16]</td><td><code>NewsgroupListResponse</code> or <code>Error</code></td></tr>
           </tbody>
         </table>
       </div>

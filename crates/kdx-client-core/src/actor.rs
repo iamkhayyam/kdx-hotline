@@ -54,7 +54,8 @@ use kdx_crypto::{AuthContext, ClientProof, KdfParams};
 use kdx_protocol::messages::{
     AccountCreate, AccountListRequest, AccountListResponse, AccountRolesRequest,
     AccountRolesResponse, AccountUpdate, AdminDisconnect, AuthChallenge, AuthRequest, AuthResponse,
-    AdminBroadcast, AdminShutdown, AuthResult, ChatEvent, ChatInvite, ChatInvited, ChatJoin,
+    AdminBroadcast, AdminShutdown, AuthResult, BanListRequest, BanListResponse, BanRemove,
+    ChatEvent, ChatInvite, ChatInvited, ChatJoin,
     ChatLeave, ChatSend, ChatTopic, ChatUserList, FileCatalogGenerated, FileCreateFolder,
     FileDelete, FileGenerateCatalog,
     ChatRoomFlags as WireChatRoomFlags, ConnectionListRequest, ConnectionListResponse, FileAlias,
@@ -62,7 +63,8 @@ use kdx_protocol::messages::{
     HistoryListResponse, IpRuleCreate, IpRuleDelete, IpRuleListRequest, IpRuleListResponse,
     NewsPostCreate,
     NewsPostDelete, NewsThreadListRequest, NewsThreadListResponse, NewsgroupCreate,
-    NewsgroupListRequest, NewsgroupListResponse, ServerSettingsRequest, ServerSettingsResponse,
+    NewsgroupDelete, NewsgroupListRequest, NewsgroupListResponse, NewsgroupUpdate,
+    ServerSettingsRequest, ServerSettingsResponse,
     ServerSettingsUpdate, TrackerListRequest, TrackerListResponse,
     FileInfoRequest, FileInfoResponse, FileListResponse, PresenceChange,
     PresenceListRequest, PresenceListResponse, PrivateMessage,
@@ -90,7 +92,7 @@ use crate::config::{
 };
 use crate::error::ClientError;
 use crate::event::{
-    AccountSummary, Direction, Event, FileSearchEntry, HistoryEntry, IpRule, NewsPost,
+    AccountSummary, BanList, Direction, Event, FileSearchEntry, HistoryEntry, IpRule, NewsPost,
     NewsgroupInfo, PresenceUser, RoleInfo, ServerSettings, TrackerServer,
 };
 use crate::handle::{ClientHandle, Command, Password, Session};
@@ -188,6 +190,8 @@ enum Waiter {
     Accounts(Reply<Vec<AccountSummary>>),
     Newsgroups(Reply<Vec<NewsgroupInfo>>),
     Thread(Reply<Vec<NewsPost>>),
+    /// `BanListRequest` and `BanRemove`, both answered by a `BanListResponse`.
+    Bans(Reply<BanList>),
     /// A `FileTransferStart` request, answered by a `TransferAccept` (sent
     /// as `FileTransferStart`) or `Error`. The caller's reply lives in the
     /// transfer itself; this is that transfer's generation.
@@ -213,6 +217,7 @@ impl Waiter {
             Waiter::Accounts(_) => PacketType::AccountListResponse,
             Waiter::Newsgroups(_) => PacketType::NewsgroupListResponse,
             Waiter::Thread(_) => PacketType::NewsThreadListResponse,
+            Waiter::Bans(_) => PacketType::BanListResponse,
             Waiter::TransferStart(_) => PacketType::FileTransferStart,
         }
     }
@@ -235,6 +240,7 @@ impl Waiter {
             Waiter::Accounts(tx) => drop(tx.send(Err(err))),
             Waiter::Newsgroups(tx) => drop(tx.send(Err(err))),
             Waiter::Thread(tx) => drop(tx.send(Err(err))),
+            Waiter::Bans(tx) => drop(tx.send(Err(err))),
             Waiter::TransferStart(_) => {}
         }
     }
@@ -1157,6 +1163,51 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
                 self.request(PacketType::NewsPostDelete, msg.encode(), Waiter::Thread(reply))
                     .await?;
             }
+            // Both answered by a BanListResponse (or an Error).
+            Command::ListBans { reply } => {
+                let msg = BanListRequest;
+                self.request(PacketType::BanListRequest, msg.encode(), Waiter::Bans(reply))
+                    .await?;
+            }
+            Command::RemoveBan { username, reply } => {
+                let msg = BanRemove { username };
+                self.request(PacketType::BanRemove, msg.encode(), Waiter::Bans(reply))
+                    .await?;
+            }
+            // Both answered by a NewsgroupListResponse (or an Error).
+            Command::UpdateNewsgroup {
+                id,
+                name,
+                description,
+                min_read_class,
+                min_post_class,
+                reply,
+            } => {
+                let Some(id) = parse_role_id(&id) else {
+                    let _ = reply.send(Err(ClientError::InvalidInput("bad newsgroup id".into())));
+                    return Ok(());
+                };
+                let msg = NewsgroupUpdate {
+                    id,
+                    name,
+                    description,
+                    min_read_class,
+                    min_post_class,
+                };
+                let waiter = Waiter::Newsgroups(reply);
+                self.request(PacketType::NewsgroupUpdate, msg.encode(), waiter)
+                    .await?;
+            }
+            Command::DeleteNewsgroup { id, reply } => {
+                let Some(id) = parse_role_id(&id) else {
+                    let _ = reply.send(Err(ClientError::InvalidInput("bad newsgroup id".into())));
+                    return Ok(());
+                };
+                let msg = NewsgroupDelete { id };
+                let waiter = Waiter::Newsgroups(reply);
+                self.request(PacketType::NewsgroupDelete, msg.encode(), waiter)
+                    .await?;
+            }
         }
         Ok(())
     }
@@ -1607,6 +1658,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
                 let response = NewsThreadListResponse::decode(&frame.payload)?;
                 if let Waiter::Thread(tx) = self.take_reply(PacketType::NewsThreadListResponse)? {
                     let _ = tx.send(Ok(response.posts.into_iter().map(Into::into).collect()));
+                }
+            }
+            PacketType::BanListResponse => {
+                let response = BanListResponse::decode(&frame.payload)?;
+                if let Waiter::Bans(tx) = self.take_reply(PacketType::BanListResponse)? {
+                    let _ = tx.send(Ok(response.into()));
                 }
             }
             PacketType::PresenceChange => {

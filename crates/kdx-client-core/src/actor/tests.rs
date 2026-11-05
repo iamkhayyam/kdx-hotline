@@ -292,6 +292,50 @@ async fn user_list_and_server_list_errors_are_delivered() {
 }
 
 #[tokio::test]
+async fn ban_and_newsgroup_admin_replies_correlate_in_order() {
+    let mut h = Harness::new();
+    let (c1, c2, c3) = (h.client.clone(), h.client.clone(), h.client.clone());
+
+    let remove = tokio::spawn(async move { c1.remove_ban("lamer").await });
+    let req = h.expect(PacketType::BanRemove).await;
+    assert_eq!(BanRemove::decode(&req.payload).unwrap().username, "lamer");
+    let group = Uuid::from_bytes([3; 16]).to_string();
+    let delete = tokio::spawn(async move { c2.delete_newsgroup(&group).await });
+    let req = h.expect(PacketType::NewsgroupDelete).await;
+    assert_eq!(NewsgroupDelete::decode(&req.payload).unwrap().id, [3; 16]);
+
+    // The Error answers the older request (the unban) only.
+    h.error("lamer is not banned").await;
+    let groups = NewsgroupListResponse { groups: vec![] };
+    h.send(PacketType::NewsgroupListResponse, groups.encode()).await;
+    match timeout(STEP, remove).await.unwrap().unwrap() {
+        Err(ClientError::Server(text)) => assert_eq!(text, "lamer is not banned"),
+        other => panic!("expected the server's refusal, got {other:?}"),
+    }
+    assert!(timeout(STEP, delete).await.unwrap().unwrap().unwrap().is_empty());
+
+    // A malformed id never reaches the wire (the listing below is next).
+    let bad = h.client.update_newsgroup("not-a-uuid", "x", "", 0, 0).await;
+    assert!(matches!(bad, Err(ClientError::InvalidInput(_))), "{bad:?}");
+    let list = tokio::spawn(async move { c3.list_bans().await });
+    h.expect(PacketType::BanListRequest).await;
+    let reply = BanListResponse {
+        total: 9,
+        bans: vec![kdx_protocol::messages::BanEntry {
+            username: "zero".into(),
+            until: 1_900_000_000,
+            reason: "flood".into(),
+            banned_by: "mod".into(),
+            banned_by_class: 2,
+        }],
+    };
+    h.send(PacketType::BanListResponse, reply.encode()).await;
+    let list = timeout(STEP, list).await.unwrap().unwrap().unwrap();
+    assert_eq!((list.total, list.bans[0].username.as_str(), list.bans[0].banned_by_class), (9, "zero", 2));
+    h.assert_alive().await;
+}
+
+#[tokio::test]
 async fn a_reply_of_the_wrong_type_closes_the_connection() {
     let mut h = Harness::new();
     let client = h.client.clone();
