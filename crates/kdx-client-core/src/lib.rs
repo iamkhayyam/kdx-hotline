@@ -14,6 +14,8 @@ mod config;
 mod error;
 mod event;
 mod handle;
+#[cfg(test)]
+mod login_tests;
 mod tls;
 mod transfer;
 
@@ -84,13 +86,26 @@ pub async fn connect(
         .get(&config.host, config.port)
         .unwrap_or_default();
 
+    // Login proofs are bound to this TLS session, so a server can't relay
+    // our login to another server (see kdx_crypto::scram).
+    let channel_binding = tls
+        .get_ref()
+        .1
+        .export_keying_material(
+            [0u8; kdx_crypto::CHANNEL_BINDING_LEN],
+            kdx_crypto::TLS_EXPORTER_LABEL,
+            None,
+        )
+        .map_err(|e| ClientError::Tls(e.to_string()))?;
+
     let mut framed = Framed::new(tls, KdxCodec::default());
     kdx_handshake(&mut framed).await?;
 
     let (cmd_tx, cmd_rx) = mpsc::channel(CHANNEL_DEPTH);
     let (event_tx, event_rx) = mpsc::channel(CHANNEL_DEPTH);
 
-    let actor = Actor::new(framed, cmd_rx, event_tx.clone());
+    let actor = Actor::new(framed, cmd_rx, event_tx.clone())
+        .with_channel_binding(channel_binding);
     tokio::spawn(actor.run());
 
     let _ = event_tx.send(Event::Connected { fingerprint }).await;

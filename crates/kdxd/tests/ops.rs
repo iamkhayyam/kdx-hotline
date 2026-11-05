@@ -589,7 +589,10 @@ async fn useradd_reads_password_from_stdin_into_the_configs_database() {
         .expect("account created");
     assert_eq!(bob.base_class, 2);
     // The trailing newline is not part of the password.
-    assert!(kdx_crypto::verify_password("correct horse", &bob.password_phc).unwrap());
+    // Only the SCRAM credential is stored (protocol v2); no PHC hash.
+    let credential = bob.credential.as_deref().expect("SCRAM credential stored");
+    assert!(bob.password_phc.is_empty());
+    assert!(kdx_crypto::verify_password("correct horse", credential).unwrap());
 
     // Creating the same account again fails cleanly.
     let again = kdxd(

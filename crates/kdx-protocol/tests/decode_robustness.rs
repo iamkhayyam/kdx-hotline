@@ -390,6 +390,7 @@ fn cases() -> Vec<(&'static str, Vec<Bytes>, Probe)> {
                 b.extend_from_slice(&[3u8; 16]);
                 b.push(2);
                 b.extend_from_slice(&[0, 2, b'h', b'i']);
+                b.extend_from_slice(&[7u8; 32]); // server_signature (v2)
                 Bytes::from(b)
             }],
             decode_only!(AuthResult),

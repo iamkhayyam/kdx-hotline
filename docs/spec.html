@@ -285,7 +285,7 @@
         </div>
         <div class="row">
           <div class="off">4</div>
-          <div class="fld"><span class="nm">version</span> <span class="sz">1 byte</span><br>Protocol version. Current value: <code>1</code>. Mismatches are connection-fatal.</div>
+          <div class="fld"><span class="nm">version</span> <span class="sz">1 byte</span><br>Protocol version. Current value: <code>2</code>. Mismatches are connection-fatal.</div>
         </div>
         <div class="row">
           <div class="off">5</div>
@@ -321,13 +321,13 @@
       <h3>Wire representation</h3>
       <pre><span class="c">// Offset  Size  Field</span>
 <span class="g">KDX\0</span>       <span class="c">// 0–3    4    magic</span>
-<span class="a">01</span>          <span class="c">// 4      1    version = 1</span>
+<span class="a">02</span>          <span class="c">// 4      1    version = 2</span>
 <span class="a">30</span>          <span class="c">// 5      1    type = 0x30 (ChatMessage)</span>
 <span class="a">00 08</span>       <span class="c">// 6–7    2    flags = REQUIRES_ACK</span>
 <span class="a">00 00 00 2A</span> <span class="c">// 8–11   4    sequence = 42</span>
 <span class="a">00 00 00 0D</span> <span class="c">// 12–15  4    length = 13 bytes of payload</span>
 <span class="a">00 00</span>       <span class="c">// 16–17  2    reserved</span>
-<span class="a">37 2B</span>       <span class="c">// 18–19  2    CRC-32(bytes 0–17) = 0xF6E5C1CE, folded to 16 bits</span>
+<span class="a">6E 91</span>       <span class="c">// 18–19  2    CRC-32(bytes 0–17) = 0x8A84E415, folded to 16 bits</span>
 <span class="c">// ... 13 bytes of payload follow</span></pre>
     </section>
 

@@ -7,10 +7,10 @@ mod common;
 use bytes::Bytes;
 use common::{bump, connect_tls, frame, kdx_handshake, test_config, TlsClient};
 use futures_util::{SinkExt, StreamExt};
-use kdx_crypto::{client_response, hash_password, KdfParams};
+use kdx_crypto::hash_password;
 use kdx_protocol::messages::{
-    AuthChallenge, AuthRequest, AuthResponse, AuthResult, FileListRequest, FileListResponse,
-    TransferAccept, TransferData, TransferEnd, TransferRequest, KIND_FILE, TRANSFER_VERIFIED,
+    FileListRequest, FileListResponse, TransferAccept, TransferData, TransferEnd, TransferRequest,
+    KIND_FILE, TRANSFER_VERIFIED,
 };
 use kdx_protocol::{fragment, PacketFlags, PacketType};
 use kdx_storage::{accounts, file_tree};
@@ -20,42 +20,8 @@ use sha2::{Digest, Sha256};
 const CHUNK: usize = 32 * 1024; // larger than the 16 KiB frame cap → exercises fragmentation
 
 async fn login(client: &mut TlsClient, seq: &mut u32, username: &str, password: &str) {
-    client
-        .send(frame(
-            PacketType::AuthRequest,
-            bump(seq),
-            AuthRequest {
-                username: username.into(),
-            }
-            .encode(),
-        ))
-        .await
-        .unwrap();
-    let challenge = AuthChallenge::decode(
-        &client.next().await.unwrap().unwrap().payload,
-    )
-    .unwrap();
-    let response = client_response(
-        password,
-        &challenge.salt,
-        &KdfParams {
-            m_cost: challenge.m_cost,
-            t_cost: challenge.t_cost,
-            p_cost: challenge.p_cost,
-        },
-        &challenge.challenge,
-    )
-    .unwrap();
-    client
-        .send(frame(
-            PacketType::AuthResponse,
-            bump(seq),
-            AuthResponse { response }.encode(),
-        ))
-        .await
-        .unwrap();
-    let result = AuthResult::decode(&client.next().await.unwrap().unwrap().payload).unwrap();
-    assert!(result.success, "{}", result.message);
+    // Channel-bound SCRAM login (protocol v2); see tests/common.
+    common::login(client, seq, username, password).await;
 }
 
 /// Send a payload, fragmenting when it exceeds the frame cap.
@@ -134,7 +100,7 @@ async fn multi_chunk_upload_end_to_end() {
     let server = serve(test_config(&dir)).await.unwrap();
     let pool = kdx_storage::connect(&dir.path().join("kdx.db")).await.unwrap();
     let phc = hash_password("pw").unwrap();
-    accounts::create(&pool, "uploader", &phc, 2).await.unwrap();
+    accounts::create(&pool, "uploader", &phc, 2, 0, 0).await.unwrap();
 
     let mut client = connect_tls(server.local_addr).await;
     let mut seq = 0u32;
@@ -179,7 +145,7 @@ async fn dropbox_accepts_upload_but_refuses_listing() {
     let server = serve(test_config(&dir)).await.unwrap();
     let pool = kdx_storage::connect(&dir.path().join("kdx.db")).await.unwrap();
     let phc = hash_password("pw").unwrap();
-    accounts::create(&pool, "dropper", &phc, 1).await.unwrap(); // plain User
+    accounts::create(&pool, "dropper", &phc, 1, 0, 0).await.unwrap(); // plain User
     // DropBox writable by class User(1); kind 2 = dropbox.
     file_tree::create_folder(&pool, file_tree::ROOT_ID, "dropbox", 2, 0, 1, None)
         .await
@@ -228,7 +194,7 @@ async fn disconnect_mid_transfer_then_resume() {
     let server = serve(test_config(&dir)).await.unwrap();
     let pool = kdx_storage::connect(&dir.path().join("kdx.db")).await.unwrap();
     let phc = hash_password("pw").unwrap();
-    accounts::create(&pool, "uploader", &phc, 2).await.unwrap();
+    accounts::create(&pool, "uploader", &phc, 2, 0, 0).await.unwrap();
 
     let data = test_blob(CHUNK * 4); // 4 chunks
     let chunks = chunk_frames(&data, [0u8; 16]); // ids fixed up below
@@ -373,8 +339,8 @@ async fn same_name_uploads_leave_exactly_one_blob() {
     let server = serve(test_config(&dir)).await.unwrap();
     let pool = kdx_storage::connect(&dir.path().join("kdx.db")).await.unwrap();
     let phc = hash_password("pw").unwrap();
-    accounts::create(&pool, "alice", &phc, 2).await.unwrap();
-    accounts::create(&pool, "bob", &phc, 2).await.unwrap();
+    accounts::create(&pool, "alice", &phc, 2, 0, 0).await.unwrap();
+    accounts::create(&pool, "bob", &phc, 2, 0, 0).await.unwrap();
     let (mut alice, mut aseq) = logged_in(&server, "alice").await;
     let (mut bob, mut bseq) = logged_in(&server, "bob").await;
     sync(&mut alice, &mut aseq).await; // bob's arrival
@@ -450,7 +416,7 @@ async fn empty_upload_completes() {
     let server = serve(test_config(&dir)).await.unwrap();
     let pool = kdx_storage::connect(&dir.path().join("kdx.db")).await.unwrap();
     let phc = hash_password("pw").unwrap();
-    accounts::create(&pool, "uploader", &phc, 2).await.unwrap();
+    accounts::create(&pool, "uploader", &phc, 2, 0, 0).await.unwrap();
     let (mut client, mut seq) = logged_in(&server, "uploader").await;
 
     let accept = start_upload(&mut client, &mut seq, "/", "empty.txt", &[], [0u8; 16]).await;
@@ -487,7 +453,7 @@ async fn client_abort_frees_slot_and_keeps_progress() {
     let server = serve(test_config(&dir)).await.unwrap();
     let pool = kdx_storage::connect(&dir.path().join("kdx.db")).await.unwrap();
     let phc = hash_password("pw").unwrap();
-    accounts::create(&pool, "uploader", &phc, 2).await.unwrap();
+    accounts::create(&pool, "uploader", &phc, 2, 0, 0).await.unwrap();
     let (mut client, mut seq) = logged_in(&server, "uploader").await;
 
     let data = test_blob(CHUNK * 4);

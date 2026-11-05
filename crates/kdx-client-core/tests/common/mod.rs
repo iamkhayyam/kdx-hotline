@@ -48,8 +48,10 @@ impl TestServer {
 
     pub async fn seed_account(&self, username: &str, password: &str, class: i64) {
         let pool = kdx_storage::connect(&self.db_path).await.unwrap();
-        let phc = kdx_crypto::hash_password(password).unwrap();
-        accounts::create(&pool, username, &phc, class).await.unwrap();
+        let credential = kdx_crypto::hash_password(password).unwrap();
+        accounts::create(&pool, username, &credential, class, 0, 0)
+            .await
+            .unwrap();
     }
 
     pub fn port(&self) -> u16 {

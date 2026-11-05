@@ -4,8 +4,10 @@ use crate::{PacketFlags, PacketType, ProtocolError};
 
 /// Wire magic identifying a KDX packet.
 pub const MAGIC: [u8; 4] = *b"KDX\0";
-/// Current protocol version.
-pub const PROTOCOL_VERSION: u8 = 1;
+/// Current protocol version. v2: SCRAM-style, TLS-channel-bound login proof
+/// (`AuthResponse` semantics changed, `AuthResult` gained a server
+/// signature); v1 peers are rejected at the frame header.
+pub const PROTOCOL_VERSION: u8 = 2;
 /// Fixed header size on the wire.
 pub const HEADER_LEN: usize = 20;
 
@@ -176,13 +178,13 @@ mod tests {
         sample_header().encode(&mut buf);
         let expected: [u8; HEADER_LEN] = [
             b'K', b'D', b'X', 0, // magic
-            0x01, // version
+            0x02, // version (PROTOCOL_VERSION)
             0x30, // type = ChatMessage
             0x00, 0x08, // flags = REQUIRES_ACK
             0x00, 0x00, 0x00, 0x2A, // sequence = 42
             0x00, 0x00, 0x00, 0x0D, // length = 13
             0x00, 0x00, // reserved
-            0x37, 0x2B, // folded CRC-32 (0xF6E5C1CE -> 0xF6E5 ^ 0xC1CE)
+            0x6E, 0x91, // folded CRC-32 (0x8A84E415 -> 0x8A84 ^ 0xE415)
         ];
         assert_eq!(&buf[..], &expected[..]);
     }

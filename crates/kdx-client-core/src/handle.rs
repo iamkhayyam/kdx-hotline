@@ -17,13 +17,33 @@ pub struct Session {
     pub class: u8,
 }
 
+/// A login password on its way to the connection actor: wiped from memory
+/// when dropped, and never shown by `Debug`.
+pub(crate) struct Password(zeroize::Zeroizing<String>);
+
+impl Password {
+    pub(crate) fn new(password: &str) -> Self {
+        Self(zeroize::Zeroizing::new(password.to_owned()))
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for Password {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Password(<redacted>)")
+    }
+}
+
 /// Commands sent from a `ClientHandle` into the connection actor. Each
 /// carries a `oneshot` for its result where the operation has one.
 #[derive(Debug)]
 pub(crate) enum Command {
     Login {
         username: String,
-        password: String,
+        password: Password,
         reply: oneshot::Sender<Result<Session, ClientError>>,
     },
     Join {
@@ -274,7 +294,7 @@ impl ClientHandle {
     pub async fn login(&self, username: &str, password: &str) -> Result<Session, ClientError> {
         self.send(|reply| Command::Login {
             username: username.to_owned(),
-            password: password.to_owned(),
+            password: Password::new(password),
             reply,
         })
         .await

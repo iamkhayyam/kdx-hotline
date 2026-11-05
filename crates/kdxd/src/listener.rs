@@ -175,7 +175,13 @@ pub async fn serve(config: Config) -> Result<Server, ServeError> {
         settings,
         bind_port: local_addr.port(),
         shutdown: Arc::new(Notify::new()),
+        login_limiter: kdx_server_core::auth::LoginLimiter::new(),
     });
+    // Convert legacy password hashes before taking connections.
+    ctx.auth
+        .prepare()
+        .await
+        .map_err(|e| ServeError::Init(e.to_string()))?;
     info!(%local_addr, "kdxd listening");
 
     // Register this server in its own tracker directory and keep the entry
@@ -265,8 +271,22 @@ pub async fn serve(config: Config) -> Result<Server, ServeError> {
                                 return;
                             }
                         };
-                        if let Err(e) =
-                            Connection::new_with_peer(tls, conn_ctx, peer.to_string()).run().await
+                        // Login proofs are bound to this TLS session.
+                        let binding = match tls.get_ref().1.export_keying_material(
+                            [0u8; kdx_crypto::CHANNEL_BINDING_LEN],
+                            kdx_crypto::TLS_EXPORTER_LABEL,
+                            None,
+                        ) {
+                            Ok(binding) => binding,
+                            Err(e) => {
+                                warn!(%peer, error = %e, "tls exporter unavailable");
+                                return;
+                            }
+                        };
+                        if let Err(e) = Connection::new_with_peer(tls, conn_ctx, peer.to_string())
+                            .with_channel_binding(binding)
+                            .run()
+                            .await
                         {
                             warn!(%peer, error = %e, "connection ended with error");
                         }

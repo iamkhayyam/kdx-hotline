@@ -9,10 +9,10 @@ use std::time::Instant;
 
 use common::{bump, connect_tls, frame, kdx_handshake, test_config, TlsClient};
 use futures_util::{SinkExt, StreamExt};
-use kdx_crypto::{client_response, hash_password, KdfParams};
+use kdx_crypto::hash_password;
 use kdx_protocol::messages::{
-    AuthChallenge, AuthRequest, AuthResponse, AuthResult, TransferAccept, TransferData,
-    TransferEnd, TransferRequest, DIRECTION_DOWNLOAD, DIRECTION_UPLOAD, TRANSFER_VERIFIED,
+    TransferAccept, TransferData, TransferEnd, TransferRequest, DIRECTION_DOWNLOAD,
+    DIRECTION_UPLOAD, TRANSFER_VERIFIED,
 };
 use kdx_protocol::{fragment, PacketFlags, PacketType, Reassembler};
 use kdx_storage::accounts;
@@ -22,40 +22,8 @@ use sha2::{Digest, Sha256};
 const CHUNK: usize = 32 * 1024; // > 16KB frame cap → server fragments each chunk
 
 async fn login(client: &mut TlsClient, seq: &mut u32, username: &str, password: &str) {
-    client
-        .send(frame(
-            PacketType::AuthRequest,
-            bump(seq),
-            AuthRequest {
-                username: username.into(),
-            }
-            .encode(),
-        ))
-        .await
-        .unwrap();
-    let challenge =
-        AuthChallenge::decode(&client.next().await.unwrap().unwrap().payload).unwrap();
-    let response = client_response(
-        password,
-        &challenge.salt,
-        &KdfParams {
-            m_cost: challenge.m_cost,
-            t_cost: challenge.t_cost,
-            p_cost: challenge.p_cost,
-        },
-        &challenge.challenge,
-    )
-    .unwrap();
-    client
-        .send(frame(
-            PacketType::AuthResponse,
-            bump(seq),
-            AuthResponse { response }.encode(),
-        ))
-        .await
-        .unwrap();
-    let result = AuthResult::decode(&client.next().await.unwrap().unwrap().payload).unwrap();
-    assert!(result.success, "{}", result.message);
+    // Channel-bound SCRAM login (protocol v2); see tests/common.
+    common::login(client, seq, username, password).await;
 }
 
 async fn send_fragmented(
@@ -197,7 +165,7 @@ async fn download_is_byte_identical() {
     let server = serve(test_config(&dir)).await.unwrap();
     let pool = kdx_storage::connect(&dir.path().join("kdx.db")).await.unwrap();
     let phc = hash_password("pw").unwrap();
-    accounts::create(&pool, "user", &phc, 2).await.unwrap();
+    accounts::create(&pool, "user", &phc, 2, 0, 0).await.unwrap();
 
     let mut client = connect_tls(server.local_addr).await;
     let mut seq = 0u32;
@@ -227,7 +195,7 @@ async fn download_resumes_after_disconnect() {
     let server = serve(test_config(&dir)).await.unwrap();
     let pool = kdx_storage::connect(&dir.path().join("kdx.db")).await.unwrap();
     let phc = hash_password("pw").unwrap();
-    accounts::create(&pool, "user", &phc, 2).await.unwrap();
+    accounts::create(&pool, "user", &phc, 2, 0, 0).await.unwrap();
 
     let data = test_blob(CHUNK * 4);
 
@@ -272,7 +240,7 @@ async fn dropbox_download_is_refused() {
     // Seed a dropbox and a file inside it before the server loads its tree.
     let pool = kdx_storage::connect(&dir.path().join("kdx.db")).await.unwrap();
     let phc = hash_password("pw").unwrap();
-    accounts::create(&pool, "user", &phc, 2).await.unwrap();
+    accounts::create(&pool, "user", &phc, 2, 0, 0).await.unwrap();
     kdx_storage::file_tree::create_folder(&pool, kdx_storage::file_tree::ROOT_ID, "drop", 2, 0, 1, None)
         .await
         .unwrap();
@@ -316,7 +284,7 @@ async fn download_throttle_caps_rate() {
     let server = serve(config).await.unwrap();
     let pool = kdx_storage::connect(&dir.path().join("kdx.db")).await.unwrap();
     let phc = hash_password("pw").unwrap();
-    accounts::create(&pool, "user", &phc, 2).await.unwrap();
+    accounts::create(&pool, "user", &phc, 2, 0, 0).await.unwrap();
 
     let mut client = connect_tls(server.local_addr).await;
     let mut seq = 0u32;
@@ -351,7 +319,7 @@ async fn huge_file_download_is_accepted() {
     let dir = tempfile::tempdir().unwrap();
     let pool = kdx_storage::connect(&dir.path().join("kdx.db")).await.unwrap();
     let phc = hash_password("pw").unwrap();
-    accounts::create(&pool, "user", &phc, 2).await.unwrap();
+    accounts::create(&pool, "user", &phc, 2, 0, 0).await.unwrap();
     // A sparse 5 GiB blob, filed before the server loads its tree.
     let files = dir.path().join("files");
     std::fs::create_dir_all(&files).unwrap();

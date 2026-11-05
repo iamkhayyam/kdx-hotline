@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use bitvec::prelude::*;
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
-use kdx_crypto::KdfParams;
+use kdx_crypto::{AuthContext, ClientProof, KdfParams};
 use kdx_protocol::messages::{
     AccountCreate, AccountListRequest, AccountListResponse, AccountRolesRequest,
     AccountRolesResponse, AccountUpdate, AdminDisconnect, AuthChallenge, AuthRequest, AuthResponse,
@@ -49,7 +49,7 @@ use crate::event::{
     AccountSummary, Direction, Event, FileSearchEntry, HistoryEntry, IpRule, NewsPost,
     NewsgroupInfo, PresenceUser, RoleInfo, ServerSettings, TrackerServer,
 };
-use crate::handle::{Command, Session};
+use crate::handle::{Command, Password, Session};
 use crate::transfer::{chunk_len, total_chunks, ChunkBitmap, Sidecar, DEFAULT_CHUNK_SIZE};
 
 const KEEPALIVE: Duration = Duration::from_secs(30);
@@ -57,7 +57,11 @@ const MAX_REASSEMBLED: usize = 4 * 1024 * 1024;
 
 /// A login in flight: which step we're waiting for and who to answer.
 struct PendingLogin {
-    password: String,
+    username: String,
+    /// Taken (and wiped on drop) as soon as the proof is computed.
+    password: Option<Password>,
+    /// Our proof, kept to check the server's signature in `AuthResult`.
+    proof: Option<ClientProof>,
     phase: LoginPhase,
     reply: oneshot::Sender<Result<Session, ClientError>>,
 }
@@ -123,6 +127,8 @@ pub(crate) struct Actor<S> {
     /// other request/response pair in this actor.
     connection_waiters: VecDeque<oneshot::Sender<Result<Vec<PresenceUser>, ClientError>>>,
     transfer: Option<Transfer>,
+    /// TLS exporter value login proofs are bound to (see `kdx_crypto::scram`).
+    channel_binding: [u8; kdx_crypto::CHANNEL_BINDING_LEN],
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
@@ -155,7 +161,19 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
             ip_rule_waiters: VecDeque::new(),
             connection_waiters: VecDeque::new(),
             transfer: None,
+            channel_binding: [0u8; kdx_crypto::CHANNEL_BINDING_LEN],
         }
+    }
+
+    /// Bind logins to the TLS session: `binding` is this connection's
+    /// `export_keying_material(32, kdx_crypto::TLS_EXPORTER_LABEL, None)`.
+    /// Without it (in-memory tests) the binding is all zeros.
+    pub(crate) fn with_channel_binding(
+        mut self,
+        binding: [u8; kdx_crypto::CHANNEL_BINDING_LEN],
+    ) -> Self {
+        self.channel_binding = binding;
+        self
     }
 
     pub(crate) async fn run(mut self) {
@@ -271,10 +289,18 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
                     let _ = reply.send(Err(ClientError::AuthFailed("login already in progress".into())));
                     return Ok(());
                 }
-                self.send(PacketType::AuthRequest, AuthRequest { username }.encode())
-                    .await?;
+                self.send(
+                    PacketType::AuthRequest,
+                    AuthRequest {
+                        username: username.clone(),
+                    }
+                    .encode(),
+                )
+                .await?;
                 self.login = Some(PendingLogin {
-                    password,
+                    username,
+                    password: Some(password),
+                    proof: None,
                     phase: LoginPhase::AwaitingChallenge,
                     reply,
                 });
@@ -1409,19 +1435,56 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
             return Ok(());
         }
         let challenge = AuthChallenge::decode(payload)?;
-        let response = kdx_crypto::client_response(
-            &login.password,
-            &challenge.salt,
-            &KdfParams {
-                m_cost: challenge.m_cost,
-                t_cost: challenge.t_cost,
-                p_cost: challenge.p_cost,
-            },
-            &challenge.challenge,
-        )?;
-        login.phase = LoginPhase::AwaitingResult;
+        let Some(password) = login.password.take() else {
+            return Ok(());
+        };
+        let username = login.username.clone();
+        let binding = self.channel_binding;
+        // `client_proof` refuses out-of-bounds KDF parameters before running
+        // Argon2, so a hostile server can't make us allocate terabytes or
+        // spin for hours; the (bounded) Argon2 work itself runs on a blocking
+        // thread, not on a runtime worker.
+        let derived = tokio::task::spawn_blocking(move || {
+            kdx_crypto::client_proof(
+                password.as_str(),
+                &AuthContext {
+                    username: &username,
+                    challenge: &challenge.challenge,
+                    salt: &challenge.salt,
+                    params: KdfParams {
+                        m_cost: challenge.m_cost,
+                        t_cost: challenge.t_cost,
+                        p_cost: challenge.p_cost,
+                    },
+                    channel_binding: &binding,
+                },
+            )
+        })
+        .await;
+        let proof = match derived {
+            Ok(Ok(proof)) => proof,
+            Ok(Err(e)) => {
+                return self.fail_login(e.to_string());
+            }
+            Err(_) => {
+                return self.fail_login("login computation failed".into());
+            }
+        };
+        let response = proof.proof;
+        if let Some(login) = self.login.as_mut() {
+            login.proof = Some(proof);
+            login.phase = LoginPhase::AwaitingResult;
+        }
         self.send(PacketType::AuthResponse, AuthResponse { response }.encode())
             .await?;
+        Ok(())
+    }
+
+    /// End the login in flight with `AuthFailed(message)`.
+    fn fail_login(&mut self, message: String) -> Result<(), ClientError> {
+        if let Some(login) = self.login.take() {
+            let _ = login.reply.send(Err(ClientError::AuthFailed(message)));
+        }
         Ok(())
     }
 
@@ -1431,14 +1494,31 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
             return Ok(());
         };
         let result = AuthResult::decode(payload)?;
-        if result.success {
-            let _ = login.reply.send(Ok(Session {
-                session_id: result.session_id,
-                class: result.class,
-            }));
-        } else {
+        if !result.success {
+            // Also valid straight after AuthRequest (throttled, server full,
+            // invalid username): the server may refuse without a challenge.
             let _ = login.reply.send(Err(ClientError::AuthFailed(result.message)));
+            return Ok(());
         }
+        // A success counts only after our proof, and only with a server
+        // signature that proves the server holds this account's credential.
+        // Otherwise it's an impostor (or a relay): fail and drop the link.
+        let verified = matches!(login.phase, LoginPhase::AwaitingResult)
+            && login
+                .proof
+                .as_ref()
+                .is_some_and(|p| p.verify_server_signature(&result.server_signature));
+        if !verified {
+            let message = "server failed to prove it knows this account".to_string();
+            let _ = login
+                .reply
+                .send(Err(ClientError::AuthFailed(message.clone())));
+            return Err(ClientError::AuthFailed(message));
+        }
+        let _ = login.reply.send(Ok(Session {
+            session_id: result.session_id,
+            class: result.class,
+        }));
         Ok(())
     }
 
