@@ -24,9 +24,8 @@ type ServerSide = Framed<DuplexStream, KdxCodec>;
 
 struct Harness {
     client: ClientHandle,
-    _events: mpsc::Receiver<Event>,
+    events: mpsc::Receiver<Event>,
     server: ServerSide,
-    actor: JoinHandle<()>,
     seq: u32,
 }
 
@@ -41,10 +40,9 @@ fn harness() -> Harness {
     )
     .with_channel_binding(BINDING);
     Harness {
-        client: ClientHandle { tx: cmd_tx },
-        _events: event_rx,
+        client: actor.spawn(cmd_tx),
+        events: event_rx,
         server: Framed::new(server_io, KdxCodec::default()),
-        actor: tokio::spawn(actor.run()),
         seq: 0,
     }
 }
@@ -161,10 +159,17 @@ async fn success_without_valid_server_signature_is_rejected() {
         finish(login).await,
         Err(ClientError::AuthFailed(_))
     ));
-    tokio::time::timeout(Duration::from_secs(5), h.actor)
-        .await
-        .expect("actor should disconnect from an impostor")
-        .unwrap();
+    // The actor hangs up on an impostor: a Disconnected event (or the
+    // event channel closing because the actor is gone).
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(event) = h.events.recv().await {
+            if matches!(event, Event::Disconnected { .. }) {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("actor should disconnect from an impostor");
 }
 
 /// A success that arrives before we've sent any proof is never valid.

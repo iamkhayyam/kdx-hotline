@@ -31,4 +31,5 @@ kdxd = { path = "../kdxd" }
 kdx-storage = { workspace = true }
 tempfile = { workspace = true }
 serde_json = { workspace = true }
+rcgen = { workspace = true }
 tokio = { workspace = true, features = ["full", "test-util"] }

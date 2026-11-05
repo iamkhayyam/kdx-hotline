@@ -1,16 +1,47 @@
 //! The connection actor: one task owning the TLS socket. It is the sole
 //! reader and writer of the stream, owns the sequence counter, correlates
-//! request/response pairs (the wire has no request IDs, so correlation is
-//! FIFO-per-response-type), drives the one active transfer, and turns
+//! request/response pairs, drives the one active transfer, and turns
 //! unsolicited server frames into events.
+//!
+//! # Request correlation
+//!
+//! The wire carries no request ids, but the server handles one connection's
+//! requests strictly in order and writes each request's direct answer
+//! before it reads the next request. Server-pushed events (chat, presence,
+//! user lists, topics, invitations, Info/Warning broadcasts, transfer data)
+//! never use a reply packet type or `Error`. So the actor keeps ONE queue,
+//! [`Pending`], of everything it is owed, in send order:
+//!
+//! - **Requests** (`Pending::Reply`) always get exactly one answer: their
+//!   reply type, or `Error`. An answer pops the head of the queue, which
+//!   must be a request expecting that type (anything else is a protocol
+//!   violation and closes the connection). An `Error` fails only the head.
+//! - **Fire-and-forget commands** (join, leave, chat, topic, room flags,
+//!   private message, invite, identity, broadcast, kick, shutdown, upload
+//!   chunks, transfer abort) get either nothing or one `Error` (and some an
+//!   `Info` ack, which stays an event). Because "nothing" can't be waited
+//!   for, each one is followed by a `Ping` barrier carrying a token
+//!   (`Pending::Barrier`): the server answers `[Error] Pong(token)`, so an
+//!   `Error` that arrives while a barrier is at the head belongs to that
+//!   barrier's command, and the `Pong` retires it. Keepalive pings are
+//!   barriers with no command.
+//! - An `Error` with nothing attributable at the head is unsolicited; like
+//!   every `Error` it is also surfaced as `Event::ServerError`.
+//!
+//! Fire-and-forget calls still resolve as soon as they are written (their
+//! errors arrive as `Event::ServerError`, as before); `invite_to_chat` waits
+//! for its barrier because it needs the outcome and the new room's id.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::io;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::SystemTime;
 
 use bitvec::prelude::*;
 use bytes::Bytes;
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{FutureExt, SinkExt, StreamExt};
 use kdx_crypto::{AuthContext, ClientProof, KdfParams};
 use kdx_protocol::messages::{
     AccountCreate, AccountListRequest, AccountListResponse, AccountRolesRequest,
@@ -30,7 +61,8 @@ use kdx_protocol::messages::{
     PrivateSend, RoleAssign, RoleCreate, RoleDelete, RoleListRequest, RoleListResponse,
     RoleUnassign, RoleUpdate, SetIdentity, TransferAccept, TransferData, TransferEnd,
     TransferRequest,
-    UserInfoRequest, UserInfoResponse, DIRECTION_DOWNLOAD, DIRECTION_UPLOAD, TRANSFER_VERIFIED,
+    UserInfoRequest, UserInfoResponse, DIRECTION_DOWNLOAD, DIRECTION_UPLOAD, TRANSFER_ABORTED,
+    TRANSFER_VERIFIED,
 };
 use kdx_protocol::{
     KdxCodec, KdxFrame, PacketFlags, PacketHeader, PacketType, Reassembler, PROTOCOL_VERSION,
@@ -38,22 +70,80 @@ use kdx_protocol::{
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::{mpsc, oneshot};
-use tokio::time::{interval, Duration};
+use tokio::sync::{mpsc, oneshot, watch};
+use tokio::task::JoinHandle;
+use tokio::time::{interval_at, sleep_until, Duration, Instant, MissedTickBehavior};
 use tokio_util::codec::Framed;
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 use uuid::Uuid;
 
+use crate::config::{
+    DEFAULT_KEEPALIVE, DEFAULT_REQUEST_TIMEOUT, DEFAULT_WRITE_TIMEOUT,
+};
 use crate::error::ClientError;
 use crate::event::{
     AccountSummary, Direction, Event, FileSearchEntry, HistoryEntry, IpRule, NewsPost,
     NewsgroupInfo, PresenceUser, RoleInfo, ServerSettings, TrackerServer,
 };
-use crate::handle::{Command, Password, Session};
-use crate::transfer::{chunk_len, total_chunks, ChunkBitmap, Sidecar, DEFAULT_CHUNK_SIZE};
+use crate::handle::{ClientHandle, Command, Password, Session};
+use crate::transfer::{
+    bitmap_bytes, choose_chunk_size, chunk_len, data_path_for, hash_download, prepare_upload,
+    progress_bitmap, validate_geometry, ChunkBitmap, PreparedUpload, Sidecar, DEFAULT_CHUNK_SIZE,
+};
 
-const KEEPALIVE: Duration = Duration::from_secs(30);
+#[cfg(test)]
+mod tests;
+
 const MAX_REASSEMBLED: usize = 4 * 1024 * 1024;
+/// Largest request payload we send: the server's reassembly cap.
+const MAX_OUTBOUND_PAYLOAD: usize = 4 * 1024 * 1024;
+/// How long the courtesy `Disconnect` frame may take on the way out.
+const GOODBYE_TIMEOUT: Duration = Duration::from_millis(500);
+/// At most this many progress events per second per transfer (plus a
+/// final one).
+const PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
+/// Progress-event bitmaps are downsampled to at most this many bits.
+const PROGRESS_MAX_BITS: usize = 1024;
+/// Persist download resume state every this many chunks…
+const SIDECAR_EVERY_CHUNKS: u32 = 64;
+/// …or at least this often while chunks are arriving.
+const SIDECAR_EVERY: Duration = Duration::from_secs(2);
+/// Upload chunks in flight (written but not yet acknowledged by their
+/// barrier `Pong`), bounded by bytes.
+const UPLOAD_WINDOW_BYTES: u64 = 4 * 1024 * 1024;
+/// A download is retried once for chunks the server skipped (e.g. because
+/// a stale resume bitmap claimed them) before giving up.
+const MAX_DOWNLOAD_ROUNDS: u8 = 2;
+/// Cap on outstanding requests + barriers; a server that stops answering
+/// while staying chatty can't grow the queue without bound.
+const MAX_PENDING: usize = 4096;
+/// Cap on invitations waiting for their room id.
+const MAX_PENDING_INVITES: usize = 64;
+/// How many abandoned transfer ids to remember (their late data / end
+/// frames are ignored instead of being taken for the current transfer's).
+const MAX_ABANDONED: usize = 16;
+
+/// Knobs the actor needs from `ClientConfig`.
+#[derive(Debug, Clone)]
+pub(crate) struct ActorOptions {
+    pub keepalive: Duration,
+    pub request_timeout: Duration,
+    pub write_timeout: Duration,
+    /// `host:port`, recorded in download sidecars so a resume is only
+    /// attempted against the same server.
+    pub server_id: String,
+}
+
+impl Default for ActorOptions {
+    fn default() -> Self {
+        Self {
+            keepalive: DEFAULT_KEEPALIVE,
+            request_timeout: DEFAULT_REQUEST_TIMEOUT,
+            write_timeout: DEFAULT_WRITE_TIMEOUT,
+            server_id: String::new(),
+        }
+    }
+}
 
 /// A login in flight: which step we're waiting for and who to answer.
 struct PendingLogin {
@@ -71,64 +161,290 @@ enum LoginPhase {
     AwaitingResult,
 }
 
+type Reply<T> = oneshot::Sender<Result<T, ClientError>>;
+
+/// A request waiting for its one reply (or `Error`).
+enum Waiter {
+    FileList(Reply<FileListResponse>),
+    FileInfo(Reply<FileInfoResponse>),
+    Catalog(Reply<u32>),
+    Search(Reply<Vec<FileSearchEntry>>),
+    Users(Reply<Vec<PresenceUser>>),
+    UserInfo(Reply<PresenceUser>),
+    Servers(Reply<Vec<TrackerServer>>),
+    Settings(Reply<ServerSettings>),
+    History(Reply<Vec<HistoryEntry>>),
+    IpRules(Reply<Vec<IpRule>>),
+    Connections(Reply<Vec<PresenceUser>>),
+    Roles(Reply<Vec<RoleInfo>>),
+    AccountRoles(Reply<Vec<String>>),
+    Accounts(Reply<Vec<AccountSummary>>),
+    Newsgroups(Reply<Vec<NewsgroupInfo>>),
+    Thread(Reply<Vec<NewsPost>>),
+    /// A `FileTransferStart` request, answered by a `TransferAccept` (sent
+    /// as `FileTransferStart`) or `Error`. The caller's reply lives in the
+    /// transfer itself; this is that transfer's generation.
+    TransferStart(u64),
+}
+
+impl Waiter {
+    fn expects(&self) -> PacketType {
+        match self {
+            Waiter::FileList(_) => PacketType::FileListResponse,
+            Waiter::FileInfo(_) => PacketType::FileInfoResponse,
+            Waiter::Catalog(_) => PacketType::FileCatalogGenerated,
+            Waiter::Search(_) => PacketType::FileSearchResponse,
+            Waiter::Users(_) => PacketType::PresenceListResponse,
+            Waiter::UserInfo(_) => PacketType::UserInfoResponse,
+            Waiter::Servers(_) => PacketType::TrackerListResponse,
+            Waiter::Settings(_) => PacketType::ServerSettingsResponse,
+            Waiter::History(_) => PacketType::HistoryListResponse,
+            Waiter::IpRules(_) => PacketType::IpRuleListResponse,
+            Waiter::Connections(_) => PacketType::ConnectionListResponse,
+            Waiter::Roles(_) => PacketType::RoleListResponse,
+            Waiter::AccountRoles(_) => PacketType::AccountRolesResponse,
+            Waiter::Accounts(_) => PacketType::AccountListResponse,
+            Waiter::Newsgroups(_) => PacketType::NewsgroupListResponse,
+            Waiter::Thread(_) => PacketType::NewsThreadListResponse,
+            Waiter::TransferStart(_) => PacketType::FileTransferStart,
+        }
+    }
+
+    fn fail(self, err: ClientError) {
+        match self {
+            Waiter::FileList(tx) => drop(tx.send(Err(err))),
+            Waiter::FileInfo(tx) => drop(tx.send(Err(err))),
+            Waiter::Catalog(tx) => drop(tx.send(Err(err))),
+            Waiter::Search(tx) => drop(tx.send(Err(err))),
+            Waiter::Users(tx) => drop(tx.send(Err(err))),
+            Waiter::UserInfo(tx) => drop(tx.send(Err(err))),
+            Waiter::Servers(tx) => drop(tx.send(Err(err))),
+            Waiter::Settings(tx) => drop(tx.send(Err(err))),
+            Waiter::History(tx) => drop(tx.send(Err(err))),
+            Waiter::IpRules(tx) => drop(tx.send(Err(err))),
+            Waiter::Connections(tx) => drop(tx.send(Err(err))),
+            Waiter::Roles(tx) => drop(tx.send(Err(err))),
+            Waiter::AccountRoles(tx) => drop(tx.send(Err(err))),
+            Waiter::Accounts(tx) => drop(tx.send(Err(err))),
+            Waiter::Newsgroups(tx) => drop(tx.send(Err(err))),
+            Waiter::Thread(tx) => drop(tx.send(Err(err))),
+            Waiter::TransferStart(_) => {}
+        }
+    }
+}
+
+/// Something the server owes us, in send order. See the module docs.
+enum Pending {
+    Reply(Waiter),
+    Barrier { token: u64, quiet: Option<Quiet> },
+}
+
+/// The fire-and-forget command a barrier stands behind.
+struct Quiet {
+    kind: QuietKind,
+    /// The `Error` the server answered it with, if any.
+    error: Option<String>,
+}
+
+#[derive(Clone, Copy)]
+enum QuietKind {
+    Plain,
+    Invite(u64),
+    UploadChunk { gen: u64, len: u64, index: u32 },
+}
+
+/// An invitation waiting for its outcome and its room id.
+struct InviteWait {
+    id: u64,
+    reply: Option<Reply<String>>,
+    /// The server answered with an `Error` (the caller already got it).
+    failed: bool,
+    /// The barrier behind the invite has come back.
+    settled: bool,
+    room: Option<String>,
+}
+
+/// What to do with a download's on-disk state when it fails.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Cleanup {
+    /// Keep (and refresh) the resume sidecar and data for a later retry.
+    Keep,
+    /// The partial data is worthless: delete it and the sidecar.
+    Discard,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Stage {
+    /// Hashing the local file (uploads only).
+    Preparing,
+    /// Request written; waiting for the server's accept.
+    AwaitingAccept { deadline: Instant },
+    /// Accepted; data flowing.
+    Running,
+    /// All data received; verifying the whole-file hash (downloads only).
+    Verifying,
+}
+
 /// The single active transfer, if any.
-enum Transfer {
+struct Transfer {
+    /// Distinguishes this transfer from earlier ones whose late replies,
+    /// barriers or blocking jobs may still arrive.
+    gen: u64,
+    reply: Option<Reply<()>>,
+    cancel: Arc<AtomicBool>,
+    stage: Stage,
+    job: Job,
+}
+
+enum Job {
     Upload(UploadJob),
     Download(DownloadJob),
 }
 
 struct UploadJob {
-    id: [u8; 16],
-    data: Vec<u8>,
+    remote_dir: String,
+    name: String,
+    file: Option<tokio::fs::File>,
     size: u64,
+    modified: Option<SystemTime>,
+    sha256: [u8; 32],
     chunk_size: u32,
     total: u32,
-    accepted: bool,
-    reply: Option<oneshot::Sender<Result<(), ClientError>>>,
+    id: [u8; 16],
+    /// Chunks the server already had at accept time.
+    skip: ChunkBitmap,
+    /// Chunks the server has acknowledged (plus `skip`).
+    done: ChunkBitmap,
+    next: u32,
+    in_flight_bytes: u64,
+    last_progress: Option<Instant>,
 }
 
 struct DownloadJob {
-    id: [u8; 16],
+    remote_path: String,
     local: PathBuf,
-    part_path: PathBuf,
+    data_path: PathBuf,
+    expected_size: Option<u64>,
+    requested_chunk: u32,
+    /// Resume state that matched this server and remote path at request
+    /// time; consumed (and checked against the accept) on the first accept.
+    resume: Option<Sidecar>,
+    /// Geometry has been accepted at least once (identity known).
+    accepted: bool,
+    round: u8,
     file: Option<tokio::fs::File>,
+    id: [u8; 16],
     size: u64,
     chunk_size: u32,
     total: u32,
     sha256: [u8; 32],
     have: ChunkBitmap,
-    reply: Option<oneshot::Sender<Result<(), ClientError>>>,
+    last_progress: Option<Instant>,
+    unsaved_chunks: u32,
+    last_sidecar: Instant,
+    sidecar_task: Option<JoinHandle<()>>,
+}
+
+/// Blocking-pool work the actor is waiting on, polled from its select loop
+/// so the actor stays responsive meanwhile.
+enum Blocking {
+    UploadPrep {
+        gen: u64,
+        task: JoinHandle<Result<PreparedUpload, ClientError>>,
+    },
+    Verify {
+        gen: u64,
+        task: JoinHandle<Result<[u8; 32], ClientError>>,
+    },
+}
+
+enum BlockingDone {
+    UploadPrep(u64, Result<PreparedUpload, ClientError>),
+    Verify(u64, Result<[u8; 32], ClientError>),
+}
+
+async fn poll_blocking(slot: &mut Option<Blocking>) -> BlockingDone {
+    fn flat<T>(r: Result<Result<T, ClientError>, tokio::task::JoinError>) -> Result<T, ClientError> {
+        r.unwrap_or_else(|e| Err(ClientError::Transfer(format!("internal error: {e}"))))
+    }
+    match slot {
+        Some(Blocking::UploadPrep { gen, task }) => BlockingDone::UploadPrep(*gen, flat(task.await)),
+        Some(Blocking::Verify { gen, task }) => BlockingDone::Verify(*gen, flat(task.await)),
+        None => std::future::pending().await,
+    }
+}
+
+/// Resolve once a disconnect has been requested (or every handle is gone).
+async fn wait_shutdown(rx: &mut watch::Receiver<bool>) {
+    loop {
+        if *rx.borrow_and_update() {
+            return;
+        }
+        if rx.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
+/// Why a write didn't happen.
+#[derive(Debug)]
+pub(crate) enum SendError {
+    /// The socket is unusable; the connection must close.
+    Fatal(io::Error),
+    /// This one request can't be sent (e.g. too large); nothing was
+    /// written and the session is unaffected.
+    Rejected(ClientError),
+}
+
+impl std::fmt::Display for SendError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SendError::Fatal(e) => write!(f, "{e}"),
+            SendError::Rejected(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl From<SendError> for ClientError {
+    fn from(e: SendError) -> Self {
+        match e {
+            SendError::Fatal(e) => ClientError::Io(e),
+            SendError::Rejected(e) => e,
+        }
+    }
 }
 
 pub(crate) struct Actor<S> {
     framed: Framed<S, KdxCodec>,
     commands: mpsc::Receiver<Command>,
     events: mpsc::Sender<Event>,
+    opts: ActorOptions,
+    shutdown: watch::Receiver<bool>,
+    /// Held until `spawn` hands it to the `ClientHandle`.
+    shutdown_tx: Option<watch::Sender<bool>>,
     reasm: Reassembler,
     seq: u32,
     login: Option<PendingLogin>,
-    list_waiters: VecDeque<oneshot::Sender<Result<FileListResponse, ClientError>>>,
-    info_waiters: VecDeque<oneshot::Sender<Result<FileInfoResponse, ClientError>>>,
-    user_list_waiters: VecDeque<oneshot::Sender<Result<Vec<PresenceUser>, ClientError>>>,
-    server_list_waiters: VecDeque<oneshot::Sender<Result<Vec<TrackerServer>, ClientError>>>,
-    settings_waiters: VecDeque<oneshot::Sender<Result<ServerSettings, ClientError>>>,
-    catalog_waiters: VecDeque<oneshot::Sender<Result<u32, ClientError>>>,
-    search_waiters: VecDeque<oneshot::Sender<Result<Vec<FileSearchEntry>, ClientError>>>,
-    user_info_waiters: VecDeque<oneshot::Sender<Result<PresenceUser, ClientError>>>,
-    role_waiters: VecDeque<oneshot::Sender<Result<Vec<RoleInfo>, ClientError>>>,
-    account_roles_waiters: VecDeque<oneshot::Sender<Result<Vec<String>, ClientError>>>,
-    account_waiters: VecDeque<oneshot::Sender<Result<Vec<AccountSummary>, ClientError>>>,
-    newsgroup_waiters: VecDeque<oneshot::Sender<Result<Vec<NewsgroupInfo>, ClientError>>>,
-    thread_waiters: VecDeque<oneshot::Sender<Result<Vec<NewsPost>, ClientError>>>,
-    history_waiters: VecDeque<oneshot::Sender<Result<Vec<HistoryEntry>, ClientError>>>,
-    ip_rule_waiters: VecDeque<oneshot::Sender<Result<Vec<IpRule>, ClientError>>>,
-    /// FIFO queue for `list_connections()` replies — the wire response
-    /// (`ConnectionListResponse`) carries no correlation id, matching every
-    /// other request/response pair in this actor.
-    connection_waiters: VecDeque<oneshot::Sender<Result<Vec<PresenceUser>, ClientError>>>,
+    pending: VecDeque<Pending>,
+    next_token: u64,
+    invites: VecDeque<InviteWait>,
+    next_invite: u64,
+    /// Rooms this client joined itself (so their user lists aren't taken
+    /// for a fresh invitation room).
+    known_rooms: HashSet<String>,
     transfer: Option<Transfer>,
     /// TLS exporter value login proofs are bound to (see `kdx_crypto::scram`).
     channel_binding: [u8; kdx_crypto::CHANNEL_BINDING_LEN],
+    next_gen: u64,
+    /// Server transfer ids we gave up on; see `MAX_ABANDONED`.
+    abandoned: VecDeque<[u8; 16]>,
+    blocking: Option<Blocking>,
+    last_inbound: Instant,
+    /// Set when the connection must close but the code that noticed can't
+    /// return the error; checked at the top of every loop turn.
+    dead: Option<String>,
+    /// Tearing down: don't write anything else.
+    closing: bool,
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
@@ -137,31 +453,30 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
         commands: mpsc::Receiver<Command>,
         events: mpsc::Sender<Event>,
     ) -> Self {
+        let (shutdown_tx, shutdown) = watch::channel(false);
         Self {
             framed,
             commands,
             events,
+            opts: ActorOptions::default(),
+            shutdown,
+            shutdown_tx: Some(shutdown_tx),
             reasm: Reassembler::default(),
             seq: 0,
             login: None,
-            list_waiters: VecDeque::new(),
-            info_waiters: VecDeque::new(),
-            user_list_waiters: VecDeque::new(),
-            server_list_waiters: VecDeque::new(),
-            settings_waiters: VecDeque::new(),
-            catalog_waiters: VecDeque::new(),
-            search_waiters: VecDeque::new(),
-            user_info_waiters: VecDeque::new(),
-            role_waiters: VecDeque::new(),
-            account_roles_waiters: VecDeque::new(),
-            account_waiters: VecDeque::new(),
-            newsgroup_waiters: VecDeque::new(),
-            thread_waiters: VecDeque::new(),
-            history_waiters: VecDeque::new(),
-            ip_rule_waiters: VecDeque::new(),
-            connection_waiters: VecDeque::new(),
+            pending: VecDeque::new(),
+            next_token: 0,
+            invites: VecDeque::new(),
+            next_invite: 0,
+            known_rooms: HashSet::new(),
             transfer: None,
             channel_binding: [0u8; kdx_crypto::CHANNEL_BINDING_LEN],
+            next_gen: 0,
+            abandoned: VecDeque::new(),
+            blocking: None,
+            last_inbound: Instant::now(),
+            dead: None,
+            closing: false,
         }
     }
 
@@ -176,20 +491,76 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
         self
     }
 
+    pub(crate) fn with_options(mut self, opts: ActorOptions) -> Self {
+        self.opts = opts;
+        self
+    }
+
+    /// Start the actor under supervision and return the handle that drives
+    /// it. If the actor task panics, the supervisor still emits
+    /// `Event::Disconnected` so the application learns the session is gone.
+    pub(crate) fn spawn(mut self, commands: mpsc::Sender<Command>) -> ClientHandle
+    where
+        S: Send + 'static,
+    {
+        let shutdown = self
+            .shutdown_tx
+            .take()
+            .unwrap_or_else(|| {
+                let (tx, rx) = watch::channel(false);
+                self.shutdown = rx;
+                tx
+            });
+        let handle = ClientHandle {
+            tx: commands,
+            shutdown: Arc::new(shutdown),
+            request_timeout: self.opts.request_timeout,
+        };
+        let events = self.events.clone();
+        let task = tokio::spawn(self.run());
+        tokio::spawn(async move {
+            if let Err(e) = task.await {
+                if e.is_panic() {
+                    error!("connection actor panicked");
+                    let _ = events
+                        .send(Event::Disconnected {
+                            reason: "internal error".into(),
+                        })
+                        .await;
+                }
+            }
+        });
+        handle
+    }
+
     pub(crate) async fn run(mut self) {
-        let mut keepalive = interval(KEEPALIVE);
-        keepalive.tick().await; // consume the immediate first tick
+        let start = Instant::now() + self.opts.keepalive;
+        let mut keepalive = interval_at(start, self.opts.keepalive);
+        keepalive.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        self.last_inbound = Instant::now();
 
         let reason = loop {
+            if let Some(reason) = self.dead.take() {
+                break reason;
+            }
+            let idle_deadline = self.last_inbound + self.opts.keepalive * 2;
+            let accept_deadline = self.accept_deadline();
+            let can_send_chunk = self.upload_can_send();
+            let blocking_active = self.blocking.is_some();
+
             tokio::select! {
+                _ = wait_shutdown(&mut self.shutdown) => {
+                    self.goodbye().await;
+                    break "disconnected".to_string();
+                }
                 cmd = self.commands.recv() => {
                     match cmd {
-                        Some(Command::Disconnect) | None => {
-                            let _ = self.send(PacketType::Disconnect, Bytes::new()).await;
+                        None => {
+                            self.goodbye().await;
                             break "disconnected".to_string();
                         }
                         Some(cmd) => {
-                            if let Err(e) = self.handle_command(cmd).await {
+                            if let Err(SendError::Fatal(e)) = self.handle_command(cmd).await {
                                 break format!("write failed: {e}");
                             }
                         }
@@ -198,14 +569,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
                 frame = self.framed.next() => {
                     match frame {
                         Some(Ok(frame)) => {
-                            match self.reasm.push(frame, MAX_REASSEMBLED) {
-                                Ok(Some(full)) => {
-                                    if let Err(e) = self.handle_frame(full).await {
-                                        break format!("protocol error: {e}");
-                                    }
-                                }
-                                Ok(None) => {} // mid-fragment
-                                Err(e) => break format!("framing error: {e}"),
+                            if let Err(reason) = self.on_frame(frame).await {
+                                break reason;
                             }
                         }
                         Some(Err(e)) => break format!("stream error: {e}"),
@@ -213,72 +578,83 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
                     }
                 }
                 _ = keepalive.tick() => {
-                    if self.send(PacketType::Ping, Bytes::new()).await.is_err() {
-                        break "keepalive write failed".to_string();
+                    // No pings mid-login: the server expects the very next
+                    // packet after its challenge to be our response.
+                    if self.login.is_none() {
+                        if let Err(e) = self.send_barrier(None).await {
+                            break format!("keepalive write failed: {e}");
+                        }
                     }
+                }
+                _ = sleep_until(idle_deadline) => {
+                    // Something may already be buffered while we were busy;
+                    // only a server that has sent nothing at all is dead.
+                    match self.framed.next().now_or_never() {
+                        Some(Some(Ok(frame))) => {
+                            if let Err(reason) = self.on_frame(frame).await {
+                                break reason;
+                            }
+                        }
+                        Some(Some(Err(e))) => break format!("stream error: {e}"),
+                        Some(None) => break "connection closed by server".to_string(),
+                        None => break "server stopped responding".to_string(),
+                    }
+                }
+                done = poll_blocking(&mut self.blocking), if blocking_active => {
+                    self.blocking = None;
+                    self.on_blocking_done(done).await;
+                }
+                _ = std::future::ready(()), if can_send_chunk => {
+                    self.send_next_chunk().await;
+                }
+                _ = sleep_until(accept_deadline.unwrap_or(idle_deadline)), if accept_deadline.is_some() => {
+                    let err = ClientError::Timeout("the server did not accept the transfer".into());
+                    self.fail_transfer(err, Cleanup::Keep).await;
                 }
             }
         };
 
+        // A write abandoned because the user asked to disconnect is just
+        // that: a disconnect.
+        let reason = if *self.shutdown.borrow() {
+            "disconnected".to_string()
+        } else {
+            reason
+        };
+        self.closing = true;
         // Fail any outstanding waiters, then announce the disconnect.
         if let Some(login) = self.login.take() {
             let _ = login.reply.send(Err(ClientError::Disconnected));
         }
-        for waiter in self.info_waiters.drain(..) {
-            let _ = waiter.send(Err(ClientError::Disconnected));
+        for pending in self.pending.drain(..) {
+            if let Pending::Reply(waiter) = pending {
+                waiter.fail(ClientError::Disconnected);
+            }
         }
-        for waiter in self.list_waiters.drain(..) {
-            let _ = waiter.send(Err(ClientError::Disconnected));
+        for invite in self.invites.drain(..) {
+            if let Some(reply) = invite.reply {
+                let _ = reply.send(Err(ClientError::Disconnected));
+            }
         }
-        for waiter in self.user_list_waiters.drain(..) {
-            let _ = waiter.send(Err(ClientError::Disconnected));
-        }
-        for waiter in self.server_list_waiters.drain(..) {
-            let _ = waiter.send(Err(ClientError::Disconnected));
-        }
-        for waiter in self.settings_waiters.drain(..) {
-            let _ = waiter.send(Err(ClientError::Disconnected));
-        }
-        for waiter in self.catalog_waiters.drain(..) {
-            let _ = waiter.send(Err(ClientError::Disconnected));
-        }
-        for waiter in self.search_waiters.drain(..) {
-            let _ = waiter.send(Err(ClientError::Disconnected));
-        }
-        for waiter in self.user_info_waiters.drain(..) {
-            let _ = waiter.send(Err(ClientError::Disconnected));
-        }
-        for waiter in self.role_waiters.drain(..) {
-            let _ = waiter.send(Err(ClientError::Disconnected));
-        }
-        for waiter in self.account_roles_waiters.drain(..) {
-            let _ = waiter.send(Err(ClientError::Disconnected));
-        }
-        for waiter in self.account_waiters.drain(..) {
-            let _ = waiter.send(Err(ClientError::Disconnected));
-        }
-        for waiter in self.newsgroup_waiters.drain(..) {
-            let _ = waiter.send(Err(ClientError::Disconnected));
-        }
-        for waiter in self.thread_waiters.drain(..) {
-            let _ = waiter.send(Err(ClientError::Disconnected));
-        }
-        for waiter in self.history_waiters.drain(..) {
-            let _ = waiter.send(Err(ClientError::Disconnected));
-        }
-        for waiter in self.ip_rule_waiters.drain(..) {
-            let _ = waiter.send(Err(ClientError::Disconnected));
-        }
-        for waiter in self.connection_waiters.drain(..) {
-            let _ = waiter.send(Err(ClientError::Disconnected));
-        }
-        if let Some(reply) = self.transfer.take().and_then(transfer_reply) {
-            let _ = reply.send(Err(ClientError::Disconnected));
-        }
-        let _ = self.events.send(Event::Disconnected { reason }).await;
+        self.fail_transfer(ClientError::Disconnected, Cleanup::Keep).await;
+        let events = self.events.clone();
+        drop(self); // close the socket before (possibly) waiting on the UI
+        let _ = events.send(Event::Disconnected { reason }).await;
     }
 
-    async fn handle_command(&mut self, cmd: Command) -> io::Result<()> {
+    async fn on_frame(&mut self, frame: KdxFrame) -> Result<(), String> {
+        self.last_inbound = Instant::now();
+        match self.reasm.push(frame, MAX_REASSEMBLED) {
+            Ok(Some(full)) => self
+                .handle_frame(full)
+                .await
+                .map_err(|e| format!("protocol error: {e}")),
+            Ok(None) => Ok(()), // mid-fragment
+            Err(e) => Err(format!("framing error: {e}")),
+        }
+    }
+
+    async fn handle_command(&mut self, cmd: Command) -> Result<(), SendError> {
         match cmd {
             Command::Login {
                 username,
@@ -306,12 +682,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
                 });
             }
             Command::Join { room, reply } => {
-                let r = self.send(PacketType::ChatJoin, ChatJoin { room }.encode()).await;
-                let _ = reply.send(r.map_err(Into::into));
+                self.known_rooms.insert(room.clone());
+                self.quiet(PacketType::ChatJoin, ChatJoin { room }.encode(), reply)
+                    .await?;
             }
             Command::Leave { room, reply } => {
-                let r = self.send(PacketType::ChatLeave, ChatLeave { room }.encode()).await;
-                let _ = reply.send(r.map_err(Into::into));
+                self.known_rooms.remove(&room);
+                self.quiet(PacketType::ChatLeave, ChatLeave { room }.encode(), reply)
+                    .await?;
             }
             Command::SendChat {
                 room,
@@ -319,27 +697,17 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
                 text,
                 reply,
             } => {
-                let r = self
-                    .send(PacketType::ChatMessage, ChatSend { room, flags, text }.encode())
-                    .await;
-                let _ = reply.send(r.map_err(Into::into));
+                let msg = ChatSend { room, flags, text };
+                self.quiet(PacketType::ChatMessage, msg.encode(), reply).await?;
             }
             Command::SetTopic { room, topic, reply } => {
-                let r = self
-                    .send(PacketType::ChatTopicSet, ChatTopic { room, topic }.encode())
-                    .await;
-                let _ = reply.send(r.map_err(Into::into));
+                let msg = ChatTopic { room, topic };
+                self.quiet(PacketType::ChatTopicSet, msg.encode(), reply).await?;
             }
             Command::ListFiles { path, reply } => {
-                match self
-                    .send(PacketType::FileListRequest, FileListRequest { path }.encode())
-                    .await
-                {
-                    Ok(()) => self.list_waiters.push_back(reply),
-                    Err(e) => {
-                        let _ = reply.send(Err(e.into()));
-                    }
-                }
+                let msg = FileListRequest { path };
+                self.request(PacketType::FileListRequest, msg.encode(), Waiter::FileList(reply))
+                    .await?;
             }
             Command::CreateFolder {
                 path,
@@ -358,20 +726,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
                     min_write_class,
                     owner,
                 };
-                match self.send(PacketType::FileCreateFolder, msg.encode()).await {
-                    Ok(()) => self.list_waiters.push_back(reply),
-                    Err(e) => {
-                        let _ = reply.send(Err(e.into()));
-                    }
-                }
+                self.request(PacketType::FileCreateFolder, msg.encode(), Waiter::FileList(reply))
+                    .await?;
             }
             Command::DeletePath { path, reply } => {
-                match self.send(PacketType::FileDelete, FileDelete { path }.encode()).await {
-                    Ok(()) => self.list_waiters.push_back(reply),
-                    Err(e) => {
-                        let _ = reply.send(Err(e.into()));
-                    }
-                }
+                let msg = FileDelete { path };
+                self.request(PacketType::FileDelete, msg.encode(), Waiter::FileList(reply))
+                    .await?;
             }
             Command::MovePath {
                 path,
@@ -379,31 +740,24 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
                 reply,
             } => {
                 let msg = FileMove { path, dest_path };
-                match self.send(PacketType::FileMove, msg.encode()).await {
-                    Ok(()) => self.list_waiters.push_back(reply),
-                    Err(e) => {
-                        let _ = reply.send(Err(e.into()));
-                    }
-                }
+                self.request(PacketType::FileMove, msg.encode(), Waiter::FileList(reply))
+                    .await?;
             }
             Command::GetFileInfo { path, reply } => {
-                match self
-                    .send(PacketType::FileInfoRequest, FileInfoRequest { path }.encode())
-                    .await
-                {
-                    Ok(()) => self.info_waiters.push_back(reply),
-                    Err(e) => {
-                        let _ = reply.send(Err(e.into()));
-                    }
-                }
+                let msg = FileInfoRequest { path };
+                self.request(PacketType::FileInfoRequest, msg.encode(), Waiter::FileInfo(reply))
+                    .await?;
             }
             Command::SetIdentity { name, description } => {
-                let _ = self
-                    .send(
-                        PacketType::SetIdentity,
-                        SetIdentity { name, description }.encode(),
-                    )
-                    .await;
+                let msg = SetIdentity { name, description };
+                match self
+                    .send_quiet(PacketType::SetIdentity, msg.encode(), QuietKind::Plain)
+                    .await
+                {
+                    Err(SendError::Fatal(e)) => return Err(SendError::Fatal(e)),
+                    Err(SendError::Rejected(e)) => warn!("identity not sent: {e}"),
+                    Ok(()) => {}
+                }
             }
             Command::AliasPath {
                 source_path,
@@ -411,67 +765,34 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
                 reply,
             } => {
                 let msg = FileAlias { source_path, dest_path };
-                match self.send(PacketType::FileAlias, msg.encode()).await {
-                    Ok(()) => self.list_waiters.push_back(reply),
-                    Err(e) => {
-                        let _ = reply.send(Err(e.into()));
-                    }
-                }
+                self.request(PacketType::FileAlias, msg.encode(), Waiter::FileList(reply))
+                    .await?;
             }
             Command::GenerateCatalog { reply } => {
-                match self
-                    .send(PacketType::FileGenerateCatalog, FileGenerateCatalog.encode())
-                    .await
-                {
-                    Ok(()) => self.catalog_waiters.push_back(reply),
-                    Err(e) => {
-                        let _ = reply.send(Err(e.into()));
-                    }
-                }
+                let msg = FileGenerateCatalog;
+                self.request(PacketType::FileGenerateCatalog, msg.encode(), Waiter::Catalog(reply))
+                    .await?;
             }
             Command::SearchFiles { query, reply } => {
-                match self
-                    .send(PacketType::FileSearchRequest, FileSearchRequest { query }.encode())
-                    .await
-                {
-                    Ok(()) => self.search_waiters.push_back(reply),
-                    Err(e) => {
-                        let _ = reply.send(Err(e.into()));
-                    }
-                }
+                let msg = FileSearchRequest { query };
+                self.request(PacketType::FileSearchRequest, msg.encode(), Waiter::Search(reply))
+                    .await?;
             }
             Command::ListUsers { reply } => {
-                match self
-                    .send(PacketType::PresenceListRequest, PresenceListRequest.encode())
-                    .await
-                {
-                    Ok(()) => self.user_list_waiters.push_back(reply),
-                    Err(e) => {
-                        let _ = reply.send(Err(e.into()));
-                    }
-                }
+                let msg = PresenceListRequest;
+                self.request(PacketType::PresenceListRequest, msg.encode(), Waiter::Users(reply))
+                    .await?;
             }
             Command::ListServers { filter, reply } => {
-                match self
-                    .send(PacketType::TrackerListRequest, TrackerListRequest { filter }.encode())
-                    .await
-                {
-                    Ok(()) => self.server_list_waiters.push_back(reply),
-                    Err(e) => {
-                        let _ = reply.send(Err(e.into()));
-                    }
-                }
+                let msg = TrackerListRequest { filter };
+                self.request(PacketType::TrackerListRequest, msg.encode(), Waiter::Servers(reply))
+                    .await?;
             }
             Command::GetServerSettings { reply } => {
-                match self
-                    .send(PacketType::ServerSettingsRequest, ServerSettingsRequest.encode())
-                    .await
-                {
-                    Ok(()) => self.settings_waiters.push_back(reply),
-                    Err(e) => {
-                        let _ = reply.send(Err(e.into()));
-                    }
-                }
+                let msg = ServerSettingsRequest;
+                let waiter = Waiter::Settings(reply);
+                self.request(PacketType::ServerSettingsRequest, msg.encode(), waiter)
+                    .await?;
             }
             Command::UpdateServerSettings {
                 name,
@@ -486,46 +807,27 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
                     greeting,
                     max_users,
                 };
-                match self.send(PacketType::ServerSettingsUpdate, msg.encode()).await {
-                    Ok(()) => self.settings_waiters.push_back(reply),
-                    Err(e) => {
-                        let _ = reply.send(Err(e.into()));
-                    }
-                }
+                let waiter = Waiter::Settings(reply);
+                self.request(PacketType::ServerSettingsUpdate, msg.encode(), waiter)
+                    .await?;
             }
             Command::Broadcast { text, reply } => {
-                let r = self
-                    .send(PacketType::AdminBroadcast, AdminBroadcast { text }.encode())
-                    .await;
-                let _ = reply.send(r.map_err(Into::into));
+                let msg = AdminBroadcast { text };
+                self.quiet(PacketType::AdminBroadcast, msg.encode(), reply).await?;
             }
             Command::ShutdownServer { message, reply } => {
-                let r = self
-                    .send(PacketType::AdminShutdown, AdminShutdown { message }.encode())
-                    .await;
-                let _ = reply.send(r.map_err(Into::into));
+                let msg = AdminShutdown { message };
+                self.quiet(PacketType::AdminShutdown, msg.encode(), reply).await?;
             }
             Command::ListHistory { limit, reply } => {
-                match self
-                    .send(PacketType::HistoryListRequest, HistoryListRequest { limit }.encode())
-                    .await
-                {
-                    Ok(()) => self.history_waiters.push_back(reply),
-                    Err(e) => {
-                        let _ = reply.send(Err(e.into()));
-                    }
-                }
+                let msg = HistoryListRequest { limit };
+                self.request(PacketType::HistoryListRequest, msg.encode(), Waiter::History(reply))
+                    .await?;
             }
             Command::ListIpRules { reply } => {
-                match self
-                    .send(PacketType::IpRuleListRequest, IpRuleListRequest.encode())
-                    .await
-                {
-                    Ok(()) => self.ip_rule_waiters.push_back(reply),
-                    Err(e) => {
-                        let _ = reply.send(Err(e.into()));
-                    }
-                }
+                let msg = IpRuleListRequest;
+                self.request(PacketType::IpRuleListRequest, msg.encode(), Waiter::IpRules(reply))
+                    .await?;
             }
             Command::CreateIpRule {
                 position,
@@ -540,35 +842,19 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
                     cidr,
                     note,
                 };
-                match self.send(PacketType::IpRuleCreate, msg.encode()).await {
-                    Ok(()) => self.ip_rule_waiters.push_back(reply),
-                    Err(e) => {
-                        let _ = reply.send(Err(e.into()));
-                    }
-                }
+                self.request(PacketType::IpRuleCreate, msg.encode(), Waiter::IpRules(reply))
+                    .await?;
             }
             Command::DeleteIpRule { id, reply } => {
                 let msg = IpRuleDelete { id };
-                match self.send(PacketType::IpRuleDelete, msg.encode()).await {
-                    Ok(()) => self.ip_rule_waiters.push_back(reply),
-                    Err(e) => {
-                        let _ = reply.send(Err(e.into()));
-                    }
-                }
+                self.request(PacketType::IpRuleDelete, msg.encode(), Waiter::IpRules(reply))
+                    .await?;
             }
             Command::ListConnections { reply } => {
-                match self
-                    .send(
-                        PacketType::ConnectionListRequest,
-                        ConnectionListRequest.encode(),
-                    )
-                    .await
-                {
-                    Ok(()) => self.connection_waiters.push_back(reply),
-                    Err(e) => {
-                        let _ = reply.send(Err(e.into()));
-                    }
-                }
+                let msg = ConnectionListRequest;
+                let waiter = Waiter::Connections(reply);
+                self.request(PacketType::ConnectionListRequest, msg.encode(), waiter)
+                    .await?;
             }
             Command::SetRoomFlags {
                 room,
@@ -585,50 +871,41 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
                 // a room-system message to every joined member (including
                 // us). No dedicated response, matching how ChatTopicSet
                 // already works.
-                let r = self.send(PacketType::ChatRoomFlags, msg.encode()).await;
-                let _ = reply.send(r.map_err(Into::into));
+                self.quiet(PacketType::ChatRoomFlags, msg.encode(), reply).await?;
             }
             Command::GetUserInfo { username, reply } => {
-                match self
-                    .send(PacketType::UserInfoRequest, UserInfoRequest { username }.encode())
-                    .await
-                {
-                    Ok(()) => self.user_info_waiters.push_back(reply),
-                    Err(e) => {
-                        let _ = reply.send(Err(e.into()));
-                    }
-                }
+                let msg = UserInfoRequest { username };
+                self.request(PacketType::UserInfoRequest, msg.encode(), Waiter::UserInfo(reply))
+                    .await?;
             }
             Command::SendPrivate { to, text, reply } => {
-                let r = self
-                    .send(PacketType::PrivateSend, PrivateSend { to, text }.encode())
-                    .await;
-                let _ = reply.send(r.map_err(Into::into));
+                let msg = PrivateSend { to, text };
+                self.quiet(PacketType::PrivateSend, msg.encode(), reply).await?;
             }
-            Command::InviteToChat { to, reply } => {
-                let r = self.send(PacketType::ChatInvite, ChatInvite { to }.encode()).await;
-                let _ = reply.send(r.map_err(Into::into));
-            }
+            Command::InviteToChat { to, reply } => self.start_invite(to, reply).await?,
             Command::Upload {
                 local,
                 remote_dir,
                 reply,
-            } => self.start_upload(local, remote_dir, reply).await?,
+            } => self.start_upload(local, remote_dir, reply),
             Command::Download {
                 remote_path,
                 local,
+                expected_size,
                 reply,
-            } => self.start_download(remote_path, local, reply).await?,
-            Command::ListRoles { reply } => {
-                match self
-                    .send(PacketType::RoleListRequest, RoleListRequest.encode())
-                    .await
-                {
-                    Ok(()) => self.role_waiters.push_back(reply),
-                    Err(e) => {
-                        let _ = reply.send(Err(e.into()));
-                    }
+            } => self.start_download(remote_path, local, expected_size, reply).await?,
+            Command::CancelTransfer { reply } => {
+                let active = self.transfer.is_some();
+                if active {
+                    let err = ClientError::Transfer("cancelled".into());
+                    self.fail_transfer(err, Cleanup::Keep).await;
                 }
+                let _ = reply.send(Ok(active));
+            }
+            Command::ListRoles { reply } => {
+                let msg = RoleListRequest;
+                self.request(PacketType::RoleListRequest, msg.encode(), Waiter::Roles(reply))
+                    .await?;
             }
             Command::CreateRole {
                 name,
@@ -643,12 +920,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
                     rank,
                     color,
                 };
-                match self.send(PacketType::RoleCreate, msg.encode()).await {
-                    Ok(()) => self.role_waiters.push_back(reply),
-                    Err(e) => {
-                        let _ = reply.send(Err(e.into()));
-                    }
-                }
+                self.request(PacketType::RoleCreate, msg.encode(), Waiter::Roles(reply))
+                    .await?;
             }
             Command::UpdateRole {
                 id,
@@ -669,27 +942,17 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
                     rank,
                     color,
                 };
-                match self.send(PacketType::RoleUpdate, msg.encode()).await {
-                    Ok(()) => self.role_waiters.push_back(reply),
-                    Err(e) => {
-                        let _ = reply.send(Err(e.into()));
-                    }
-                }
+                self.request(PacketType::RoleUpdate, msg.encode(), Waiter::Roles(reply))
+                    .await?;
             }
             Command::DeleteRole { id, reply } => {
                 let Some(id) = parse_role_id(&id) else {
                     let _ = reply.send(Err(ClientError::InvalidInput("bad role id".into())));
                     return Ok(());
                 };
-                match self
-                    .send(PacketType::RoleDelete, RoleDelete { id }.encode())
-                    .await
-                {
-                    Ok(()) => self.role_waiters.push_back(reply),
-                    Err(e) => {
-                        let _ = reply.send(Err(e.into()));
-                    }
-                }
+                let msg = RoleDelete { id };
+                self.request(PacketType::RoleDelete, msg.encode(), Waiter::Roles(reply))
+                    .await?;
             }
             Command::AssignRole {
                 username,
@@ -701,12 +964,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
                     return Ok(());
                 };
                 let msg = RoleAssign { username, role_id };
-                match self.send(PacketType::RoleAssign, msg.encode()).await {
-                    Ok(()) => self.role_waiters.push_back(reply),
-                    Err(e) => {
-                        let _ = reply.send(Err(e.into()));
-                    }
-                }
+                self.request(PacketType::RoleAssign, msg.encode(), Waiter::Roles(reply))
+                    .await?;
             }
             Command::UnassignRole {
                 username,
@@ -718,21 +977,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
                     return Ok(());
                 };
                 let msg = RoleUnassign { username, role_id };
-                match self.send(PacketType::RoleUnassign, msg.encode()).await {
-                    Ok(()) => self.role_waiters.push_back(reply),
-                    Err(e) => {
-                        let _ = reply.send(Err(e.into()));
-                    }
-                }
+                self.request(PacketType::RoleUnassign, msg.encode(), Waiter::Roles(reply))
+                    .await?;
             }
             Command::AccountRoles { username, reply } => {
                 let msg = AccountRolesRequest { username };
-                match self.send(PacketType::AccountRolesRequest, msg.encode()).await {
-                    Ok(()) => self.account_roles_waiters.push_back(reply),
-                    Err(e) => {
-                        let _ = reply.send(Err(e.into()));
-                    }
-                }
+                let waiter = Waiter::AccountRoles(reply);
+                self.request(PacketType::AccountRolesRequest, msg.encode(), waiter)
+                    .await?;
             }
             Command::DisconnectUser {
                 username,
@@ -745,19 +997,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
                     reason,
                     ban_secs,
                 };
-                let r = self.send(PacketType::AdminDisconnect, msg.encode()).await;
-                let _ = reply.send(r.map_err(Into::into));
+                self.quiet(PacketType::AdminDisconnect, msg.encode(), reply).await?;
             }
             Command::ListAccounts { reply } => {
-                match self
-                    .send(PacketType::AccountListRequest, AccountListRequest.encode())
-                    .await
-                {
-                    Ok(()) => self.account_waiters.push_back(reply),
-                    Err(e) => {
-                        let _ = reply.send(Err(e.into()));
-                    }
-                }
+                let msg = AccountListRequest;
+                self.request(PacketType::AccountListRequest, msg.encode(), Waiter::Accounts(reply))
+                    .await?;
             }
             Command::CreateAccount {
                 username,
@@ -774,12 +1019,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
                     granted,
                     revoked,
                 };
-                match self.send(PacketType::AccountCreate, msg.encode()).await {
-                    Ok(()) => self.account_waiters.push_back(reply),
-                    Err(e) => {
-                        let _ = reply.send(Err(e.into()));
-                    }
-                }
+                self.request(PacketType::AccountCreate, msg.encode(), Waiter::Accounts(reply))
+                    .await?;
             }
             Command::UpdateAccount {
                 username,
@@ -794,23 +1035,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
                     granted,
                     revoked,
                 };
-                match self.send(PacketType::AccountUpdate, msg.encode()).await {
-                    Ok(()) => self.account_waiters.push_back(reply),
-                    Err(e) => {
-                        let _ = reply.send(Err(e.into()));
-                    }
-                }
+                self.request(PacketType::AccountUpdate, msg.encode(), Waiter::Accounts(reply))
+                    .await?;
             }
             Command::ListNewsgroups { reply } => {
-                match self
-                    .send(PacketType::NewsgroupListRequest, NewsgroupListRequest.encode())
-                    .await
-                {
-                    Ok(()) => self.newsgroup_waiters.push_back(reply),
-                    Err(e) => {
-                        let _ = reply.send(Err(e.into()));
-                    }
-                }
+                let msg = NewsgroupListRequest;
+                let waiter = Waiter::Newsgroups(reply);
+                self.request(PacketType::NewsgroupListRequest, msg.encode(), waiter)
+                    .await?;
             }
             Command::CreateNewsgroup {
                 name,
@@ -825,12 +1057,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
                     min_read_class,
                     min_post_class,
                 };
-                match self.send(PacketType::NewsgroupCreate, msg.encode()).await {
-                    Ok(()) => self.newsgroup_waiters.push_back(reply),
-                    Err(e) => {
-                        let _ = reply.send(Err(e.into()));
-                    }
-                }
+                let waiter = Waiter::Newsgroups(reply);
+                self.request(PacketType::NewsgroupCreate, msg.encode(), waiter)
+                    .await?;
             }
             Command::ListThread {
                 newsgroup_id,
@@ -841,12 +1070,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
                     return Ok(());
                 };
                 let msg = NewsThreadListRequest { newsgroup_id };
-                match self.send(PacketType::NewsThreadListRequest, msg.encode()).await {
-                    Ok(()) => self.thread_waiters.push_back(reply),
-                    Err(e) => {
-                        let _ = reply.send(Err(e.into()));
-                    }
-                }
+                let waiter = Waiter::Thread(reply);
+                self.request(PacketType::NewsThreadListRequest, msg.encode(), waiter)
+                    .await?;
             }
             Command::CreatePost {
                 newsgroup_id,
@@ -877,12 +1103,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
                     subject,
                     body,
                 };
-                match self.send(PacketType::NewsPostCreate, msg.encode()).await {
-                    Ok(()) => self.thread_waiters.push_back(reply),
-                    Err(e) => {
-                        let _ = reply.send(Err(e.into()));
-                    }
-                }
+                self.request(PacketType::NewsPostCreate, msg.encode(), Waiter::Thread(reply))
+                    .await?;
             }
             Command::DeletePost { post_id, reply } => {
                 let Some(post_id) = parse_role_id(&post_id) else {
@@ -890,117 +1112,266 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
                     return Ok(());
                 };
                 let msg = NewsPostDelete { post_id };
-                match self.send(PacketType::NewsPostDelete, msg.encode()).await {
-                    Ok(()) => self.thread_waiters.push_back(reply),
-                    Err(e) => {
-                        let _ = reply.send(Err(e.into()));
+                self.request(PacketType::NewsPostDelete, msg.encode(), Waiter::Thread(reply))
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
+    // ---- request/barrier plumbing -------------------------------------
+
+    fn push_pending(&mut self, pending: Pending) {
+        if self.pending.len() >= MAX_PENDING {
+            self.dead = Some("server is not answering requests".into());
+        }
+        self.pending.push_back(pending);
+    }
+
+    /// Send a request that gets exactly one reply-or-Error and queue its
+    /// waiter. A request that can't be sent fails only its caller.
+    async fn request(
+        &mut self,
+        packet_type: PacketType,
+        payload: Bytes,
+        waiter: Waiter,
+    ) -> Result<(), SendError> {
+        match self.send(packet_type, payload).await {
+            Ok(()) => {
+                self.push_pending(Pending::Reply(waiter));
+                Ok(())
+            }
+            Err(SendError::Rejected(e)) => {
+                waiter.fail(e);
+                Ok(())
+            }
+            Err(SendError::Fatal(e)) => {
+                waiter.fail(ClientError::Disconnected);
+                Err(SendError::Fatal(e))
+            }
+        }
+    }
+
+    /// Send a fire-and-forget command followed by its barrier, resolving
+    /// `reply` once both are written.
+    async fn quiet(
+        &mut self,
+        packet_type: PacketType,
+        payload: Bytes,
+        reply: Reply<()>,
+    ) -> Result<(), SendError> {
+        match self.send_quiet(packet_type, payload, QuietKind::Plain).await {
+            Ok(()) => {
+                let _ = reply.send(Ok(()));
+                Ok(())
+            }
+            Err(SendError::Rejected(e)) => {
+                let _ = reply.send(Err(e));
+                Ok(())
+            }
+            Err(SendError::Fatal(e)) => {
+                let _ = reply.send(Err(ClientError::Disconnected));
+                Err(SendError::Fatal(e))
+            }
+        }
+    }
+
+    async fn send_quiet(
+        &mut self,
+        packet_type: PacketType,
+        payload: Bytes,
+        kind: QuietKind,
+    ) -> Result<(), SendError> {
+        self.send(packet_type, payload).await?;
+        self.send_barrier(Some(Quiet { kind, error: None })).await
+    }
+
+    /// Write a `Ping(token)` and queue the barrier it stands for.
+    async fn send_barrier(&mut self, quiet: Option<Quiet>) -> Result<(), SendError> {
+        self.next_token = self.next_token.wrapping_add(1);
+        let token = self.next_token;
+        self.send(PacketType::Ping, Bytes::copy_from_slice(&token.to_be_bytes()))
+            .await?;
+        self.push_pending(Pending::Barrier { token, quiet });
+        Ok(())
+    }
+
+    /// Pop the request at the head of the queue, which must be waiting for
+    /// a `packet_type` reply.
+    fn take_reply(&mut self, packet_type: PacketType) -> Result<Waiter, ClientError> {
+        let head_matches = matches!(
+            self.pending.front(),
+            Some(Pending::Reply(w)) if w.expects() == packet_type
+        );
+        match self.pending.pop_front() {
+            Some(Pending::Reply(waiter)) if head_matches => Ok(waiter),
+            other => {
+                if let Some(other) = other {
+                    self.pending.push_front(other);
+                }
+                Err(protocol_violation(format!("unexpected {packet_type:?}")))
+            }
+        }
+    }
+
+    async fn on_pong(&mut self, payload: &[u8]) -> Result<(), ClientError> {
+        let Some(Pending::Barrier { token, quiet }) = self.pending.pop_front() else {
+            return Err(protocol_violation("unexpected Pong"));
+        };
+        if payload != token.to_be_bytes() {
+            warn!("Pong token mismatch");
+        }
+        let Some(quiet) = quiet else {
+            return Ok(());
+        };
+        match quiet.kind {
+            QuietKind::Plain => {}
+            QuietKind::Invite(id) => self.invite_settled(id).await,
+            QuietKind::UploadChunk { gen, len, index } => {
+                self.upload_chunk_acked(gen, len, index, quiet.error.is_none())
+                    .await
+            }
+        }
+        Ok(())
+    }
+
+    async fn on_error(&mut self, payload: &[u8]) -> Result<(), ClientError> {
+        let text = String::from_utf8_lossy(payload).into_owned();
+        match self.pending.front_mut() {
+            Some(Pending::Reply(_)) => {
+                if let Some(Pending::Reply(waiter)) = self.pending.pop_front() {
+                    match waiter {
+                        Waiter::TransferStart(gen) => {
+                            if self.is_current(gen) {
+                                let err = ClientError::Transfer(text.clone());
+                                self.fail_transfer(err, Cleanup::Keep).await;
+                            }
+                        }
+                        waiter => waiter.fail(ClientError::Server(text.clone())),
                     }
                 }
             }
-            Command::Disconnect => unreachable!("handled in run loop"),
+            Some(Pending::Barrier {
+                quiet: Some(quiet), ..
+            }) if quiet.error.is_none() => {
+                quiet.error = Some(text.clone());
+                match quiet.kind {
+                    QuietKind::Plain => {}
+                    QuietKind::Invite(id) => self.invite_refused(id, &text),
+                    QuietKind::UploadChunk { gen, .. } => {
+                        if self.is_current(gen) {
+                            let err = ClientError::Transfer(text.clone());
+                            self.fail_transfer(err, Cleanup::Keep).await;
+                        }
+                    }
+                }
+            }
+            // Nothing attributable is waiting: an unsolicited error.
+            _ => {}
         }
+        self.emit(Event::ServerError { text }).await;
         Ok(())
     }
 
-    async fn start_upload(
-        &mut self,
-        local: PathBuf,
-        remote_dir: String,
-        reply: oneshot::Sender<Result<(), ClientError>>,
-    ) -> io::Result<()> {
-        if self.transfer.is_some() {
-            let _ = reply.send(Err(ClientError::Transfer("a transfer is already active".into())));
+    // ---- private-chat invitations -------------------------------------
+
+    async fn start_invite(&mut self, to: String, reply: Reply<String>) -> Result<(), SendError> {
+        if self.invites.len() >= MAX_PENDING_INVITES {
+            let _ = reply.send(Err(ClientError::InvalidInput(
+                "too many invitations in flight".into(),
+            )));
             return Ok(());
         }
-        let name = match local.file_name().and_then(|n| n.to_str()) {
-            Some(n) => n.to_string(),
-            None => {
-                let _ = reply.send(Err(ClientError::Transfer("invalid local file name".into())));
-                return Ok(());
+        self.next_invite += 1;
+        let id = self.next_invite;
+        match self
+            .send_quiet(PacketType::ChatInvite, ChatInvite { to }.encode(), QuietKind::Invite(id))
+            .await
+        {
+            Ok(()) => {
+                self.invites.push_back(InviteWait {
+                    id,
+                    reply: Some(reply),
+                    failed: false,
+                    settled: false,
+                    room: None,
+                });
+                Ok(())
             }
-        };
-        let data = match tokio::fs::read(&local).await {
-            Ok(d) => d,
-            Err(e) => {
-                let _ = reply.send(Err(ClientError::Io(e)));
-                return Ok(());
+            Err(SendError::Rejected(e)) => {
+                let _ = reply.send(Err(e));
+                Ok(())
             }
-        };
-        let size = data.len() as u64;
-        let chunk_size = DEFAULT_CHUNK_SIZE;
-        let total = total_chunks(size, chunk_size);
-        let sha256: [u8; 32] = Sha256::digest(&data).into();
-
-        let request = TransferRequest {
-            direction: DIRECTION_UPLOAD,
-            path: remote_dir,
-            name,
-            size,
-            chunk_size,
-            sha256,
-            resume_id: [0u8; 16],
-            have_bitmap: vec![],
-        };
-        self.send(PacketType::FileTransferStart, request.encode()).await?;
-        self.transfer = Some(Transfer::Upload(UploadJob {
-            id: [0u8; 16],
-            data,
-            size,
-            chunk_size,
-            total,
-            accepted: false,
-            reply: Some(reply),
-        }));
-        Ok(())
-    }
-
-    async fn start_download(
-        &mut self,
-        remote_path: String,
-        local: PathBuf,
-        reply: oneshot::Sender<Result<(), ClientError>>,
-    ) -> io::Result<()> {
-        if self.transfer.is_some() {
-            let _ = reply.send(Err(ClientError::Transfer("a transfer is already active".into())));
-            return Ok(());
+            Err(SendError::Fatal(e)) => {
+                let _ = reply.send(Err(ClientError::Disconnected));
+                Err(SendError::Fatal(e))
+            }
         }
-        let (dir, name) = split_remote(&remote_path);
-        let chunk_size = DEFAULT_CHUNK_SIZE;
-
-        // Resume from a sidecar if one matches this local target.
-        let sidecar = Sidecar::read(&local);
-        let (resume_id, have_bitmap) = match &sidecar {
-            Some(sc) if sc.chunk_size == chunk_size => (sc.transfer_id, sc.bitmap.clone()),
-            _ => ([0u8; 16], vec![]),
-        };
-
-        let request = TransferRequest {
-            direction: DIRECTION_DOWNLOAD,
-            path: dir,
-            name,
-            size: 0,
-            chunk_size,
-            sha256: [0u8; 32],
-            resume_id,
-            have_bitmap,
-        };
-        self.send(PacketType::FileTransferStart, request.encode()).await?;
-
-        let part_path = with_part_suffix(&local);
-        self.transfer = Some(Transfer::Download(DownloadJob {
-            id: [0u8; 16],
-            local,
-            part_path,
-            file: None,
-            size: 0,
-            chunk_size,
-            total: 0,
-            sha256: [0u8; 32],
-            have: BitVec::new(),
-            reply: Some(reply),
-        }));
-        Ok(())
     }
+
+    /// The server refused invitation `id`. Tell the caller now, but keep the
+    /// entry until its barrier returns: the server may already have created
+    /// (and torn down) the room, whose member list would otherwise be taken
+    /// for a later invitation's room.
+    fn invite_refused(&mut self, id: u64, text: &str) {
+        if let Some(invite) = self.invites.iter_mut().find(|i| i.id == id) {
+            invite.failed = true;
+            if let Some(reply) = invite.reply.take() {
+                let _ = reply.send(Err(ClientError::Server(text.to_string())));
+            }
+        }
+    }
+
+    async fn invite_settled(&mut self, id: u64) {
+        if let Some(invite) = self.invites.iter_mut().find(|i| i.id == id) {
+            invite.settled = true;
+        }
+        self.resolve_invites();
+    }
+
+    /// The server put us in a private room we didn't join ourselves: that is
+    /// the room of the oldest invitation still waiting for one.
+    fn on_fresh_private_room(&mut self, room: &str) {
+        let Some(invite) = self
+            .invites
+            .iter_mut()
+            .find(|i| i.room.is_none() && !(i.failed && i.settled))
+        else {
+            return;
+        };
+        invite.room = Some(room.to_string());
+        if !invite.failed {
+            self.known_rooms.insert(room.to_string());
+        }
+        self.resolve_invites();
+    }
+
+    fn resolve_invites(&mut self) {
+        self.invites.retain_mut(|invite| {
+            if !invite.settled {
+                return true;
+            }
+            if invite.failed {
+                return false;
+            }
+            match (&invite.room, invite.reply.take()) {
+                (Some(room), Some(reply)) => {
+                    let _ = reply.send(Ok(room.clone()));
+                    false
+                }
+                (Some(_), None) => false,
+                // Accepted but its room hasn't shown up yet; drop it if the
+                // caller has given up.
+                (None, Some(reply)) if reply.is_closed() => false,
+                (None, reply) => {
+                    invite.reply = reply;
+                    true
+                }
+            }
+        });
+    }
+
+    // ---- inbound frames -------------------------------------------------
 
     async fn handle_frame(&mut self, frame: KdxFrame) -> Result<(), ClientError> {
         match frame.header.packet_type {
@@ -1019,6 +1390,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
             }
             PacketType::ChatUserList => {
                 let list = ChatUserList::decode(&frame.payload)?;
+                if list.room.starts_with("priv-") && !self.known_rooms.contains(&list.room) {
+                    self.on_fresh_private_room(&list.room);
+                }
                 self.emit(Event::UserList {
                     room: list.room,
                     users: list.users,
@@ -1035,68 +1409,68 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
             }
             PacketType::FileListResponse => {
                 let response = FileListResponse::decode(&frame.payload)?;
-                if let Some(waiter) = self.list_waiters.pop_front() {
-                    let _ = waiter.send(Ok(response));
+                if let Waiter::FileList(tx) = self.take_reply(PacketType::FileListResponse)? {
+                    let _ = tx.send(Ok(response));
                 }
             }
             PacketType::FileInfoResponse => {
                 let response = FileInfoResponse::decode(&frame.payload)?;
-                if let Some(waiter) = self.info_waiters.pop_front() {
-                    let _ = waiter.send(Ok(response));
+                if let Waiter::FileInfo(tx) = self.take_reply(PacketType::FileInfoResponse)? {
+                    let _ = tx.send(Ok(response));
                 }
             }
             PacketType::FileCatalogGenerated => {
                 let response = FileCatalogGenerated::decode(&frame.payload)?;
-                if let Some(waiter) = self.catalog_waiters.pop_front() {
-                    let _ = waiter.send(Ok(response.count));
+                if let Waiter::Catalog(tx) = self.take_reply(PacketType::FileCatalogGenerated)? {
+                    let _ = tx.send(Ok(response.count));
                 }
             }
             PacketType::FileSearchResponse => {
                 let response = FileSearchResponse::decode(&frame.payload)?;
-                if let Some(waiter) = self.search_waiters.pop_front() {
-                    let _ = waiter.send(Ok(response.entries.into_iter().map(Into::into).collect()));
+                if let Waiter::Search(tx) = self.take_reply(PacketType::FileSearchResponse)? {
+                    let _ = tx.send(Ok(response.entries.into_iter().map(Into::into).collect()));
                 }
             }
             PacketType::PresenceListResponse => {
                 let response = PresenceListResponse::decode(&frame.payload)?;
-                if let Some(waiter) = self.user_list_waiters.pop_front() {
-                    let _ = waiter.send(Ok(response.users.into_iter().map(Into::into).collect()));
+                if let Waiter::Users(tx) = self.take_reply(PacketType::PresenceListResponse)? {
+                    let _ = tx.send(Ok(response.users.into_iter().map(Into::into).collect()));
                 }
             }
             PacketType::UserInfoResponse => {
                 let response = UserInfoResponse::decode(&frame.payload)?;
-                if let Some(waiter) = self.user_info_waiters.pop_front() {
-                    let _ = waiter.send(Ok(response.entry.into()));
+                if let Waiter::UserInfo(tx) = self.take_reply(PacketType::UserInfoResponse)? {
+                    let _ = tx.send(Ok(response.entry.into()));
                 }
             }
             PacketType::TrackerListResponse => {
                 let response = TrackerListResponse::decode(&frame.payload)?;
-                if let Some(waiter) = self.server_list_waiters.pop_front() {
-                    let _ = waiter.send(Ok(response.servers.into_iter().map(Into::into).collect()));
+                if let Waiter::Servers(tx) = self.take_reply(PacketType::TrackerListResponse)? {
+                    let _ = tx.send(Ok(response.servers.into_iter().map(Into::into).collect()));
                 }
             }
             PacketType::ServerSettingsResponse => {
                 let response = ServerSettingsResponse::decode(&frame.payload)?;
-                if let Some(waiter) = self.settings_waiters.pop_front() {
-                    let _ = waiter.send(Ok(response.into()));
+                if let Waiter::Settings(tx) = self.take_reply(PacketType::ServerSettingsResponse)? {
+                    let _ = tx.send(Ok(response.into()));
                 }
             }
             PacketType::HistoryListResponse => {
                 let response = HistoryListResponse::decode(&frame.payload)?;
-                if let Some(waiter) = self.history_waiters.pop_front() {
-                    let _ = waiter.send(Ok(response.entries.into_iter().map(Into::into).collect()));
+                if let Waiter::History(tx) = self.take_reply(PacketType::HistoryListResponse)? {
+                    let _ = tx.send(Ok(response.entries.into_iter().map(Into::into).collect()));
                 }
             }
             PacketType::IpRuleListResponse => {
                 let response = IpRuleListResponse::decode(&frame.payload)?;
-                if let Some(waiter) = self.ip_rule_waiters.pop_front() {
-                    let _ = waiter.send(Ok(response.rules.into_iter().map(Into::into).collect()));
+                if let Waiter::IpRules(tx) = self.take_reply(PacketType::IpRuleListResponse)? {
+                    let _ = tx.send(Ok(response.rules.into_iter().map(Into::into).collect()));
                 }
             }
             PacketType::ConnectionListResponse => {
                 let response = ConnectionListResponse::decode(&frame.payload)?;
-                if let Some(waiter) = self.connection_waiters.pop_front() {
-                    let _ = waiter.send(Ok(response
+                if let Waiter::Connections(tx) = self.take_reply(PacketType::ConnectionListResponse)? {
+                    let _ = tx.send(Ok(response
                         .connections
                         .into_iter()
                         .map(Into::into)
@@ -1105,14 +1479,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
             }
             PacketType::RoleListResponse => {
                 let response = RoleListResponse::decode(&frame.payload)?;
-                if let Some(waiter) = self.role_waiters.pop_front() {
-                    let _ = waiter.send(Ok(response.roles.into_iter().map(Into::into).collect()));
+                if let Waiter::Roles(tx) = self.take_reply(PacketType::RoleListResponse)? {
+                    let _ = tx.send(Ok(response.roles.into_iter().map(Into::into).collect()));
                 }
             }
             PacketType::AccountRolesResponse => {
                 let response = AccountRolesResponse::decode(&frame.payload)?;
-                if let Some(waiter) = self.account_roles_waiters.pop_front() {
-                    let _ = waiter.send(Ok(response
+                if let Waiter::AccountRoles(tx) = self.take_reply(PacketType::AccountRolesResponse)? {
+                    let _ = tx.send(Ok(response
                         .role_ids
                         .into_iter()
                         .map(|id| Uuid::from_bytes(id).to_string())
@@ -1121,8 +1495,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
             }
             PacketType::AccountListResponse => {
                 let response = AccountListResponse::decode(&frame.payload)?;
-                if let Some(waiter) = self.account_waiters.pop_front() {
-                    let _ = waiter.send(Ok(response
+                if let Waiter::Accounts(tx) = self.take_reply(PacketType::AccountListResponse)? {
+                    let _ = tx.send(Ok(response
                         .accounts
                         .into_iter()
                         .map(Into::into)
@@ -1131,14 +1505,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
             }
             PacketType::NewsgroupListResponse => {
                 let response = NewsgroupListResponse::decode(&frame.payload)?;
-                if let Some(waiter) = self.newsgroup_waiters.pop_front() {
-                    let _ = waiter.send(Ok(response.groups.into_iter().map(Into::into).collect()));
+                if let Waiter::Newsgroups(tx) = self.take_reply(PacketType::NewsgroupListResponse)? {
+                    let _ = tx.send(Ok(response.groups.into_iter().map(Into::into).collect()));
                 }
             }
             PacketType::NewsThreadListResponse => {
                 let response = NewsThreadListResponse::decode(&frame.payload)?;
-                if let Some(waiter) = self.thread_waiters.pop_front() {
-                    let _ = waiter.send(Ok(response.posts.into_iter().map(Into::into).collect()));
+                if let Waiter::Thread(tx) = self.take_reply(PacketType::NewsThreadListResponse)? {
+                    let _ = tx.send(Ok(response.posts.into_iter().map(Into::into).collect()));
                 }
             }
             PacketType::PresenceChange => {
@@ -1176,7 +1550,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
                 })
                 .await;
             }
-            PacketType::Error => self.on_error(&frame.payload).await,
+            PacketType::Error => self.on_error(&frame.payload).await?,
             PacketType::Info => {
                 self.emit(Event::ServerInfo {
                     text: String::from_utf8_lossy(&frame.payload).into_owned(),
@@ -1195,236 +1569,848 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
                 };
                 self.emit(Event::ServerError { text }).await;
             }
-            PacketType::Pong => {}
+            PacketType::Pong => self.on_pong(&frame.payload).await?,
             other => debug!(packet_type = ?other, "unhandled inbound packet"),
         }
         Ok(())
     }
 
-    /// The server accepted our transfer. For an upload, stream the missing
-    /// chunks; for a download, allocate the file and wait for data.
+    // ---- transfers: common ------------------------------------------------
+
+    fn next_generation(&mut self) -> u64 {
+        self.next_gen += 1;
+        self.next_gen
+    }
+
+    fn is_current(&self, gen: u64) -> bool {
+        self.transfer.as_ref().is_some_and(|t| t.gen == gen)
+    }
+
+    fn accept_deadline(&self) -> Option<Instant> {
+        match self.transfer.as_ref()?.stage {
+            Stage::AwaitingAccept { deadline } => Some(deadline),
+            _ => None,
+        }
+    }
+
+    /// Tell the server we're abandoning `transfer_id` (a server that
+    /// supports it releases the slot / stops streaming; older servers just
+    /// answer with an `Error`, which the barrier absorbs).
+    async fn send_abort(&mut self, transfer_id: [u8; 16]) {
+        if self.abandoned.len() >= MAX_ABANDONED {
+            self.abandoned.pop_front();
+        }
+        self.abandoned.push_back(transfer_id);
+        if self.closing {
+            return;
+        }
+        let end = TransferEnd {
+            transfer_id,
+            status: TRANSFER_ABORTED,
+            message: "cancelled by client".into(),
+        };
+        if let Err(SendError::Fatal(e)) = self
+            .send_quiet(PacketType::FileTransferEnd, end.encode(), QuietKind::Plain)
+            .await
+        {
+            self.dead = Some(format!("write failed: {e}"));
+        }
+    }
+
+    /// End the active transfer with `err`: stop its background work, tell
+    /// the server, settle its on-disk state per `cleanup`, and answer the
+    /// caller. No-op when nothing is active.
+    async fn fail_transfer(&mut self, err: ClientError, cleanup: Cleanup) {
+        let Some(mut transfer) = self.transfer.take() else {
+            return;
+        };
+        transfer.cancel.store(true, Ordering::Relaxed);
+        self.blocking = None; // only ever this transfer's job; dropping detaches it
+        let (id, direction) = match &mut transfer.job {
+            Job::Upload(job) => {
+                let accepted = matches!(transfer.stage, Stage::Running);
+                if accepted {
+                    self.send_abort(job.id).await;
+                }
+                (accepted.then_some(job.id), Direction::Upload)
+            }
+            Job::Download(job) => {
+                if job.accepted && transfer.stage != Stage::Verifying {
+                    self.send_abort(job.id).await;
+                }
+                if let Some(mut file) = job.file.take() {
+                    let _ = file.flush().await;
+                }
+                if let Some(task) = job.sidecar_task.take() {
+                    let _ = task.await;
+                }
+                if job.accepted {
+                    match cleanup {
+                        Cleanup::Keep => {
+                            let sidecar = job.sidecar(&self.opts.server_id);
+                            let local = job.local.clone();
+                            let _ = tokio::task::spawn_blocking(move || sidecar.write(&local)).await;
+                        }
+                        Cleanup::Discard => {
+                            let _ = tokio::fs::remove_file(&job.data_path).await;
+                            let _ = tokio::fs::remove_file(Sidecar::path_for(&job.local)).await;
+                        }
+                    }
+                }
+                (job.accepted.then_some(job.id), Direction::Download)
+            }
+        };
+        if let Some(id) = id {
+            self.emit(Event::TransferComplete {
+                id: Uuid::from_bytes(id).to_string(),
+                direction,
+                status: TRANSFER_ABORTED,
+                message: err.to_string(),
+            })
+            .await;
+        }
+        if let Some(reply) = transfer.reply.take() {
+            let _ = reply.send(Err(err));
+        }
+    }
+
+    async fn on_blocking_done(&mut self, done: BlockingDone) {
+        match done {
+            BlockingDone::UploadPrep(gen, result) if self.is_current(gen) => match result {
+                Ok(prepared) => self.send_upload_request(prepared).await,
+                Err(e) => self.fail_transfer(e, Cleanup::Keep).await,
+            },
+            BlockingDone::Verify(gen, result) if self.is_current(gen) => {
+                self.finish_download(result).await
+            }
+            _ => {} // a cancelled transfer's leftover work
+        }
+    }
+
     async fn on_transfer_accept(&mut self, payload: &[u8]) -> Result<(), ClientError> {
         let accept = TransferAccept::decode(payload)?;
-        match self.transfer.take() {
-            Some(Transfer::Upload(mut job)) => {
-                job.id = accept.transfer_id;
-                job.accepted = true;
-                let have = BitVec::<u8, Lsb0>::from_vec(accept.have_bitmap);
-                // Send every chunk the server doesn't already have.
-                for index in 0..job.total {
-                    if have.get(index as usize).map(|b| *b).unwrap_or(false) {
-                        continue;
-                    }
-                    let len = chunk_len(job.size, job.chunk_size, index, job.total);
-                    let offset = index as usize * job.chunk_size as usize;
-                    let slice = &job.data[offset..offset + len];
-                    let data = TransferData {
-                        transfer_id: job.id,
-                        chunk_index: index,
-                        chunk_hash: Sha256::digest(slice).into(),
-                        data: Bytes::copy_from_slice(slice),
-                    };
-                    self.send_fragmented(PacketType::FileTransferData, data.encode())
-                        .await?;
-                    self.emit_progress(job.id, Direction::Upload, index + 1, job.total, &have)
-                        .await;
-                }
-                self.transfer = Some(Transfer::Upload(job));
-            }
-            Some(Transfer::Download(mut job)) => {
-                job.id = accept.transfer_id;
-                job.size = accept.size;
-                job.chunk_size = accept.chunk_size;
-                job.total = accept.total_chunks;
-                job.sha256 = accept.sha256;
-                let mut have = BitVec::<u8, Lsb0>::from_vec(accept.have_bitmap);
-                have.resize(job.total as usize, false);
-                job.have = have;
-
-                // Open (or reopen) the partial file, sized to the full length.
-                let file = tokio::fs::OpenOptions::new()
-                    .create(true)
-                    .read(true)
-                    .write(true)
-                    .truncate(false)
-                    .open(&job.part_path)
-                    .await?;
-                file.set_len(job.size).await?;
-                job.file = Some(file);
-                self.transfer = Some(Transfer::Download(job));
-            }
-            other => {
-                // Stray accept with no matching transfer; restore state.
-                self.transfer = other;
-                warn!("unexpected TransferAccept");
-            }
+        let Waiter::TransferStart(gen) = self.take_reply(PacketType::FileTransferStart)? else {
+            return Err(protocol_violation("unexpected TransferAccept"));
+        };
+        let awaiting = self
+            .transfer
+            .as_ref()
+            .is_some_and(|t| t.gen == gen && matches!(t.stage, Stage::AwaitingAccept { .. }));
+        if !awaiting {
+            // Accepted after we gave up on it (cancel / timeout).
+            self.send_abort(accept.transfer_id).await;
+            return Ok(());
+        }
+        let is_upload = matches!(
+            self.transfer.as_ref().map(|t| &t.job),
+            Some(Job::Upload(_))
+        );
+        if is_upload {
+            self.on_upload_accept(accept).await;
+        } else {
+            self.on_download_accept(accept).await;
         }
         Ok(())
     }
 
     async fn on_transfer_data(&mut self, payload: &[u8]) -> Result<(), ClientError> {
         let data = TransferData::decode(payload)?;
-        let Some(Transfer::Download(job)) = self.transfer.as_mut() else {
-            return Ok(()); // not downloading; ignore
+        let Some(Transfer {
+            stage: Stage::Running,
+            job: Job::Download(job),
+            ..
+        }) = self.transfer.as_mut()
+        else {
+            return Ok(()); // not receiving; ignore
         };
-        if data.transfer_id != job.id || data.chunk_index >= job.total {
+        if data.transfer_id != job.id {
+            return Ok(()); // a stale transfer's data
+        }
+        let index = data.chunk_index;
+        let expected = chunk_len(job.size, job.chunk_size, index, job.total);
+        if index >= job.total || data.data.len() != expected {
+            let err = ClientError::Transfer(format!("server sent a malformed chunk {index}"));
+            self.fail_transfer(err, Cleanup::Keep).await;
             return Ok(());
         }
         let actual: [u8; 32] = Sha256::digest(&data.data).into();
         if actual != data.chunk_hash {
-            return Err(ClientError::Transfer(format!(
-                "chunk {} hash mismatch",
-                data.chunk_index
-            )));
+            let err = ClientError::Transfer(format!("chunk {index} hash mismatch"));
+            self.fail_transfer(err, Cleanup::Keep).await;
+            return Ok(());
         }
-        let offset = data.chunk_index as u64 * job.chunk_size as u64;
-        let file = job.file.as_mut().expect("file opened on accept");
-        file.seek(io::SeekFrom::Start(offset)).await?;
-        file.write_all(&data.data).await?;
-        job.have.set(data.chunk_index as usize, true);
-
-        // Persist resume state after every accepted chunk.
-        let sidecar = Sidecar {
-            transfer_id: job.id,
-            size: job.size,
-            chunk_size: job.chunk_size,
-            sha256: job.sha256,
-            bitmap: job.have.clone().into_vec(),
+        // `chunk_len` guarantees offset + len <= size.
+        let offset = index as u64 * job.chunk_size as u64;
+        let written = match job.file.as_mut() {
+            Some(file) => write_at(file, offset, &data.data).await,
+            None => Err(io::Error::other("download file is not open")),
         };
-        let _ = sidecar.write(&job.local);
-
-        let done = job.have.count_ones() as u32;
-        let (id, total, bitmap) = (job.id, job.total, job.have.clone());
-        self.emit_progress(id, Direction::Download, done, total, &bitmap).await;
+        if let Err(e) = written {
+            self.fail_transfer(ClientError::Io(e), Cleanup::Keep).await;
+            return Ok(());
+        }
+        job.have.set(index as usize, true);
+        job.unsaved_chunks += 1;
+        let now = Instant::now();
+        let sidecar_due = job.unsaved_chunks >= SIDECAR_EVERY_CHUNKS
+            || now.duration_since(job.last_sidecar) >= SIDECAR_EVERY;
+        if sidecar_due && job.sidecar_task.as_ref().is_none_or(|t| t.is_finished()) {
+            job.unsaved_chunks = 0;
+            job.last_sidecar = now;
+            job.sidecar_task = Some(spawn_sidecar_write(
+                job.sidecar(&self.opts.server_id),
+                job.local.clone(),
+            ));
+        }
+        self.maybe_emit_progress(false).await;
         Ok(())
     }
 
     async fn on_transfer_end(&mut self, payload: &[u8]) -> Result<(), ClientError> {
         let end = TransferEnd::decode(payload)?;
-        match self.transfer.take() {
-            Some(Transfer::Upload(mut job)) => {
-                let verified = end.status == TRANSFER_VERIFIED;
-                self.emit(Event::TransferComplete {
-                    id: Uuid::from_bytes(job.id).to_string(),
-                    direction: Direction::Upload,
-                    status: end.status,
-                    message: end.message.clone(),
-                })
-                .await;
-                if let Some(reply) = job.reply.take() {
-                    let _ = reply.send(if verified {
-                        Ok(())
-                    } else {
-                        Err(ClientError::Transfer(end.message))
-                    });
+        if let Some(pos) = self.abandoned.iter().position(|id| *id == end.transfer_id) {
+            // The late end of a transfer we already gave up on.
+            self.abandoned.remove(pos);
+            return Ok(());
+        }
+        let Some(transfer) = self.transfer.as_ref() else {
+            warn!("TransferEnd with no active transfer");
+            return Ok(());
+        };
+        match transfer.stage {
+            Stage::AwaitingAccept { .. } => {
+                // The server can't end what it hasn't accepted. Treat the
+                // End as its (malformed) answer to our request, so later
+                // replies still line up.
+                let gen = transfer.gen;
+                if matches!(
+                    self.pending.front(),
+                    Some(Pending::Reply(Waiter::TransferStart(g))) if *g == gen
+                ) {
+                    self.pending.pop_front();
+                }
+                let err = ClientError::Transfer("server ended the transfer before accepting it".into());
+                self.fail_transfer(err, Cleanup::Keep).await;
+            }
+            Stage::Preparing | Stage::Verifying => warn!("unexpected TransferEnd"),
+            Stage::Running => {
+                let id = match &transfer.job {
+                    Job::Upload(job) => job.id,
+                    Job::Download(job) => job.id,
+                };
+                if end.transfer_id != id {
+                    warn!("TransferEnd for another transfer");
+                    return Ok(());
+                }
+                if matches!(transfer.job, Job::Upload(_)) {
+                    self.finish_upload(end).await;
+                } else {
+                    self.download_ended(end).await;
                 }
             }
-            Some(Transfer::Download(mut job)) => {
-                let result = self.finish_download(&mut job).await;
-                self.emit(Event::TransferComplete {
-                    id: Uuid::from_bytes(job.id).to_string(),
-                    direction: Direction::Download,
-                    status: if result.is_ok() { TRANSFER_VERIFIED } else { 1 },
-                    message: match &result {
-                        Ok(()) => "verified".into(),
-                        Err(e) => e.to_string(),
-                    },
-                })
-                .await;
-                if let Some(reply) = job.reply.take() {
-                    let _ = reply.send(result);
-                }
-            }
-            None => warn!("TransferEnd with no active transfer"),
         }
         Ok(())
     }
 
-    /// Verify the downloaded file's whole-file hash, then promote `.part` to
-    /// the final path and drop the resume sidecar.
-    async fn finish_download(&self, job: &mut DownloadJob) -> Result<(), ClientError> {
-        let mut file = job.file.take().expect("file opened on accept");
-        file.flush().await?;
-        file.seek(io::SeekFrom::Start(0)).await?;
-        let mut hasher = Sha256::new();
-        let mut buf = vec![0u8; 128 * 1024];
-        loop {
-            let n = file.read(&mut buf).await?;
-            if n == 0 {
-                break;
+    fn progress_event(&mut self, force: bool) -> Option<Event> {
+        let now = Instant::now();
+        let transfer = self.transfer.as_mut()?;
+        let (id, direction, bits, last) = match &mut transfer.job {
+            Job::Upload(job) => (job.id, Direction::Upload, &job.done, &mut job.last_progress),
+            Job::Download(job) => (job.id, Direction::Download, &job.have, &mut job.last_progress),
+        };
+        let total = bits.len() as u32;
+        let done = bits.count_ones() as u32;
+        let due = force
+            || done == total
+            || last.is_none_or(|t| now.duration_since(t) >= PROGRESS_INTERVAL);
+        if !due {
+            return None;
+        }
+        *last = Some(now);
+        let (bitmap, bitmap_bits) = progress_bitmap(bits, PROGRESS_MAX_BITS);
+        Some(Event::TransferProgress {
+            id: Uuid::from_bytes(id).to_string(),
+            direction,
+            done,
+            total,
+            bitmap,
+            bitmap_bits,
+        })
+    }
+
+    async fn maybe_emit_progress(&mut self, force: bool) {
+        if let Some(event) = self.progress_event(force) {
+            self.emit(event).await;
+        }
+    }
+
+    // ---- uploads ------------------------------------------------------------
+
+    fn start_upload(&mut self, local: PathBuf, remote_dir: String, reply: Reply<()>) {
+        if self.transfer.is_some() {
+            let _ = reply.send(Err(ClientError::Transfer("a transfer is already active".into())));
+            return;
+        }
+        let name = match local.file_name().and_then(|n| n.to_str()) {
+            Some(n) if n.len() <= u16::MAX as usize => n.to_string(),
+            _ => {
+                let _ = reply.send(Err(ClientError::Transfer("invalid local file name".into())));
+                return;
             }
-            hasher.update(&buf[..n]);
+        };
+        let gen = self.next_generation();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let task = {
+            let cancel = cancel.clone();
+            tokio::task::spawn_blocking(move || prepare_upload(&local, &cancel))
+        };
+        self.blocking = Some(Blocking::UploadPrep { gen, task });
+        self.transfer = Some(Transfer {
+            gen,
+            reply: Some(reply),
+            cancel,
+            stage: Stage::Preparing,
+            job: Job::Upload(UploadJob {
+                remote_dir,
+                name,
+                file: None,
+                size: 0,
+                modified: None,
+                sha256: [0u8; 32],
+                chunk_size: DEFAULT_CHUNK_SIZE,
+                total: 0,
+                id: [0u8; 16],
+                skip: BitVec::new(),
+                done: BitVec::new(),
+                next: 0,
+                in_flight_bytes: 0,
+                last_progress: None,
+            }),
+        });
+    }
+
+    /// The local file is hashed: ask the server to accept it.
+    async fn send_upload_request(&mut self, prepared: PreparedUpload) {
+        let deadline = Instant::now() + self.opts.request_timeout;
+        let Some(Transfer {
+            gen,
+            stage,
+            job: Job::Upload(job),
+            ..
+        }) = self.transfer.as_mut()
+        else {
+            return;
+        };
+        let gen = *gen;
+        job.size = prepared.size;
+        job.modified = prepared.modified;
+        job.sha256 = prepared.sha256;
+        job.chunk_size = choose_chunk_size(prepared.size);
+        job.file = Some(tokio::fs::File::from_std(prepared.file));
+        let request = TransferRequest {
+            direction: DIRECTION_UPLOAD,
+            path: job.remote_dir.clone(),
+            name: job.name.clone(),
+            size: job.size,
+            chunk_size: job.chunk_size,
+            sha256: job.sha256,
+            resume_id: [0u8; 16],
+            have_bitmap: vec![],
+        };
+        *stage = Stage::AwaitingAccept { deadline };
+        self.send_transfer_request(gen, request).await;
+    }
+
+    async fn send_transfer_request(&mut self, gen: u64, request: TransferRequest) {
+        match self.send(PacketType::FileTransferStart, request.encode()).await {
+            Ok(()) => self.push_pending(Pending::Reply(Waiter::TransferStart(gen))),
+            Err(SendError::Rejected(e)) => self.fail_transfer(e, Cleanup::Keep).await,
+            Err(SendError::Fatal(e)) => self.dead = Some(format!("write failed: {e}")),
         }
-        let actual: [u8; 32] = hasher.finalize().into();
-        if actual != job.sha256 {
-            return Err(ClientError::Transfer("downloaded file hash mismatch".into()));
+    }
+
+    async fn on_upload_accept(&mut self, accept: TransferAccept) {
+        let Some(Transfer {
+            stage,
+            job: Job::Upload(job),
+            ..
+        }) = self.transfer.as_mut()
+        else {
+            return;
+        };
+        let problem = validate_geometry(
+            true,
+            job.chunk_size,
+            accept.chunk_size,
+            accept.total_chunks,
+            accept.size,
+            accept.have_bitmap.len(),
+        )
+        .err()
+        .or_else(|| (accept.size != job.size).then(|| "server changed the upload size".into()));
+        if let Some(problem) = problem {
+            job.id = accept.transfer_id;
+            *stage = Stage::Running; // so the failure tells the server
+            self.fail_transfer(ClientError::Transfer(problem), Cleanup::Keep).await;
+            return;
         }
-        drop(file);
-        tokio::fs::rename(&job.part_path, &job.local).await?;
-        Sidecar::remove(&job.local);
+        job.id = accept.transfer_id;
+        job.total = accept.total_chunks;
+        let mut skip = ChunkBitmap::from_vec(accept.have_bitmap);
+        skip.resize(job.total as usize, false);
+        job.done = skip.clone();
+        job.skip = skip;
+        job.next = 0;
+        job.in_flight_bytes = 0;
+        *stage = Stage::Running;
+        // With nothing to send (an empty file, or the server already has
+        // every chunk) we simply wait for the server's TransferEnd.
+        self.maybe_emit_progress(true).await;
+    }
+
+    fn upload_can_send(&self) -> bool {
+        match self.transfer.as_ref() {
+            Some(Transfer {
+                stage: Stage::Running,
+                job: Job::Upload(job),
+                ..
+            }) => {
+                job.next < job.total
+                    && (job.in_flight_bytes == 0
+                        || job.in_flight_bytes + job.chunk_size as u64 <= UPLOAD_WINDOW_BYTES)
+            }
+            _ => false,
+        }
+    }
+
+    /// Read, hash and send the next missing chunk, then its barrier. One
+    /// chunk per loop turn, so commands and Disconnect are serviced
+    /// throughout an upload.
+    async fn send_next_chunk(&mut self) {
+        let Some(Transfer {
+            gen,
+            job: Job::Upload(job),
+            ..
+        }) = self.transfer.as_mut()
+        else {
+            return;
+        };
+        let gen = *gen;
+        while job.next < job.total && job.skip[job.next as usize] {
+            job.next += 1;
+        }
+        if job.next >= job.total {
+            return;
+        }
+        let index = job.next;
+        job.next += 1;
+        let len = chunk_len(job.size, job.chunk_size, index, job.total);
+        let offset = index as u64 * job.chunk_size as u64;
+        let read = match job.file.as_mut() {
+            Some(file) => read_chunk(file, offset, len, job.size, job.modified).await,
+            None => Err(ClientError::Transfer("upload file is not open".into())),
+        };
+        let bytes = match read {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                self.fail_transfer(e, Cleanup::Keep).await;
+                return;
+            }
+        };
+        job.in_flight_bytes += len as u64;
+        let data = TransferData {
+            transfer_id: job.id,
+            chunk_index: index,
+            chunk_hash: Sha256::digest(&bytes).into(),
+            data: Bytes::from(bytes),
+        };
+        let kind = QuietKind::UploadChunk {
+            gen,
+            len: len as u64,
+            index,
+        };
+        match self
+            .send_quiet(PacketType::FileTransferData, data.encode(), kind)
+            .await
+        {
+            Ok(()) => {}
+            Err(SendError::Rejected(e)) => self.fail_transfer(e, Cleanup::Keep).await,
+            Err(SendError::Fatal(e)) => self.dead = Some(format!("write failed: {e}")),
+        }
+    }
+
+    async fn upload_chunk_acked(&mut self, gen: u64, len: u64, index: u32, ok: bool) {
+        let Some(Transfer {
+            gen: current,
+            job: Job::Upload(job),
+            ..
+        }) = self.transfer.as_mut()
+        else {
+            return;
+        };
+        if *current != gen {
+            return;
+        }
+        job.in_flight_bytes = job.in_flight_bytes.saturating_sub(len);
+        if ok && (index as usize) < job.done.len() {
+            job.done.set(index as usize, true);
+            self.maybe_emit_progress(false).await;
+        }
+    }
+
+    async fn finish_upload(&mut self, end: TransferEnd) {
+        let verified = end.status == TRANSFER_VERIFIED;
+        if verified {
+            if let Some(Transfer {
+                job: Job::Upload(job),
+                ..
+            }) = self.transfer.as_mut()
+            {
+                job.done.fill(true);
+            }
+            self.maybe_emit_progress(true).await;
+        }
+        let Some(mut transfer) = self.transfer.take() else {
+            return;
+        };
+        transfer.cancel.store(true, Ordering::Relaxed);
+        let id = match &transfer.job {
+            Job::Upload(job) => job.id,
+            Job::Download(job) => job.id,
+        };
+        self.emit(Event::TransferComplete {
+            id: Uuid::from_bytes(id).to_string(),
+            direction: Direction::Upload,
+            status: end.status,
+            message: end.message.clone(),
+        })
+        .await;
+        if let Some(reply) = transfer.reply.take() {
+            let _ = reply.send(if verified {
+                Ok(())
+            } else {
+                Err(ClientError::Transfer(end.message))
+            });
+        }
+    }
+
+    // ---- downloads ------------------------------------------------------------
+
+    async fn start_download(
+        &mut self,
+        remote_path: String,
+        local: PathBuf,
+        expected_size: Option<u64>,
+        reply: Reply<()>,
+    ) -> Result<(), SendError> {
+        if self.transfer.is_some() {
+            let _ = reply.send(Err(ClientError::Transfer("a transfer is already active".into())));
+            return Ok(());
+        }
+        let (dir, name) = split_remote(&remote_path);
+        if name.is_empty() || local.file_name().is_none() {
+            let _ = reply.send(Err(ClientError::InvalidInput("invalid download path".into())));
+            return Ok(());
+        }
+        if expected_size.is_some_and(|s| s > crate::transfer::MAX_TRANSFER_SIZE) {
+            let _ = reply.send(Err(ClientError::InvalidInput("file is too large".into())));
+            return Ok(());
+        }
+
+        // Resume only from a sidecar for this server and remote file whose
+        // data file is still there.
+        let data_path = data_path_for(&local);
+        let resume = {
+            let (local, data_path) = (local.clone(), data_path.clone());
+            tokio::task::spawn_blocking(move || {
+                std::fs::metadata(&data_path)
+                    .is_ok_and(|m| m.is_file())
+                    .then(|| Sidecar::read(&local))
+                    .flatten()
+            })
+            .await
+            .ok()
+            .flatten()
+        };
+        let resume = resume.filter(|sc| {
+            sc.server == self.opts.server_id
+                && sc.remote == remote_path
+                && expected_size.is_none_or(|s| s == sc.size)
+        });
+        let requested_chunk = match (&resume, expected_size) {
+            (Some(sc), _) => sc.chunk_size,
+            (None, Some(size)) => choose_chunk_size(size),
+            (None, None) => DEFAULT_CHUNK_SIZE,
+        };
+        let (resume_id, have_bitmap) = match &resume {
+            Some(sc) => (sc.transfer_id, sc.bitmap.clone()),
+            None => ([0u8; 16], vec![]),
+        };
+
+        let gen = self.next_generation();
+        let request = TransferRequest {
+            direction: DIRECTION_DOWNLOAD,
+            path: dir,
+            name,
+            size: 0,
+            chunk_size: requested_chunk,
+            sha256: [0u8; 32],
+            resume_id,
+            have_bitmap,
+        };
+        match self.send(PacketType::FileTransferStart, request.encode()).await {
+            Ok(()) => self.push_pending(Pending::Reply(Waiter::TransferStart(gen))),
+            Err(SendError::Rejected(e)) => {
+                let _ = reply.send(Err(e));
+                return Ok(());
+            }
+            Err(SendError::Fatal(e)) => {
+                let _ = reply.send(Err(ClientError::Disconnected));
+                return Err(SendError::Fatal(e));
+            }
+        }
+        self.transfer = Some(Transfer {
+            gen,
+            reply: Some(reply),
+            cancel: Arc::new(AtomicBool::new(false)),
+            stage: Stage::AwaitingAccept {
+                deadline: Instant::now() + self.opts.request_timeout,
+            },
+            job: Job::Download(DownloadJob {
+                remote_path,
+                local,
+                data_path,
+                expected_size,
+                requested_chunk,
+                resume,
+                accepted: false,
+                round: 0,
+                file: None,
+                id: [0u8; 16],
+                size: 0,
+                chunk_size: requested_chunk,
+                total: 0,
+                sha256: [0u8; 32],
+                have: BitVec::new(),
+                last_progress: None,
+                unsaved_chunks: 0,
+                last_sidecar: Instant::now(),
+                sidecar_task: None,
+            }),
+        });
         Ok(())
     }
 
-    async fn on_error(&mut self, payload: &[u8]) {
-        let text = String::from_utf8_lossy(payload).into_owned();
-        // If a transfer is mid-negotiation, an Error frame aborts it.
-        if let Some(reply) = self.transfer.take().and_then(transfer_reply) {
-            let _ = reply.send(Err(ClientError::Transfer(text.clone())));
+    async fn on_download_accept(&mut self, accept: TransferAccept) {
+        let server_id = self.opts.server_id.clone();
+        let Some(Transfer {
+            stage,
+            job: Job::Download(job),
+            ..
+        }) = self.transfer.as_mut()
+        else {
+            return;
+        };
+        // Validate everything before touching the filesystem.
+        let mut problem = validate_geometry(
+            false,
+            job.requested_chunk,
+            accept.chunk_size,
+            accept.total_chunks,
+            accept.size,
+            accept.have_bitmap.len(),
+        )
+        .err();
+        if problem.is_none() && job.expected_size.is_some_and(|s| s != accept.size) {
+            problem = Some("the file's size changed on the server".into());
         }
-        // A file listing/mutation can fail (missing privilege, name exists,
-        // not found) — fail the pending waiter instead of hanging it.
-        if let Some(waiter) = self.list_waiters.pop_front() {
-            let _ = waiter.send(Err(ClientError::Server(text.clone())));
+        let same_file = accept.size == job.size
+            && accept.sha256 == job.sha256
+            && accept.chunk_size == job.chunk_size;
+        if problem.is_none() && job.accepted && !same_file {
+            // A follow-up round for a file that changed meanwhile.
+            let err = ClientError::Transfer("the file changed on the server".into());
+            job.id = accept.transfer_id;
+            *stage = Stage::Running;
+            self.fail_transfer(err, Cleanup::Discard).await;
+            return;
         }
-        // A catalog generation or search can fail the same way (missing
-        // privilege, or search before any catalog exists).
-        if let Some(waiter) = self.catalog_waiters.pop_front() {
-            let _ = waiter.send(Err(ClientError::Server(text.clone())));
+        if let Some(problem) = problem {
+            // Refused before anything is created for this attempt; any
+            // earlier resume state is left as it was.
+            let accepted_before = job.accepted;
+            job.id = accept.transfer_id;
+            *stage = Stage::Running;
+            if !accepted_before {
+                self.send_abort(accept.transfer_id).await;
+            }
+            self.fail_transfer(ClientError::Transfer(problem), Cleanup::Keep).await;
+            return;
         }
-        if let Some(waiter) = self.search_waiters.pop_front() {
-            let _ = waiter.send(Err(ClientError::Server(text.clone())));
+
+        job.id = accept.transfer_id;
+        if !job.accepted {
+            job.size = accept.size;
+            job.chunk_size = accept.chunk_size;
+            job.total = accept.total_chunks;
+            job.sha256 = accept.sha256;
+            // Trust local resume state only if it describes this exact file.
+            let mut have: ChunkBitmap = match job.resume.take() {
+                Some(sc)
+                    if sc.size == job.size
+                        && sc.sha256 == job.sha256
+                        && sc.chunk_size == job.chunk_size
+                        && sc.bitmap.len() == bitmap_bytes(job.total) =>
+                {
+                    ChunkBitmap::from_vec(sc.bitmap)
+                }
+                _ => BitVec::new(),
+            };
+            have.resize(job.total as usize, false);
+            let fresh = have.not_any();
+            let opened = tokio::fs::OpenOptions::new()
+                .create(true)
+                .read(true)
+                .write(true)
+                .truncate(fresh)
+                .open(&job.data_path)
+                .await;
+            match opened {
+                Ok(file) => job.file = Some(file),
+                Err(e) => {
+                    self.fail_transfer(ClientError::Io(e), Cleanup::Keep).await;
+                    return;
+                }
+            }
+            job.have = have;
+            job.accepted = true;
+            // Record the identity straight away so an interruption resumes.
+            job.unsaved_chunks = 0;
+            job.last_sidecar = Instant::now();
+            job.sidecar_task = Some(spawn_sidecar_write(job.sidecar(&server_id), job.local.clone()));
         }
-        // Likewise a pending User Info lookup (e.g. the user isn't online).
-        if let Some(waiter) = self.user_info_waiters.pop_front() {
-            let _ = waiter.send(Err(ClientError::Server(text.clone())));
-        }
-        // Role mutations routinely fail on privilege/not-found errors — don't
-        // leave the caller hanging until disconnect.
-        if let Some(waiter) = self.role_waiters.pop_front() {
-            let _ = waiter.send(Err(ClientError::Server(text.clone())));
-        }
-        if let Some(waiter) = self.account_roles_waiters.pop_front() {
-            let _ = waiter.send(Err(ClientError::Server(text.clone())));
-        }
-        // Account mutations fail on privilege / duplicate-name / not-found.
-        if let Some(waiter) = self.account_waiters.pop_front() {
-            let _ = waiter.send(Err(ClientError::Server(text.clone())));
-        }
-        // News ops fail on privilege / class thresholds / not-found.
-        if let Some(waiter) = self.newsgroup_waiters.pop_front() {
-            let _ = waiter.send(Err(ClientError::Server(text.clone())));
-        }
-        if let Some(waiter) = self.thread_waiters.pop_front() {
-            let _ = waiter.send(Err(ClientError::Server(text.clone())));
-        }
-        // Server settings requests/updates fail on missing SERVER_ADMIN.
-        if let Some(waiter) = self.settings_waiters.pop_front() {
-            let _ = waiter.send(Err(ClientError::Server(text.clone())));
-        }
-        // Server History requests fail on missing SERVER_ADMIN.
-        if let Some(waiter) = self.history_waiters.pop_front() {
-            let _ = waiter.send(Err(ClientError::Server(text.clone())));
-        }
-        // IP rule ops fail on missing SERVER_ADMIN or bad action/CIDR input.
-        if let Some(waiter) = self.ip_rule_waiters.pop_front() {
-            let _ = waiter.send(Err(ClientError::Server(text.clone())));
-        }
-        // Connection Monitor requests fail on missing USER_KICK.
-        if let Some(waiter) = self.connection_waiters.pop_front() {
-            let _ = waiter.send(Err(ClientError::Server(text.clone())));
-        }
-        self.emit(Event::ServerError { text }).await;
+        *stage = Stage::Running;
+        self.maybe_emit_progress(true).await;
     }
+
+    /// The server finished streaming. Either ask again for chunks it
+    /// skipped, or verify the whole file off the actor.
+    async fn download_ended(&mut self, end: TransferEnd) {
+        let request_timeout = self.opts.request_timeout;
+        let Some(Transfer {
+            gen,
+            stage,
+            cancel,
+            job: Job::Download(job),
+            ..
+        }) = self.transfer.as_mut()
+        else {
+            return;
+        };
+        let gen = *gen;
+        if end.status != TRANSFER_VERIFIED {
+            // The server is done with it; nothing to abort.
+            *stage = Stage::Verifying;
+            let err = ClientError::Transfer(format!("server aborted the download: {}", end.message));
+            self.fail_transfer(err, Cleanup::Keep).await;
+            return;
+        }
+        let flushed = match job.file.as_mut() {
+            Some(file) => file.flush().await,
+            None => Ok(()),
+        };
+        if let Err(e) = flushed {
+            *stage = Stage::Verifying;
+            self.fail_transfer(ClientError::Io(e), Cleanup::Keep).await;
+            return;
+        }
+        if !job.have.all() {
+            if job.round + 1 < MAX_DOWNLOAD_ROUNDS {
+                // The server skipped chunks we don't have (e.g. a stale
+                // resume bitmap): ask once more for exactly what's missing.
+                job.round += 1;
+                job.requested_chunk = job.chunk_size;
+                let (dir, name) = split_remote(&job.remote_path);
+                let request = TransferRequest {
+                    direction: DIRECTION_DOWNLOAD,
+                    path: dir,
+                    name,
+                    size: 0,
+                    chunk_size: job.chunk_size,
+                    sha256: [0u8; 32],
+                    resume_id: job.id,
+                    have_bitmap: bitmap_vec(&job.have),
+                };
+                *stage = Stage::AwaitingAccept {
+                    deadline: Instant::now() + request_timeout,
+                };
+                self.send_transfer_request(gen, request).await;
+            } else {
+                *stage = Stage::Verifying;
+                let err = ClientError::Transfer("the server did not send every chunk".into());
+                self.fail_transfer(err, Cleanup::Discard).await;
+            }
+            return;
+        }
+        // Every chunk is on disk: hash it (at most `size` bytes) on the
+        // blocking pool while the actor keeps serving commands.
+        drop(job.file.take());
+        *stage = Stage::Verifying;
+        let (path, size, cancel) = (job.data_path.clone(), job.size, cancel.clone());
+        let task = tokio::task::spawn_blocking(move || hash_download(&path, size, &cancel));
+        self.blocking = Some(Blocking::Verify { gen, task });
+        self.maybe_emit_progress(true).await;
+    }
+
+    async fn finish_download(&mut self, result: Result<[u8; 32], ClientError>) {
+        let Some(Transfer {
+            job: Job::Download(job),
+            ..
+        }) = self.transfer.as_mut()
+        else {
+            return;
+        };
+        let failure = match result {
+            Ok(actual) if actual == job.sha256 => None,
+            // The data is wrong: a retry must start from scratch.
+            Ok(_) => Some((
+                ClientError::Transfer("downloaded file hash mismatch".into()),
+                Cleanup::Discard,
+            )),
+            Err(e @ ClientError::Io(_)) => Some((e, Cleanup::Keep)),
+            Err(e) => Some((e, Cleanup::Discard)),
+        };
+        let sidecar_task = job.sidecar_task.take();
+        let (data_path, local, id) = (job.data_path.clone(), job.local.clone(), job.id);
+        if let Some(task) = sidecar_task {
+            let _ = task.await;
+        }
+        if let Some((err, cleanup)) = failure {
+            self.fail_transfer(err, cleanup).await;
+            return;
+        }
+        if let Err(e) = tokio::fs::rename(&data_path, &local).await {
+            self.fail_transfer(ClientError::Io(e), Cleanup::Keep).await;
+            return;
+        }
+        let _ = tokio::fs::remove_file(Sidecar::path_for(&local)).await;
+        let Some(mut transfer) = self.transfer.take() else {
+            return;
+        };
+        self.emit(Event::TransferComplete {
+            id: Uuid::from_bytes(id).to_string(),
+            direction: Direction::Download,
+            status: TRANSFER_VERIFIED,
+            message: "verified".into(),
+        })
+        .await;
+        if let Some(reply) = transfer.reply.take() {
+            let _ = reply.send(Ok(()));
+        }
+    }
+
+    // ---- login ----------------------------------------------------------------
 
     async fn on_auth_challenge(&mut self, payload: &[u8]) -> Result<(), ClientError> {
         let Some(login) = self.login.as_mut() else {
@@ -1522,42 +2508,28 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
         Ok(())
     }
 
-    async fn emit_progress(
-        &self,
-        id: [u8; 16],
-        direction: Direction,
-        done: u32,
-        total: u32,
-        bitmap: &ChunkBitmap,
-    ) {
-        self.emit(Event::TransferProgress {
-            id: Uuid::from_bytes(id).to_string(),
-            direction,
-            done,
-            total,
-            bitmap: bitmap.clone().into_vec(),
-        })
-        .await;
+    // ---- output ---------------------------------------------------------------
+
+    /// Deliver an event to the application. Waits while the event channel is
+    /// full (backpressure), but never past a disconnect request.
+    async fn emit(&mut self, event: Event) {
+        let send = self.events.send(event);
+        tokio::select! {
+            biased;
+            _ = wait_shutdown(&mut self.shutdown) => {}
+            _ = send => {}
+        }
     }
 
-    async fn emit(&self, event: Event) {
-        let _ = self.events.send(event).await;
-    }
-
-    async fn send(&mut self, packet_type: PacketType, payload: Bytes) -> io::Result<()> {
-        let header = PacketHeader {
-            version: PROTOCOL_VERSION,
-            packet_type,
-            flags: PacketFlags::empty(),
-            sequence: self.seq,
-            length: payload.len() as u32,
-        };
-        self.seq = self.seq.wrapping_add(1);
-        self.write_frame(KdxFrame { header, payload }).await
-    }
-
-    /// Send a payload, fragmenting when it exceeds the frame cap.
-    async fn send_fragmented(&mut self, packet_type: PacketType, payload: Bytes) -> io::Result<()> {
+    /// Send a payload, fragmenting it when it exceeds the frame cap. A
+    /// payload the server could never reassemble fails only this request.
+    async fn send(&mut self, packet_type: PacketType, payload: Bytes) -> Result<(), SendError> {
+        if payload.len() > MAX_OUTBOUND_PAYLOAD {
+            return Err(SendError::Rejected(ClientError::InvalidInput(format!(
+                "request too large ({} bytes)",
+                payload.len()
+            ))));
+        }
         let mut seq = self.seq;
         let frames = kdx_protocol::fragment(
             packet_type,
@@ -1572,24 +2544,109 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
         );
         self.seq = seq;
         for frame in frames {
-            self.write_frame(frame).await?;
+            self.write_frame(frame).await.map_err(SendError::Fatal)?;
         }
         Ok(())
     }
 
+    /// Write one frame, bounded by the write timeout and abandoned at once if
+    /// a disconnect is requested (a server that stops reading can't wedge
+    /// the actor).
     async fn write_frame(&mut self, frame: KdxFrame) -> io::Result<()> {
-        self.framed.send(frame).await.map_err(|e| match e {
-            kdx_protocol::ProtocolError::Io(e) => e,
-            other => io::Error::other(other),
-        })
+        let write = tokio::time::timeout(self.opts.write_timeout, self.framed.send(frame));
+        tokio::select! {
+            biased;
+            _ = wait_shutdown(&mut self.shutdown) => {
+                Err(io::Error::new(io::ErrorKind::Interrupted, "disconnect requested"))
+            }
+            result = write => match result {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(kdx_protocol::ProtocolError::Io(e))) => Err(e),
+                Ok(Err(other)) => Err(io::Error::other(other)),
+                Err(_) => Err(io::Error::new(io::ErrorKind::TimedOut, "write timed out")),
+            },
+        }
+    }
+
+    /// Best-effort courtesy `Disconnect` on the way out, briefly bounded.
+    async fn goodbye(&mut self) {
+        let header = PacketHeader {
+            version: PROTOCOL_VERSION,
+            packet_type: PacketType::Disconnect,
+            flags: PacketFlags::empty(),
+            sequence: self.seq,
+            length: 0,
+        };
+        self.seq = self.seq.wrapping_add(1);
+        let frame = KdxFrame {
+            header,
+            payload: Bytes::new(),
+        };
+        let _ = tokio::time::timeout(GOODBYE_TIMEOUT, self.framed.send(frame)).await;
     }
 }
 
-/// Extract a transfer's reply channel for failure on teardown.
-fn transfer_reply(t: Transfer) -> Option<oneshot::Sender<Result<(), ClientError>>> {
-    match t {
-        Transfer::Upload(mut j) => j.reply.take(),
-        Transfer::Download(mut j) => j.reply.take(),
+impl DownloadJob {
+    /// The resume sidecar describing this download's current state.
+    fn sidecar(&self, server: &str) -> Sidecar {
+        Sidecar {
+            server: server.to_string(),
+            remote: self.remote_path.clone(),
+            transfer_id: self.id,
+            size: self.size,
+            chunk_size: self.chunk_size,
+            sha256: self.sha256,
+            bitmap: bitmap_vec(&self.have),
+        }
+    }
+}
+
+fn protocol_violation(what: impl std::fmt::Display) -> ClientError {
+    ClientError::Server(format!("protocol violation: {what}"))
+}
+
+/// A bitmap's bytes with the unused tail bits cleared.
+fn bitmap_vec(bits: &ChunkBitmap) -> Vec<u8> {
+    let mut bits = bits.clone();
+    bits.set_uninitialized(false);
+    bits.into_vec()
+}
+
+fn spawn_sidecar_write(sidecar: Sidecar, local: PathBuf) -> JoinHandle<()> {
+    tokio::task::spawn_blocking(move || {
+        if let Err(e) = sidecar.write(&local) {
+            warn!("could not save download resume state: {e}");
+        }
+    })
+}
+
+/// Write `data` at `offset` and wait for it to reach the OS.
+async fn write_at(file: &mut tokio::fs::File, offset: u64, data: &[u8]) -> io::Result<()> {
+    file.seek(io::SeekFrom::Start(offset)).await?;
+    file.write_all(data).await?;
+    file.flush().await
+}
+
+/// Read one upload chunk at its offset, refusing if the file has changed
+/// (length or mtime) since it was hashed.
+async fn read_chunk(
+    file: &mut tokio::fs::File,
+    offset: u64,
+    len: usize,
+    size: u64,
+    modified: Option<SystemTime>,
+) -> Result<Vec<u8>, ClientError> {
+    let changed = || ClientError::Transfer("local file changed during upload".into());
+    let meta = file.metadata().await?;
+    if meta.len() != size || meta.modified().ok() != modified {
+        return Err(changed());
+    }
+    file.seek(io::SeekFrom::Start(offset)).await?;
+    let mut buf = vec![0u8; len];
+    match file.read_exact(&mut buf).await {
+        Ok(_) => Ok(buf),
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => Err(changed()),
+        Err(e) => Err(ClientError::Io(e)),
     }
 }
 
@@ -1603,12 +2660,6 @@ fn split_remote(path: &str) -> (String, String) {
         }
         None => ("/".to_string(), trimmed.to_string()),
     }
-}
-
-fn with_part_suffix(local: &std::path::Path) -> PathBuf {
-    let mut s = local.as_os_str().to_owned();
-    s.push(".part");
-    PathBuf::from(s)
 }
 
 /// Parse a `RoleInfo::id`-style UUID string back into wire bytes.
