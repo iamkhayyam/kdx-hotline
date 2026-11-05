@@ -9,6 +9,7 @@ use kdx_crypto::{KdfParams, StoredCredential, CHANNEL_BINDING_LEN};
 use kdx_storage::accounts::{self, AccountRow};
 use kdx_storage::{SqlitePool, StorageError};
 use rand::RngCore;
+use sha2::{Digest, Sha256};
 use tokio::sync::OnceCell;
 use tokio::time::Instant;
 use tracing::{debug, info, warn};
@@ -18,6 +19,9 @@ use super::classes::{effective_privileges, BaseClass, Privileges};
 
 /// `server_secrets` row holding the key for unknown-user decoy salts.
 const DECOY_KEY_SECRET: &str = "auth.decoy_salt_key";
+
+/// How long a password-change challenge stays valid for its proof.
+pub const PASSWORD_CHANGE_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Debug, thiserror::Error)]
 pub enum AuthError {
@@ -31,6 +35,13 @@ pub enum AuthError {
     AccountExists,
     #[error("username must be 1 to {} bytes", crate::limits::MAX_USERNAME_LEN)]
     InvalidUsername,
+    /// The session's account was deleted or replaced.
+    #[error("your account no longer exists")]
+    AccountGone,
+    /// The credential a password change was proven against was replaced
+    /// meanwhile (another change, or an admin reset).
+    #[error("your password was changed meanwhile; start again")]
+    CredentialChanged,
     #[error("storage error: {0}")]
     Storage(#[from] kdx_storage::StorageError),
     #[error("crypto error: {0}")]
@@ -89,6 +100,59 @@ pub struct Verified {
     /// `HMAC(ServerKey, AuthMessage)`, returned in the successful
     /// `AuthResult` so the client can authenticate the server.
     pub server_signature: [u8; 32],
+    /// Which credential the login was proven against, so the connection can
+    /// tell (with [`AuthManager::credential_stamp`]) whether a password
+    /// change or reset replaced it while the login was in flight.
+    pub credential_stamp: CredentialStamp,
+}
+
+/// Identifies one stored credential (a hash of its encoding) without
+/// holding any of its key material.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CredentialStamp([u8; 32]);
+
+impl CredentialStamp {
+    fn of(credential: &StoredCredential) -> Self {
+        Self(Sha256::digest(credential.encode().as_bytes()).into())
+    }
+}
+
+/// A password change in flight on one connection, between
+/// `PasswordChangeChallenge` and `PasswordChangeProof`: it pins the
+/// transcript the proof must be bound to and the credential the change may
+/// replace. Valid for one proof, until [`PASSWORD_CHANGE_TIMEOUT`].
+pub struct PendingPasswordChange {
+    challenge: [u8; 32],
+    account_id: String,
+    username: String,
+    channel_binding: [u8; CHANNEL_BINDING_LEN],
+    /// The account's credential when the challenge went out.
+    credential: StoredCredential,
+    /// Its stored encoding, which the change compares-and-swaps against.
+    stored: String,
+    expires_at: Instant,
+}
+
+impl PendingPasswordChange {
+    /// Whether the challenge is too old to answer.
+    pub fn expired(&self) -> bool {
+        Instant::now() >= self.expires_at
+    }
+
+    /// The account being changed.
+    pub fn username(&self) -> &str {
+        &self.username
+    }
+}
+
+impl std::fmt::Debug for PendingPasswordChange {
+    // Credential material stays out of logs.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingPasswordChange")
+            .field("username", &self.username)
+            .field("expires_at", &self.expires_at)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Keeps an activated session registered only if the login completes: drop
@@ -300,8 +364,10 @@ impl AuthManager {
         // no live session to kick, so build the session from the row as it
         // is now. An account deleted (or replaced) meanwhile can't log in on
         // the old one's proof.
+        // Likewise a password change or reset since then: the old password
+        // must not log in once its credential has been replaced.
         let account = match accounts::by_username(&self.pool, &pending.username).await? {
-            Some(row) if row.id == account.id => row,
+            Some(row) if row.id == account.id && holds_credential(&row, &credential) => row,
             _ => return Err(AuthError::InvalidCredentials),
         };
 
@@ -344,7 +410,116 @@ impl AuthManager {
         Ok(Verified {
             session,
             server_signature,
+            credential_stamp: CredentialStamp::of(&credential),
         })
+    }
+
+    /// The stamp of `username`'s current credential, if the account still
+    /// exists as `account_id` and its credential is usable: compare with
+    /// [`Verified::credential_stamp`] to see whether a login went stale.
+    pub async fn credential_stamp(
+        &self,
+        username: &str,
+        account_id: &str,
+    ) -> Result<Option<CredentialStamp>, AuthError> {
+        let Some(row) = accounts::by_username(&self.pool, username).await? else {
+            return Ok(None);
+        };
+        if row.id != account_id {
+            return Ok(None);
+        }
+        Ok(self
+            .credential_for(&row)
+            .await
+            .map(|credential| CredentialStamp::of(&credential)))
+    }
+
+    /// Start a password change for `session`'s own account: a fresh
+    /// challenge plus the current credential's salt and parameters, pinned
+    /// (with `channel_binding`) in the returned pending state.
+    pub async fn begin_password_change(
+        &self,
+        session: &Session,
+        channel_binding: [u8; CHANNEL_BINDING_LEN],
+    ) -> Result<(ChallengeData, PendingPasswordChange), AuthError> {
+        let row = accounts::by_username(&self.pool, &session.username)
+            .await?
+            .filter(|row| row.id == session.account_id)
+            .ok_or(AuthError::AccountGone)?;
+        let credential = self
+            .credential_for(&row)
+            .await
+            .ok_or(AuthError::Internal("the account's stored credential is unusable"))?;
+        // A legacy row was just converted, and stored as this encoding.
+        let stored = row.credential.clone().unwrap_or_else(|| credential.encode());
+        let challenge = kdx_crypto::generate_challenge();
+        let data = ChallengeData {
+            challenge,
+            salt: credential.salt.clone(),
+            params: credential.params,
+        };
+        let now = Instant::now();
+        Ok((
+            data,
+            PendingPasswordChange {
+                challenge,
+                account_id: row.id,
+                username: row.username,
+                channel_binding,
+                credential,
+                stored,
+                expires_at: now
+                    .checked_add(PASSWORD_CHANGE_TIMEOUT)
+                    .unwrap_or(now),
+            },
+        ))
+    }
+
+    /// Finish a password change: refuse an unacceptable `new` credential
+    /// ([`AuthError::Crypto`], before looking at the proof), verify the
+    /// proof of the current password in constant time
+    /// ([`AuthError::InvalidCredentials`]), then store `new` in place of
+    /// exactly the credential the challenge was issued for
+    /// ([`AuthError::CredentialChanged`] if it was replaced meanwhile).
+    /// Returns the `ServerSignature` for the client.
+    pub async fn complete_password_change(
+        &self,
+        pending: PendingPasswordChange,
+        proof: &[u8; 32],
+        new: &StoredCredential,
+    ) -> Result<[u8; 32], AuthError> {
+        new.check_acceptable()?;
+        let Some(server_signature) = pending.credential.verify_password_change_proof(
+            &pending.username,
+            &pending.challenge,
+            &pending.channel_binding,
+            new,
+            proof,
+        ) else {
+            return Err(AuthError::InvalidCredentials);
+        };
+        if !accounts::set_credential(
+            &self.pool,
+            &pending.account_id,
+            &new.encode(),
+            Some(&pending.stored),
+        )
+        .await?
+        {
+            return Err(AuthError::CredentialChanged);
+        }
+        Ok(server_signature)
+    }
+
+    /// An administrator's password reset: store `credential` for account
+    /// `account_id` unconditionally. `false` if there is no such account.
+    pub async fn set_credential(
+        &self,
+        account_id: &str,
+        credential: &StoredCredential,
+    ) -> Result<bool, AuthError> {
+        credential.check_acceptable()?;
+        Ok(accounts::set_credential(&self.pool, account_id, &credential.encode(), None).await?)
     }
 
     /// Register a verified session. Call right before delivering the
@@ -407,11 +582,11 @@ impl AuthManager {
         Ok(BaseClass::try_from(row.base_class as u8).ok())
     }
 
-    /// Provision a new account. `password` is the initial plaintext (arriving
-    /// only over TLS); only its SCRAM credential is stored (Argon2 runs on a
-    /// blocking thread). The account and its `granted`/`revoked` privilege
-    /// overrides are written in one INSERT; a taken name (including a
-    /// concurrent create) is [`AuthError::AccountExists`].
+    /// Provision a new account from a local plaintext `password` (the
+    /// `kdxd useradd` CLI): its SCRAM credential is derived here, on a
+    /// blocking thread, and only that is stored. Over the wire, accounts are
+    /// created with a client-derived credential instead
+    /// ([`AuthManager::create_account_with_credential`]).
     pub async fn create_account(
         &self,
         username: &str,
@@ -424,13 +599,35 @@ impl AuthManager {
             return Err(AuthError::InvalidUsername);
         }
         let password = password.to_owned();
-        let credential = tokio::task::spawn_blocking(move || kdx_crypto::hash_password(&password))
+        let credential = tokio::task::spawn_blocking(move || StoredCredential::derive(&password))
             .await
             .map_err(|_| AuthError::Internal("credential derivation task failed"))??;
+        self.create_account_with_credential(username, &credential, base_class, granted, revoked)
+            .await
+    }
+
+    /// Provision a new account with `credential` (derived by the creating
+    /// client from the initial password, which the server never sees; it
+    /// must pass `check_acceptable`). The account and its
+    /// `granted`/`revoked` privilege overrides are written in one INSERT; a
+    /// taken name (including a concurrent create) is
+    /// [`AuthError::AccountExists`].
+    pub async fn create_account_with_credential(
+        &self,
+        username: &str,
+        credential: &StoredCredential,
+        base_class: i64,
+        granted: i64,
+        revoked: i64,
+    ) -> Result<(), AuthError> {
+        if username.is_empty() || username.len() > crate::limits::MAX_USERNAME_LEN {
+            return Err(AuthError::InvalidUsername);
+        }
+        credential.check_acceptable()?;
         match accounts::create(
             &self.pool,
             username,
-            &credential,
+            &credential.encode(),
             base_class,
             granted,
             revoked,
@@ -500,6 +697,16 @@ impl AuthManager {
     /// The configured idle session lifetime (`session_ttl_secs`).
     pub fn session_ttl(&self) -> Duration {
         self.session_ttl
+    }
+}
+
+/// Whether `row` still holds `credential` (it doesn't once a password change
+/// or reset replaced it). A not-yet-converted legacy row is compared by its
+/// conversion, which runs no KDF.
+fn holds_credential(row: &AccountRow, credential: &StoredCredential) -> bool {
+    match &row.credential {
+        Some(encoded) => StoredCredential::decode(encoded).is_ok_and(|c| c == *credential),
+        None => StoredCredential::from_legacy_phc(&row.password_phc).is_ok_and(|c| c == *credential),
     }
 }
 
@@ -711,6 +918,14 @@ mod tests {
         mgr.create_account("muted", "pw", 1, 0, Privileges::CHAT_SEND.bits() as i64)
             .await
             .unwrap();
+        // A client-derived credential must be acceptable.
+        let mut weak = StoredCredential::derive("pw").unwrap();
+        weak.salt.truncate(8);
+        assert!(matches!(
+            mgr.create_account_with_credential("weak", &weak, 1, 0, 0).await,
+            Err(AuthError::Crypto(_))
+        ));
+        assert!(accounts::by_username(&pool, "weak").await.unwrap().is_none());
         let row = accounts::by_username(&pool, "muted")
             .await
             .unwrap()
@@ -731,6 +946,149 @@ mod tests {
         // The created account logs in with its overrides applied.
         let session = login(&mgr, "muted", "pw").await.unwrap().session;
         assert!(!session.privileges.contains(Privileges::CHAT_SEND));
+    }
+
+    fn change_proof(
+        username: &str,
+        data: &ChallengeData,
+        current: &str,
+        new: &StoredCredential,
+    ) -> ClientProof {
+        kdx_crypto::password_change_proof(
+            current,
+            &kdx_crypto::PasswordChangeContext {
+                current: AuthContext {
+                    username,
+                    challenge: &data.challenge,
+                    salt: &data.salt,
+                    params: data.params,
+                    channel_binding: &BINDING,
+                },
+                new_credential: new,
+            },
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn password_change_replaces_the_credential() {
+        let (pool, _dir) = test_pool().await;
+        seed(&pool, "phraq", "s3cret", 1).await;
+        let mgr = AuthManager::new(pool, Duration::from_secs(60));
+        let session = login(&mgr, "phraq", "s3cret").await.unwrap().session;
+
+        let new = StoredCredential::derive("n3w pass").unwrap();
+        let (data, pending) = mgr.begin_password_change(&session, BINDING).await.unwrap();
+        assert!(!pending.expired());
+        let proof = change_proof("phraq", &data, "s3cret", &new);
+        let signature = mgr
+            .complete_password_change(pending, &proof.proof, &new)
+            .await
+            .unwrap();
+        assert!(proof.verify_server_signature(&signature));
+
+        assert!(matches!(
+            login(&mgr, "phraq", "s3cret").await,
+            Err(AuthError::InvalidCredentials)
+        ));
+        assert!(login(&mgr, "phraq", "n3w pass").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn password_change_challenges_expire() {
+        let (pool, _dir) = test_pool().await;
+        seed(&pool, "phraq", "s3cret", 1).await;
+        let mgr = AuthManager::new(pool, Duration::from_secs(60));
+        let session = login(&mgr, "phraq", "s3cret").await.unwrap().session;
+        let (_, pending) = mgr.begin_password_change(&session, BINDING).await.unwrap();
+        assert_eq!(pending.username(), "phraq");
+        // Pure in-memory from here on (sqlx misbehaves under a paused clock).
+        tokio::time::pause();
+        tokio::time::advance(PASSWORD_CHANGE_TIMEOUT - Duration::from_secs(1)).await;
+        assert!(!pending.expired());
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(pending.expired());
+    }
+
+    #[tokio::test]
+    async fn password_change_refusals() {
+        let (pool, _dir) = test_pool().await;
+        seed(&pool, "phraq", "s3cret", 1).await;
+        let mgr = AuthManager::new(pool, Duration::from_secs(60));
+        let session = login(&mgr, "phraq", "s3cret").await.unwrap().session;
+        let new = StoredCredential::derive("n3w pass").unwrap();
+
+        // Wrong current password.
+        let (data, pending) = mgr.begin_password_change(&session, BINDING).await.unwrap();
+        let proof = change_proof("phraq", &data, "guess", &new);
+        assert!(matches!(
+            mgr.complete_password_change(pending, &proof.proof, &new).await,
+            Err(AuthError::InvalidCredentials)
+        ));
+
+        // A login proof for the same challenge is not a change proof.
+        let (data, pending) = mgr.begin_password_change(&session, BINDING).await.unwrap();
+        let login_proof = prove("phraq", &data, "s3cret");
+        assert!(matches!(
+            mgr.complete_password_change(pending, &login_proof.proof, &new).await,
+            Err(AuthError::InvalidCredentials)
+        ));
+
+        // An unacceptable new credential is refused before the proof.
+        let mut weak = new.clone();
+        weak.params.m_cost = 8;
+        let (_, pending) = mgr.begin_password_change(&session, BINDING).await.unwrap();
+        assert!(matches!(
+            mgr.complete_password_change(pending, &[0u8; 32], &weak).await,
+            Err(AuthError::Crypto(_))
+        ));
+
+        // Replaced meanwhile (an admin reset): the proof is right, but the
+        // change no longer applies.
+        let (data, pending) = mgr.begin_password_change(&session, BINDING).await.unwrap();
+        let proof = change_proof("phraq", &data, "s3cret", &new);
+        let reset = StoredCredential::derive("admin set").unwrap();
+        assert!(mgr.set_credential(&session.account_id, &reset).await.unwrap());
+        assert!(matches!(
+            mgr.complete_password_change(pending, &proof.proof, &new).await,
+            Err(AuthError::CredentialChanged)
+        ));
+        assert!(login(&mgr, "phraq", "admin set").await.is_ok());
+
+        // Nothing changed by any of the refusals above but the reset.
+        assert!(matches!(
+            login(&mgr, "phraq", "n3w pass").await,
+            Err(AuthError::InvalidCredentials)
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_login_in_flight_fails_once_its_credential_is_replaced() {
+        let (pool, _dir) = test_pool().await;
+        seed(&pool, "phraq", "s3cret", 1).await;
+        let mgr = AuthManager::new(pool, Duration::from_secs(60));
+        let session = login(&mgr, "phraq", "s3cret").await.unwrap().session;
+        let id = session.account_id.clone();
+
+        // Challenge issued for the old credential, proof made with the old
+        // password, password reset in between: refused.
+        let (data, pending) = mgr.begin("phraq", BINDING).await.unwrap();
+        let proof = prove("phraq", &data, "s3cret");
+        let stamp_before = mgr.credential_stamp("phraq", &id).await.unwrap().unwrap();
+        let reset = StoredCredential::derive("fresh").unwrap();
+        mgr.set_credential(&id, &reset).await.unwrap();
+        assert!(matches!(
+            mgr.complete(pending, &proof.proof).await,
+            Err(AuthError::InvalidCredentials)
+        ));
+
+        // The stamp tells a completed-but-not-yet-live login it went stale.
+        let fresh = login(&mgr, "phraq", "fresh").await.unwrap();
+        let stamp_now = mgr.credential_stamp("phraq", &id).await.unwrap().unwrap();
+        assert_ne!(stamp_before, stamp_now);
+        assert_eq!(fresh.credential_stamp, stamp_now);
+        assert!(mgr.credential_stamp("phraq", "other-id").await.unwrap().is_none());
+        assert!(mgr.credential_stamp("nobody", &id).await.unwrap().is_none());
     }
 
     #[tokio::test]

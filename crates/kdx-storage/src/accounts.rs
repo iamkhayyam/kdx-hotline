@@ -201,6 +201,39 @@ pub async fn upgrade_credential(
     Ok(result.rows_affected() == 1)
 }
 
+/// Replace account `id`'s credential (a password change or reset), wiping
+/// any legacy PHC string in the same statement. With `expected`, only if the
+/// stored credential is still exactly that string (compare-and-swap: a
+/// change proven against one credential can't overwrite another written
+/// meanwhile). Returns whether a row was updated.
+pub async fn set_credential(
+    pool: &SqlitePool,
+    id: &str,
+    credential: &str,
+    expected: Option<&str>,
+) -> Result<bool, StorageError> {
+    let result = match expected {
+        Some(expected) => {
+            sqlx::query(
+                "UPDATE accounts SET credential = ?, password_phc = '' WHERE id = ? AND credential = ?",
+            )
+            .bind(credential)
+            .bind(id)
+            .bind(expected)
+            .execute(pool)
+            .await?
+        }
+        None => {
+            sqlx::query("UPDATE accounts SET credential = ?, password_phc = '' WHERE id = ?")
+                .bind(credential)
+                .bind(id)
+                .execute(pool)
+                .await?
+        }
+    };
+    Ok(result.rows_affected() == 1)
+}
+
 /// Rewrite the database file and truncate the WAL, so overwritten values
 /// (wiped legacy password hashes) don't linger in free pages or old WAL
 /// frames. Run once after converting legacy rows; not cheap on a big DB.
@@ -300,6 +333,43 @@ mod tests {
         assert_eq!(row.password_phc, "");
         assert_eq!(row.credential.as_deref(), Some("$converted"));
         assert!(legacy_rows(&pool).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn set_credential_replaces_and_compares_and_swaps() {
+        let (pool, _dir) = pool().await;
+        let row = create(&pool, "phraq", "$old", 1, 0, 0).await.unwrap();
+
+        // A stale expectation changes nothing.
+        assert!(!set_credential(&pool, &row.id, "$new", Some("$other"))
+            .await
+            .unwrap());
+        let stored = by_username(&pool, "phraq").await.unwrap().unwrap();
+        assert_eq!(stored.credential.as_deref(), Some("$old"));
+
+        assert!(set_credential(&pool, &row.id, "$new", Some("$old"))
+            .await
+            .unwrap());
+        // The old expectation no longer matches (a second change racing the
+        // first loses).
+        assert!(!set_credential(&pool, &row.id, "$newer", Some("$old"))
+            .await
+            .unwrap());
+        // An unconditional reset always applies to an existing row...
+        assert!(set_credential(&pool, &row.id, "$reset", None).await.unwrap());
+        let stored = by_username(&pool, "phraq").await.unwrap().unwrap();
+        assert_eq!(stored.credential.as_deref(), Some("$reset"));
+        // ...and to nothing else.
+        assert!(!set_credential(&pool, "no-such-id", "$x", None).await.unwrap());
+
+        // A legacy row's PHC string is wiped with it.
+        let old = create_legacy(&pool, "oldtimer", "$argon2id$v=19$legacy", 1)
+            .await
+            .unwrap();
+        assert!(set_credential(&pool, &old.id, "$fresh", None).await.unwrap());
+        let stored = by_username(&pool, "oldtimer").await.unwrap().unwrap();
+        assert_eq!(stored.password_phc, "");
+        assert_eq!(stored.credential.as_deref(), Some("$fresh"));
     }
 
     #[tokio::test]

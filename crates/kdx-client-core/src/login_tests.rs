@@ -7,6 +7,9 @@ use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use kdx_crypto::{KdfParams, StoredCredential};
 use kdx_protocol::messages::{AuthChallenge, AuthRequest, AuthResponse, AuthResult};
+use kdx_protocol::messages::{
+    PasswordChangeChallenge, PasswordChangeProof, PasswordChangeResult,
+};
 use kdx_protocol::{KdxCodec, KdxFrame, PacketFlags, PacketHeader, PacketType, PROTOCOL_VERSION};
 use tokio::io::DuplexStream;
 use tokio::sync::{mpsc, oneshot};
@@ -299,4 +302,148 @@ fn login_command_debug_redacts_the_password() {
     let shown = format!("{command:?}");
     assert!(shown.contains("phraq"));
     assert!(!shown.contains("hunter2"), "{shown}");
+}
+
+/// Log in against an honest server holding `credential`.
+async fn honest_login(h: &mut Harness, credential: &StoredCredential) {
+    let login = start_login(&h.client, "s3cret");
+    h.expect(PacketType::AuthRequest).await;
+    let challenge = challenge_for(credential);
+    h.send_challenge(&challenge).await;
+    let response = h.expect(PacketType::AuthResponse).await;
+    let proof = AuthResponse::decode(&response.payload).unwrap().response;
+    let signature = credential
+        .verify_proof("phraq", &challenge.challenge, &BINDING, &proof)
+        .unwrap();
+    h.send_result(true, "welcome", signature).await;
+    finish(login).await.unwrap();
+}
+
+fn start_change(
+    client: &ClientHandle,
+    current: &str,
+    new: &str,
+) -> JoinHandle<Result<String, ClientError>> {
+    let client = client.clone();
+    let (current, new) = (current.to_owned(), new.to_owned());
+    tokio::spawn(async move { client.change_password(&current, &new).await })
+}
+
+/// Serve a password-change challenge for `credential` and return the proof
+/// the client answers with, plus the new credential it carries.
+async fn change_round(h: &mut Harness, credential: &StoredCredential) -> ([u8; 32], StoredCredential, [u8; 32]) {
+    h.expect(PacketType::PasswordChangeBegin).await;
+    let challenge = PasswordChangeChallenge {
+        challenge: [4u8; 32],
+        salt: credential.salt.clone(),
+        m_cost: credential.params.m_cost,
+        t_cost: credential.params.t_cost,
+        p_cost: credential.params.p_cost,
+    };
+    h.send(PacketType::PasswordChangeChallenge, challenge.encode())
+        .await;
+    let frame = h.expect(PacketType::PasswordChangeProof).await;
+    let msg = PasswordChangeProof::decode(&frame.payload).unwrap();
+    let new = StoredCredential {
+        salt: msg.credential.salt.clone(),
+        params: KdfParams {
+            m_cost: msg.credential.m_cost,
+            t_cost: msg.credential.t_cost,
+            p_cost: msg.credential.p_cost,
+        },
+        stored_key: msg.credential.stored_key,
+        server_key: msg.credential.server_key,
+    };
+    (msg.proof, new, challenge.challenge)
+}
+
+/// The client proves the current password over the change message — bound
+/// to the logged-in username and this connection's channel binding — and
+/// sends a fresh credential for the new password; an honest server's
+/// signature completes it.
+#[tokio::test]
+async fn password_change_against_an_honest_server() {
+    let credential = StoredCredential::derive("s3cret").unwrap();
+    let mut h = harness();
+    honest_login(&mut h, &credential).await;
+
+    let change = start_change(&h.client, "s3cret", "n3w-pass");
+    let (proof, new, challenge) = change_round(&mut h, &credential).await;
+    let signature = credential
+        .verify_password_change_proof("phraq", &challenge, &BINDING, &new, &proof)
+        .expect("change proof verifies with the username and binding");
+    // The credential carried is a fresh one for the new password.
+    assert!(new.matches_password("n3w-pass").unwrap());
+    assert_ne!(new.salt, credential.salt);
+    let result = PasswordChangeResult {
+        success: true,
+        message: "password changed".into(),
+        server_signature: signature,
+    };
+    h.send(PacketType::PasswordChangeResult, result.encode()).await;
+    let message = tokio::time::timeout(Duration::from_secs(30), change)
+        .await
+        .expect("change hung")
+        .unwrap()
+        .unwrap();
+    assert_eq!(message, "password changed");
+}
+
+/// A "success" the server can't sign with the account's ServerKey is not
+/// believed, and the connection is dropped, as for a login.
+#[tokio::test]
+async fn password_change_success_without_valid_signature_is_rejected() {
+    let credential = StoredCredential::derive("s3cret").unwrap();
+    let mut h = harness();
+    honest_login(&mut h, &credential).await;
+
+    let change = start_change(&h.client, "s3cret", "n3w-pass");
+    change_round(&mut h, &credential).await;
+    let result = PasswordChangeResult {
+        success: true,
+        message: "sure".into(),
+        server_signature: [7u8; 32],
+    };
+    h.send(PacketType::PasswordChangeResult, result.encode()).await;
+    let outcome = tokio::time::timeout(Duration::from_secs(30), change)
+        .await
+        .expect("change hung")
+        .unwrap();
+    assert!(matches!(outcome, Err(ClientError::AuthFailed(_))), "{outcome:?}");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(event) = h.events.recv().await {
+            if matches!(event, Event::Disconnected { .. }) {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("client should hang up");
+}
+
+/// A refusal is a wrong-password failure; the session carries on.
+#[tokio::test]
+async fn password_change_refusal_is_auth_failed() {
+    let credential = StoredCredential::derive("s3cret").unwrap();
+    let mut h = harness();
+    honest_login(&mut h, &credential).await;
+
+    let change = start_change(&h.client, "guess", "n3w-pass");
+    change_round(&mut h, &credential).await;
+    let result = PasswordChangeResult {
+        success: false,
+        message: "the current password is incorrect".into(),
+        server_signature: [0u8; 32],
+    };
+    h.send(PacketType::PasswordChangeResult, result.encode()).await;
+    match tokio::time::timeout(Duration::from_secs(30), change)
+        .await
+        .expect("change hung")
+        .unwrap()
+    {
+        Err(ClientError::AuthFailed(message)) => {
+            assert_eq!(message, "the current password is incorrect")
+        }
+        other => panic!("expected AuthFailed, got {other:?}"),
+    }
 }

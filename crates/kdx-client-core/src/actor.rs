@@ -39,6 +39,15 @@
 //! caller needs the outcome: `join` resolves when its barrier returns (with
 //! the server's `Error`, if it refused), and `invite_to_chat` also waits for
 //! the new room's id.
+//!
+//! A password change is two ordinary requests, issued one after the other
+//! by `ClientHandle::change_password` (which runs the Argon2 work outside
+//! the actor): `PasswordChangeBegin`, answered by `PasswordChangeChallenge`
+//! or `Error`, then `PasswordChangeProof`, answered by
+//! `PasswordChangeResult` or `Error`. The actor attaches the logged-in
+//! username and the channel binding to the challenge, since the proof is
+//! bound to both. Neither request is ever sent before login (the server
+//! would treat it as a protocol violation during authentication).
 
 use std::collections::{HashSet, VecDeque};
 use std::io;
@@ -51,6 +60,10 @@ use bitvec::prelude::*;
 use bytes::Bytes;
 use futures_util::{FutureExt, SinkExt, StreamExt};
 use kdx_crypto::{AuthContext, ClientProof, KdfParams};
+use kdx_protocol::messages::{
+    AccountSetPassword, PasswordChangeBegin, PasswordChangeChallenge, PasswordChangeProof,
+    PasswordChangeResult,
+};
 use kdx_protocol::messages::{
     AccountCreate, AccountListRequest, AccountListResponse, AccountRolesRequest,
     AccountRolesResponse, AccountUpdate, AdminDisconnect, AuthChallenge, AuthRequest, AuthResponse,
@@ -93,7 +106,7 @@ use crate::event::{
     AccountSummary, Direction, Event, FileSearchEntry, HistoryEntry, IpRule, NewsPost,
     NewsgroupInfo, PresenceUser, RoleInfo, ServerSettings, TrackerServer,
 };
-use crate::handle::{ClientHandle, Command, Password, Session};
+use crate::handle::{ChangeChallenge, ClientHandle, Command, Password, Session};
 use crate::transfer::{
     bitmap_bytes, choose_chunk_size, chunk_len, data_path_for, hash_download, prepare_upload,
     progress_bitmap, validate_geometry, ChunkBitmap, PreparedUpload, Sidecar, DEFAULT_CHUNK_SIZE,
@@ -188,6 +201,8 @@ enum Waiter {
     Accounts(Reply<Vec<AccountSummary>>),
     Newsgroups(Reply<Vec<NewsgroupInfo>>),
     Thread(Reply<Vec<NewsPost>>),
+    PasswordChallenge(Reply<ChangeChallenge>),
+    PasswordChanged(Reply<PasswordChangeResult>),
     /// A `FileTransferStart` request, answered by a `TransferAccept` (sent
     /// as `FileTransferStart`) or `Error`. The caller's reply lives in the
     /// transfer itself; this is that transfer's generation.
@@ -213,6 +228,8 @@ impl Waiter {
             Waiter::Accounts(_) => PacketType::AccountListResponse,
             Waiter::Newsgroups(_) => PacketType::NewsgroupListResponse,
             Waiter::Thread(_) => PacketType::NewsThreadListResponse,
+            Waiter::PasswordChallenge(_) => PacketType::PasswordChangeChallenge,
+            Waiter::PasswordChanged(_) => PacketType::PasswordChangeResult,
             Waiter::TransferStart(_) => PacketType::FileTransferStart,
         }
     }
@@ -235,6 +252,8 @@ impl Waiter {
             Waiter::Accounts(tx) => drop(tx.send(Err(err))),
             Waiter::Newsgroups(tx) => drop(tx.send(Err(err))),
             Waiter::Thread(tx) => drop(tx.send(Err(err))),
+            Waiter::PasswordChallenge(tx) => drop(tx.send(Err(err))),
+            Waiter::PasswordChanged(tx) => drop(tx.send(Err(err))),
             Waiter::TransferStart(_) => {}
         }
     }
@@ -451,6 +470,8 @@ pub(crate) struct Actor<S> {
     /// A login succeeded on this connection; another one is refused (the
     /// server has no answer for a second `AuthRequest`).
     authenticated: bool,
+    /// The username that logged in (password-change proofs are bound to it).
+    username: Option<String>,
     pending: VecDeque<Pending>,
     next_token: u64,
     invites: VecDeque<InviteWait>,
@@ -491,6 +512,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
             seq: 0,
             login: None,
             authenticated: false,
+            username: None,
             pending: VecDeque::new(),
             next_token: 0,
             invites: VecDeque::new(),
@@ -542,6 +564,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
             tx: commands,
             shutdown: Arc::new(shutdown),
             request_timeout: self.opts.request_timeout,
+            password_change: Arc::default(),
         };
         let events = self.events.clone();
         let task = tokio::spawn(self.run());
@@ -1048,7 +1071,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
             }
             Command::CreateAccount {
                 username,
-                password,
+                credential,
                 base_class,
                 granted,
                 revoked,
@@ -1056,7 +1079,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
             } => {
                 let msg = AccountCreate {
                     username,
-                    password,
+                    credential,
                     base_class,
                     granted,
                     revoked,
@@ -1078,6 +1101,42 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
                     revoked,
                 };
                 self.request(PacketType::AccountUpdate, msg.encode(), Waiter::Accounts(reply))
+                    .await?;
+            }
+            Command::SetAccountPassword {
+                username,
+                credential,
+                reply,
+            } => {
+                let msg = AccountSetPassword {
+                    username,
+                    credential,
+                };
+                let waiter = Waiter::Accounts(reply);
+                self.request(PacketType::AccountSetPassword, msg.encode(), waiter)
+                    .await?;
+            }
+            Command::BeginPasswordChange { reply } => {
+                if !self.authenticated {
+                    let _ = reply.send(Err(ClientError::InvalidInput("log in first".into())));
+                    return Ok(());
+                }
+                let waiter = Waiter::PasswordChallenge(reply);
+                self.request(PacketType::PasswordChangeBegin, PasswordChangeBegin.encode(), waiter)
+                    .await?;
+            }
+            Command::FinishPasswordChange {
+                proof,
+                credential,
+                reply,
+            } => {
+                if !self.authenticated {
+                    let _ = reply.send(Err(ClientError::InvalidInput("log in first".into())));
+                    return Ok(());
+                }
+                let msg = PasswordChangeProof { proof, credential };
+                let waiter = Waiter::PasswordChanged(reply);
+                self.request(PacketType::PasswordChangeProof, msg.encode(), waiter)
                     .await?;
             }
             Command::ListNewsgroups { reply } => {
@@ -1607,6 +1666,24 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
                 let response = NewsThreadListResponse::decode(&frame.payload)?;
                 if let Waiter::Thread(tx) = self.take_reply(PacketType::NewsThreadListResponse)? {
                     let _ = tx.send(Ok(response.posts.into_iter().map(Into::into).collect()));
+                }
+            }
+            PacketType::PasswordChangeChallenge => {
+                let challenge = PasswordChangeChallenge::decode(&frame.payload)?;
+                let waiter = self.take_reply(PacketType::PasswordChangeChallenge)?;
+                if let Waiter::PasswordChallenge(tx) = waiter {
+                    let username = self.username.clone().unwrap_or_default();
+                    let _ = tx.send(Ok(ChangeChallenge {
+                        challenge,
+                        username,
+                        channel_binding: self.channel_binding,
+                    }));
+                }
+            }
+            PacketType::PasswordChangeResult => {
+                let result = PasswordChangeResult::decode(&frame.payload)?;
+                if let Waiter::PasswordChanged(tx) = self.take_reply(PacketType::PasswordChangeResult)? {
+                    let _ = tx.send(Ok(result));
                 }
             }
             PacketType::PresenceChange => {
@@ -2597,6 +2674,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
             return Err(ClientError::AuthFailed(message));
         }
         self.authenticated = true;
+        self.username = Some(login.username);
         let _ = login.reply.send(Ok(Session {
             session_id: result.session_id,
             class: result.class,

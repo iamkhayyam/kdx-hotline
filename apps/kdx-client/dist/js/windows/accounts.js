@@ -1,12 +1,16 @@
 // Accounts — SysOp account management (Administration). List accounts, create
-// new ones, and edit an account's class + per-privilege overrides. Viewing and
-// mutating both require USER_ADMIN; the server enforces it and errors
-// otherwise. Overrides are tri-state per privilege: Inherit (follow the class),
-// Grant (force on), or Revoke (force off) — mapped onto the granted/revoked
-// bitmasks the account row carries.
+// new ones, edit an account's class + per-privilege overrides, and reset
+// another account's password. Viewing and mutating both require USER_ADMIN;
+// the server enforces it (and who may manage whom) and errors otherwise.
+// Overrides are tri-state per privilege: Inherit (follow the class), Grant
+// (force on), or Revoke (force off) — mapped onto the granted/revoked
+// bitmasks the account row carries. Passwords typed here never reach the
+// server: client-core derives the stored credential from them locally.
 
 import { invoke } from "../bridge.js";
 import { esc, num, errorText } from "../html.js";
+import { askConfirm, confirmThen } from "../confirm.js";
+import { newPasswordProblem } from "../passwords.js";
 
 const CLASS_NAME = ["guest", "user", "power user", "admin"];
 
@@ -40,6 +44,7 @@ export function buildAccounts() {
       <div class="ab-grid">
         <label>Login<input id="ac-username" spellcheck="false" autocomplete="off" /></label>
         <label id="ac-pass-field">Password<input id="ac-password" type="password" autocomplete="new-password" /></label>
+        <label id="ac-pass2-field">Confirm password<input id="ac-password2" type="password" autocomplete="new-password" /></label>
         <label>Class
           <select id="ac-class">
             <option value="0">guest</option>
@@ -53,6 +58,17 @@ export function buildAccounts() {
       <div class="ab-actions">
         <button type="submit" class="btn">Save</button>
         <button type="button" class="btn" id="ac-cancel">Cancel</button>
+        <button type="button" class="btn" id="ac-setpw-open">Set Password…</button>
+      </div>
+      <div class="ac-setpw hidden" id="ac-setpw">
+        <div class="ab-grid">
+          <label>New password<input id="ac-newpw" type="password" autocomplete="new-password" /></label>
+          <label>Confirm new password<input id="ac-newpw2" type="password" autocomplete="new-password" /></label>
+        </div>
+        <div class="ab-actions">
+          <button type="button" class="btn danger" id="ac-setpw-go">Set Password</button>
+          <button type="button" class="btn" id="ac-setpw-cancel">Cancel</button>
+        </div>
       </div>
       <div class="rl-assign-result" id="ac-result"></div>
     </form>
@@ -129,8 +145,13 @@ export function buildAccounts() {
     $("#ac-username").value = account ? account.username : "";
     $("#ac-username").disabled = !!account;
     $("#ac-password").value = "";
-    // Password only applies when creating; hide the field when editing.
+    $("#ac-password2").value = "";
+    // The initial password applies only when creating; an existing
+    // account's password is reset separately (Set Password…).
     $("#ac-pass-field").classList.toggle("hidden", !!account);
+    $("#ac-pass2-field").classList.toggle("hidden", !!account);
+    $("#ac-setpw-open").classList.toggle("hidden", !account);
+    closeSetPassword();
     $("#ac-class").value = String(account ? account.base_class : 1);
     for (const sel of overridesEl.querySelectorAll("select")) {
       const bit = Number(sel.dataset.bit);
@@ -144,9 +165,68 @@ export function buildAccounts() {
   }
 
   function closeEditor() {
+    closeSetPassword();
+    $("#ac-password").value = "";
+    $("#ac-password2").value = "";
     editor.classList.add("hidden");
     listEl.classList.remove("hidden");
     editingUser = null;
+  }
+
+  // ---- Set Password… (an administrator's reset of another account) ----
+  function closeSetPassword() {
+    $("#ac-newpw").value = "";
+    $("#ac-newpw2").value = "";
+    $("#ac-setpw").classList.add("hidden");
+  }
+
+  async function setPassword() {
+    const username = editingUser;
+    if (!username) return;
+    const password = $("#ac-newpw").value;
+    const problem = newPasswordProblem(password, $("#ac-newpw2").value);
+    if (problem) {
+      result.textContent = problem;
+      return;
+    }
+    result.textContent = "";
+    try {
+      const done = await confirmThen(
+        () =>
+          askConfirm(
+            `Set a new password for ${username}?\nTheir current password stops working, and every session they have open is signed out.`,
+            { confirmLabel: "Set Password", danger: true }
+          ),
+        async () => {
+          accounts = await invoke("set_account_password", { username, newPassword: password });
+        }
+      );
+      if (done) {
+        closeSetPassword();
+        render();
+        result.textContent = `password set for ${username} — tell them the new one out-of-band`;
+      }
+    } catch (err) {
+      result.textContent = errorText(err);
+    }
+  }
+
+  $("#ac-setpw-open").addEventListener("click", () => {
+    result.textContent = "";
+    $("#ac-setpw").classList.remove("hidden");
+    $("#ac-newpw").focus();
+  });
+  $("#ac-setpw-cancel").addEventListener("click", closeSetPassword);
+  $("#ac-setpw-go").addEventListener("click", setPassword);
+  // Enter in these fields sets the password; it must not submit (Save) the
+  // class/override editor around them.
+  for (const id of ["#ac-newpw", "#ac-newpw2"]) {
+    $(id).addEventListener("keydown", (e) => {
+      if (e.key === "Enter") {
+        e.preventDefault();
+        setPassword();
+      }
+    });
   }
 
   function collectOverrides() {
@@ -176,8 +256,9 @@ export function buildAccounts() {
         accounts = await invoke("update_account", { username, baseClass, granted, revoked });
       } else {
         const password = $("#ac-password").value;
-        if (!password) {
-          result.textContent = "a password is required for a new account";
+        const problem = newPasswordProblem(password, $("#ac-password2").value);
+        if (problem) {
+          result.textContent = problem;
           return;
         }
         accounts = await invoke("create_account", { username, password, baseClass, granted, revoked });

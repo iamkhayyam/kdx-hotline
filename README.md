@@ -163,6 +163,18 @@ Local server build: `cargo build -p kdxd --release` → `target/release/kdxd`.
   a copy of the database is not enough to log in (it still permits offline
   guessing at Argon2id cost, so keep it private — kdxd creates it `0600`).
   Failed logins are throttled per address and per address+username.
+- No password crosses the wire for any purpose. Clients derive every stored
+  credential themselves: a logged-in user changes their password (Connect
+  window → Change Password…) by proving the current one with a fresh,
+  TLS-bound proof under its own domain label and sending a credential derived
+  from the new one; wrong current passwords count as failed logins and three
+  drop the connection, and the account's other sessions are signed out. An
+  administrator resets a password it may manage (Accounts → Set Password…,
+  same rank rules as editing the account; never its own) or creates an
+  account by sending a client-derived credential; the target's sessions are
+  kicked. Because the server never sees passwords, password strength is
+  enforced only by the client (the desktop app requires 8+ characters, typed
+  twice). Guest accounts, often shared, can't change their own password.
 - The server bounds every client-controlled size and rate (frame and
   reassembly caps, input lengths, per-connection pacing, connection caps,
   handshake/idle/write timeouts, room and transfer limits) and runs as an

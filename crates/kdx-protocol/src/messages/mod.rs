@@ -16,7 +16,8 @@ mod tracker;
 mod wire;
 
 pub use account::{
-    AccountCreate, AccountListRequest, AccountListResponse, AccountSummary, AccountUpdate,
+    AccountCreate, AccountListRequest, AccountListResponse, AccountSetPassword, AccountSummary,
+    AccountUpdate, Credential,
 };
 pub use admin::{
     AdminBroadcast, AdminDisconnect, AdminShutdown, ConnectionListRequest,
@@ -24,7 +25,10 @@ pub use admin::{
     IpRuleDelete, IpRuleEntry, IpRuleListRequest, IpRuleListResponse, ServerSettingsRequest,
     ServerSettingsResponse, ServerSettingsUpdate,
 };
-pub use auth::{AuthChallenge, AuthRequest, AuthResponse, AuthResult};
+pub use auth::{
+    AuthChallenge, AuthRequest, AuthResponse, AuthResult, PasswordChangeBegin,
+    PasswordChangeChallenge, PasswordChangeProof, PasswordChangeResult,
+};
 pub use chat::{
     ChatEvent, ChatInvite, ChatInvited, ChatJoin, ChatLeave, ChatRoomFlags, ChatSend, ChatTopic,
     ChatUserList, CHAT_ACTION, CHAT_SYSTEM,
