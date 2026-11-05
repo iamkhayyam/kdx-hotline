@@ -52,6 +52,8 @@ pub const MAX_HISTORY_DETAIL_LEN: usize = 512;
 pub const MAX_JOINED_ROOMS_PER_CONNECTION: usize = 32;
 /// Total chat rooms (public + private) the server will hold.
 pub const MAX_ROOMS: usize = 1024;
+/// Entries sent in one `FileListResponse` (its count field is a `u16`).
+pub const MAX_FILE_LIST_ENTRIES: usize = 10_000;
 
 /// Truncate `s` to at most `max` bytes on a UTF-8 character boundary.
 pub fn truncate_utf8(s: &str, max: usize) -> &str {
