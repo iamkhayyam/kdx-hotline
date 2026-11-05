@@ -166,6 +166,11 @@ impl HistoryLog {
     ) -> Result<(), HistoryError> {
         let actor = actor.map(|a| truncate_utf8(a, MAX_HISTORY_ACTOR_LEN));
         let detail = truncate_utf8(detail, MAX_HISTORY_DETAIL_LEN);
+        // Write everything queued by `record_detached` before this call
+        // first, so the log's order matches the order events happened in
+        // (e.g. a login recorded detached, then an admin action recorded
+        // inline must not appear swapped).
+        self.flush().await;
         storage::record(&self.pool, to_db_timestamp(timestamp), actor, action, detail).await?;
         let since = self.shared.since_prune.fetch_add(1, Ordering::Relaxed) + 1;
         if since == self.config.prune_every {
@@ -219,8 +224,11 @@ impl HistoryLog {
         Ok(apply_retention(&self.pool, &self.config).await?)
     }
 
-    /// The most recent `limit` entries, newest first.
+    /// The most recent `limit` entries, newest first. Events queued by
+    /// `record_detached` before this call are written first, so a reader
+    /// sees everything that happened before it asked.
     pub async fn recent(&self, limit: u32) -> Result<Vec<HistoryEntry>, HistoryError> {
+        self.flush().await;
         Ok(storage::recent(&self.pool, limit)
             .await?
             .into_iter()
@@ -422,6 +430,20 @@ mod tests {
         assert!(history.record_detached(2, Some("flood"), "login_failed", "late"));
         history.flush().await;
         assert_eq!(rows(&history).await, 10);
+    }
+
+    #[tokio::test]
+    async fn inline_records_stay_ordered_after_detached_ones() {
+        let (history, _dir) = log().await;
+        // Same second, so only insertion order separates them.
+        assert!(history.record_detached(100, Some("phraq"), "login", "peer=a"));
+        history
+            .record(100, Some("sysop"), "server_settings_updated", "")
+            .await
+            .unwrap();
+        let entries = history.recent(10).await.unwrap();
+        let actions: Vec<_> = entries.iter().map(|e| e.action.as_str()).collect();
+        assert_eq!(actions, ["server_settings_updated", "login"]);
     }
 
     #[tokio::test]

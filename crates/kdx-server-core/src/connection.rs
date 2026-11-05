@@ -1200,6 +1200,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                         self.send_error("missing FILE_DOWNLOAD privilege").await?;
                         continue;
                     }
+                    // One download stream per connection, like uploads: a
+                    // second request must not silently replace the first.
+                    if download.is_some() {
+                        self.send_error("a download is already active").await?;
+                        continue;
+                    }
                     let remote = format!(
                         "{}/{}",
                         request.path.trim_end_matches('/'),
@@ -1429,7 +1435,17 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                         }
                         other => {
                             upload = other;
-                            self.send_error("no matching active transfer").await?;
+                            // Or the client is cancelling a download: stop
+                            // pumping it (dropping the stream frees its slot).
+                            if download
+                                .as_ref()
+                                .is_some_and(|pump| pump.transfer_id == end.transfer_id)
+                            {
+                                debug!(status = end.status, "client cancelled its download");
+                                download = None;
+                            } else {
+                                self.send_error("no matching active transfer").await?;
+                            }
                         }
                     }
                 }
@@ -2689,12 +2705,15 @@ type Pulled = (ActiveDownload, Result<Option<DownloadChunk>, TransferError>);
 /// stream and persists across dispatch turns, so a throttle sleep or disk
 /// read in progress is never lost when another select branch wins.
 struct DownloadPump {
+    /// The stream's wire transfer id, so a client `TransferEnd` can cancel it.
+    transfer_id: [u8; 16],
     pull: std::pin::Pin<Box<dyn std::future::Future<Output = Pulled> + Send>>,
 }
 
 impl DownloadPump {
     fn new(mut stream: ActiveDownload) -> Self {
         Self {
+            transfer_id: *stream.id().as_bytes(),
             pull: Box::pin(async move {
                 let chunk = stream.next_chunk().await;
                 (stream, chunk)
@@ -3949,6 +3968,66 @@ mod tests {
             assert!(start.elapsed() < Duration::from_secs(3));
             conn.await.unwrap().unwrap();
             assert!(ctx.presence.list().await.is_empty());
+        }
+
+        #[tokio::test]
+        async fn second_download_is_refused_and_cancel_stops_the_stream() {
+            // 1 MiB at 64 KiB/s keeps the first download streaming for ~15 s.
+            let (ctx, dir) = throttled_ctx(64 * 1024).await;
+            seed_file(&ctx, dir.path(), "big.bin", 1024 * 1024).await;
+            let (mut client, mut seq, conn, _) = connect_as(&ctx, 256 * 1024, "unknown", "phraq").await;
+            let download = TransferRequest {
+                direction: DIRECTION_DOWNLOAD,
+                path: "/".into(),
+                name: "big.bin".into(),
+                size: 0,
+                chunk_size: 32 * 1024,
+                sha256: [0; 32],
+                resume_id: [0; 16],
+                have_bitmap: vec![],
+            };
+            request(&mut client, &mut seq, PacketType::FileTransferStart, download.encode()).await;
+            let accept = recv_type(&mut client, PacketType::FileTransferStart).await;
+            let transfer_id = TransferAccept::decode(&accept.payload).unwrap().transfer_id;
+
+            // A second download on the same connection is refused, and the
+            // first keeps streaming.
+            request(&mut client, &mut seq, PacketType::FileTransferStart, download.encode()).await;
+            let refused = recv_type(&mut client, PacketType::Error).await;
+            assert_eq!(&refused.payload[..], b"a download is already active");
+
+            // The client cancels: no more chunks, no TransferEnd, no Error.
+            let cancel = TransferEnd {
+                transfer_id,
+                status: kdx_protocol::messages::TRANSFER_ABORTED,
+                message: "cancelled".into(),
+            };
+            request(&mut client, &mut seq, PacketType::FileTransferEnd, cancel.encode()).await;
+            let ping = client_frame(PacketType::Ping, bump(&mut seq), Bytes::from_static(b"after"));
+            client.send(ping).await.unwrap();
+            let mut reasm = Reassembler::default();
+            let mut chunks_after_cancel = 0;
+            loop {
+                let frame = recv_logical(&mut client, &mut reasm).await;
+                match frame.header.packet_type {
+                    PacketType::Pong if &frame.payload[..] == b"after" => break,
+                    // At most the chunk already in flight when the cancel landed.
+                    PacketType::FileTransferData => chunks_after_cancel += 1,
+                    PacketType::FileTransferEnd => panic!("cancelled download still finished"),
+                    PacketType::Error => panic!("cancel was refused: {:?}", frame.payload),
+                    _ => {}
+                }
+            }
+            assert!(chunks_after_cancel <= 2, "{chunks_after_cancel} chunks after cancel");
+
+            // The slot is free again: a new download starts.
+            request(&mut client, &mut seq, PacketType::FileTransferStart, download.encode()).await;
+            recv_type(&mut client, PacketType::FileTransferStart).await;
+            client
+                .send(client_frame(PacketType::Disconnect, bump(&mut seq), Bytes::new()))
+                .await
+                .unwrap();
+            conn.await.unwrap().unwrap();
         }
 
         #[tokio::test]

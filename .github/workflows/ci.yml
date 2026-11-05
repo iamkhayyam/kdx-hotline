@@ -73,5 +73,26 @@ jobs:
           key: ci-${{ runner.os }}-tauri-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ci-${{ runner.os }}-tauri-
 
-      - name: cargo check (kdx-client)
-        run: cargo check -p kdx-client --locked
+      # Unit tests include the per-window command ACL check (mock runtime).
+      - name: cargo test (kdx-client)
+        run: cargo test -p kdx-client --locked
+
+  webview:
+    name: Webview JS checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Syntax-check every module
+        run: |
+          for f in $(git ls-files 'apps/kdx-client/dist/js/*.js'); do
+            node --check "$f"
+          done
+
+      - name: No unescaped interpolation into HTML
+        run: node apps/kdx-client/scripts/check-escaping.mjs
+
+      - name: Unit tests
+        run: node --test apps/kdx-client/tests/*.test.mjs
