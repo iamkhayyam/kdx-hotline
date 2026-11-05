@@ -329,12 +329,18 @@ jobs:
           cp crates/kdxd/kdxd.service dist/kdxd/
           cd dist && zip -r ../kdxd-linux.zip kdxd
 
+      # Only the deliverables: Tauri leaves its staging trees (the .app
+      # bundle, the deb's data dir, the AppImage's AppDir) under bundle/, and
+      # every file in them would otherwise become a Release asset.
       - name: Upload artifacts
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ${{ matrix.artifact }}
           path: |
-            target/release/bundle/**
+            target/release/bundle/dmg/*.dmg
+            target/release/bundle/nsis/*-setup.exe
+            target/release/bundle/deb/*.deb
+            target/release/bundle/appimage/*.AppImage
             kdxd-*.zip
           if-no-files-found: error
 
@@ -346,10 +352,48 @@ jobs:
     permissions:
       contents: write
     steps:
+      # For the release notes in CHANGELOG.md.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+          sparse-checkout: CHANGELOG.md
+          sparse-checkout-cone-mode: false
+
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: artifacts
           merge-multiple: true
+
+      # Exactly one asset per deliverable: two platforms producing the same
+      # file name would silently overwrite each other on the Release.
+      - name: Check release assets
+        working-directory: artifacts
+        run: |
+          set -euo pipefail
+          find . -type f -printf '%f\n' | sort > ../asset-names
+          cat ../asset-names
+          dupes=$(uniq -d ../asset-names)
+          if [ -n "$dupes" ]; then echo "::error::duplicate asset names: $dupes"; exit 1; fi
+          for want in '\.dmg$' '-setup\.exe$' '\.deb$' '\.AppImage$' '^kdxd-macos\.zip$' '^kdxd-windows\.zip$' '^kdxd-linux\.zip$'; do
+            grep -qE "$want" ../asset-names || { echo "::error::no asset matching $want"; exit 1; }
+          done
+
+      # The tag's section of CHANGELOG.md ("## [X.Y.Z] ..." up to the next
+      # "## [") becomes the Release body; a tag without one fails here.
+      - name: Release notes from CHANGELOG.md
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          awk -v v="$version" '
+            /^## \[/ { if (on) exit; if (index($0, "## [" v "]") == 1) { on = 1; next } }
+            on { print }
+          ' CHANGELOG.md > release-notes.md
+          if ! grep -q '[^[:space:]]' release-notes.md; then
+            echo "::error::CHANGELOG.md has no section for $version"; exit 1
+          fi
+          cat release-notes.md
 
       # Checksums so users can verify what they downloaded (listed by asset
       # name, as the Release shows them: `sha256sum -c SHA256SUMS`).
@@ -363,4 +407,7 @@ jobs:
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
+          name: KDX ${{ github.ref_name }}
+          body_path: release-notes.md
           files: artifacts/**/*
+          fail_on_unmatched_files: true

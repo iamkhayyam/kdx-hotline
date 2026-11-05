@@ -194,7 +194,7 @@
     <div class="state-card">
       <h4>kdxd — Cargo.toml</h4>
       <div class="state-row"><span class="field">name</span><span class="present">kdxd ✓</span></div>
-      <div class="state-row"><span class="field">version</span><span class="present">0.1.0 (workspace) ✓</span></div>
+      <div class="state-row"><span class="field">version</span><span class="present">0.2.0 (workspace) ✓</span></div>
       <div class="state-row"><span class="field">license</span><span class="present">MIT (workspace) ✓</span></div>
       <div class="state-row"><span class="field">description</span><span class="present">"KDX server daemon — early-2000s Hotline-style chat and file sharing over TLS 1.3" ✓</span></div>
       <div class="state-row"><span class="field">authors</span><span class="present">theusual ✓</span></div>
@@ -207,7 +207,7 @@
     <div class="state-card">
       <h4>KDX.app — tauri.conf.json</h4>
       <div class="state-row"><span class="field">productName</span><span class="present">KDX ✓</span></div>
-      <div class="state-row"><span class="field">version</span><span class="present">0.1.0 ✓</span></div>
+      <div class="state-row"><span class="field">version</span><span class="present">0.2.0 ✓</span></div>
       <div class="state-row"><span class="field">identifier</span><span class="present">net.kdx.hotline.client ✓</span></div>
       <div class="state-row"><span class="field">targets</span><span class="present">app, dmg ✓</span></div>
       <div class="state-row"><span class="field">icon set</span><span class="present">full set (icns, ico, pngs) ✓</span></div>
@@ -459,8 +459,8 @@ Library/WebKit/net.kdx.hotline.client/
 <span class="cm"># or</span>
 <span class="key">APPLE_API_ISSUER</span> + <span class="key">APPLE_API_KEY</span> <span class="cm">(key id)</span> + <span class="key">APPLE_API_KEY_P8</span> <span class="cm">(the .p8 file's contents)</span></pre>
       <p>The workflow writes the <code>.p8</code> to a private temp file (removed at the end of the job) and passes Tauri <code>APPLE_API_KEY_PATH</code>. Tauri submits <code>KDX.app</code>, waits and staples the ticket; the workflow then notarizes the dmg (built separately with <code>hdiutil</code>, since <code>--bundles app</code> builds only the app) and staples it, and notarizes <code>kdxd-macos.zip</code> (a zip can't hold a stapled ticket, so Gatekeeper checks <code>kdxd</code> online). With credentials, verification also runs <code>stapler validate</code> and <code>spctl --assess</code> on the app and the dmg. Notarization credentials without the Developer ID secrets fail the run. To do it by hand:</p>
-      <pre><span class="cmd">xcrun notarytool submit KDX_0.1.0_aarch64.dmg --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_PASSWORD" --wait</span>
-<span class="cmd">xcrun stapler staple KDX_0.1.0_aarch64.dmg</span></pre>
+      <pre><span class="cmd">xcrun notarytool submit KDX_0.2.0_aarch64.dmg --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_PASSWORD" --wait</span>
+<span class="cmd">xcrun stapler staple KDX_0.2.0_aarch64.dmg</span></pre>
     </div>
     <div class="task">
       <div class="task-head"><strong>Verify a build</strong></div>
@@ -484,7 +484,7 @@ Library/WebKit/net.kdx.hotline.client/
       <p>5. Resume: start a large download, Cancel in the Transfers window; quit KDX; relaunch, reconnect, download the same file to the same place (no file exists there yet, so no Replace prompt): progress starts partway and the result is byte-identical. Also with the network dropped mid-download.</p>
       <p>6. Upload a file from <code>~/Documents</code> and from an external volume via the Open dialog: both succeed.</p>
       <p>7. Address Book: save a bookmark with a password; quit and relaunch; log in with it without typing the password. Keychain Access shows a generic password "net.kdx.hotline.client" / "bookmark:…" in the login keychain. Delete the bookmark: the item is gone. After installing a rebuilt (ad-hoc) copy, the one-time keychain prompt appears and Always Allow works.</p>
-      <p>8. Upgrade from an unsandboxed build (e.g. v0.1.0 from the release page, with a pinned server, a bookmark and changed settings): install the sandboxed build over it and launch — the server connects without a first-contact prompt, bookmarks and settings are intact, and <code>~/Library/Application Support/net.kdx.hotline.client</code> has moved into the container.</p>
+      <p>8. Upgrade from an unsandboxed build (any build from before the sandbox, with a pinned server, a bookmark and changed settings): install the sandboxed build over it and launch — the server connects without a first-contact prompt, bookmarks and settings are intact, and <code>~/Library/Application Support/net.kdx.hotline.client</code> has moved into the container.</p>
       <p>9. Console.app, filter "Sandbox" / process KDX, during all of the above: no <code>deny(1) file-write-create</code> or <code>file-read-data</code> violations — except, for a destination on another volume, one refused hidden <code>.&lt;hex&gt;.kdxtmp</code> beside the chosen file (KDX then writes the chosen file in place; the download still succeeds).</p>
       <p>10. A stale partial (cancel a download, then set its files' modification time 8 days back with <code>touch -t</code>) is gone after the next connect.</p>
     </div>
