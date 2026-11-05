@@ -10,6 +10,7 @@ pub mod history;
 pub mod ip_rules;
 pub mod news;
 pub mod roles;
+pub mod settings;
 pub mod transfer_state;
 
 pub use db::connect;

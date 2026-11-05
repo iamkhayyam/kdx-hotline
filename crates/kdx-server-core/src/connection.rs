@@ -46,6 +46,7 @@ use tracing::{debug, warn};
 use uuid::Uuid;
 
 use crate::auth::{AuthManager, BaseClass, Privileges, Role, RoleManager, Session};
+use crate::auth::policy::{self, Refusal};
 use crate::chat::{Member, Outbound, RoomCommand, RoomManager};
 use crate::files::{FileTree, NodeKind};
 use crate::news::{NewsManager, Post as NewsPostDomain};
@@ -984,173 +985,108 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                 }
                 PacketType::RoleListRequest => {
                     RoleListRequest::decode(&frame.payload)?;
-                    match self.ctx.roles.list().await {
-                        Ok(roles) => {
-                            let response = RoleListResponse {
-                                roles: roles.into_iter().map(role_to_wire).collect(),
-                            };
-                            self.send(
-                                PacketType::RoleListResponse,
-                                PacketFlags::empty(),
-                                response.encode(),
-                            )
-                            .await?;
-                        }
-                        Err(e) => self.send_error(&e.to_string()).await?,
-                    }
-                }
-                PacketType::RoleCreate => {
-                    let create = RoleCreate::decode(&frame.payload)?;
-                    let session = self.session.as_ref().expect("authed").clone();
-                    if !session.privileges.contains(Privileges::USER_ADMIN) {
+                    // Role names and privilege bits are admin data, gated
+                    // like AccountRolesRequest (AUTHZ-12).
+                    let privs = self.session.as_ref().expect("authed").privileges;
+                    if !privs.contains(Privileges::USER_ADMIN) {
                         self.send_error("missing USER_ADMIN privilege").await?;
                         continue;
                     }
-                    let admin_name = session.username.clone();
-                    let color = (!create.color.is_empty()).then_some(create.color.as_str());
-                    let result = self
-                        .ctx
-                        .roles
-                        .create(
-                            &create.name,
-                            Privileges::from_bits_truncate(create.privileges),
-                            create.rank,
-                            color,
-                        )
-                        .await;
-                    match result {
-                        Ok(_) => {
+                    self.reply_role_list().await?;
+                }
+                // Role and account mutations go through `auth::policy`, which
+                // enforces rank / no-self-escalation / last-admin rules and
+                // kicks every live session whose privileges changed.
+                PacketType::RoleCreate => {
+                    let create = RoleCreate::decode(&frame.payload)?;
+                    let session = self.session.as_ref().expect("authed").clone();
+                    match policy::create_role(&self.ctx, &session, &create).await {
+                        Ok(()) => {
                             let _ = self
                                 .ctx
                                 .history
-                                .record(unix_now(), Some(&admin_name), "role_created", &create.name)
+                                .record(unix_now(), Some(&session.username), "role_created", &create.name)
                                 .await;
                             self.reply_role_list().await?
                         }
-                        Err(e) => self.send_error(&e.to_string()).await?,
+                        Err(refusal) => self.send_refusal(refusal).await?,
                     }
                 }
                 PacketType::RoleUpdate => {
                     let update = RoleUpdate::decode(&frame.payload)?;
                     let session = self.session.as_ref().expect("authed").clone();
-                    if !session.privileges.contains(Privileges::USER_ADMIN) {
-                        self.send_error("missing USER_ADMIN privilege").await?;
-                        continue;
-                    }
-                    let admin_name = session.username.clone();
-                    let color = (!update.color.is_empty()).then_some(update.color.as_str());
-                    let result = self
-                        .ctx
-                        .roles
-                        .update(
-                            Uuid::from_bytes(update.id),
-                            &update.name,
-                            Privileges::from_bits_truncate(update.privileges),
-                            update.rank,
-                            color,
-                        )
-                        .await;
-                    match result {
+                    match policy::update_role(&self.ctx, &session, &update).await {
                         Ok(()) => {
                             let _ = self
                                 .ctx
                                 .history
-                                .record(unix_now(), Some(&admin_name), "role_updated", &update.name)
+                                .record(unix_now(), Some(&session.username), "role_updated", &update.name)
                                 .await;
                             self.reply_role_list().await?
                         }
-                        Err(e) => self.send_error(&e.to_string()).await?,
+                        Err(refusal) => self.send_refusal(refusal).await?,
                     }
                 }
                 PacketType::RoleDelete => {
                     let delete = RoleDelete::decode(&frame.payload)?;
                     let session = self.session.as_ref().expect("authed").clone();
-                    if !session.privileges.contains(Privileges::USER_ADMIN) {
-                        self.send_error("missing USER_ADMIN privilege").await?;
-                        continue;
-                    }
-                    let admin_name = session.username.clone();
                     let role_id = Uuid::from_bytes(delete.id);
-                    match self.ctx.roles.delete(role_id).await {
+                    match policy::delete_role(&self.ctx, &session, role_id).await {
                         Ok(()) => {
                             let _ = self
                                 .ctx
                                 .history
-                                .record(unix_now(), Some(&admin_name), "role_deleted", &role_id.to_string())
+                                .record(unix_now(), Some(&session.username), "role_deleted", &role_id.to_string())
                                 .await;
                             self.reply_role_list().await?
                         }
-                        Err(e) => self.send_error(&e.to_string()).await?,
+                        Err(refusal) => self.send_refusal(refusal).await?,
                     }
                 }
                 PacketType::RoleAssign => {
                     let assign = RoleAssign::decode(&frame.payload)?;
                     let session = self.session.as_ref().expect("authed").clone();
-                    if !session.privileges.contains(Privileges::USER_ADMIN) {
-                        self.send_error("missing USER_ADMIN privilege").await?;
-                        continue;
-                    }
-                    let admin_name = session.username.clone();
-                    match self.ctx.auth.account_id(&assign.username).await? {
-                        Some(account_id) => {
-                            match self
+                    let role_id = Uuid::from_bytes(assign.role_id);
+                    match policy::set_role_assignment(&self.ctx, &session, &assign.username, role_id, true)
+                        .await
+                    {
+                        Ok(()) => {
+                            let _ = self
                                 .ctx
-                                .roles
-                                .assign(&account_id, Uuid::from_bytes(assign.role_id))
-                                .await
-                            {
-                                Ok(()) => {
-                                    let _ = self
-                                        .ctx
-                                        .history
-                                        .record(
-                                            unix_now(),
-                                            Some(&admin_name),
-                                            "role_assigned",
-                                            &format!("target={}", assign.username),
-                                        )
-                                        .await;
-                                    self.reply_role_list().await?
-                                }
-                                Err(e) => self.send_error(&e.to_string()).await?,
-                            }
+                                .history
+                                .record(
+                                    unix_now(),
+                                    Some(&session.username),
+                                    "role_assigned",
+                                    &format!("target={}", assign.username),
+                                )
+                                .await;
+                            self.reply_role_list().await?
                         }
-                        None => self.send_error("no such account").await?,
+                        Err(refusal) => self.send_refusal(refusal).await?,
                     }
                 }
                 PacketType::RoleUnassign => {
                     let unassign = RoleUnassign::decode(&frame.payload)?;
                     let session = self.session.as_ref().expect("authed").clone();
-                    if !session.privileges.contains(Privileges::USER_ADMIN) {
-                        self.send_error("missing USER_ADMIN privilege").await?;
-                        continue;
-                    }
-                    let admin_name = session.username.clone();
-                    match self.ctx.auth.account_id(&unassign.username).await? {
-                        Some(account_id) => {
-                            match self
+                    let role_id = Uuid::from_bytes(unassign.role_id);
+                    match policy::set_role_assignment(&self.ctx, &session, &unassign.username, role_id, false)
+                        .await
+                    {
+                        Ok(()) => {
+                            let _ = self
                                 .ctx
-                                .roles
-                                .unassign(&account_id, Uuid::from_bytes(unassign.role_id))
-                                .await
-                            {
-                                Ok(()) => {
-                                    let _ = self
-                                        .ctx
-                                        .history
-                                        .record(
-                                            unix_now(),
-                                            Some(&admin_name),
-                                            "role_unassigned",
-                                            &format!("target={}", unassign.username),
-                                        )
-                                        .await;
-                                    self.reply_role_list().await?
-                                }
-                                Err(e) => self.send_error(&e.to_string()).await?,
-                            }
+                                .history
+                                .record(
+                                    unix_now(),
+                                    Some(&session.username),
+                                    "role_unassigned",
+                                    &format!("target={}", unassign.username),
+                                )
+                                .await;
+                            self.reply_role_list().await?
                         }
-                        None => self.send_error("no such account").await?,
+                        Err(refusal) => self.send_refusal(refusal).await?,
                     }
                 }
                 PacketType::AccountRolesRequest => {
@@ -1160,23 +1096,33 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                         self.send_error("missing USER_ADMIN privilege").await?;
                         continue;
                     }
-                    match self.ctx.auth.account_id(&request.username).await? {
-                        Some(account_id) => match self.ctx.roles.for_account(&account_id).await {
-                            Ok(roles) => {
-                                let response = AccountRolesResponse {
-                                    username: request.username,
-                                    role_ids: roles.into_iter().map(|r| *r.id.as_bytes()).collect(),
-                                };
-                                self.send(
-                                    PacketType::AccountRolesResponse,
-                                    PacketFlags::empty(),
-                                    response.encode(),
-                                )
-                                .await?;
-                            }
-                            Err(e) => self.send_error(&e.to_string()).await?,
-                        },
-                        None => self.send_error("no such account").await?,
+                    let account_id = match self.ctx.auth.account_id(&request.username).await {
+                        Ok(Some(account_id)) => account_id,
+                        Ok(None) => {
+                            self.send_error("no such account").await?;
+                            continue;
+                        }
+                        Err(e) => {
+                            self.send_refusal(Refusal::internal("account roles lookup", e)).await?;
+                            continue;
+                        }
+                    };
+                    match self.ctx.roles.for_account(&account_id).await {
+                        Ok(roles) => {
+                            let response = AccountRolesResponse {
+                                username: request.username,
+                                role_ids: roles.into_iter().map(|r| *r.id.as_bytes()).collect(),
+                            };
+                            self.send(
+                                PacketType::AccountRolesResponse,
+                                PacketFlags::empty(),
+                                response.encode(),
+                            )
+                            .await?;
+                        }
+                        Err(e) => {
+                            self.send_refusal(Refusal::internal("account roles lookup", e)).await?
+                        }
                     }
                 }
                 PacketType::AccountListRequest => {
@@ -1190,82 +1136,32 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                 }
                 PacketType::AccountCreate => {
                     let create = AccountCreate::decode(&frame.payload)?;
-                    let (admin_name, admin_class, privs) = {
-                        let s = self.session.as_ref().expect("authed");
-                        (s.username.clone(), s.class as u8, s.privileges)
-                    };
-                    if !privs.contains(Privileges::USER_ADMIN) {
-                        self.send_error("missing USER_ADMIN privilege").await?;
-                        continue;
-                    }
-                    // Can't mint an account outranking yourself.
-                    if create.base_class > admin_class {
-                        self.send_error("cannot create an account above your own class")
-                            .await?;
-                        continue;
-                    }
-                    if create.username.is_empty() || create.password.is_empty() {
-                        self.send_error("username and password are required").await?;
-                        continue;
-                    }
-                    match self
-                        .ctx
-                        .auth
-                        .create_account(
-                            &create.username,
-                            &create.password,
-                            create.base_class as i64,
-                            create.granted as i64,
-                            create.revoked as i64,
-                        )
-                        .await
-                    {
+                    let session = self.session.as_ref().expect("authed").clone();
+                    match policy::create_account(&self.ctx, &session, &create).await {
                         Ok(()) => {
                             let _ = self
                                 .ctx
                                 .history
-                                .record(unix_now(), Some(&admin_name), "account_created", &create.username)
+                                .record(unix_now(), Some(&session.username), "account_created", &create.username)
                                 .await;
                             self.reply_account_list().await?
                         }
-                        Err(e) => self.send_error(&e.to_string()).await?,
+                        Err(refusal) => self.send_refusal(refusal).await?,
                     }
                 }
                 PacketType::AccountUpdate => {
                     let update = AccountUpdate::decode(&frame.payload)?;
-                    let (admin_name, admin_class, privs) = {
-                        let s = self.session.as_ref().expect("authed");
-                        (s.username.clone(), s.class as u8, s.privileges)
-                    };
-                    if !privs.contains(Privileges::USER_ADMIN) {
-                        self.send_error("missing USER_ADMIN privilege").await?;
-                        continue;
-                    }
-                    if update.base_class > admin_class {
-                        self.send_error("cannot raise an account above your own class")
-                            .await?;
-                        continue;
-                    }
-                    match self
-                        .ctx
-                        .auth
-                        .update_account(
-                            &update.username,
-                            update.base_class as i64,
-                            update.granted as i64,
-                            update.revoked as i64,
-                        )
-                        .await
-                    {
+                    let session = self.session.as_ref().expect("authed").clone();
+                    match policy::update_account(&self.ctx, &session, &update).await {
                         Ok(()) => {
                             let _ = self
                                 .ctx
                                 .history
-                                .record(unix_now(), Some(&admin_name), "account_updated", &update.username)
+                                .record(unix_now(), Some(&session.username), "account_updated", &update.username)
                                 .await;
                             self.reply_account_list().await?
                         }
-                        Err(e) => self.send_error(&e.to_string()).await?,
+                        Err(refusal) => self.send_refusal(refusal).await?,
                     }
                 }
                 PacketType::TrackerListRequest => {
@@ -1331,7 +1227,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                             )
                             .await?;
                         }
-                        Err(e) => self.send_error(&e.to_string()).await?,
+                        Err(e) => self.send_refusal(Refusal::internal("history listing", e)).await?,
                     }
                 }
                 PacketType::IpRuleListRequest => {
@@ -1341,34 +1237,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                         self.send_error("missing SERVER_ADMIN privilege").await?;
                         continue;
                     }
-                    match self.ctx.ip_rules.list().await {
-                        Ok(rules) => {
-                            let response = IpRuleListResponse {
-                                rules: rules
-                                    .into_iter()
-                                    .map(|r| WireIpRule {
-                                        id: r.id,
-                                        position: r.position,
-                                        action: match r.action {
-                                            crate::ip_rules::Action::Allow => "allow".into(),
-                                            crate::ip_rules::Action::Deny => "deny".into(),
-                                        },
-                                        cidr: r.cidr,
-                                        note: r.note,
-                                        created_by: r.created_by,
-                                        created_at: r.created_at,
-                                    })
-                                    .collect(),
-                            };
-                            self.send(
-                                PacketType::IpRuleListResponse,
-                                PacketFlags::empty(),
-                                response.encode(),
-                            )
-                            .await?;
-                        }
-                        Err(e) => self.send_error(&e.to_string()).await?,
-                    }
+                    self.reply_ip_rule_list().await?;
                 }
                 PacketType::IpRuleCreate => {
                     let create = IpRuleCreate::decode(&frame.payload)?;
@@ -1378,11 +1247,17 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                         continue;
                     }
                     let admin_name = session.username.clone();
+                    if let Err(msg) =
+                        crate::limits::check_len("note", &create.note, crate::limits::MAX_REASON_LEN)
+                    {
+                        self.send_error(&msg).await?;
+                        continue;
+                    }
                     let action = match create.action.as_str() {
                         "allow" => crate::ip_rules::Action::Allow,
                         "deny" => crate::ip_rules::Action::Deny,
-                        other => {
-                            self.send_error(&format!("invalid action: {other}")).await?;
+                        _ => {
+                            self.send_error("action must be 'allow' or 'deny'").await?;
                             continue;
                         }
                     };
@@ -1400,6 +1275,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                         .await
                     {
                         Ok(_) => {
+                            // Rules are checked at accept; apply the new set to
+                            // sessions already connected too (AUTHZ-8).
+                            self.enforce_ip_rules_on_live_sessions().await;
                             let _ = self
                                 .ctx
                                 .history
@@ -1412,7 +1290,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                                 .await;
                             self.reply_ip_rule_list().await?
                         }
-                        Err(e) => self.send_error(&e.to_string()).await?,
+                        Err(e) => self.send_refusal(ip_rule_refusal("ip rule create", e)).await?,
                     }
                 }
                 PacketType::IpRuleDelete => {
@@ -1425,6 +1303,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                     let admin_name = session.username.clone();
                     match self.ctx.ip_rules.delete(&del.id).await {
                         Ok(()) => {
+                            // Dropping an allow-exception can newly deny
+                            // addresses that are connected right now.
+                            self.enforce_ip_rules_on_live_sessions().await;
                             let _ = self
                                 .ctx
                                 .history
@@ -1432,7 +1313,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                                 .await;
                             self.reply_ip_rule_list().await?
                         }
-                        Err(e) => self.send_error(&e.to_string()).await?,
+                        Err(e) => self.send_refusal(ip_rule_refusal("ip rule delete", e)).await?,
                     }
                 }
                 PacketType::ServerSettingsUpdate => {
@@ -1443,15 +1324,31 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                         continue;
                     }
                     let admin_name = session.username.clone();
-                    if update.name.trim().is_empty() {
-                        self.send_error("server name is required").await?;
+                    // Required name and length caps (OPS-11): an oversized
+                    // greeting would otherwise break every later login.
+                    if let Err(msg) = ServerSettings::validate(
+                        &update.name,
+                        &update.description,
+                        &update.greeting,
+                    ) {
+                        self.send_error(&msg).await?;
                         continue;
                     }
                     let new_name = update.name.clone();
-                    self.ctx
+                    // Persisted, so a restart keeps it (STORE-14).
+                    if let Err(e) = self
+                        .ctx
                         .settings
                         .update(update.name, update.description, update.greeting, update.max_users)
-                        .await;
+                        .await
+                    {
+                        let refusal = match e {
+                            crate::settings::SettingsError::Invalid(msg) => Refusal::denied(msg),
+                            other => Refusal::internal("settings update", other),
+                        };
+                        self.send_refusal(refusal).await?;
+                        continue;
+                    }
                     let _ = self
                         .ctx
                         .history
@@ -1467,6 +1364,18 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                         continue;
                     }
                     let admin_name = session.username.clone();
+                    if broadcast.text.trim().is_empty() {
+                        self.send_error("broadcast text is required").await?;
+                        continue;
+                    }
+                    if let Err(msg) = crate::limits::check_len(
+                        "broadcast",
+                        &broadcast.text,
+                        crate::limits::MAX_BROADCAST_LEN,
+                    ) {
+                        self.send_error(&msg).await?;
+                        continue;
+                    }
                     let outbound = Outbound {
                         packet_type: PacketType::Info,
                         flags: PacketFlags::SYSTEM_MESSAGE,
@@ -1531,6 +1440,23 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                         self.send_error("newsgroup name is required").await?;
                         continue;
                     }
+                    if let Err(msg) = crate::limits::check_len(
+                        "newsgroup name",
+                        &create.name,
+                        crate::limits::MAX_NAME_LEN,
+                    )
+                    .and_then(|()| {
+                        crate::limits::check_len(
+                            "newsgroup description",
+                            &create.description,
+                            crate::limits::MAX_LONG_DESCRIPTION_LEN,
+                        )
+                    }) {
+                        self.send_error(&msg).await?;
+                        continue;
+                    }
+                    // `create_group` refuses class thresholds above Admin
+                    // (STORE-12): such a group would be invisible to all.
                     match self
                         .ctx
                         .news
@@ -1550,7 +1476,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                                 .await;
                             self.reply_newsgroup_list().await?
                         }
-                        Err(e) => self.send_error(&e.to_string()).await?,
+                        Err(e) => self.send_refusal(news_refusal("newsgroup create", e)).await?,
                     }
                 }
                 PacketType::NewsThreadListRequest => {
@@ -1565,7 +1491,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                             }
                             self.reply_thread_list(group_id).await?;
                         }
-                        Err(e) => self.send_error(&e.to_string()).await?,
+                        Err(e) => self.send_refusal(news_refusal("news listing", e)).await?,
                     }
                 }
                 PacketType::NewsPostCreate => {
@@ -1574,11 +1500,22 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                         let s = self.session.as_ref().expect("authed");
                         (s.username.clone(), s.class as u8)
                     };
+                    if let Err(msg) = crate::limits::check_len(
+                        "subject",
+                        &post.subject,
+                        crate::limits::MAX_NEWS_SUBJECT_LEN,
+                    )
+                    .and_then(|()| {
+                        crate::limits::check_len("body", &post.body, crate::limits::MAX_NEWS_BODY_LEN)
+                    }) {
+                        self.send_error(&msg).await?;
+                        continue;
+                    }
                     let group_id = Uuid::from_bytes(post.newsgroup_id);
                     let group = match self.ctx.news.group(group_id).await {
                         Ok(g) => g,
                         Err(e) => {
-                            self.send_error(&e.to_string()).await?;
+                            self.send_refusal(news_refusal("news post", e)).await?;
                             continue;
                         }
                     };
@@ -1590,7 +1527,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                         self.send_error("a subject is required").await?;
                         continue;
                     }
-                    // All-zero parent id means "thread root".
+                    // Per-account posting rate limit (DOS-11).
+                    if !self.ctx.news.allow_post(&author) {
+                        self.send_error("you are posting too fast; wait a few seconds")
+                            .await?;
+                        continue;
+                    }
+                    // All-zero parent id means "thread root". A reply's parent
+                    // must be in this same group (STORE-11).
                     let parent = (post.parent_id != [0u8; 16]).then(|| Uuid::from_bytes(post.parent_id));
                     match self
                         .ctx
@@ -1598,48 +1542,79 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                         .create_post(group_id, parent, &author, &post.subject, &post.body, unix_now())
                         .await
                     {
+                        // Only a reader of the group gets the thread list back;
+                        // a post-only member just gets their own post echoed
+                        // (AUTHZ-10 / STORE-7).
+                        Ok(created) if my_class < group.min_read_class => {
+                            self.send_thread_list(group_id, vec![created]).await?
+                        }
                         Ok(_) => self.reply_thread_list(group_id).await?,
-                        Err(e) => self.send_error(&e.to_string()).await?,
+                        Err(e) => self.send_refusal(news_refusal("news post", e)).await?,
                     }
                 }
                 PacketType::NewsPostDelete => {
                     let del = NewsPostDelete::decode(&frame.payload)?;
-                    let (username, privs) = {
+                    let (username, privs, my_class) = {
                         let s = self.session.as_ref().expect("authed");
-                        (s.username.clone(), s.privileges)
+                        (s.username.clone(), s.privileges, s.class as u8)
                     };
                     let post_id = Uuid::from_bytes(del.post_id);
-                    match self.ctx.news.post(post_id).await {
-                        Ok(post) => {
-                            // Authors may delete their own posts; USER_ADMIN may
-                            // delete anyone's.
-                            if post.author != username && !privs.contains(Privileges::USER_ADMIN) {
-                                self.send_error("you can only delete your own posts").await?;
-                                continue;
-                            }
-                            match self.ctx.news.delete_post(post_id).await {
-                                Ok(()) => self.reply_thread_list(post.newsgroup_id).await?,
-                                Err(e) => self.send_error(&e.to_string()).await?,
-                            }
+                    let post = match self.ctx.news.post(post_id).await {
+                        Ok(post) => post,
+                        Err(e) => {
+                            self.send_refusal(news_refusal("news delete", e)).await?;
+                            continue;
                         }
-                        Err(e) => self.send_error(&e.to_string()).await?,
+                    };
+                    let group = match self.ctx.news.group(post.newsgroup_id).await {
+                        Ok(group) => group,
+                        Err(e) => {
+                            self.send_refusal(news_refusal("news delete", e)).await?;
+                            continue;
+                        }
+                    };
+                    let can_read = my_class >= group.min_read_class;
+                    // USER_ADMIN may delete anyone's post in a group they can
+                    // read, replies included. Everyone else may delete only
+                    // their own post, and not once others have replied to it,
+                    // since the delete cascades to the replies (AUTHZ-10).
+                    let result = if privs.contains(Privileges::USER_ADMIN) && can_read {
+                        self.ctx.news.delete_post(post_id).await.map(|()| true)
+                    } else if post.author == username {
+                        self.ctx.news.delete_own_post(post_id, &username).await
+                    } else {
+                        self.send_error("you can only delete your own posts").await?;
+                        continue;
+                    };
+                    match result {
+                        Ok(true) if can_read => self.reply_thread_list(post.newsgroup_id).await?,
+                        Ok(true) => self.send_thread_list(post.newsgroup_id, Vec::new()).await?,
+                        Ok(false) => {
+                            self.send_error("cannot delete a post other users have replied to")
+                                .await?
+                        }
+                        Err(e) => self.send_refusal(news_refusal("news delete", e)).await?,
                     }
                 }
                 PacketType::AdminDisconnect => {
                     let req = AdminDisconnect::decode(&frame.payload)?;
-                    // Pull what we need as owned values so we don't hold a
-                    // borrow of `self.session` across the `&mut self` sends.
-                    let (admin_name, admin_class, privs) = {
-                        let s = self.session.as_ref().expect("authed");
-                        (s.username.clone(), s.class as u8, s.privileges)
-                    };
+                    let session = self.session.as_ref().expect("authed").clone();
                     // Kicking always needs USER_KICK; a ban additionally needs
-                    // USER_BAN.
-                    if !privs.contains(Privileges::USER_KICK) {
-                        self.send_error("missing USER_KICK privilege").await?;
-                        continue;
-                    }
-                    if req.ban_secs > 0 && !privs.contains(Privileges::USER_BAN) {
+                    // USER_BAN. Both are checked against the account's stored
+                    // privileges as well as the login snapshot, so a demoted
+                    // moderator can't keep acting (AUTHZ-2).
+                    let actor = match policy::resolve_actor(&self.ctx, &session, Privileges::USER_KICK)
+                        .await
+                    {
+                        Ok(actor) => actor,
+                        Err(refusal) => {
+                            self.send_refusal(refusal).await?;
+                            continue;
+                        }
+                    };
+                    let admin_name = actor.username.clone();
+                    let admin_class = actor.authority.class;
+                    if req.ban_secs > 0 && !actor.authority.privileges.contains(Privileges::USER_BAN) {
                         self.send_error("missing USER_BAN privilege").await?;
                         continue;
                     }
@@ -1647,35 +1622,48 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                         self.send_error("cannot disconnect yourself").await?;
                         continue;
                     }
-                    // Rank guard: never act on a user who outranks you. Prefer
-                    // the live (effective) class; fall back to the stored
-                    // account class so an offline ban target is still checked.
-                    let target_class = match self.ctx.presence.get(&req.username).await {
-                        Some(entry) => Some(entry.class),
-                        None => self
-                            .ctx
-                            .auth
-                            .account_class(&req.username)
-                            .await?
-                            .map(|c| c as u8),
+                    if let Err(msg) =
+                        crate::limits::check_len("reason", &req.reason, crate::limits::MAX_REASON_LEN)
+                    {
+                        self.send_error(&msg).await?;
+                        continue;
+                    }
+                    // Rank guard: never act on a user who outranks you. Take
+                    // the higher of the live (presence) and stored class, so
+                    // neither a stale session nor an offline target slips by.
+                    let live_class = self.ctx.presence.get(&req.username).await.map(|e| e.class);
+                    let stored = match self.ctx.roles.account_state(&req.username).await {
+                        Ok(stored) => stored,
+                        Err(e) => {
+                            self.send_refusal(Refusal::internal("disconnect", e)).await?;
+                            continue;
+                        }
                     };
-                    if target_class.is_some_and(|tc| tc > admin_class) {
+                    let target_class = live_class.max(stored.as_ref().map(|s| s.class as u8));
+                    if target_class.is_some_and(|tc| tc > admin_class as u8) {
                         self.send_error("cannot disconnect a higher-class user").await?;
                         continue;
                     }
                     // Record the ban before kicking, so a racing reconnect is
-                    // already refused by the login path.
+                    // already refused by the login path. A shorter re-ban never
+                    // cuts short a longer ban set by a higher rank (STORE-13).
+                    let mut longer_ban_kept = false;
                     if req.ban_secs > 0 {
-                        match self.ctx.auth.account_id(&req.username).await? {
-                            Some(account_id) => {
-                                let until = unix_now() as i64 + req.ban_secs as i64;
-                                self.ctx
-                                    .auth
-                                    .set_ban(&account_id, until, &req.reason, &admin_name)
-                                    .await?;
-                            }
-                            None => {
-                                self.send_error("no such account").await?;
+                        let Some(target) = &stored else {
+                            self.send_error("no such account").await?;
+                            continue;
+                        };
+                        let now = unix_now() as i64;
+                        let until = now.saturating_add(req.ban_secs as i64);
+                        match self
+                            .ctx
+                            .roles
+                            .set_ban(&target.account_id, until, &req.reason, &admin_name, admin_class, now)
+                            .await
+                        {
+                            Ok(in_force) => longer_ban_kept = in_force > until,
+                            Err(e) => {
+                                self.send_refusal(Refusal::internal("ban", e)).await?;
                                 continue;
                             }
                         }
@@ -1693,9 +1681,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                             .await?;
                     } else {
                         let ack = if req.ban_secs > 0 {
+                            let kept = if longer_ban_kept {
+                                " (a longer existing ban stays in force)"
+                            } else {
+                                ""
+                            };
                             format!(
-                                "banned {} — {} session(s) dropped",
-                                req.username, reached
+                                "banned {}{} — {} session(s) dropped",
+                                req.username, kept, reached
                             )
                         } else {
                             format!("disconnected {} — {} session(s)", req.username, reached)
@@ -1772,6 +1765,35 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
         .await
     }
 
+    /// Report a refused or failed admin request: a policy refusal goes to the
+    /// client verbatim; an internal failure is logged here and the client
+    /// gets only a generic message (STORE-9).
+    async fn send_refusal(&mut self, refusal: Refusal) -> Result<(), ProtocolError> {
+        if let Refusal::Internal { what, detail } = &refusal {
+            warn!(error = %detail, "{what} failed");
+        }
+        self.send_error(&refusal.client_message()).await
+    }
+
+    /// Apply the current IP rules to already-connected sessions: drop every
+    /// user connected from an address the rules now deny, except the acting
+    /// admin (who can then still undo a rule that would lock them out).
+    async fn enforce_ip_rules_on_live_sessions(&mut self) {
+        let actor = self.session.as_ref().expect("authed").username.clone();
+        let kicked = self
+            .ctx
+            .ip_rules
+            .disconnect_denied(
+                &self.ctx.presence,
+                "your address is no longer allowed on this server",
+                &actor,
+            )
+            .await;
+        if !kicked.is_empty() {
+            debug!(users = ?kicked, "disconnected sessions denied by IP rules");
+        }
+    }
+
     /// Send the full, current role list — the reply to a successful role
     /// mutation as well as to `RoleListRequest` itself, so every client's
     /// Roles window can just re-render from one message shape.
@@ -1788,7 +1810,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                 )
                 .await?;
             }
-            Err(e) => self.send_error(&e.to_string()).await?,
+            Err(e) => self.send_refusal(Refusal::internal("role listing", e)).await?,
         }
         Ok(())
     }
@@ -1817,7 +1839,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                 )
                 .await?;
             }
-            Err(e) => self.send_error(&e.to_string()).await?,
+            Err(e) => self.send_refusal(Refusal::internal("account listing", e)).await?,
         }
         Ok(())
     }
@@ -1901,7 +1923,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                 )
                 .await?;
             }
-            Err(e) => self.send_error(&e.to_string()).await?,
+            Err(e) => self.send_refusal(ip_rule_refusal("ip rule listing", e)).await?,
         }
         Ok(())
     }
@@ -1931,30 +1953,48 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                 )
                 .await?;
             }
-            Err(e) => self.send_error(&e.to_string()).await?,
+            Err(e) => self.send_refusal(news_refusal("newsgroup listing", e)).await?,
         }
         Ok(())
     }
 
-    /// Send every post in a newsgroup — the reply to `NewsThreadListRequest`
-    /// and to a successful post/delete, so the News window re-renders from one
-    /// shape. The caller has already passed the read-class check.
+    /// Send the newest posts of a newsgroup — the reply to
+    /// `NewsThreadListRequest` and to a reader's successful post/delete, so
+    /// the News window re-renders from one shape. Bounded by
+    /// [`crate::news::reply_window`] (DOS-11). The caller has already passed
+    /// the read-class check.
     async fn reply_thread_list(&mut self, group_id: Uuid) -> Result<(), ConnectionError> {
-        match self.ctx.news.posts(group_id).await {
-            Ok(posts) => {
-                let response = NewsThreadListResponse {
-                    newsgroup_id: *group_id.as_bytes(),
-                    posts: posts.into_iter().map(news_post_to_wire).collect(),
-                };
-                self.send(
-                    PacketType::NewsThreadListResponse,
-                    PacketFlags::empty(),
-                    response.encode(),
-                )
-                .await?;
+        match self
+            .ctx
+            .news
+            .recent_posts(group_id, crate::news::THREAD_REPLY_MAX_POSTS)
+            .await
+        {
+            Ok(newest_first) => {
+                let posts = crate::news::reply_window(newest_first);
+                self.send_thread_list(group_id, posts).await?;
             }
-            Err(e) => self.send_error(&e.to_string()).await?,
+            Err(e) => self.send_refusal(news_refusal("news listing", e)).await?,
         }
+        Ok(())
+    }
+
+    /// Send exactly `posts` as a group's `NewsThreadListResponse`.
+    async fn send_thread_list(
+        &mut self,
+        group_id: Uuid,
+        posts: Vec<NewsPostDomain>,
+    ) -> Result<(), ConnectionError> {
+        let response = NewsThreadListResponse {
+            newsgroup_id: *group_id.as_bytes(),
+            posts: posts.into_iter().map(news_post_to_wire).collect(),
+        };
+        self.send(
+            PacketType::NewsThreadListResponse,
+            PacketFlags::empty(),
+            response.encode(),
+        )
+        .await?;
         Ok(())
     }
 
@@ -2079,6 +2119,33 @@ fn role_to_wire(role: Role) -> RoleInfo {
         privileges: role.privileges.bits(),
         rank: role.rank,
         color: role.color.unwrap_or_default(),
+    }
+}
+
+/// What a client may be told about a failed news operation.
+fn news_refusal(what: &'static str, err: crate::news::NewsError) -> Refusal {
+    use crate::news::NewsError;
+    match err {
+        NewsError::Storage(e) => Refusal::storage(
+            what,
+            &e,
+            "a newsgroup with that name already exists",
+            "no such post",
+        ),
+        NewsError::CorruptId => Refusal::internal(what, err),
+        other => Refusal::denied(other.to_string()),
+    }
+}
+
+/// What a client may be told about a failed IP-rule operation.
+fn ip_rule_refusal(what: &'static str, err: crate::ip_rules::IpRuleError) -> Refusal {
+    use crate::ip_rules::IpRuleError;
+    match err {
+        IpRuleError::InvalidCidr(_) => {
+            Refusal::denied("invalid CIDR (expected e.g. 10.0.0.0/8 or 2001:db8::/32)")
+        }
+        IpRuleError::InvalidAction(_) => Refusal::denied("action must be 'allow' or 'deny'"),
+        IpRuleError::Storage(e) => Refusal::storage(what, &e, "that rule already exists", "no such rule"),
     }
 }
 
@@ -2532,5 +2599,401 @@ mod tests {
             .await
             .unwrap();
         conn.await.unwrap().unwrap();
+    }
+
+    // ---- admin authorization hardening (AUTH-1, AUTHZ-*, STORE-*, DOS-11) ----
+
+    type Client = Framed<tokio::io::DuplexStream, KdxCodec>;
+    type ConnTask = tokio::task::JoinHandle<Result<(), ConnectionError>>;
+
+    /// Handshake and log `username` (password "s3cret") in on a fresh duplex
+    /// connection whose presence address is `peer`, then ping so the
+    /// dispatch loop (and its presence join) is known to be running.
+    async fn connect_as(ctx: &Arc<ServerCtx>, username: &str, peer: &str) -> (Client, u32, ConnTask) {
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let conn = tokio::spawn(Connection::new_with_peer(server, ctx.clone(), peer.to_string()).run());
+        let mut client = client_framed(client);
+        let mut seq = 0;
+        do_handshake(&mut client, &mut seq).await;
+        let login = do_login(&mut client, &mut seq, username, "s3cret").await;
+        assert!(login.success, "{username} should log in");
+        let pong = send_and_recv(&mut client, &mut seq, PacketType::Ping, Bytes::from_static(b"p")).await;
+        assert_eq!(pong.header.packet_type, PacketType::Pong);
+        (client, seq, conn)
+    }
+
+    async fn hang_up(mut client: Client, mut seq: u32, conn: ConnTask) {
+        client
+            .send(client_frame(PacketType::Disconnect, bump(&mut seq), Bytes::new()))
+            .await
+            .unwrap();
+        conn.await.unwrap().unwrap();
+    }
+
+    /// Read until the server's `Disconnect` frame (`true`) or EOF/timeout.
+    async fn wait_for_disconnect(client: &mut Client) -> bool {
+        loop {
+            match timeout(Duration::from_secs(5), client.next()).await {
+                Ok(Some(Ok(frame))) if frame.header.packet_type == PacketType::Disconnect => return true,
+                Ok(Some(Ok(_))) => continue,
+                _ => return false,
+            }
+        }
+    }
+
+    async fn seed(ctx: &ServerCtx, username: &str, class: i64, granted: Privileges) {
+        ctx.auth
+            .create_account(username, "s3cret", class, granted.bits() as i64, 0)
+            .await
+            .unwrap();
+    }
+
+    fn error_text(frame: &KdxFrame) -> String {
+        assert_eq!(frame.header.packet_type, PacketType::Error);
+        String::from_utf8_lossy(&frame.payload).into_owned()
+    }
+
+    #[tokio::test]
+    async fn delegated_user_admin_cannot_escalate_or_touch_admins() {
+        let (ctx, _dir) = admin_test_ctx().await;
+        seed(&ctx, "helpdesk", 2, Privileges::USER_ADMIN).await;
+        let (mut client, mut seq, conn) = connect_as(&ctx, "helpdesk", "unknown").await;
+
+        let all = Privileges::all().bits();
+        let attempts = [
+            // Grant itself every privilege.
+            (
+                PacketType::AccountUpdate,
+                AccountUpdate { username: "helpdesk".into(), base_class: 2, granted: all, revoked: 0 }.encode(),
+            ),
+            // Demote and strip the real admin.
+            (
+                PacketType::AccountUpdate,
+                AccountUpdate { username: "sysop".into(), base_class: 0, granted: 0, revoked: all }.encode(),
+            ),
+            // Mint a puppet holding privileges it lacks...
+            (
+                PacketType::AccountCreate,
+                AccountCreate {
+                    username: "puppet".into(),
+                    password: "pw".into(),
+                    base_class: 1,
+                    granted: Privileges::SERVER_ADMIN.bits(),
+                    revoked: 0,
+                }
+                .encode(),
+            ),
+            // ...or of its own rank.
+            (
+                PacketType::AccountCreate,
+                AccountCreate { username: "peer".into(), password: "pw".into(), base_class: 2, granted: 0, revoked: 0 }
+                    .encode(),
+            ),
+            // A role carrying privileges it lacks.
+            (
+                PacketType::RoleCreate,
+                RoleCreate { name: "Root".into(), privileges: all, rank: 99, color: String::new() }.encode(),
+            ),
+        ];
+        for (packet_type, payload) in attempts {
+            let frame = send_and_recv(&mut client, &mut seq, packet_type, payload).await;
+            assert_eq!(frame.header.packet_type, PacketType::Error, "{packet_type:?} must be refused");
+        }
+
+        // A role within its own privileges is fine, but it can't hand that
+        // role to itself (it doesn't outrank itself)...
+        let create = RoleCreate { name: "Helper".into(), privileges: Privileges::CHAT_SEND.bits(), rank: 1, color: String::new() };
+        let frame = send_and_recv(&mut client, &mut seq, PacketType::RoleCreate, create.encode()).await;
+        let role_id = RoleListResponse::decode(&frame.payload).unwrap().roles[0].id;
+        let assign = RoleAssign { username: "helpdesk".into(), role_id };
+        let frame = send_and_recv(&mut client, &mut seq, PacketType::RoleAssign, assign.encode()).await;
+        assert_eq!(frame.header.packet_type, PacketType::Error);
+        // ...while it can still manage a lower account within its bounds.
+        let demote = AccountUpdate { username: "plain".into(), base_class: 0, granted: 0, revoked: 0 };
+        let frame = send_and_recv(&mut client, &mut seq, PacketType::AccountUpdate, demote.encode()).await;
+        assert_eq!(frame.header.packet_type, PacketType::AccountListResponse);
+
+        // None of the escalations stuck.
+        let sysop = ctx.roles.account_state("sysop").await.unwrap().unwrap();
+        assert_eq!((sysop.class, sysop.revoked), (BaseClass::Admin, 0));
+        let me = ctx.roles.account_state("helpdesk").await.unwrap().unwrap();
+        assert_eq!(me.effective(), BaseClass::PowerUser.privileges() | Privileges::USER_ADMIN);
+        assert!(ctx.roles.account_state("puppet").await.unwrap().is_none());
+        assert!(ctx.roles.account_state("peer").await.unwrap().is_none());
+
+        hang_up(client, seq, conn).await;
+    }
+
+    #[tokio::test]
+    async fn last_admin_cannot_demote_or_strip_itself() {
+        let (ctx, _dir) = admin_test_ctx().await;
+        seed(&ctx, "backup", 3, Privileges::empty()).await;
+        let (mut client, mut seq, conn) = connect_as(&ctx, "sysop", "unknown").await;
+
+        // With a second admin around, demoting that one is fine...
+        let demote = AccountUpdate { username: "backup".into(), base_class: 1, granted: 0, revoked: 0 };
+        let frame = send_and_recv(&mut client, &mut seq, PacketType::AccountUpdate, demote.encode()).await;
+        assert_eq!(frame.header.packet_type, PacketType::AccountListResponse);
+
+        // ...but now sysop is the last one.
+        let attempts = [
+            AccountUpdate { username: "sysop".into(), base_class: 2, granted: 0, revoked: 0 },
+            AccountUpdate {
+                username: "sysop".into(),
+                base_class: 3,
+                granted: 0,
+                revoked: Privileges::USER_ADMIN.bits(),
+            },
+        ];
+        for update in attempts {
+            let frame = send_and_recv(&mut client, &mut seq, PacketType::AccountUpdate, update.encode()).await;
+            assert!(error_text(&frame).contains("administrator"));
+        }
+        let sysop = ctx.roles.account_state("sysop").await.unwrap().unwrap();
+        assert!(sysop.administers());
+
+        hang_up(client, seq, conn).await;
+    }
+
+    #[tokio::test]
+    async fn demoting_a_live_admin_disconnects_them() {
+        let (ctx, _dir) = admin_test_ctx().await;
+        seed(&ctx, "deputy", 3, Privileges::empty()).await;
+        let (mut deputy, _dseq, deputy_conn) = connect_as(&ctx, "deputy", "unknown").await;
+        let (mut sysop, mut seq, conn) = connect_as(&ctx, "sysop", "unknown").await;
+
+        let demote = AccountUpdate { username: "deputy".into(), base_class: 1, granted: 0, revoked: 0 };
+        let frame = send_and_recv(&mut sysop, &mut seq, PacketType::AccountUpdate, demote.encode()).await;
+        assert_eq!(frame.header.packet_type, PacketType::AccountListResponse);
+
+        // The demoted admin's live session is forced to reconnect.
+        assert!(wait_for_disconnect(&mut deputy).await, "deputy should be disconnected");
+        deputy_conn.await.unwrap().unwrap();
+
+        hang_up(sysop, seq, conn).await;
+    }
+
+    #[tokio::test]
+    async fn stale_session_cannot_reuse_revoked_admin_rights() {
+        let (ctx, _dir) = admin_test_ctx().await;
+        seed(&ctx, "deputy", 3, Privileges::empty()).await;
+        let (mut deputy, mut seq, conn) = connect_as(&ctx, "deputy", "unknown").await;
+
+        // Demoted behind the session's back (no kick): its login snapshot
+        // still says Admin, but the stored account now rules.
+        ctx.auth.update_account("deputy", 1, 0, 0).await.unwrap();
+
+        let repromote = AccountUpdate { username: "deputy".into(), base_class: 3, granted: 0, revoked: 0 };
+        let frame = send_and_recv(&mut deputy, &mut seq, PacketType::AccountUpdate, repromote.encode()).await;
+        assert_eq!(frame.header.packet_type, PacketType::Error);
+        let demote_sysop = AccountUpdate { username: "sysop".into(), base_class: 0, granted: 0, revoked: 0 };
+        let frame = send_and_recv(&mut deputy, &mut seq, PacketType::AccountUpdate, demote_sysop.encode()).await;
+        assert_eq!(frame.header.packet_type, PacketType::Error);
+        let kick = AdminDisconnect { username: "sysop".into(), reason: String::new(), ban_secs: 60 };
+        let frame = send_and_recv(&mut deputy, &mut seq, PacketType::AdminDisconnect, kick.encode()).await;
+        assert_eq!(frame.header.packet_type, PacketType::Error);
+
+        assert_eq!(ctx.roles.account_state("deputy").await.unwrap().unwrap().class, BaseClass::User);
+        assert_eq!(ctx.roles.account_state("sysop").await.unwrap().unwrap().class, BaseClass::Admin);
+
+        hang_up(deputy, seq, conn).await;
+    }
+
+    #[tokio::test]
+    async fn role_list_is_admin_only_and_role_grants_kick_live_holders() {
+        let (ctx, _dir) = admin_test_ctx().await;
+        let (mut plain, mut pseq, plain_conn) = connect_as(&ctx, "plain", "unknown").await;
+        let frame = send_and_recv(&mut plain, &mut pseq, PacketType::RoleListRequest, RoleListRequest.encode()).await;
+        assert_eq!(frame.header.packet_type, PacketType::Error);
+
+        let (mut sysop, mut seq, conn) = connect_as(&ctx, "sysop", "unknown").await;
+        let create = RoleCreate { name: "Mod".into(), privileges: Privileges::USER_KICK.bits(), rank: 5, color: "#e11b1b".into() };
+        let frame = send_and_recv(&mut sysop, &mut seq, PacketType::RoleCreate, create.encode()).await;
+        let role_id = RoleListResponse::decode(&frame.payload).unwrap().roles[0].id;
+        let assign = RoleAssign { username: "plain".into(), role_id };
+        let frame = send_and_recv(&mut sysop, &mut seq, PacketType::RoleAssign, assign.encode()).await;
+        assert_eq!(frame.header.packet_type, PacketType::RoleListResponse);
+
+        // plain's session predates the grant: it must reconnect.
+        assert!(wait_for_disconnect(&mut plain).await, "role holder should be disconnected");
+        plain_conn.await.unwrap().unwrap();
+
+        // A malformed color is refused rather than stored.
+        let bad = RoleCreate { name: "Evil".into(), privileges: 0, rank: 0, color: "red;background:url(x)".into() };
+        let frame = send_and_recv(&mut sysop, &mut seq, PacketType::RoleCreate, bad.encode()).await;
+        assert_eq!(frame.header.packet_type, PacketType::Error);
+
+        hang_up(sysop, seq, conn).await;
+    }
+
+    fn thread_posts(frame: &KdxFrame) -> Vec<WireNewsPost> {
+        assert_eq!(frame.header.packet_type, PacketType::NewsThreadListResponse);
+        NewsThreadListResponse::decode(&frame.payload).unwrap().posts
+    }
+
+    fn newsgroup_id(frame: &KdxFrame, name: &str) -> [u8; 16] {
+        assert_eq!(frame.header.packet_type, PacketType::NewsgroupListResponse);
+        NewsgroupListResponse::decode(&frame.payload)
+            .unwrap()
+            .groups
+            .into_iter()
+            .find(|g| g.name == name)
+            .expect("group listed")
+            .id
+    }
+
+    fn news_post(group: [u8; 16], parent: [u8; 16], subject: &str) -> Bytes {
+        NewsPostCreate { newsgroup_id: group, parent_id: parent, subject: subject.into(), body: "body".into() }.encode()
+    }
+
+    #[tokio::test]
+    async fn news_replies_respect_read_class_group_boundaries_and_authorship() {
+        let (ctx, _dir) = admin_test_ctx().await;
+        let (mut sysop, mut seq, conn) = connect_as(&ctx, "sysop", "unknown").await;
+
+        // A class threshold above Admin would hide the group from everyone.
+        let hidden = NewsgroupCreate { name: "hidden".into(), description: String::new(), min_read_class: 4, min_post_class: 0 };
+        let frame = send_and_recv(&mut sysop, &mut seq, PacketType::NewsgroupCreate, hidden.encode()).await;
+        assert_eq!(frame.header.packet_type, PacketType::Error);
+        assert!(ctx.news.list_groups().await.unwrap().is_empty());
+
+        // A write-only suggestion box (read: admin, post: anyone) and a public group.
+        let box_group = NewsgroupCreate { name: "suggestions".into(), description: String::new(), min_read_class: 3, min_post_class: 0 };
+        let frame = send_and_recv(&mut sysop, &mut seq, PacketType::NewsgroupCreate, box_group.encode()).await;
+        let suggestions = newsgroup_id(&frame, "suggestions");
+        let public = NewsgroupCreate { name: "general".into(), description: String::new(), min_read_class: 0, min_post_class: 0 };
+        let frame = send_and_recv(&mut sysop, &mut seq, PacketType::NewsgroupCreate, public.encode()).await;
+        let general = newsgroup_id(&frame, "general");
+
+        let frame = send_and_recv(&mut sysop, &mut seq, PacketType::NewsPostCreate, news_post(suggestions, [0; 16], "secret plans")).await;
+        let secret_id = thread_posts(&frame)[0].id;
+
+        // A post-only member gets back just their own post, never the group.
+        let (mut plain, mut pseq, plain_conn) = connect_as(&ctx, "plain", "unknown").await;
+        let frame = send_and_recv(&mut plain, &mut pseq, PacketType::NewsPostCreate, news_post(suggestions, [0; 16], "idea")).await;
+        let posts = thread_posts(&frame);
+        assert_eq!(posts.len(), 1);
+        assert_eq!(posts[0].author, "plain");
+
+        // A reply must name a parent in the same group.
+        let frame = send_and_recv(&mut plain, &mut pseq, PacketType::NewsPostCreate, news_post(general, secret_id, "re: secret")).await;
+        assert_eq!(frame.header.packet_type, PacketType::Error);
+
+        // plain starts a thread, sysop replies; plain may no longer delete the
+        // root, since that would take sysop's reply with it.
+        let frame = send_and_recv(&mut plain, &mut pseq, PacketType::NewsPostCreate, news_post(general, [0; 16], "hello")).await;
+        let root_id = thread_posts(&frame)[0].id;
+        let frame = send_and_recv(&mut sysop, &mut seq, PacketType::NewsPostCreate, news_post(general, root_id, "re: hello")).await;
+        assert_eq!(thread_posts(&frame).len(), 2);
+        let delete = NewsPostDelete { post_id: root_id };
+        let frame = send_and_recv(&mut plain, &mut pseq, PacketType::NewsPostDelete, delete.encode()).await;
+        assert_eq!(frame.header.packet_type, PacketType::Error);
+        assert_eq!(ctx.news.posts(Uuid::from_bytes(general)).await.unwrap().len(), 2);
+        // A moderator (USER_ADMIN) still can.
+        let frame = send_and_recv(&mut sysop, &mut seq, PacketType::NewsPostDelete, delete.encode()).await;
+        assert!(thread_posts(&frame).is_empty());
+
+        hang_up(plain, pseq, plain_conn).await;
+        hang_up(sysop, seq, conn).await;
+    }
+
+    #[tokio::test]
+    async fn deny_rule_disconnects_matching_live_sessions() {
+        let (ctx, _dir) = admin_test_ctx().await;
+        // How an IPv4 client shows up on a dual-stack listener.
+        let (mut plain, _pseq, plain_conn) = connect_as(&ctx, "plain", "[::ffff:10.9.9.9]:4000").await;
+        let (mut sysop, mut seq, conn) = connect_as(&ctx, "sysop", "192.0.2.1:5000").await;
+
+        let rule = IpRuleCreate { position: 10, action: "deny".into(), cidr: "10.0.0.0/8".into(), note: "abuse".into() };
+        let frame = send_and_recv(&mut sysop, &mut seq, PacketType::IpRuleCreate, rule.encode()).await;
+        assert_eq!(frame.header.packet_type, PacketType::IpRuleListResponse);
+
+        assert!(wait_for_disconnect(&mut plain).await, "denied address should be dropped");
+        plain_conn.await.unwrap().unwrap();
+        // The admin, from an allowed address, is untouched.
+        let pong = send_and_recv(&mut sysop, &mut seq, PacketType::Ping, Bytes::from_static(b"p")).await;
+        assert_eq!(pong.header.packet_type, PacketType::Pong);
+
+        hang_up(sysop, seq, conn).await;
+    }
+
+    #[tokio::test]
+    async fn bad_admin_input_gets_errors_not_disconnects() {
+        let (ctx, _dir) = admin_test_ctx().await;
+        let (mut sysop, mut seq, conn) = connect_as(&ctx, "sysop", "unknown").await;
+
+        // An oversized greeting would break every later login (OPS-11).
+        let update = ServerSettingsUpdate {
+            name: "Test Server".into(),
+            description: String::new(),
+            greeting: "g".repeat(crate::limits::MAX_GREETING_LEN + 1),
+            max_users: 10,
+        };
+        let frame = send_and_recv(&mut sysop, &mut seq, PacketType::ServerSettingsUpdate, update.encode()).await;
+        assert!(error_text(&frame).contains("greeting"));
+        assert_eq!(ctx.settings.greeting().await, "");
+
+        // A duplicate role name is reported plainly, without SQL text (STORE-9).
+        let create = RoleCreate { name: "Mod".into(), privileges: 0, rank: 0, color: String::new() };
+        send_and_recv(&mut sysop, &mut seq, PacketType::RoleCreate, create.encode()).await;
+        let frame = send_and_recv(&mut sysop, &mut seq, PacketType::RoleCreate, create.encode()).await;
+        let text = error_text(&frame);
+        assert!(text.contains("already exists"), "got: {text}");
+        assert!(!text.contains("UNIQUE") && !text.contains("code"), "leaked: {text}");
+
+        // Length caps (limits.rs).
+        let broadcast = AdminBroadcast { text: "b".repeat(crate::limits::MAX_BROADCAST_LEN + 1) };
+        let frame = send_and_recv(&mut sysop, &mut seq, PacketType::AdminBroadcast, broadcast.encode()).await;
+        assert_eq!(frame.header.packet_type, PacketType::Error);
+        let group = NewsgroupCreate {
+            name: "n".repeat(crate::limits::MAX_NAME_LEN + 1),
+            description: String::new(),
+            min_read_class: 0,
+            min_post_class: 0,
+        };
+        let frame = send_and_recv(&mut sysop, &mut seq, PacketType::NewsgroupCreate, group.encode()).await;
+        assert_eq!(frame.header.packet_type, PacketType::Error);
+        let kick = AdminDisconnect { username: "plain".into(), reason: "r".repeat(crate::limits::MAX_REASON_LEN + 1), ban_secs: 0 };
+        let frame = send_and_recv(&mut sysop, &mut seq, PacketType::AdminDisconnect, kick.encode()).await;
+        assert_eq!(frame.header.packet_type, PacketType::Error);
+
+        // Still connected, and logins still work.
+        let pong = send_and_recv(&mut sysop, &mut seq, PacketType::Ping, Bytes::from_static(b"p")).await;
+        assert_eq!(pong.header.packet_type, PacketType::Pong);
+        let (plain, pseq, plain_conn) = connect_as(&ctx, "plain", "unknown").await;
+        hang_up(plain, pseq, plain_conn).await;
+
+        hang_up(sysop, seq, conn).await;
+    }
+
+    #[tokio::test]
+    async fn moderator_cannot_shorten_an_admin_ban() {
+        let (ctx, _dir) = admin_test_ctx().await;
+        seed(&ctx, "mod", 2, Privileges::USER_KICK | Privileges::USER_BAN).await;
+
+        let (mut sysop, mut seq, conn) = connect_as(&ctx, "sysop", "unknown").await;
+        let ban = AdminDisconnect { username: "plain".into(), reason: "spam".into(), ban_secs: 3600 };
+        let frame = send_and_recv(&mut sysop, &mut seq, PacketType::AdminDisconnect, ban.encode()).await;
+        assert_eq!(frame.header.packet_type, PacketType::Info);
+        hang_up(sysop, seq, conn).await;
+
+        let (mut moderator, mut mseq, mconn) = connect_as(&ctx, "mod", "unknown").await;
+        let short = AdminDisconnect { username: "plain".into(), reason: "oops".into(), ban_secs: 1 };
+        let frame = send_and_recv(&mut moderator, &mut mseq, PacketType::AdminDisconnect, short.encode()).await;
+        assert_eq!(frame.header.packet_type, PacketType::Info);
+        let ack = String::from_utf8_lossy(&frame.payload).into_owned();
+        assert!(ack.contains("longer existing ban"), "got: {ack}");
+        hang_up(moderator, mseq, mconn).await;
+
+        // Still banned (the 1 s re-ban did not replace the hour-long one).
+        let (client, server) = tokio::io::duplex(8192);
+        let banned_conn = tokio::spawn(Connection::new(server, ctx.clone()).run());
+        let mut client = client_framed(client);
+        let mut bseq = 0;
+        do_handshake(&mut client, &mut bseq).await;
+        let result = do_login(&mut client, &mut bseq, "plain", "s3cret").await;
+        assert!(!result.success, "plain should still be banned");
+        drop(client);
+        let _ = banned_conn.await;
     }
 }
