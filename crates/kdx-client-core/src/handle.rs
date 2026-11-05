@@ -682,10 +682,16 @@ impl ClientHandle {
         .await
     }
 
-    /// Download `remote_path` (a `/dir/file` path) to `local`, resuming from a
-    /// `.kdxpart` sidecar if one matches this server and remote file. The
-    /// bytes accumulate in `<local>.kdxdata` and are renamed to `local` only
-    /// after the whole-file hash verifies. Resolves on completion.
+    /// Download `remote_path` (a `/dir/file` path) to `local`. Resolves on
+    /// completion.
+    ///
+    /// The bytes accumulate in the client's data directory
+    /// (`ClientConfig::data_dir`/`transfers/`, with a `.kdxpart` resume
+    /// sidecar), never beside `local`: only after the whole-file hash
+    /// verifies is the file moved (or, across filesystems, copied) to
+    /// `local`, so a sandboxed app needs write access to `local` alone. An
+    /// interrupted download of the same file from the same server to the
+    /// same `local` resumes, also after a reconnect or restart.
     ///
     /// `local` is used verbatim: derive its file name from server-supplied
     /// names only via [`crate::safe_local_file_name`].

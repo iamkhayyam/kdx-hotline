@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<!-- macOS container migration manifest (bundled as
+     Contents/Resources/container-migration.plist). On the first launch of
+     the sandboxed build, macOS moves what an earlier, unsandboxed build
+     stored into the app's container, at the same relative path, so an
+     upgrade keeps the user's state:
+     - Application Support/net.kdx.hotline.client: known_hosts.toml (pinned
+       server keys; losing them would turn every server back into a
+       first-contact prompt) and any partial downloads;
+     - WebKit/net.kdx.hotline.client: the webview's localStorage (Address
+       Book bookmarks, settings, window positions).
+     Keychain items need no migration. Nothing happens on a fresh install. -->
+<dict>
+  <key>Move</key>
+  <array>
+    <string>${ApplicationSupport}/net.kdx.hotline.client</string>
+    <string>${Library}/WebKit/net.kdx.hotline.client</string>
+  </array>
+</dict>
+</plist>

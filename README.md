@@ -125,6 +125,29 @@ cd target/release/bundle/dmg
 sh bundle_dmg.sh --volname "KDX" KDX_0.1.0_aarch64.dmg ../macos/KDX.app
 ```
 
+#### macOS: App Sandbox, signing, notarization
+
+The macOS app runs in the **App Sandbox** (`entitlements.plist`: sandbox,
+outbound network, and the file picked in the Open/Save dialog — nothing
+else). Everything KDX stores — pinned server keys, partial downloads and
+their resume state (`transfers/`), the webview's bookmarks/settings — lives
+in its container (`~/Library/Containers/net.kdx.hotline.client/`);
+Address Book passwords are in the login keychain. A download is written to
+the chosen file only once its whole-file hash verifies. A first sandboxed
+launch moves an earlier unsandboxed build's state into the container
+(`container-migration.plist`).
+
+Entitlements only apply to a **signed** bundle. `tauri.conf.json` sets
+`signingIdentity: "-"`, so every `cargo tauri build` is ad-hoc signed (with
+the hardened runtime) and sandboxed; `cargo tauri dev` / `cargo run` are
+not. For distribution, sign with a Developer ID and notarize by setting
+`APPLE_SIGNING_IDENTITY` (plus `APPLE_CERTIFICATE` /
+`APPLE_CERTIFICATE_PASSWORD` in CI) and `APPLE_ID` / `APPLE_PASSWORD` /
+`APPLE_TEAM_ID`; until then, users open the downloaded app once via System
+Settings → Privacy & Security → *Open Anyway*. Details, verification
+commands and the manual macOS test checklist:
+[docs/packaging.html](docs/packaging.html#macos).
+
 ### Server (kdxd)
 
 Each release carries `kdxd-<os>.zip`: the release binary, `kdxd.example.toml`,

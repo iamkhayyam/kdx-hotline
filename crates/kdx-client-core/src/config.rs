@@ -23,6 +23,8 @@ pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 pub const DEFAULT_KEEPALIVE: Duration = Duration::from_secs(30);
 /// Default bound on writing one frame to the socket.
 pub const DEFAULT_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Default age after which an untouched partial download is swept.
+pub const DEFAULT_STALE_PARTIAL_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 /// Connection parameters.
 #[derive(Debug, Clone)]
@@ -30,8 +32,11 @@ pub struct ClientConfig {
     pub host: String,
     pub port: u16,
     pub trust: TrustPolicy,
-    /// Where `known_hosts.toml` lives. (Download resume sidecars are written
-    /// next to the downloaded file, as `<file>.kdxpart` / `<file>.kdxdata`.)
+    /// The client's own state directory (an app's private data directory;
+    /// inside the container for a sandboxed macOS app). Holds
+    /// `known_hosts.toml`, and under `transfers/` every partial download:
+    /// its bytes (`<id>.kdxdata`) and resume sidecar (`<id>.kdxpart`). Only
+    /// the verified file is ever written to a download's destination.
     pub data_dir: PathBuf,
     /// Bound on the whole connect: TCP connect, TLS handshake and the KDX
     /// version handshake. Default 15 s.
@@ -48,6 +53,11 @@ pub struct ClientConfig {
     /// Bound on writing one frame (a server that stops reading can't wedge
     /// the client). Default 30 s.
     pub write_timeout: Duration,
+    /// Partial downloads nothing has touched for this long are deleted from
+    /// `data_dir/transfers/` when connecting (resuming them is then no
+    /// longer possible), so abandoned downloads can't fill the disk.
+    /// `None` keeps them forever. Default 7 days.
+    pub stale_partial_age: Option<Duration>,
 }
 
 impl ClientConfig {
@@ -61,6 +71,7 @@ impl ClientConfig {
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
             keepalive: DEFAULT_KEEPALIVE,
             write_timeout: DEFAULT_WRITE_TIMEOUT,
+            stale_partial_age: Some(DEFAULT_STALE_PARTIAL_AGE),
         }
     }
 }

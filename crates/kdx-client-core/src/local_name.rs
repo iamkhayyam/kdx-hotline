@@ -6,8 +6,11 @@
 //! (`CON`, `nul.txt`) or carry control/bidi characters that disguise its
 //! extension.
 
-/// Longest name we return, in bytes. Leaves room for the `.kdxpart` /
-/// `.kdxdata` suffixes within the usual 255-byte file-name limit.
+/// Longest name we return, in bytes: comfortably within the usual 255-byte
+/// file-name limit. (Nothing is appended to a download's name any more —
+/// partials live in the client's data directory, and the only file ever
+/// created beside a destination is a fixed-length 40-byte temp name during
+/// a cross-filesystem copy.)
 const MAX_NAME_BYTES: usize = 200;
 
 /// Used when nothing usable is left of the server's name.

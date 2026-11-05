@@ -20,6 +20,10 @@ struct Harness {
     srv: Framed<DuplexStream, KdxCodec>,
     reasm: Reassembler,
     seq: u32,
+    /// The client's transfers directory (`<data_dir>/transfers`), where
+    /// partial downloads live.
+    transfers: PathBuf,
+    _data_dir: tempfile::TempDir,
 }
 
 impl Harness {
@@ -28,11 +32,24 @@ impl Harness {
     }
 
     fn with_pipe(buffer: usize) -> Self {
+        Self::build(buffer, Publish::Auto)
+    }
+
+    /// A harness whose downloads reach their destination by `publish`.
+    fn with_publish(publish: Publish) -> Self {
+        Self::build(1024 * 1024, publish)
+    }
+
+    fn build(buffer: usize, publish: Publish) -> Self {
+        let data_dir = tempfile::tempdir().unwrap();
+        let transfers = data_dir.path().join(crate::transfer::TRANSFERS_DIR);
         let (client_io, server_io) = tokio::io::duplex(buffer);
         let (cmd_tx, cmd_rx) = mpsc::channel(256);
         let (ev_tx, ev_rx) = mpsc::channel(256);
         let opts = ActorOptions {
             server_id: "test.example:10700".into(),
+            transfers_dir: Some(transfers.clone()),
+            publish,
             ..ActorOptions::default()
         };
         let actor = Actor::new(Framed::new(client_io, KdxCodec::default()), cmd_rx, ev_tx)
@@ -44,6 +61,22 @@ impl Harness {
             srv: Framed::new(server_io, KdxCodec::default()),
             reasm: Reassembler::default(),
             seq: 0,
+            transfers,
+            _data_dir: data_dir,
+        }
+    }
+
+    /// The partial-download files for `/files/out.bin` → `local`.
+    fn partial(&self, local: &Path) -> PartialPaths {
+        PartialPaths::new(&self.transfers, "test.example:10700", "/files/out.bin", local)
+    }
+
+    /// Every file in the transfers directory (empty if it doesn't exist).
+    fn partial_files(&self) -> Vec<String> {
+        if self.transfers.exists() {
+            files_in(&self.transfers)
+        } else {
+            Vec::new()
         }
     }
 
@@ -700,6 +733,7 @@ async fn hostile_download_accepts_are_rejected_without_creating_files() {
         let result = timeout(STEP, call).await.unwrap().unwrap();
         assert!(matches!(result, Err(ClientError::Transfer(_))), "{what}: {result:?}");
         assert!(files_in(dir.path()).is_empty(), "{what}: created {:?}", files_in(dir.path()));
+        assert!(h.partial_files().is_empty(), "{what}: created {:?}", h.partial_files());
         // The client tells the server it's abandoning the transfer.
         h.expect(PacketType::FileTransferEnd).await;
     }
@@ -717,6 +751,7 @@ async fn transfer_end_before_accept_is_an_error_not_a_panic() {
     // The actor survived and the session still lines up.
     h.assert_alive().await;
     assert!(files_in(dir.path()).is_empty());
+    assert!(h.partial_files().is_empty());
 }
 
 #[tokio::test]
@@ -734,10 +769,10 @@ async fn malformed_chunks_fail_the_download_without_writing_past_the_size() {
     h.send(PacketType::FileTransferData, chunk(6, 1, &blob(100_000))).await;
     let result = timeout(STEP, call).await.unwrap().unwrap();
     assert!(matches!(result, Err(ClientError::Transfer(_))), "{result:?}");
-    let data_file = dir.path().join("out.bin.kdxdata");
+    let data_file = h.partial(&dir.path().join("out.bin")).data;
     let len = std::fs::metadata(&data_file).map(|m| m.len()).unwrap_or(0);
     assert!(len <= data.len() as u64, "wrote past the advertised size");
-    assert!(!dir.path().join("out.bin").exists());
+    assert!(files_in(dir.path()).is_empty(), "nothing at the destination");
 }
 
 #[tokio::test]
@@ -760,7 +795,8 @@ async fn a_download_completes_with_throttled_capped_progress() {
     h.send(PacketType::FileTransferEnd, end(7, TRANSFER_VERIFIED)).await;
     timeout(STEP, call).await.unwrap().unwrap().unwrap();
     assert_eq!(std::fs::read(dir.path().join("out.bin")).unwrap(), data);
-    assert_eq!(files_in(dir.path()), vec!["out.bin".to_string()], "no sidecar or data file left");
+    assert_eq!(files_in(dir.path()), vec!["out.bin".to_string()]);
+    assert!(h.partial_files().is_empty(), "no sidecar or data file left");
 
     let mut progress = 0;
     let mut last_done = 0;
@@ -783,20 +819,141 @@ async fn a_download_completes_with_throttled_capped_progress() {
     assert!(progress < total as usize / 2, "{progress} progress events for {total} chunks");
 }
 
-fn write_sidecar(dir: &Path, size: u64, sha256: [u8; 32], bitmap: Vec<u8>) {
+/// macOS App Sandbox: a save dialog grants the chosen file only, so the
+/// partial bytes and resume state must live in the client's data directory
+/// and nothing may appear beside the destination before the verified file.
+#[tokio::test]
+async fn partials_live_in_the_data_dir_until_the_verified_file_is_moved() {
+    let mut h = Harness::new();
+    let dir = tempfile::tempdir().unwrap();
+    let local = dir.path().join("out.bin");
+    let data = blob(32768 * 3);
+    let (call, req) = start_download(&mut h, dir.path(), None).await;
+    h.send(
+        PacketType::FileTransferStart,
+        accept(20, req.chunk_size, 3, data.len() as u64, sha(&data), vec![]),
+    )
+    .await;
+    h.send(PacketType::FileTransferData, chunk(20, 0, &data[..32768])).await;
+    h.send(PacketType::FileTransferData, chunk(20, 1, &data[32768..65536])).await;
+    h.assert_alive().await; // both chunks are processed
+
+    assert!(files_in(dir.path()).is_empty(), "created {:?}", files_in(dir.path()));
+    let partial = h.partial(&local);
+    let mut want = vec![
+        partial.data.file_name().unwrap().to_string_lossy().into_owned(),
+        partial.sidecar.file_name().unwrap().to_string_lossy().into_owned(),
+    ];
+    want.sort();
+    // The sidecar is written at accept time, off the actor (on the blocking
+    // pool): give that write a moment to land.
+    let deadline = Instant::now() + STEP;
+    while h.partial_files() != want && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(h.partial_files(), want);
+    // The sidecar records where the file goes.
+    let sidecar = Sidecar::read(&partial.sidecar).expect("sidecar in the data dir");
+    assert_eq!(sidecar.destination, local);
+    assert_eq!(sidecar.remote, "/files/out.bin");
+    assert_eq!(sidecar.server, "test.example:10700");
+    assert_eq!(std::fs::read(&partial.data).unwrap()[..65536], data[..65536]);
+
+    h.send(PacketType::FileTransferData, chunk(20, 2, &data[65536..])).await;
+    h.send(PacketType::FileTransferEnd, end(20, TRANSFER_VERIFIED)).await;
+    timeout(STEP, call).await.unwrap().unwrap().unwrap();
+    assert_eq!(std::fs::read(&local).unwrap(), data);
+    assert_eq!(files_in(dir.path()), vec!["out.bin".to_string()]);
+    assert!(h.partial_files().is_empty(), "left {:?}", h.partial_files());
+}
+
+/// A destination on another filesystem (rename fails with EXDEV) or under a
+/// sandbox that refuses the rename: the verified bytes are copied instead,
+/// replacing what the user chose to overwrite, and the partial is removed.
+#[tokio::test]
+async fn the_copy_fallbacks_publish_the_verified_file() {
+    for publish in [Publish::ForceCopy, Publish::ForceInPlace] {
+        let mut h = Harness::with_publish(publish);
+        let dir = tempfile::tempdir().unwrap();
+        let local = dir.path().join("out.bin");
+        std::fs::write(&local, b"the user chose to replace this").unwrap();
+        let data = blob(32768 * 2 + 5);
+        let (call, req) = start_download(&mut h, dir.path(), None).await;
+        h.send(
+            PacketType::FileTransferStart,
+            accept(21, req.chunk_size, 3, data.len() as u64, sha(&data), vec![]),
+        )
+        .await;
+        for (i, piece) in data.chunks(32768).enumerate() {
+            h.send(PacketType::FileTransferData, chunk(21, i as u32, piece)).await;
+        }
+        h.send(PacketType::FileTransferEnd, end(21, TRANSFER_VERIFIED)).await;
+        timeout(STEP, call).await.unwrap().unwrap().unwrap();
+        assert_eq!(std::fs::read(&local).unwrap(), data, "{publish:?}");
+        assert_eq!(files_in(dir.path()), vec!["out.bin".to_string()], "{publish:?}");
+        assert!(h.partial_files().is_empty(), "{publish:?}: left {:?}", h.partial_files());
+    }
+}
+
+/// A destination that can't be written fails the download but keeps the
+/// verified partial; the retry only re-publishes it.
+#[tokio::test]
+async fn a_failed_publish_keeps_the_verified_partial_for_a_retry() {
+    for publish in [Publish::Auto, Publish::ForceInPlace] {
+        let mut h = Harness::with_publish(publish);
+        let parent = tempfile::tempdir().unwrap();
+        let dir = parent.path().join("gone");
+        let local = dir.join("out.bin");
+        let data = blob(1000);
+        // The destination's folder vanishes before the file is moved there.
+        let (call, req) = start_download(&mut h, &dir, None).await;
+        h.send(
+            PacketType::FileTransferStart,
+            accept(22, req.chunk_size, 1, 1000, sha(&data), vec![]),
+        )
+        .await;
+        h.send(PacketType::FileTransferData, chunk(22, 0, &data)).await;
+        h.send(PacketType::FileTransferEnd, end(22, TRANSFER_VERIFIED)).await;
+        let err = timeout(STEP, call).await.unwrap().unwrap().unwrap_err();
+        assert!(matches!(err, ClientError::Io(_)), "{publish:?}: {err:?}");
+        let partial = h.partial(&local);
+        assert_eq!(std::fs::read(&partial.data).unwrap(), data);
+        let sidecar = Sidecar::read(&partial.sidecar).expect("resume state kept");
+        assert_eq!(sidecar.bitmap, vec![0b1]);
+
+        // Once the folder is back, the retry has nothing left to fetch.
+        std::fs::create_dir(&dir).unwrap();
+        let (call, req) = start_download(&mut h, &dir, None).await;
+        assert_eq!(req.have_bitmap, vec![0b1], "{publish:?}");
+        h.send(
+            PacketType::FileTransferStart,
+            accept(23, req.chunk_size, 1, 1000, sha(&data), vec![0b1]),
+        )
+        .await;
+        h.send(PacketType::FileTransferEnd, end(23, TRANSFER_VERIFIED)).await;
+        timeout(STEP, call).await.unwrap().unwrap().unwrap();
+        assert_eq!(std::fs::read(&local).unwrap(), data);
+        assert!(h.partial_files().is_empty(), "{publish:?}: left {:?}", h.partial_files());
+    }
+}
+
+fn write_sidecar(h: &Harness, dir: &Path, size: u64, sha256: [u8; 32], bitmap: Vec<u8>) {
     let local = dir.join("out.bin");
+    let partial = h.partial(&local);
+    create_transfers_dir(&h.transfers).unwrap();
     Sidecar {
         server: "test.example:10700".into(),
         remote: "/files/out.bin".into(),
+        destination: local,
         transfer_id: [1; 16],
         size,
         chunk_size: 32768,
         sha256,
         bitmap,
     }
-    .write(&local)
+    .write(&partial.sidecar)
     .unwrap();
-    std::fs::write(data_path_for(&local), vec![0xAA; size as usize]).unwrap();
+    std::fs::write(&partial.data, vec![0xAA; size as usize]).unwrap();
 }
 
 #[tokio::test]
@@ -805,7 +962,7 @@ async fn a_stale_sidecar_for_a_changed_file_recovers_in_a_second_round() {
     let dir = tempfile::tempdir().unwrap();
     let data = blob(32768 * 3);
     // A sidecar from an older version of the file claims chunks 0 and 1.
-    write_sidecar(dir.path(), data.len() as u64, [7; 32], vec![0b011]);
+    write_sidecar(&h, dir.path(), data.len() as u64, [7; 32], vec![0b011]);
 
     let (call, req) = start_download(&mut h, dir.path(), None).await;
     assert_eq!(req.have_bitmap, vec![0b011], "resume is attempted");
@@ -835,28 +992,56 @@ async fn a_stale_sidecar_for_a_changed_file_recovers_in_a_second_round() {
     timeout(STEP, call).await.unwrap().unwrap().unwrap();
     assert_eq!(std::fs::read(dir.path().join("out.bin")).unwrap(), data);
     assert_eq!(files_in(dir.path()), vec!["out.bin".to_string()]);
+    assert!(h.partial_files().is_empty());
 }
 
+/// A sidecar is only trusted for the server, remote file and destination it
+/// records, even when found at this download's own path.
 #[tokio::test]
-async fn a_sidecar_from_another_server_is_ignored() {
+async fn a_sidecar_for_another_server_or_destination_is_ignored() {
     let mut h = Harness::new();
     let dir = tempfile::tempdir().unwrap();
     let local = dir.path().join("out.bin");
-    Sidecar {
-        server: "elsewhere.example:10700".into(),
+    let partial = h.partial(&local);
+    let mine = Sidecar {
+        server: "test.example:10700".into(),
         remote: "/files/out.bin".into(),
+        destination: local.clone(),
         transfer_id: [1; 16],
         size: 10,
         chunk_size: 32768,
         sha256: [0; 32],
         bitmap: vec![1],
+    };
+    let others = [
+        Sidecar {
+            server: "elsewhere.example:10700".into(),
+            ..mine.clone()
+        },
+        Sidecar {
+            remote: "/files/other.bin".into(),
+            ..mine.clone()
+        },
+        Sidecar {
+            destination: dir.path().join("elsewhere.bin"),
+            ..mine.clone()
+        },
+    ];
+    create_transfers_dir(&h.transfers).unwrap();
+    for other in others {
+        other.write(&partial.sidecar).unwrap();
+        std::fs::write(&partial.data, [0u8; 10]).unwrap();
+        let (call, req) = start_download(&mut h, dir.path(), None).await;
+        assert!(req.have_bitmap.is_empty(), "{other:?}");
+        assert_eq!(req.resume_id, [0; 16]);
+        h.error("not found").await;
+        assert!(timeout(STEP, call).await.unwrap().unwrap().is_err());
     }
-    .write(&local)
-    .unwrap();
-    std::fs::write(data_path_for(&local), [0u8; 10]).unwrap();
+    // The matching one is used.
+    mine.write(&partial.sidecar).unwrap();
     let (call, req) = start_download(&mut h, dir.path(), None).await;
-    assert!(req.have_bitmap.is_empty());
-    assert_eq!(req.resume_id, [0; 16]);
+    assert_eq!(req.have_bitmap, vec![1]);
+    assert_eq!(req.resume_id, [1; 16]);
     h.error("not found").await;
     assert!(timeout(STEP, call).await.unwrap().unwrap().is_err());
 }
@@ -878,6 +1063,7 @@ async fn a_whole_file_hash_mismatch_discards_the_partial_download() {
     let err = timeout(STEP, call).await.unwrap().unwrap().unwrap_err();
     assert!(err.to_string().contains("mismatch"), "{err:?}");
     assert!(files_in(dir.path()).is_empty(), "left {:?}", files_in(dir.path()));
+    assert!(h.partial_files().is_empty(), "left {:?}", h.partial_files());
 
     // The retry starts from scratch.
     let (_call, req) = start_download(&mut h, dir.path(), None).await;
@@ -888,6 +1074,7 @@ async fn a_whole_file_hash_mismatch_discards_the_partial_download() {
 async fn a_cancelled_download_keeps_resume_state_and_resumes() {
     let mut h = Harness::new();
     let dir = tempfile::tempdir().unwrap();
+    let local = dir.path().join("out.bin");
     let data = blob(32768 * 2);
     let (call, req) = start_download(&mut h, dir.path(), None).await;
     h.send(
@@ -900,8 +1087,9 @@ async fn a_cancelled_download_keeps_resume_state_and_resumes() {
     assert!(h.client.cancel_transfer().await.unwrap());
     let err = timeout(STEP, call).await.unwrap().unwrap().unwrap_err();
     assert!(err.to_string().contains("cancelled"), "{err:?}");
-    let sidecar = Sidecar::read(&dir.path().join("out.bin")).expect("resume state kept");
+    let sidecar = Sidecar::read(&h.partial(&local).sidecar).expect("resume state kept");
     assert_eq!(sidecar.bitmap, vec![0b01]);
+    assert!(files_in(dir.path()).is_empty(), "nothing at the destination");
     assert!(!h.client.cancel_transfer().await.unwrap());
     // The server is told the client abandoned the transfer.
     h.expect(PacketType::FileTransferEnd).await;
@@ -919,8 +1107,25 @@ async fn a_cancelled_download_keeps_resume_state_and_resumes() {
     h.send(PacketType::FileTransferData, chunk(12, 1, &data[32768..])).await;
     h.send(PacketType::FileTransferEnd, end(12, TRANSFER_VERIFIED)).await;
     timeout(STEP, call).await.unwrap().unwrap().unwrap();
-    assert_eq!(std::fs::read(dir.path().join("out.bin")).unwrap(), data);
+    assert_eq!(std::fs::read(&local).unwrap(), data);
     assert_eq!(files_in(dir.path()), vec!["out.bin".to_string()]);
+    assert!(h.partial_files().is_empty());
+}
+
+#[tokio::test]
+async fn downloads_without_a_data_directory_are_refused() {
+    let (client_io, _server_io) = tokio::io::duplex(1024);
+    let (cmd_tx, cmd_rx) = mpsc::channel(8);
+    let (ev_tx, _ev_rx) = mpsc::channel(8);
+    let actor = Actor::new(Framed::new(client_io, KdxCodec::default()), cmd_rx, ev_tx);
+    let client = actor.spawn(cmd_tx);
+    let dir = tempfile::tempdir().unwrap();
+    let err = timeout(STEP, client.download("/files/out.bin", dir.path().join("out.bin")))
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert!(matches!(err, ClientError::InvalidInput(_)), "{err:?}");
+    assert!(files_in(dir.path()).is_empty());
 }
 
 // ---- sending (CLIENT-12 / PROTO-1) -----------------------------------------

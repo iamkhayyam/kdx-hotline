@@ -2,6 +2,8 @@
 //! client-core `ClientHandle`, and a per-connection task forwards core events
 //! to the webview.
 
+#[cfg(test)]
+mod bundle_tests;
 mod commands;
 mod events;
 mod sanitize;
