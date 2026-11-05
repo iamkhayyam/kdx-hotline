@@ -1,6 +1,6 @@
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
-use super::wire::{expect_end, get_str, put_str};
+use super::wire::{expect_end, get_bool, get_str, list_capacity, put_count16, put_str};
 use crate::ProtocolError;
 
 /// Message-level flags carried in chat payloads (distinct from packet-level
@@ -180,8 +180,8 @@ impl ChatUserList {
     pub fn encode(&self) -> Bytes {
         let mut buf = BytesMut::new();
         put_str(&mut buf, &self.room);
-        buf.put_u16(self.users.len() as u16);
-        for user in &self.users {
+        let n = put_count16(&mut buf, self.users.len());
+        for user in &self.users[..n] {
             put_str(&mut buf, user);
         }
         buf.freeze()
@@ -193,7 +193,7 @@ impl ChatUserList {
             return Err(ProtocolError::MalformedPayload("ChatUserList"));
         }
         let count = payload.get_u16() as usize;
-        let mut users = Vec::with_capacity(count.min(1024));
+        let mut users = Vec::with_capacity(list_capacity(count, payload.remaining(), 2));
         for _ in 0..count {
             users.push(get_str(&mut payload, "ChatUserList")?);
         }
@@ -256,11 +256,11 @@ impl ChatRoomFlags {
     }
     pub fn decode(mut payload: &[u8]) -> Result<Self, ProtocolError> {
         let room = get_str(&mut payload, "ChatRoomFlags")?;
-        if payload.remaining() < 2 {
+        if payload.remaining() < 1 {
             return Err(ProtocolError::MalformedPayload("ChatRoomFlags"));
         }
         let min_class_join = payload.get_u8();
-        let interview_mode = payload.get_u8() != 0;
+        let interview_mode = get_bool(&mut payload, "ChatRoomFlags")?;
         expect_end(payload, "ChatRoomFlags")?;
         Ok(Self {
             room,
@@ -350,5 +350,28 @@ mod tests {
         assert_eq!(ChatRoomFlags::decode(&flags_off.encode()).unwrap(), flags_off);
         // Room string present but the two flag bytes are missing.
         assert!(ChatRoomFlags::decode(&[0, 1, 65]).is_err());
+        // interview_mode is a strict 0/1 boolean.
+        assert!(ChatRoomFlags::decode(&[0, 1, 65, 0, 2]).is_err());
+    }
+
+    #[test]
+    fn oversized_user_list_and_text_clamp_consistently() {
+        use crate::messages::wire::test_support::allow_oversize;
+
+        let list = ChatUserList {
+            room: "lobby".into(),
+            users: (0..70_000).map(|i| format!("u{i}")).collect(),
+        };
+        let back = ChatUserList::decode(&allow_oversize(|| list.encode())).unwrap();
+        assert_eq!(back.users[..], list.users[..u16::MAX as usize]);
+
+        let send = ChatSend {
+            room: "lobby".into(),
+            flags: 0,
+            text: "z".repeat(100_000),
+        };
+        let back = ChatSend::decode(&allow_oversize(|| send.encode())).unwrap();
+        assert_eq!(back.text.len(), u16::MAX as usize);
+        assert_eq!(back.room, "lobby");
     }
 }

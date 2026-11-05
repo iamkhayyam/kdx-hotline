@@ -1,6 +1,6 @@
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
-use super::wire::{expect_end, get_str, put_str};
+use super::wire::{expect_end, get_str, list_capacity, put_count16, put_count32, put_str};
 use crate::ProtocolError;
 
 /// Client → server: forcibly disconnect a user by username, optionally banning
@@ -235,8 +235,8 @@ impl HistoryListRequest {
 impl HistoryListResponse {
     pub fn encode(&self) -> Bytes {
         let mut buf = BytesMut::new();
-        buf.put_u32(self.entries.len() as u32);
-        for e in &self.entries {
+        let n = put_count32(&mut buf, self.entries.len());
+        for e in &self.entries[..n] {
             buf.put_u64(e.timestamp);
             put_str(&mut buf, &e.actor);
             put_str(&mut buf, &e.action);
@@ -249,7 +249,9 @@ impl HistoryListResponse {
             return Err(ProtocolError::MalformedPayload("HistoryListResponse"));
         }
         let count = payload.get_u32() as usize;
-        let mut entries = Vec::with_capacity(count.min(4096));
+        // Minimum entry: timestamp + three string prefixes.
+        let min_entry = 8 + 2 * 3;
+        let mut entries = Vec::with_capacity(list_capacity(count, payload.remaining(), min_entry));
         for _ in 0..count {
             if payload.remaining() < 8 {
                 return Err(ProtocolError::MalformedPayload("HistoryListResponse"));
@@ -325,8 +327,8 @@ impl IpRuleListRequest {
 impl IpRuleListResponse {
     pub fn encode(&self) -> Bytes {
         let mut buf = BytesMut::new();
-        buf.put_u32(self.rules.len() as u32);
-        for r in &self.rules {
+        let n = put_count32(&mut buf, self.rules.len());
+        for r in &self.rules[..n] {
             put_str(&mut buf, &r.id);
             buf.put_i32(r.position);
             put_str(&mut buf, &r.action);
@@ -342,7 +344,9 @@ impl IpRuleListResponse {
             return Err(ProtocolError::MalformedPayload("IpRuleListResponse"));
         }
         let count = payload.get_u32() as usize;
-        let mut rules = Vec::with_capacity(count.min(4096));
+        // Minimum entry: five string prefixes + position + created_at.
+        let min_entry = 2 * 5 + 4 + 8;
+        let mut rules = Vec::with_capacity(list_capacity(count, payload.remaining(), min_entry));
         for _ in 0..count {
             let id = get_str(&mut payload, "IpRuleListResponse")?;
             if payload.remaining() < 4 {
@@ -436,8 +440,8 @@ impl ConnectionListRequest {
 impl ConnectionListResponse {
     pub fn encode(&self) -> Bytes {
         let mut buf = BytesMut::new();
-        buf.put_u16(self.connections.len() as u16);
-        for e in &self.connections {
+        let n = put_count16(&mut buf, self.connections.len());
+        for e in &self.connections[..n] {
             put_str(&mut buf, &e.username);
             buf.put_u8(e.class);
             buf.put_u64(e.login_at);
@@ -453,7 +457,9 @@ impl ConnectionListResponse {
             return Err(ProtocolError::MalformedPayload("ConnectionListResponse"));
         }
         let count = payload.get_u16() as usize;
-        let mut connections = Vec::with_capacity(count.min(1024));
+        let min_entry = super::presence::MIN_ENTRY_LEN;
+        let mut connections =
+            Vec::with_capacity(list_capacity(count, payload.remaining(), min_entry));
         for _ in 0..count {
             let username = get_str(&mut payload, "ConnectionListResponse")?;
             if payload.remaining() < 1 + 8 + 4 {
@@ -580,6 +586,87 @@ mod tests {
 
         assert!(HistoryListRequest::decode(&[0]).is_err());
         assert!(HistoryListResponse::decode(&[0, 0]).is_err());
+    }
+
+    #[test]
+    fn oversized_history_detail_cannot_forge_entries() {
+        use crate::messages::wire::test_support::allow_oversize;
+
+        // PROTO-8: a detail longer than 65,535 bytes used to wrap its u16
+        // length prefix, so the rest of the detail was parsed as further
+        // HistoryEntry records. Build a detail that, under the old wrapping
+        // encoder, decodes as a forged "password_changed" entry whose own
+        // detail swallows the real remaining entries.
+        let tail = HistoryEntry {
+            timestamp: 3,
+            actor: String::new(),
+            action: "server_started".into(),
+            detail: String::new(),
+        };
+        let tail_len = HistoryListResponse {
+            entries: vec![tail.clone()],
+        }
+        .encode()
+        .len()
+            - 4;
+        let wrap = 20; // the wrapped prefix will claim 20 bytes
+        let total = 0x1_0000 + wrap;
+        // The forged entry's detail prefix must itself be valid UTF-8 inside
+        // the real detail string, so make it 0xC3A9 ("é") and pad the forged
+        // action until that is exactly the number of bytes left to swallow.
+        let swallow = 0xC3A9;
+        let actor = "sysop";
+        let header_len = 8 + 2 + actor.len() + 2 + 2; // + action bytes
+        let action_len = total - wrap + tail_len - swallow - header_len;
+        let action = format!("{:<action_len$}", "password_changed");
+        let mut forged = BytesMut::new();
+        forged.put_u64(1);
+        put_str(&mut forged, actor);
+        put_str(&mut forged, &action);
+        forged.put_u16(swallow as u16);
+        let mut detail = "A".repeat(wrap);
+        detail.push_str(std::str::from_utf8(&forged).unwrap());
+        let pad = total - detail.len();
+        if pad % 2 == 1 {
+            detail.push('A');
+        }
+        // Multi-byte padding, so the clamp has to back off to a boundary.
+        detail.push_str(&"é".repeat(pad / 2));
+        assert_eq!(detail.len(), total);
+
+        let real = HistoryEntry {
+            timestamp: 2,
+            actor: "mod".into(),
+            action: "kicked".into(),
+            detail,
+        };
+        let resp = HistoryListResponse {
+            entries: vec![real.clone(), tail.clone()],
+        };
+
+        // What the old `len as u16` encoder produced: the forgery works.
+        let mut wrapped = BytesMut::new();
+        wrapped.put_u32(2);
+        wrapped.put_u64(real.timestamp);
+        put_str(&mut wrapped, &real.actor);
+        put_str(&mut wrapped, &real.action);
+        wrapped.put_u16(real.detail.len() as u16);
+        wrapped.put_slice(real.detail.as_bytes());
+        wrapped.put_slice(&HistoryListResponse { entries: vec![tail.clone()] }.encode()[4..]);
+        let forged_view = HistoryListResponse::decode(&wrapped).unwrap();
+        assert_eq!(forged_view.entries.len(), 2);
+        assert_eq!(forged_view.entries[1].actor, "sysop");
+        assert_eq!(forged_view.entries[1].action.trim_end(), "password_changed");
+
+        // The clamping encoder: same two records, first detail truncated.
+        let enc = allow_oversize(|| resp.encode());
+        let back = HistoryListResponse::decode(&enc).unwrap();
+        assert_eq!(back.entries.len(), 2, "no extra records");
+        assert_eq!(back.entries[1], tail);
+        let clamped = &back.entries[0].detail;
+        assert_eq!(clamped.len(), u16::MAX as usize - 1, "backed off mid-char");
+        assert!(real.detail.starts_with(clamped.as_str()));
+        assert_eq!(back.encode(), enc);
     }
 
     #[test]

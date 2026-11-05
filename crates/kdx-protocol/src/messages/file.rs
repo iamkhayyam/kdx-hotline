@@ -1,6 +1,9 @@
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
-use super::wire::{expect_end, get_str, put_str};
+use super::wire::{
+    expect_end, get_bool, get_bytes16, get_str, list_capacity, put_bytes16, put_count16,
+    put_count32, put_str,
+};
 use crate::ProtocolError;
 
 /// Node kinds on the wire (mirror kdx-storage's kind column).
@@ -116,31 +119,37 @@ impl FileInfoResponse {
     }
 
     pub fn decode(mut payload: &[u8]) -> Result<Self, ProtocolError> {
-        let name = get_str(&mut payload, "FileInfoResponse")?;
-        // Minimum: kind + size + sha-presence + 2 classes + owner-presence.
-        // sha256 and owner are optional, so the fixed tail is small.
-        if payload.remaining() < 1 + 8 + 1 + 1 + 1 + 1 {
-            return Err(ProtocolError::MalformedPayload("FileInfoResponse"));
+        const CTX: &str = "FileInfoResponse";
+        let name = get_str(&mut payload, CTX)?;
+        // Every fixed-width read is bounds-checked right before it: the
+        // optional sha256 makes the tail's length depend on a flag byte, so a
+        // single up-front length check cannot cover it.
+        if payload.remaining() < 1 + 8 {
+            return Err(ProtocolError::MalformedPayload(CTX));
         }
         let kind = payload.get_u8();
         let size = payload.get_u64();
-        let has_sha = payload.get_u8();
-        let sha256 = if has_sha == 1 {
+        let sha256 = if get_bool(&mut payload, CTX)? {
+            if payload.remaining() < 32 {
+                return Err(ProtocolError::MalformedPayload(CTX));
+            }
             let mut h = [0u8; 32];
             payload.copy_to_slice(&mut h);
             Some(h)
         } else {
             None
         };
+        if payload.remaining() < 2 {
+            return Err(ProtocolError::MalformedPayload(CTX));
+        }
         let min_read_class = payload.get_u8();
         let min_write_class = payload.get_u8();
-        let has_owner = payload.get_u8();
-        let owner = if has_owner == 1 {
-            Some(get_str(&mut payload, "FileInfoResponse")?)
+        let owner = if get_bool(&mut payload, CTX)? {
+            Some(get_str(&mut payload, CTX)?)
         } else {
             None
         };
-        expect_end(payload, "FileInfoResponse")?;
+        expect_end(payload, CTX)?;
         Ok(Self {
             name,
             kind,
@@ -288,8 +297,8 @@ impl FileListResponse {
     pub fn encode(&self) -> Bytes {
         let mut buf = BytesMut::new();
         put_str(&mut buf, &self.path);
-        buf.put_u16(self.entries.len() as u16);
-        for entry in &self.entries {
+        let n = put_count16(&mut buf, self.entries.len());
+        for entry in &self.entries[..n] {
             put_str(&mut buf, &entry.name);
             buf.put_u8(entry.kind);
             buf.put_u64(entry.size);
@@ -303,7 +312,8 @@ impl FileListResponse {
             return Err(ProtocolError::MalformedPayload("FileListResponse"));
         }
         let count = payload.get_u16() as usize;
-        let mut entries = Vec::with_capacity(count.min(1024));
+        // Minimum entry: name prefix + kind + size.
+        let mut entries = Vec::with_capacity(list_capacity(count, payload.remaining(), 2 + 1 + 8));
         for _ in 0..count {
             let name = get_str(&mut payload, "FileListResponse")?;
             if payload.remaining() < 9 {
@@ -340,14 +350,13 @@ impl FileCreateFolder {
     pub fn decode(mut payload: &[u8]) -> Result<Self, ProtocolError> {
         let path = get_str(&mut payload, "FileCreateFolder")?;
         let name = get_str(&mut payload, "FileCreateFolder")?;
-        if payload.remaining() < 4 {
+        if payload.remaining() < 3 {
             return Err(ProtocolError::MalformedPayload("FileCreateFolder"));
         }
         let kind = payload.get_u8();
         let min_read_class = payload.get_u8();
         let min_write_class = payload.get_u8();
-        let has_owner = payload.get_u8();
-        let owner = if has_owner == 1 {
+        let owner = if get_bool(&mut payload, "FileCreateFolder")? {
             Some(get_str(&mut payload, "FileCreateFolder")?)
         } else {
             None
@@ -420,8 +429,8 @@ impl FileSearchRequest {
 impl FileSearchResponse {
     pub fn encode(&self) -> Bytes {
         let mut buf = BytesMut::new();
-        buf.put_u32(self.entries.len() as u32);
-        for e in &self.entries {
+        let n = put_count32(&mut buf, self.entries.len());
+        for e in &self.entries[..n] {
             put_str(&mut buf, &e.path);
             put_str(&mut buf, &e.name);
             buf.put_u8(e.kind);
@@ -434,7 +443,9 @@ impl FileSearchResponse {
             return Err(ProtocolError::MalformedPayload("FileSearchResponse"));
         }
         let count = payload.get_u32() as usize;
-        let mut entries = Vec::with_capacity(count.min(4096));
+        // Minimum entry: path prefix + name prefix + kind + size.
+        let min_entry = 2 + 2 + 1 + 8;
+        let mut entries = Vec::with_capacity(list_capacity(count, payload.remaining(), min_entry));
         for _ in 0..count {
             let path = get_str(&mut payload, "FileSearchResponse")?;
             let name = get_str(&mut payload, "FileSearchResponse")?;
@@ -490,8 +501,7 @@ impl TransferRequest {
         buf.put_u32(self.chunk_size);
         buf.put_slice(&self.sha256);
         buf.put_slice(&self.resume_id);
-        buf.put_u16(self.have_bitmap.len() as u16);
-        buf.put_slice(&self.have_bitmap);
+        put_bytes16(&mut buf, &self.have_bitmap);
         buf.freeze()
     }
 
@@ -500,9 +510,12 @@ impl TransferRequest {
             return Err(ProtocolError::MalformedPayload("TransferRequest"));
         }
         let direction = payload.get_u8();
+        if direction != DIRECTION_UPLOAD && direction != DIRECTION_DOWNLOAD {
+            return Err(ProtocolError::MalformedPayload("TransferRequest"));
+        }
         let path = get_str(&mut payload, "TransferRequest")?;
         let name = get_str(&mut payload, "TransferRequest")?;
-        if payload.remaining() < 8 + 4 + 32 + 16 + 2 {
+        if payload.remaining() < 8 + 4 + 32 + 16 {
             return Err(ProtocolError::MalformedPayload("TransferRequest"));
         }
         let size = payload.get_u64();
@@ -511,10 +524,8 @@ impl TransferRequest {
         payload.copy_to_slice(&mut sha256);
         let mut resume_id = [0u8; 16];
         payload.copy_to_slice(&mut resume_id);
-        let bitmap_len = payload.get_u16() as usize;
-        if payload.remaining() != bitmap_len {
-            return Err(ProtocolError::MalformedPayload("TransferRequest"));
-        }
+        let have_bitmap = get_bytes16(&mut payload, "TransferRequest")?;
+        expect_end(payload, "TransferRequest")?;
         Ok(Self {
             direction,
             path,
@@ -523,7 +534,7 @@ impl TransferRequest {
             chunk_size,
             sha256,
             resume_id,
-            have_bitmap: payload[..bitmap_len].to_vec(),
+            have_bitmap,
         })
     }
 }
@@ -536,13 +547,12 @@ impl TransferAccept {
         buf.put_u32(self.total_chunks);
         buf.put_u64(self.size);
         buf.put_slice(&self.sha256);
-        buf.put_u16(self.have_bitmap.len() as u16);
-        buf.put_slice(&self.have_bitmap);
+        put_bytes16(&mut buf, &self.have_bitmap);
         buf.freeze()
     }
 
     pub fn decode(mut payload: &[u8]) -> Result<Self, ProtocolError> {
-        if payload.remaining() < 16 + 4 + 4 + 8 + 32 + 2 {
+        if payload.remaining() < 16 + 4 + 4 + 8 + 32 {
             return Err(ProtocolError::MalformedPayload("TransferAccept"));
         }
         let mut transfer_id = [0u8; 16];
@@ -552,17 +562,15 @@ impl TransferAccept {
         let size = payload.get_u64();
         let mut sha256 = [0u8; 32];
         payload.copy_to_slice(&mut sha256);
-        let bitmap_len = payload.get_u16() as usize;
-        if payload.remaining() != bitmap_len {
-            return Err(ProtocolError::MalformedPayload("TransferAccept"));
-        }
+        let have_bitmap = get_bytes16(&mut payload, "TransferAccept")?;
+        expect_end(payload, "TransferAccept")?;
         Ok(Self {
             transfer_id,
             chunk_size,
             total_chunks,
             size,
             sha256,
-            have_bitmap: payload[..bitmap_len].to_vec(),
+            have_bitmap,
         })
     }
 }
@@ -802,6 +810,136 @@ mod tests {
         };
         assert_eq!(FileMove::decode(&mv.encode()).unwrap(), mv);
         assert!(FileMove::decode(&[0, 1, 65]).is_err());
+    }
+
+    #[test]
+    fn file_info_response_short_sha_is_an_error_not_a_panic() {
+        // PROTO-3 / FILES-12: name "", kind 0, size 0, has_sha = 1, then only
+        // three bytes. Used to pass the length guard and panic in
+        // `copy_to_slice`, killing the client actor.
+        let payload = [0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0];
+        assert!(matches!(
+            FileInfoResponse::decode(&payload),
+            Err(ProtocolError::MalformedPayload("FileInfoResponse"))
+        ));
+        // Every truncation of a valid sha-carrying encoding is rejected too.
+        let full = FileInfoResponse {
+            name: "a".into(),
+            kind: KIND_FILE,
+            size: 1,
+            sha256: Some([1u8; 32]),
+            min_read_class: 0,
+            min_write_class: 0,
+            owner: Some("o".into()),
+        }
+        .encode();
+        for len in 0..full.len() {
+            assert!(FileInfoResponse::decode(&full[..len]).is_err(), "prefix {len}");
+        }
+    }
+
+    #[test]
+    fn rejects_non_canonical_flags_and_direction() {
+        let info = FileInfoResponse {
+            name: "a".into(),
+            kind: KIND_DIR,
+            size: 0,
+            sha256: None,
+            min_read_class: 0,
+            min_write_class: 0,
+            owner: None,
+        };
+        let enc = info.encode().to_vec();
+        // Layout: name(2+1) kind(1) size(8) has_sha(1) classes(2) has_owner(1).
+        let has_sha_at = 3 + 1 + 8;
+        let has_owner_at = has_sha_at + 1 + 2;
+        assert_eq!(FileInfoResponse::decode(&enc).unwrap(), info);
+        for bad in [2u8, 0x80, 0xFF] {
+            let mut b = enc.clone();
+            b[has_sha_at] = bad;
+            assert!(FileInfoResponse::decode(&b).is_err(), "has_sha={bad}");
+            let mut b = enc.clone();
+            b[has_owner_at] = bad;
+            assert!(FileInfoResponse::decode(&b).is_err(), "has_owner={bad}");
+        }
+
+        let mk = FileCreateFolder {
+            path: "/".into(),
+            name: "d".into(),
+            kind: KIND_DIR,
+            min_read_class: 0,
+            min_write_class: 0,
+            owner: None,
+        };
+        let mut b = mk.encode().to_vec();
+        *b.last_mut().unwrap() = 2; // has_owner
+        assert!(FileCreateFolder::decode(&b).is_err());
+
+        let req = TransferRequest {
+            direction: DIRECTION_DOWNLOAD,
+            path: "/pub".into(),
+            name: "f".into(),
+            size: 0,
+            chunk_size: 32 * 1024,
+            sha256: [0u8; 32],
+            resume_id: [0u8; 16],
+            have_bitmap: vec![],
+        };
+        let mut b = req.encode().to_vec();
+        for bad in [2u8, 7, 0xFF] {
+            b[0] = bad;
+            assert!(TransferRequest::decode(&b).is_err(), "direction={bad}");
+        }
+    }
+
+    #[test]
+    fn oversized_lists_and_bitmaps_clamp_consistently() {
+        use crate::messages::wire::test_support::allow_oversize;
+
+        // PROTO-8: 70,000 entries no longer wrap the u16 count to 4,464 and
+        // leave the rest to be misparsed; exactly 65,535 are written and read.
+        let list = FileListResponse {
+            path: "/big".into(),
+            entries: (0..70_000u64)
+                .map(|i| FileEntry {
+                    name: format!("f{i}"),
+                    kind: KIND_FILE,
+                    size: i,
+                })
+                .collect(),
+        };
+        let enc = allow_oversize(|| list.encode());
+        let back = FileListResponse::decode(&enc).unwrap();
+        assert_eq!(back.entries.len(), u16::MAX as usize);
+        assert_eq!(back.entries[..], list.entries[..u16::MAX as usize]);
+        assert_eq!(back.encode(), enc, "re-encoding is byte-identical");
+
+        let accept = TransferAccept {
+            transfer_id: [1u8; 16],
+            chunk_size: 4096,
+            total_chunks: 560_000,
+            size: 0,
+            sha256: [2u8; 32],
+            have_bitmap: (0..70_000u32).map(|i| i as u8).collect(),
+        };
+        let back = TransferAccept::decode(&allow_oversize(|| accept.encode())).unwrap();
+        assert_eq!(back.have_bitmap[..], accept.have_bitmap[..u16::MAX as usize]);
+        assert_eq!(back.sha256, accept.sha256);
+
+        let req = TransferRequest {
+            direction: DIRECTION_DOWNLOAD,
+            path: "/pub".into(),
+            name: "x".repeat(70_000),
+            size: 0,
+            chunk_size: 4096,
+            sha256: [0u8; 32],
+            resume_id: [3u8; 16],
+            have_bitmap: vec![0xFF; 70_000],
+        };
+        let back = TransferRequest::decode(&allow_oversize(|| req.encode())).unwrap();
+        assert_eq!(back.name.len(), u16::MAX as usize);
+        assert_eq!(back.have_bitmap.len(), u16::MAX as usize);
+        assert_eq!(back.resume_id, req.resume_id);
     }
 
     #[test]
