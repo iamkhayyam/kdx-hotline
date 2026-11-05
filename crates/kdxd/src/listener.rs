@@ -76,9 +76,6 @@ const DENY_LOG_POLL: Duration = Duration::from_secs(30);
 /// Longest rule note copied into an `ip_denied` row.
 const DENY_LOG_NOTE_LEN: usize = 200;
 
-/// How often expired login sessions are swept from the `AuthManager`.
-const SESSION_SWEEP_EVERY: Duration = Duration::from_secs(60);
-
 /// A running server: its bound address, shared context, and the accept-loop
 /// task handle.
 pub struct Server {
@@ -195,7 +192,10 @@ pub async fn serve(config: Config) -> Result<Server, ServeError> {
         Some(host) => spawn_self_registration(&ctx, host.clone(), local_addr.port()),
         None => info!("public_host not set; not listing this server in its tracker directory"),
     }
-    spawn_session_sweeper(&ctx);
+    // No session sweeper: a login session lives exactly as long as its
+    // connection (the connection's guards end it on every path, and it
+    // enforces `session_ttl_secs` as an idle timeout), so `max_users` keeps
+    // counting long-lived connections.
     let denials = DenyLog::spawn_writer(&ctx);
     let limits = Arc::new(ConnLimits::new(
         config.max_connections,
@@ -329,22 +329,6 @@ fn spawn_self_registration(ctx: &Arc<ServerCtx>, host: String, port: u16) {
                 description: snap.description,
             };
             ctx.tracker.heartbeat(entry).await;
-        }
-    });
-}
-
-/// Sweep expired login sessions out of the `AuthManager` periodically;
-/// nothing else removes a session whose connection died before cleanup.
-/// Holds only a weak reference, so the task ends with the server.
-fn spawn_session_sweeper(ctx: &Arc<ServerCtx>) {
-    let ctx = Arc::downgrade(ctx);
-    tokio::spawn(async move {
-        let mut tick = tokio::time::interval(SESSION_SWEEP_EVERY);
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        loop {
-            tick.tick().await;
-            let Some(ctx) = ctx.upgrade() else { break };
-            ctx.auth.sweep();
         }
     });
 }

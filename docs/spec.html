@@ -429,7 +429,7 @@
         <li>Fragments share <strong>consecutive sequence numbers</strong>, consumed from the connection's monotonic counter.</li>
         <li>The connection is TCP/TLS (ordered delivery), so only <strong>one fragment group can be open at a time</strong>. An unfragmented frame or a new group while one is open is a connection-fatal protocol error.</li>
         <li>Out-of-order fragments (<code>FragmentOutOfOrder</code>) and interleaved unfragmented frames (<code>FragmentInterleaved</code>) are connection-fatal.</li>
-        <li>A configurable <code>max_total</code> cap bounds reassembled payload size. Exceeding it is connection-fatal (<code>ReassemblyTooLarge</code>).</li>
+        <li>A configurable <code>max_total</code> cap bounds reassembled payload size (<code>ReassemblyTooLarge</code>). The server does not buffer past it: it skips the rest of that group (which must still arrive in order) and answers the whole message with one <code>Error</code>, so the session survives.</li>
         <li>The reassembler can be <code>abort()</code>-ed on timeout, leaving the connection ready to accept a fresh packet.</li>
       </ul>
 

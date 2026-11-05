@@ -177,7 +177,22 @@ pub struct Connection<S> {
     /// This connection's TLS exporter value (`kdx_crypto::TLS_EXPORTER_LABEL`)
     /// that login proofs are bound to. All zeros for streams without TLS.
     channel_binding: [u8; kdx_crypto::CHANNEL_BINDING_LEN],
+    #[cfg(test)]
+    hooks: TestHooks,
 }
+
+/// Fault and timing injection for this module's tests.
+#[cfg(test)]
+#[derive(Default)]
+struct TestHooks {
+    /// Hold every upload's `finish` until this is notified.
+    finish_gate: Option<Arc<Notify>>,
+    /// Fail the upload chunk with this index as a disk error would.
+    fail_chunk: Option<u32>,
+}
+
+/// Disconnect reason for a session whose address the IP rules deny.
+const ADDRESS_DENIED: &str = "your address is no longer allowed on this server";
 
 impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
     pub fn new(stream: S, ctx: Arc<ServerCtx>) -> Self {
@@ -196,6 +211,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
             next_sequence: 0,
             peer_addr,
             channel_binding: [0u8; kdx_crypto::CHANNEL_BINDING_LEN],
+            #[cfg(test)]
+            hooks: TestHooks::default(),
         }
     }
 
@@ -356,20 +373,21 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                     match self.ctx.auth.complete(pending, &response.response).await {
                         Ok(verified) => {
                             let session = verified.session;
-                            if self.server_is_full_for(&session).await {
+                            // Register the session now (unless the server is
+                            // full), but keep it only once the result (and
+                            // greeting) actually went out: on a send error or
+                            // the auth timeout the guard unregisters it, so
+                            // nothing leaks.
+                            let cap = self.user_cap_for(&session).await;
+                            let ctx = self.ctx.clone();
+                            let Some(registration) = ctx.auth.admit(&session, cap) else {
                                 failures += 1;
                                 self.send_auth_failure("server is full".into()).await?;
                                 if failures >= MAX_AUTH_ATTEMPTS {
                                     return Err(ConnectionError::TooManyAuthAttempts);
                                 }
                                 continue;
-                            }
-                            // Register the session now, but keep it only once
-                            // the result (and greeting) actually went out: on
-                            // a send error or the auth timeout the guard
-                            // unregisters it, so nothing leaks.
-                            let ctx = self.ctx.clone();
-                            let registration = ctx.auth.activate(&session);
+                            };
                             let result = AuthResult {
                                 success: true,
                                 session_id: *session.id.as_bytes(),
@@ -420,15 +438,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                         Err(crate::auth::AuthError::Banned { until, reason }) => {
                             failures += 1;
                             self.ctx.login_limiter.record_failure(peer_ip, &username);
+                            let message = ban_message(until, &reason);
                             let reason = crate::limits::truncate_utf8(
                                 &reason,
                                 crate::limits::MAX_REASON_LEN,
                             );
-                            let message = if reason.is_empty() {
-                                format!("banned until {until}")
-                            } else {
-                                format!("banned until {until}: {reason}")
-                            };
                             self.record_history(
                                 Some(username.clone()),
                                 "login_banned",
@@ -469,14 +483,51 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
         .await
     }
 
-    /// `max_users` (0 = unlimited) caps registered sessions. Accounts with
-    /// SERVER_ADMIN may always log in, so an operator can't be locked out
-    /// of a full server.
-    async fn server_is_full_for(&self, session: &Session) -> bool {
+    /// The `max_users` cap on registered sessions that applies to
+    /// `session`'s login (`None` = no cap). 0 means unlimited, and accounts
+    /// with SERVER_ADMIN may always log in, so an operator can't be locked
+    /// out of a full server.
+    async fn user_cap_for(&self, session: &Session) -> Option<usize> {
         let max_users = self.ctx.settings.snapshot().await.max_users as usize;
-        max_users != 0
-            && !session.privileges.contains(Privileges::SERVER_ADMIN)
-            && self.ctx.auth.live_session_count() >= max_users
+        (max_users != 0 && !session.privileges.contains(Privileges::SERVER_ADMIN))
+            .then_some(max_users)
+    }
+
+    /// Why a session that has just joined presence must not go on, if
+    /// anything changed while its login was in flight. A login can sit
+    /// between challenge and proof for up to `AUTH_TIMEOUT`, and demotion
+    /// kicks, bans and IP-rule enforcement only reach presence entries.
+    /// Every such change is written to the database before its kick is
+    /// sent, and `presence.join` returns only once we're in the roster, so
+    /// this re-read sees every change whose kick missed us; any later kick
+    /// reaches our kill signal. Fails closed.
+    async fn stale_login_reason(&self, session: &Session) -> Option<String> {
+        const RECHECK_FAILED: &str = "internal server error; please reconnect";
+        match self.ctx.roles.account_state(&session.username).await {
+            Ok(Some(stored))
+                if stored.account_id == session.account_id
+                    && stored.class == session.class
+                    && stored.effective() == session.privileges => {}
+            Ok(_) => return Some(policy::PRIVILEGES_CHANGED.to_string()),
+            Err(e) => {
+                warn!(error = %e, "could not re-check a new session's account");
+                return Some(RECHECK_FAILED.to_string());
+            }
+        }
+        match self.ctx.auth.active_ban(&session.account_id).await {
+            Ok(None) => {}
+            Ok(Some((until, reason))) => return Some(ban_message(until, &reason)),
+            Err(e) => {
+                warn!(error = %e, "could not re-check a new session's bans");
+                return Some(RECHECK_FAILED.to_string());
+            }
+        }
+        if let Some(ip) = crate::ip_rules::parse_peer_ip(&self.peer_addr) {
+            if let crate::ip_rules::Verdict::Deny { .. } = self.ctx.ip_rules.match_ip(ip).await {
+                return Some(ADDRESS_DENIED.to_string());
+            }
+        }
+        None
     }
 
     /// The peer's IP, for the login limiter. Streams without a network peer
@@ -520,6 +571,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                 outbound_tx.clone(),
             )
             .await;
+        if let Some(reason) = self.stale_login_reason(&session).await {
+            debug!(user = %session.username, %reason, "login went stale while in flight");
+            self.farewell(&mut outbound_rx, Some(reason)).await;
+            guard.cleanup().await;
+            return Ok(());
+        }
 
         let result = self
             .dispatch_inner(&mut guard.joined, &outbound_tx, &mut outbound_rx, &mut kill)
@@ -540,9 +597,17 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
         outbound_rx: &mut mpsc::Receiver<Outbound>,
         kill: &mut KillSignal,
     ) -> Result<(), ConnectionError> {
-        // One upload at a time per connection; the chunk stream is inherently
-        // serialized on the socket anyway.
+        // One upload at a time per connection, in one of three places: in
+        // `upload` between chunks; in `chunk_write` while a chunk is being
+        // throttled and stored; in `finishing` once every chunk is in and it
+        // is being verified and filed. The slow parts run as select branches
+        // (or a task) so Pings, kicks and events keep flowing meanwhile.
         let mut upload: Option<ActiveUpload> = None;
+        let mut chunk_write: Option<ChunkWrite> = None;
+        let mut finishing: Option<Finishing> = None;
+        // The last upload the server ended. Chunks (and a cancel) the client
+        // still had in flight for it are dropped without an `Error`.
+        let mut ended_upload: Option<[u8; 16]> = None;
         // The download being streamed, pumped one chunk per loop turn below
         // the kill and event branches, so a kick never waits on it.
         let mut download: Option<DownloadPump> = None;
@@ -554,6 +619,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
         // Fixed when a fragment group opens, so neither trickled fragments
         // nor outbound traffic can extend it.
         let mut reassembly_deadline: Option<tokio::time::Instant> = None;
+        // The rest of an oversized fragment group, being skipped.
+        let mut skipping: Option<Skipping> = None;
 
         enum Next {
             Killed(Option<String>),
@@ -561,10 +628,18 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
             Frame(Option<Result<KdxFrame, ProtocolError>>),
             ReassemblyTimedOut,
             IdleTimedOut,
+            ChunkWritten(Box<Written>),
+            Finished([u8; 16], Result<(), TransferError>),
             Download(Box<Pulled>),
         }
 
         loop {
+            // While a chunk is being settled the client's next frames wait in
+            // the socket: their answers must follow the chunk's `Error`, if
+            // any (the client pairs them up by order). Idleness is judged
+            // only while frames are being read, and a frame that is already
+            // waiting beats the idle deadline (it is polled first).
+            let reading = chunk_write.is_none();
             let next = {
                 // Over its inbound budget, the peer is simply read more
                 // slowly; kills and events keep flowing meanwhile.
@@ -576,13 +651,17 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                     // Senders never all drop while we hold outbound_tx.
                     event = outbound_rx.recv() => Next::Event(event.expect("outbound channel open")),
                     _ = sleep_until_opt(reassembly_deadline) => Next::ReassemblyTimedOut,
-                    _ = tokio::time::sleep_until(idle_deadline) => Next::IdleTimedOut,
+                    written = next_written(&mut chunk_write) => Next::ChunkWritten(Box::new(written)),
                     next = async {
                         if let Some(at) = throttled_until {
                             tokio::time::sleep_until(at).await;
                         }
                         framed.next().await
-                    } => Next::Frame(next),
+                    }, if reading => Next::Frame(next),
+                    _ = tokio::time::sleep_until(idle_deadline), if reading => Next::IdleTimedOut,
+                    (transfer_id, result) = next_finished(&mut finishing) => {
+                        Next::Finished(transfer_id, result)
+                    }
                     pulled = next_download(&mut download) => Next::Download(Box::new(pulled)),
                 }
             };
@@ -625,9 +704,84 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                     self.farewell(outbound_rx, Some("idle timeout".into())).await;
                     break Err(ConnectionError::IdleTimeout);
                 }
+                Next::ChunkWritten(written) => {
+                    chunk_write = None;
+                    let (active, result) = *written;
+                    match result {
+                        Ok(false) => upload = Some(active), // more chunks to come
+                        Ok(true) => finishing = Some(self.start_finish(active)),
+                        // Recoverable per-chunk problems: report, let the
+                        // client resend.
+                        Err(
+                            e @ (TransferError::ChunkHashMismatch
+                            | TransferError::BadChunkIndex
+                            | TransferError::BadChunkLength),
+                        ) => {
+                            upload = Some(active);
+                            self.send_error(&e.to_string()).await?;
+                        }
+                        // A server-side failure (disk, database): end this
+                        // attempt but keep the upload resumable.
+                        Err(e) => {
+                            warn!(error = %e, "upload chunk could not be stored");
+                            let transfer_id = *active.id().as_bytes();
+                            self.ctx.transfers.release(active).await;
+                            ended_upload = Some(transfer_id);
+                            let end = TransferEnd {
+                                transfer_id,
+                                status: kdx_protocol::messages::TRANSFER_ABORTED,
+                                message: "upload interrupted by a server error; resume later"
+                                    .into(),
+                            };
+                            self.send(
+                                PacketType::FileTransferEnd,
+                                PacketFlags::TRANSFER_END,
+                                end.encode(),
+                            )
+                            .await?;
+                        }
+                    }
+                    continue;
+                }
+                Next::Finished(transfer_id, result) => {
+                    finishing = None;
+                    ended_upload = Some(transfer_id);
+                    let (status, message) = upload_outcome(result);
+                    let end = TransferEnd {
+                        transfer_id,
+                        status,
+                        message,
+                    };
+                    self.send(
+                        PacketType::FileTransferEnd,
+                        PacketFlags::TRANSFER_END,
+                        end.encode(),
+                    )
+                    .await?;
+                    continue;
+                }
                 Next::Download(pulled) => {
                     let (stream, chunk) = *pulled;
-                    self.pump_download(&mut download, stream, chunk?).await?;
+                    match chunk {
+                        Ok(chunk) => self.pump_download(&mut download, stream, chunk).await?,
+                        // A read failure (I/O error, a blob shorter than
+                        // recorded) ends this download, not the session.
+                        Err(e) => {
+                            warn!(error = %e, "download aborted");
+                            download = None;
+                            let end = TransferEnd {
+                                transfer_id: *stream.id().as_bytes(),
+                                status: kdx_protocol::messages::TRANSFER_ABORTED,
+                                message: format!("download failed: {}", e.client_message()),
+                            };
+                            self.send(
+                                PacketType::FileTransferEnd,
+                                PacketFlags::TRANSFER_END,
+                                end.encode(),
+                            )
+                            .await?;
+                        }
+                    }
                     continue;
                 }
                 Next::Frame(item) => item,
@@ -653,15 +807,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                 rate.inbound.allow();
             }
 
-            let cap = reassembly_cap(frame.header.packet_type);
-            let pushed = self.reassembler.push(frame, cap)?;
-            if !self.reassembler.is_reassembling() {
+            let pushed = self.reassemble(frame, &mut skipping).await?;
+            if !self.reassembler.is_reassembling() && skipping.is_none() {
                 reassembly_deadline = None;
             } else if reassembly_deadline.is_none() {
                 reassembly_deadline = Some(tokio::time::Instant::now() + REASSEMBLY_TIMEOUT);
             }
             let Some(frame) = pushed else {
-                continue; // mid-group fragment
+                continue; // mid-group fragment, or a refused oversized message
             };
 
             match frame.header.packet_type {
@@ -1263,7 +1416,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                         self.send_error("missing FILE_UPLOAD privilege").await?;
                         continue;
                     }
-                    if upload.is_some() {
+                    // (`chunk_write` is always empty while frames are read.)
+                    if upload.is_some() || finishing.is_some() {
                         self.send_error("a transfer is already active").await?;
                         continue;
                     }
@@ -1298,7 +1452,6 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                         .await;
                     match result {
                         Ok((active, accept)) => {
-                            let transfer_id = accept.transfer_id;
                             let msg = TransferAccept {
                                 transfer_id: accept.transfer_id,
                                 chunk_size: accept.chunk_size,
@@ -1313,38 +1466,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                                 msg.encode(),
                             )
                             .await?;
-                            if !active.is_complete() {
+                            if active.is_complete() {
+                                // Nothing left for the client to send (an
+                                // empty file, or a resume of an upload whose
+                                // chunks all arrived): verify and file it.
+                                finishing = Some(self.start_finish(active));
+                            } else {
                                 upload = Some(active);
-                                continue;
                             }
-                            // Nothing left for the client to send (an empty
-                            // file, or a resume of an upload whose chunks
-                            // all arrived): verify and file it now.
-                            let (status, message) =
-                                match self.ctx.transfers.finish(&self.ctx.tree, active).await {
-                                    Ok(()) => (TRANSFER_VERIFIED, "verified".to_string()),
-                                    Err(TransferError::FileHashMismatch) => {
-                                        (TRANSFER_HASH_MISMATCH, "file hash mismatch".to_string())
-                                    }
-                                    Err(e) => {
-                                        warn!(error = %e, "upload could not be filed");
-                                        (
-                                            kdx_protocol::messages::TRANSFER_ABORTED,
-                                            format!("upload not filed: {}", e.client_message()),
-                                        )
-                                    }
-                                };
-                            let end = TransferEnd {
-                                transfer_id,
-                                status,
-                                message,
-                            };
-                            self.send(
-                                PacketType::FileTransferEnd,
-                                PacketFlags::TRANSFER_END,
-                                end.encode(),
-                            )
-                            .await?;
                         }
                         Err(e) => {
                             if e.is_internal() {
@@ -1356,81 +1485,29 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                 }
                 PacketType::FileTransferData => {
                     let data = TransferData::decode(&frame.payload)?;
-                    let Some(active) = upload.as_mut() else {
-                        self.send_error("no active transfer").await?;
-                        continue;
-                    };
-                    if data.transfer_id != *active.id().as_bytes() {
-                        self.send_error("unknown transfer id").await?;
-                        continue;
-                    }
-                    match self
-                        .ctx
-                        .transfers
-                        .write_chunk(active, data.chunk_index, &data.chunk_hash, &data.data)
-                        .await
-                    {
-                        Ok(false) => {} // more chunks to come
-                        Ok(true) => {
-                            let finished = upload.take().expect("active upload present");
-                            let transfer_id = *finished.id().as_bytes();
-                            let (status, message) =
-                                match self.ctx.transfers.finish(&self.ctx.tree, finished).await {
-                                    Ok(()) => (TRANSFER_VERIFIED, "verified".to_string()),
-                                    Err(TransferError::FileHashMismatch) => {
-                                        (TRANSFER_HASH_MISMATCH, "file hash mismatch".to_string())
-                                    }
-                                    // Name taken / folder gone meanwhile, or
-                                    // a server failure: the upload has been
-                                    // discarded; tell the client, stay up.
-                                    Err(e) => {
-                                        warn!(error = %e, "upload could not be filed");
-                                        (
-                                            kdx_protocol::messages::TRANSFER_ABORTED,
-                                            format!("upload not filed: {}", e.client_message()),
-                                        )
-                                    }
-                                };
-                            let end = TransferEnd {
-                                transfer_id,
-                                status,
-                                message,
-                            };
-                            self.send(
-                                PacketType::FileTransferEnd,
-                                PacketFlags::TRANSFER_END,
-                                end.encode(),
-                            )
-                            .await?;
+                    // An upload the server already ended (aborted, or all
+                    // chunks in and being finished): the client sent these
+                    // before it heard; one `TransferEnd` said it all.
+                    let ended = ended_upload == Some(data.transfer_id)
+                        || finishing
+                            .as_ref()
+                            .is_some_and(|f| f.transfer_id == data.transfer_id);
+                    // (Checked after the live upload: a resume can reuse the
+                    // id of an attempt the server aborted.)
+                    match upload.as_ref() {
+                        Some(active) if data.transfer_id == *active.id().as_bytes() => {}
+                        _ if ended => continue,
+                        Some(_) => {
+                            self.send_error("unknown transfer id").await?;
+                            continue;
                         }
-                        // Recoverable per-chunk problems: report, let the
-                        // client resend.
-                        Err(
-                            e @ (TransferError::ChunkHashMismatch
-                            | TransferError::BadChunkIndex
-                            | TransferError::BadChunkLength),
-                        ) => self.send_error(&e.to_string()).await?,
-                        // A server-side failure (disk, database): end this
-                        // attempt but keep the upload resumable.
-                        Err(e) => {
-                            warn!(error = %e, "upload chunk could not be stored");
-                            let failed = upload.take().expect("active upload present");
-                            let transfer_id = *failed.id().as_bytes();
-                            self.ctx.transfers.release(failed).await;
-                            let end = TransferEnd {
-                                transfer_id,
-                                status: kdx_protocol::messages::TRANSFER_ABORTED,
-                                message: "upload interrupted by a server error; resume later"
-                                    .into(),
-                            };
-                            self.send(
-                                PacketType::FileTransferEnd,
-                                PacketFlags::TRANSFER_END,
-                                end.encode(),
-                            )
-                            .await?;
+                        None => {
+                            self.send_error("no active transfer").await?;
+                            continue;
                         }
                     }
+                    let active = upload.take().expect("matched above");
+                    chunk_write = Some(self.write_chunk(active, data));
                 }
                 PacketType::FileTransferEnd => {
                     // The client is abandoning (or pausing) its upload: free
@@ -1451,6 +1528,18 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                             {
                                 debug!(status = end.status, "client cancelled its download");
                                 download = None;
+                            } else if ended_upload == Some(end.transfer_id)
+                                || finishing
+                                    .as_ref()
+                                    .is_some_and(|f| f.transfer_id == end.transfer_id)
+                            {
+                                // Crossed with the server's own end of it
+                                // (verifying can't be called off half-way);
+                                // the client hears the outcome either way.
+                                debug!(
+                                    status = end.status,
+                                    "client ended an upload the server ended"
+                                );
                             } else {
                                 self.send_error("no matching active transfer").await?;
                             }
@@ -2239,6 +2328,104 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
         }
     }
 
+    /// Feed one inbound frame to the reassembler. A fragment group over its
+    /// type's cap is not buffered: the rest of it is skipped and the whole
+    /// message answered with one `Error`, which keeps the client's
+    /// request/answer pairing intact and the session up.
+    async fn reassemble(
+        &mut self,
+        frame: KdxFrame,
+        skipping: &mut Option<Skipping>,
+    ) -> Result<Option<KdxFrame>, ConnectionError> {
+        let header = frame.header;
+        let more = header.flags.contains(PacketFlags::MORE_FRAGMENTS);
+        match skipping.as_mut() {
+            Some(skip) => {
+                // Only the rest of that group may follow, in order.
+                if !header.flags.contains(PacketFlags::FRAGMENTED)
+                    || header.packet_type != skip.packet_type
+                {
+                    return Err(ProtocolError::FragmentInterleaved.into());
+                }
+                if header.sequence != skip.next_sequence {
+                    return Err(ProtocolError::FragmentOutOfOrder {
+                        expected: skip.next_sequence,
+                        got: header.sequence,
+                    }
+                    .into());
+                }
+                if more {
+                    skip.next_sequence = header.sequence.wrapping_add(1);
+                    return Ok(None);
+                }
+                *skipping = None;
+            }
+            None => match self
+                .reassembler
+                .push(frame, reassembly_cap(header.packet_type))
+            {
+                Ok(pushed) => return Ok(pushed),
+                Err(ProtocolError::ReassemblyTooLarge { .. }) => {
+                    self.reassembler.abort();
+                    if more {
+                        *skipping = Some(Skipping {
+                            packet_type: header.packet_type,
+                            next_sequence: header.sequence.wrapping_add(1),
+                        });
+                        return Ok(None);
+                    }
+                }
+                Err(e) => return Err(e.into()),
+            },
+        }
+        // The whole oversized message has gone by: one answer for it.
+        debug!(packet_type = ?header.packet_type, "refused an oversized message");
+        let limit = reassembly_cap(header.packet_type);
+        self.send_error(&format!("message too large (the limit is {limit} bytes)"))
+            .await?;
+        Ok(None)
+    }
+
+    /// Settle one upload chunk (throttle, verify, store) as a select branch
+    /// of the dispatch loop. The future owns the upload until it is done.
+    fn write_chunk(&self, mut active: ActiveUpload, data: TransferData) -> ChunkWrite {
+        let ctx = self.ctx.clone();
+        #[cfg(test)]
+        let fault = self.hooks.fail_chunk == Some(data.chunk_index);
+        Box::pin(async move {
+            #[cfg(test)]
+            if fault {
+                let injected = std::io::Error::other("injected chunk write failure");
+                return (active, Err(TransferError::Io(injected)));
+            }
+            let result = ctx
+                .transfers
+                .write_chunk(&mut active, data.chunk_index, &data.chunk_hash, &data.data)
+                .await;
+            (active, result)
+        })
+    }
+
+    /// Verify and file an upload whose chunks have all arrived, on its own
+    /// task: hashing a big file can take minutes, during which the dispatch
+    /// loop keeps answering. The task runs to completion even if this
+    /// connection goes away meanwhile, since `finish` stopped half-way could
+    /// leave a filed entry without its bytes.
+    fn start_finish(&self, active: ActiveUpload) -> Finishing {
+        let transfer_id = *active.id().as_bytes();
+        let ctx = self.ctx.clone();
+        #[cfg(test)]
+        let gate = self.hooks.finish_gate.clone();
+        let task = tokio::spawn(async move {
+            #[cfg(test)]
+            if let Some(gate) = gate {
+                gate.notified().await;
+            }
+            ctx.transfers.finish(&ctx.tree, active).await
+        });
+        Finishing { transfer_id, task }
+    }
+
     /// Handle one pulled download chunk: send it and queue the next pull, or
     /// end the transfer once the stream is exhausted.
     async fn pump_download(
@@ -2315,11 +2502,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
         let kicked = self
             .ctx
             .ip_rules
-            .disconnect_denied(
-                &self.ctx.presence,
-                "your address is no longer allowed on this server",
-                &actor,
-            )
+            .disconnect_denied(&self.ctx.presence, ADDRESS_DENIED, &actor)
             .await;
         if !kicked.is_empty() {
             debug!(users = ?kicked, "disconnected sessions denied by IP rules");
@@ -2755,6 +2938,78 @@ async fn next_download(download: &mut Option<DownloadPump>) -> Pulled {
     match download {
         Some(pump) => pump.pull.as_mut().await,
         None => std::future::pending().await,
+    }
+}
+
+/// What settling one upload chunk yields: the upload back, and whether every
+/// chunk has now arrived.
+type Written = (ActiveUpload, Result<bool, TransferError>);
+
+/// An upload chunk being settled (see [`Connection::write_chunk`]).
+type ChunkWrite = std::pin::Pin<Box<dyn std::future::Future<Output = Written> + Send>>;
+
+/// An upload being verified and filed (see [`Connection::start_finish`]).
+struct Finishing {
+    transfer_id: [u8; 16],
+    task: tokio::task::JoinHandle<Result<(), TransferError>>,
+}
+
+/// The rest of a fragment group that went over its cap, being skipped.
+struct Skipping {
+    packet_type: PacketType,
+    next_sequence: u32,
+}
+
+/// The settled chunk write; pending forever if there is none. Cancel-safe:
+/// the write itself lives in `write`.
+async fn next_written(write: &mut Option<ChunkWrite>) -> Written {
+    match write {
+        Some(write) => write.as_mut().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// The outcome of the upload being finished; pending forever if there is
+/// none. Cancel-safe: the work runs on its own task.
+async fn next_finished(finishing: &mut Option<Finishing>) -> ([u8; 16], Result<(), TransferError>) {
+    match finishing {
+        Some(finishing) => {
+            let result = (&mut finishing.task)
+                .await
+                .unwrap_or_else(|e| Err(TransferError::Io(std::io::Error::other(e))));
+            (finishing.transfer_id, result)
+        }
+        None => std::future::pending().await,
+    }
+}
+
+/// `TransferEnd` status and message for a finished upload.
+fn upload_outcome(result: Result<(), TransferError>) -> (u8, String) {
+    match result {
+        Ok(()) => (TRANSFER_VERIFIED, "verified".to_string()),
+        Err(TransferError::FileHashMismatch) => {
+            (TRANSFER_HASH_MISMATCH, "file hash mismatch".to_string())
+        }
+        // Name taken / folder gone meanwhile, or a server failure: the
+        // upload has been discarded; tell the client, stay up.
+        Err(e) => {
+            warn!(error = %e, "upload could not be filed");
+            (
+                kdx_protocol::messages::TRANSFER_ABORTED,
+                format!("upload not filed: {}", e.client_message()),
+            )
+        }
+    }
+}
+
+/// What a banned account is told (at login, or when a ban lands while its
+/// login is in flight).
+fn ban_message(until: i64, reason: &str) -> String {
+    let reason = crate::limits::truncate_utf8(reason, crate::limits::MAX_REASON_LEN);
+    if reason.is_empty() {
+        format!("banned until {until}")
+    } else {
+        format!("banned until {until}: {reason}")
     }
 }
 
@@ -3780,7 +4035,10 @@ mod tests {
         type Client = Framed<DuplexStream, KdxCodec>;
 
         /// Connect over a `capacity`-byte duplex pipe presenting `peer` as
-        /// the network address, and log in as `username`.
+        /// the network address, and log in as `username`. Returns once the
+        /// dispatch loop answers a Ping, so the server's post-login database
+        /// work is done (tests may pause the clock next; sqlx misbehaves
+        /// under a paused clock).
         async fn connect_as(
             ctx: &Arc<ServerCtx>,
             capacity: usize,
@@ -3796,6 +4054,7 @@ mod tests {
             do_handshake(&mut client, &mut seq).await;
             let login = do_login(&mut client, &mut seq, username, "s3cret").await;
             assert!(login.success, "{}", login.message);
+            ping(&mut client, &mut seq).await;
             (client, seq, conn, login)
         }
 
@@ -3997,6 +4256,11 @@ mod tests {
 
         /// `test_ctx` with downloads throttled to `rate` bytes/sec.
         async fn throttled_ctx(rate: u64) -> (Arc<ServerCtx>, tempfile::TempDir) {
+            rate_limited_ctx(0, rate).await
+        }
+
+        /// `test_ctx` with uploads and downloads throttled (bytes/sec).
+        async fn rate_limited_ctx(upload: u64, download: u64) -> (Arc<ServerCtx>, tempfile::TempDir) {
             let (ctx, dir) = test_ctx().await;
             let mut inner = Arc::try_unwrap(ctx).ok().expect("sole owner of a fresh ctx");
             let pool = kdx_storage::connect(&dir.path().join("test.db")).await.unwrap();
@@ -4004,13 +4268,336 @@ mod tests {
                 pool,
                 crate::transfer::TransferConfig {
                     files_root: dir.path().join("files"),
-                    max_upload_bytes_per_sec: 0,
-                    max_download_bytes_per_sec: rate,
+                    max_upload_bytes_per_sec: upload,
+                    max_download_bytes_per_sec: download,
                 },
             )
             .await
             .unwrap();
             (Arc::new(inner), dir)
+        }
+
+        /// `connect_as` with test hooks installed on the server side.
+        async fn connect_hooked(
+            ctx: &Arc<ServerCtx>,
+            username: &str,
+            hooks: TestHooks,
+        ) -> (Client, u32, JoinHandle<Result<(), ConnectionError>>) {
+            let (client, server) = tokio::io::duplex(1024 * 1024);
+            let mut conn = Connection::new(server, ctx.clone());
+            conn.hooks = hooks;
+            let conn = tokio::spawn(conn.run());
+            let mut client = client_framed(client);
+            let mut seq = 0;
+            do_handshake(&mut client, &mut seq).await;
+            let login = do_login(&mut client, &mut seq, username, "s3cret").await;
+            assert!(login.success, "{}", login.message);
+            (client, seq, conn)
+        }
+
+        /// Start uploading `data` to `/name` in `chunk_size` chunks; returns
+        /// the transfer id.
+        async fn start_upload(
+            client: &mut Client,
+            seq: &mut u32,
+            name: &str,
+            data: &[u8],
+            chunk_size: u32,
+        ) -> [u8; 16] {
+            let upload = TransferRequest {
+                direction: kdx_protocol::messages::DIRECTION_UPLOAD,
+                path: "/".into(),
+                name: name.into(),
+                size: data.len() as u64,
+                chunk_size,
+                sha256: sha2::Sha256::digest(data).into(),
+                resume_id: [0; 16],
+                have_bitmap: vec![],
+            };
+            request(client, seq, PacketType::FileTransferStart, upload.encode()).await;
+            let accept = recv_type(client, PacketType::FileTransferStart).await;
+            TransferAccept::decode(&accept.payload).unwrap().transfer_id
+        }
+
+        /// Send chunk `index` of `data` as a client does: fragmented, then
+        /// its Ping barrier (token = the index).
+        async fn send_chunk(
+            client: &mut Client,
+            seq: &mut u32,
+            transfer_id: [u8; 16],
+            data: &[u8],
+            chunk_size: usize,
+            index: u32,
+        ) {
+            let start = index as usize * chunk_size;
+            let bytes = &data[start..(start + chunk_size).min(data.len())];
+            let chunk = TransferData {
+                transfer_id,
+                chunk_index: index,
+                chunk_hash: sha2::Sha256::digest(bytes).into(),
+                data: Bytes::copy_from_slice(bytes),
+            };
+            let frames = kdx_protocol::fragment(
+                PacketType::FileTransferData,
+                PacketFlags::empty(),
+                chunk.encode(),
+                kdx_protocol::DEFAULT_MAX_FRAME_PAYLOAD,
+                || bump(seq),
+            );
+            for frame in frames {
+                client.feed(frame).await.unwrap();
+            }
+            let barrier = Bytes::copy_from_slice(&index.to_be_bytes());
+            client
+                .feed(client_frame(PacketType::Ping, bump(seq), barrier))
+                .await
+                .unwrap();
+            client.flush().await.unwrap();
+        }
+
+        fn upload_data(len: usize) -> Vec<u8> {
+            (0..len).map(|i| (i % 251) as u8).collect()
+        }
+
+        #[tokio::test]
+        async fn pings_and_requests_are_answered_while_an_upload_finishes() {
+            let (ctx, _dir) = test_ctx().await;
+            let gate = Arc::new(Notify::new());
+            let hooks = TestHooks {
+                finish_gate: Some(gate.clone()),
+                ..TestHooks::default()
+            };
+            let (mut client, mut seq, conn) = connect_hooked(&ctx, "phraq", hooks).await;
+            let data = upload_data(8192);
+            let id = start_upload(&mut client, &mut seq, "up.bin", &data, 4096).await;
+            for index in 0..2 {
+                send_chunk(&mut client, &mut seq, id, &data, 4096, index).await;
+            }
+
+            // Every chunk is in and verifying is held at the gate (think: a
+            // 16 GiB hash on a slow disk). The barriers still come back...
+            let mut reasm = Reassembler::default();
+            let mut pongs = 0;
+            while pongs < 2 {
+                let frame = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    recv_logical(&mut client, &mut reasm),
+                )
+                .await
+                .expect("barrier Pongs must not wait for the verification");
+                match frame.header.packet_type {
+                    PacketType::Pong => pongs += 1,
+                    PacketType::FileTransferEnd => panic!("finished before the gate opened"),
+                    PacketType::Error => panic!("chunk refused: {}", error_text(&frame)),
+                    _ => {}
+                }
+            }
+            // ...and so do keepalives and ordinary requests.
+            ping(&mut client, &mut seq).await;
+            request(&mut client, &mut seq, PacketType::PresenceListRequest, PresenceListRequest.encode())
+                .await;
+            recv_type(&mut client, PacketType::PresenceListResponse).await;
+            // A second upload must wait for this one.
+            let again = TransferRequest {
+                direction: kdx_protocol::messages::DIRECTION_UPLOAD,
+                path: "/".into(),
+                name: "other.bin".into(),
+                size: 1,
+                chunk_size: 4096,
+                sha256: [0; 32],
+                resume_id: [0; 16],
+                have_bitmap: vec![],
+            };
+            request(&mut client, &mut seq, PacketType::FileTransferStart, again.encode()).await;
+            let refused = recv_type(&mut client, PacketType::Error).await;
+            assert_eq!(error_text(&refused), "a transfer is already active");
+
+            // Once verified, the outcome arrives on its own.
+            gate.notify_one();
+            let end = recv_type(&mut client, PacketType::FileTransferEnd).await;
+            let end = TransferEnd::decode(&end.payload).unwrap();
+            assert_eq!((end.transfer_id, end.status), (id, TRANSFER_VERIFIED));
+            assert_eq!(ctx.tree.resolve("/up.bin").await.unwrap().size, 8192);
+            request(&mut client, &mut seq, PacketType::Disconnect, Bytes::new()).await;
+            conn.await.unwrap().unwrap();
+        }
+
+        #[tokio::test]
+        async fn a_kick_lands_mid_verification_and_the_upload_is_still_filed() {
+            let (ctx, _dir) = test_ctx().await;
+            let gate = Arc::new(Notify::new());
+            let hooks = TestHooks {
+                finish_gate: Some(gate.clone()),
+                ..TestHooks::default()
+            };
+            let (mut client, mut seq, conn) = connect_hooked(&ctx, "phraq", hooks).await;
+            let data = upload_data(4096);
+            let id = start_upload(&mut client, &mut seq, "up.bin", &data, 4096).await;
+            send_chunk(&mut client, &mut seq, id, &data, 4096, 0).await;
+            recv_type(&mut client, PacketType::Pong).await;
+
+            assert_eq!(ctx.presence.disconnect("phraq", "bye").await, 1);
+            let bye = tokio::time::timeout(
+                Duration::from_secs(5),
+                recv_type(&mut client, PacketType::Disconnect),
+            )
+            .await
+            .expect("a kick must not wait for the verification");
+            assert_eq!(&bye.payload[..], b"bye");
+            conn.await.unwrap().unwrap();
+
+            // Verifying runs to completion without the connection.
+            gate.notify_one();
+            let filed = tokio::time::timeout(Duration::from_secs(10), async {
+                while ctx.tree.resolve("/up.bin").await.is_err() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await;
+            assert!(filed.is_ok(), "the verified upload was never filed");
+        }
+
+        #[tokio::test]
+        async fn a_kick_does_not_wait_for_the_upload_throttle() {
+            // 1 KiB/s with a 64 s burst: a 160 KiB chunk waits 96 s.
+            let (ctx, _dir) = rate_limited_ctx(1024, 0).await;
+            let (mut client, mut seq, conn, _) = connect_as(&ctx, 1024 * 1024, "unknown", "phraq").await;
+            let data = upload_data(160 * 1024);
+            let id = start_upload(&mut client, &mut seq, "slow.bin", &data, 256 * 1024).await;
+
+            tokio::time::pause();
+            let start = Instant::now();
+            send_chunk(&mut client, &mut seq, id, &data, 256 * 1024, 0).await;
+            let kicker = {
+                let ctx = ctx.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    ctx.presence.disconnect("phraq", "bye").await
+                })
+            };
+            let bye = recv_type(&mut client, PacketType::Disconnect).await;
+            assert_eq!(&bye.payload[..], b"bye");
+            assert_eq!(kicker.await.unwrap(), 1);
+            assert!(start.elapsed() < Duration::from_secs(5), "{:?}", start.elapsed());
+            conn.await.unwrap().unwrap();
+        }
+
+        #[tokio::test]
+        async fn a_waiting_frame_beats_an_overdue_idle_deadline() {
+            // 1 KiB/s with a 64 s burst: a 160 KiB chunk waits 96 s, past the
+            // 60 s idle timeout, while its barrier Ping sits unread.
+            let (ctx, _dir) = rate_limited_ctx(1024, 0).await;
+            // Keep `finish` (database work) out of the paused stretch.
+            let gate = Arc::new(Notify::new());
+            let hooks = TestHooks {
+                finish_gate: Some(gate.clone()),
+                ..TestHooks::default()
+            };
+            let (mut client, mut seq, conn) = connect_hooked(&ctx, "phraq", hooks).await;
+            let data = upload_data(160 * 1024);
+            let id = start_upload(&mut client, &mut seq, "slow.bin", &data, 256 * 1024).await;
+
+            tokio::time::pause();
+            let start = Instant::now();
+            send_chunk(&mut client, &mut seq, id, &data, 256 * 1024, 0).await;
+            let mut reasm = Reassembler::default();
+            loop {
+                let frame = recv_logical(&mut client, &mut reasm).await;
+                match frame.header.packet_type {
+                    PacketType::Pong => break,
+                    PacketType::Disconnect => {
+                        panic!("closed: {}", String::from_utf8_lossy(&frame.payload))
+                    }
+                    _ => {}
+                }
+            }
+            assert!(start.elapsed() >= Duration::from_secs(90), "{:?}", start.elapsed());
+
+            tokio::time::resume();
+            gate.notify_one();
+            let end = recv_type(&mut client, PacketType::FileTransferEnd).await;
+            assert_eq!(TransferEnd::decode(&end.payload).unwrap().status, TRANSFER_VERIFIED);
+            request(&mut client, &mut seq, PacketType::Disconnect, Bytes::new()).await;
+            conn.await.unwrap().unwrap();
+        }
+
+        #[tokio::test]
+        async fn chunks_in_flight_for_an_aborted_upload_get_no_errors() {
+            let (ctx, _dir) = test_ctx().await;
+            let hooks = TestHooks {
+                fail_chunk: Some(1),
+                ..TestHooks::default()
+            };
+            let (mut client, mut seq, conn) = connect_hooked(&ctx, "phraq", hooks).await;
+            let data = upload_data(4 * 4096);
+            let id = start_upload(&mut client, &mut seq, "up.bin", &data, 4096).await;
+            // The client pipelines its window: every chunk (and its barrier)
+            // is out before it hears that chunk 1 could not be stored.
+            for index in 0..4 {
+                send_chunk(&mut client, &mut seq, id, &data, 4096, index).await;
+            }
+            let mut reasm = Reassembler::default();
+            let mut seen: Vec<String> = Vec::new();
+            while seen.iter().filter(|s| s.starts_with("pong")).count() < 4 {
+                let frame = recv_logical(&mut client, &mut reasm).await;
+                match frame.header.packet_type {
+                    PacketType::Pong => {
+                        let token = u32::from_be_bytes(frame.payload[..].try_into().unwrap());
+                        seen.push(format!("pong {token}"));
+                    }
+                    PacketType::FileTransferEnd => {
+                        let end = TransferEnd::decode(&frame.payload).unwrap();
+                        assert_eq!(end.transfer_id, id);
+                        assert_eq!(end.status, kdx_protocol::messages::TRANSFER_ABORTED);
+                        seen.push("end".into());
+                    }
+                    PacketType::Error => seen.push(format!("error {}", error_text(&frame))),
+                    _ => {}
+                }
+            }
+            // One TransferEnd, ahead of the failed chunk's barrier, and no
+            // "no active transfer" error per chunk still in flight.
+            assert_eq!(seen, ["pong 0", "end", "pong 1", "pong 2", "pong 3"]);
+            request(&mut client, &mut seq, PacketType::Disconnect, Bytes::new()).await;
+            conn.await.unwrap().unwrap();
+        }
+
+        #[tokio::test]
+        async fn a_download_read_error_ends_only_the_transfer() {
+            let (ctx, dir) = test_ctx().await;
+            // The blob on disk is shorter than the size recorded for it.
+            let path = dir.path().join("files").join("short.bin");
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, vec![1u8; 10 * 1024]).unwrap();
+            let root = ctx.tree.resolve("/").await.unwrap();
+            ctx.tree
+                .add_file(&root.id, "short.bin", 100 * 1024, &[7; 32], path.to_str().unwrap())
+                .await
+                .unwrap();
+
+            let (mut client, mut seq, conn, _) = connect_as(&ctx, 256 * 1024, "unknown", "phraq").await;
+            let download = TransferRequest {
+                direction: DIRECTION_DOWNLOAD,
+                path: "/".into(),
+                name: "short.bin".into(),
+                size: 0,
+                chunk_size: 32 * 1024,
+                sha256: [0; 32],
+                resume_id: [0; 16],
+                have_bitmap: vec![],
+            };
+            request(&mut client, &mut seq, PacketType::FileTransferStart, download.encode()).await;
+            let accept = recv_type(&mut client, PacketType::FileTransferStart).await;
+            let id = TransferAccept::decode(&accept.payload).unwrap().transfer_id;
+            let end = recv_type(&mut client, PacketType::FileTransferEnd).await;
+            let end = TransferEnd::decode(&end.payload).unwrap();
+            assert_eq!(end.transfer_id, id);
+            assert_eq!(end.status, kdx_protocol::messages::TRANSFER_ABORTED);
+            // The session carries on.
+            ping(&mut client, &mut seq).await;
+            assert_eq!(ctx.presence.list().await.len(), 1);
+            request(&mut client, &mut seq, PacketType::Disconnect, Bytes::new()).await;
+            conn.await.unwrap().unwrap();
         }
 
         async fn seed_file(ctx: &ServerCtx, dir: &std::path::Path, name: &str, len: usize) {
@@ -4199,25 +4786,82 @@ mod tests {
             assert!(ctx.presence.list().await.is_empty());
         }
 
+        /// `payload` as a fragmented `packet_type` message.
+        fn fragmented(seq: &mut u32, packet_type: PacketType, payload: Bytes) -> Vec<KdxFrame> {
+            kdx_protocol::fragment(
+                packet_type,
+                PacketFlags::empty(),
+                payload,
+                kdx_protocol::DEFAULT_MAX_FRAME_PAYLOAD,
+                || bump(seq),
+            )
+        }
+
+        /// A control message well past its cap: the cap trips mid-group.
+        fn oversized_group(seq: &mut u32) -> Vec<KdxFrame> {
+            let payload = Bytes::from(vec![b'x'; MAX_CONTROL_PAYLOAD + 20_000]);
+            fragmented(seq, PacketType::ChatMessage, payload)
+        }
+
         #[tokio::test]
-        async fn control_messages_have_a_smaller_reassembly_cap() {
+        async fn control_messages_over_their_cap_get_an_error_not_a_disconnect() {
             let (ctx, _dir) = test_ctx().await;
             let (mut client, mut seq, conn, _) = connect_as(&ctx, 256 * 1024, "unknown", "phraq").await;
-            let frames = kdx_protocol::fragment(
-                PacketType::Ping,
-                PacketFlags::empty(),
-                Bytes::from(vec![0u8; MAX_CONTROL_PAYLOAD + 1]),
-                kdx_protocol::DEFAULT_MAX_FRAME_PAYLOAD,
-                || bump(&mut seq),
-            );
+            // Over the cap by a lot (it trips mid-group, the rest is skipped),
+            // and a longest-possible chat line, over it by a few bytes on
+            // its last fragment.
+            let line = ChatSend {
+                room: "lobby".into(),
+                flags: 0,
+                text: "x".repeat(u16::MAX as usize),
+            };
+            let mut frames = oversized_group(&mut seq);
+            frames.extend(fragmented(&mut seq, PacketType::ChatMessage, line.encode()));
             for frame in frames {
-                if client.send(frame).await.is_err() {
-                    break;
+                client.feed(frame).await.unwrap();
+            }
+            let barrier = client_frame(PacketType::Ping, bump(&mut seq), Bytes::from_static(b"after"));
+            client.feed(barrier).await.unwrap();
+            client.flush().await.unwrap();
+
+            // One Error per message, then the barrier's Pong.
+            let mut reasm = Reassembler::default();
+            let mut errors = Vec::new();
+            loop {
+                let frame = recv_logical(&mut client, &mut reasm).await;
+                match frame.header.packet_type {
+                    PacketType::Error => errors.push(error_text(&frame)),
+                    PacketType::Pong => {
+                        assert_eq!(&frame.payload[..], b"after");
+                        break;
+                    }
+                    _ => {}
                 }
             }
+            assert_eq!(errors.len(), 2, "{errors:?}");
+            assert!(errors.iter().all(|e| e.contains("too large")), "{errors:?}");
+            ping(&mut client, &mut seq).await;
+            assert_eq!(ctx.presence.list().await.len(), 1);
+            request(&mut client, &mut seq, PacketType::Disconnect, Bytes::new()).await;
+            conn.await.unwrap().unwrap();
+        }
+
+        #[tokio::test]
+        async fn a_frame_cutting_into_a_skipped_group_is_still_fatal() {
+            let (ctx, _dir) = test_ctx().await;
+            let (mut client, mut seq, conn, _) = connect_as(&ctx, 256 * 1024, "unknown", "phraq").await;
+            let mut frames = oversized_group(&mut seq);
+            frames.truncate(frames.len() - 1); // the group never ends...
+            for frame in frames {
+                client.feed(frame).await.unwrap();
+            }
+            // ...before something else arrives.
+            let ping = client_frame(PacketType::Ping, bump(&mut seq), Bytes::new());
+            client.feed(ping).await.unwrap();
+            client.flush().await.unwrap();
             assert!(matches!(
                 conn.await.unwrap(),
-                Err(ConnectionError::Protocol(ProtocolError::ReassemblyTooLarge { .. }))
+                Err(ConnectionError::Protocol(ProtocolError::FragmentInterleaved))
             ));
             assert!(ctx.presence.list().await.is_empty());
         }
@@ -4892,5 +5536,237 @@ mod tests {
         assert!(!result.success, "plain should still be banned");
         drop(client);
         let _ = banned_conn.await;
+    }
+
+    // ---- logins in flight (L-A, L-B, L-D) ----
+
+    /// Answer the `AuthChallenge` in `challenge` with `password`'s proof and
+    /// return the server's `AuthResult`.
+    async fn answer_challenge(
+        client: &mut Client,
+        seq: &mut u32,
+        username: &str,
+        password: &str,
+        challenge: &KdxFrame,
+    ) -> AuthResult {
+        assert_eq!(challenge.header.packet_type, PacketType::AuthChallenge);
+        let challenge = AuthChallenge::decode(&challenge.payload).unwrap();
+        let proof = client_proof(
+            password,
+            &AuthContext {
+                username,
+                challenge: &challenge.challenge,
+                salt: &challenge.salt,
+                params: kdx_crypto::KdfParams {
+                    m_cost: challenge.m_cost,
+                    t_cost: challenge.t_cost,
+                    p_cost: challenge.p_cost,
+                },
+                channel_binding: &[0u8; kdx_crypto::CHANNEL_BINDING_LEN],
+            },
+        )
+        .unwrap();
+        let response = AuthResponse {
+            response: proof.proof,
+        };
+        client
+            .send(client_frame(PacketType::AuthResponse, bump(seq), response.encode()))
+            .await
+            .unwrap();
+        let frame = client.next().await.unwrap().unwrap();
+        assert_eq!(frame.header.packet_type, PacketType::AuthResult);
+        AuthResult::decode(&frame.payload).unwrap()
+    }
+
+    /// The reason in the server's next `Disconnect`, skipping other frames.
+    async fn disconnect_reason(client: &mut Client) -> String {
+        loop {
+            let frame = timeout(Duration::from_secs(5), client.next())
+                .await
+                .expect("the server should close promptly")
+                .expect("stream open")
+                .expect("valid frame");
+            if frame.header.packet_type == PacketType::Disconnect {
+                return String::from_utf8_lossy(&frame.payload).into_owned();
+            }
+        }
+    }
+
+    /// Start a login on a fresh connection from `peer` and stop at the
+    /// challenge, as a client sitting on its proof would.
+    async fn pending_login(
+        ctx: &Arc<ServerCtx>,
+        peer: &str,
+        username: &str,
+    ) -> (Client, u32, ConnTask, KdxFrame) {
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let conn = tokio::spawn(
+            Connection::new_with_peer(server, ctx.clone(), peer.to_string()).run(),
+        );
+        let mut client = client_framed(client);
+        let mut seq = 0;
+        do_handshake(&mut client, &mut seq).await;
+        let challenge = send_auth_request(&mut client, &mut seq, username).await;
+        (client, seq, conn, challenge)
+    }
+
+    #[tokio::test]
+    async fn demotion_while_a_login_is_pending_applies_to_it() {
+        let (ctx, _dir) = admin_test_ctx().await;
+        seed(&ctx, "deputy", 3, Privileges::empty()).await;
+        let (mut client, mut seq, conn, challenge) = pending_login(&ctx, "unknown", "deputy").await;
+
+        // Demoted while the proof is outstanding: the kick reaches no one.
+        ctx.auth.update_account("deputy", 1, 0, 0).await.unwrap();
+        assert_eq!(ctx.presence.disconnect("deputy", policy::PRIVILEGES_CHANGED).await, 0);
+
+        let result = answer_challenge(&mut client, &mut seq, "deputy", "s3cret", &challenge).await;
+        assert!(result.success, "{}", result.message);
+        assert_eq!(result.class, BaseClass::User as u8);
+        let frame = send_and_recv(
+            &mut client,
+            &mut seq,
+            PacketType::ServerSettingsRequest,
+            ServerSettingsRequest.encode(),
+        )
+        .await;
+        assert_eq!(frame.header.packet_type, PacketType::Error, "admin rights survived the demotion");
+        hang_up(client, seq, conn).await;
+    }
+
+    #[tokio::test]
+    async fn deny_rule_while_a_login_is_pending_closes_it() {
+        let (ctx, _dir) = admin_test_ctx().await;
+        let (mut client, mut seq, conn, challenge) = pending_login(&ctx, "10.0.0.5:1", "plain").await;
+
+        // The rule lands while the proof is outstanding; enforcing it on
+        // live sessions can't reach this one yet.
+        ctx.ip_rules
+            .create(10, crate::ip_rules::Action::Deny, "10.0.0.0/8", "abuse", "sysop", unix_now())
+            .await
+            .unwrap();
+        let kicked = ctx.ip_rules.disconnect_denied(&ctx.presence, ADDRESS_DENIED, "sysop").await;
+        assert!(kicked.is_empty());
+
+        let result = answer_challenge(&mut client, &mut seq, "plain", "s3cret", &challenge).await;
+        assert!(result.success, "{}", result.message);
+        assert_eq!(disconnect_reason(&mut client).await, ADDRESS_DENIED);
+        conn.await.unwrap().unwrap();
+        assert!(ctx.presence.list().await.is_empty());
+        assert_eq!(ctx.auth.live_session_count(), 0);
+    }
+
+    /// A session as `AuthManager::complete` builds it (password "s3cret").
+    async fn verified_session(ctx: &ServerCtx, username: &str) -> Session {
+        let binding = [0u8; kdx_crypto::CHANNEL_BINDING_LEN];
+        let (data, pending) = ctx.auth.begin(username, binding).await.unwrap();
+        let proof = client_proof(
+            "s3cret",
+            &AuthContext {
+                username,
+                challenge: &data.challenge,
+                salt: &data.salt,
+                params: data.params,
+                channel_binding: &binding,
+            },
+        )
+        .unwrap();
+        ctx.auth.complete(pending, &proof.proof).await.unwrap().session
+    }
+
+    #[tokio::test]
+    async fn changes_between_proof_and_presence_are_caught_on_joining() {
+        let (ctx, _dir) = admin_test_ctx().await;
+        seed(&ctx, "deputy", 3, Privileges::empty()).await;
+        seed(&ctx, "helper", 1, Privileges::empty()).await;
+        // Sessions built by `complete`, before the changes below land.
+        let plain = verified_session(&ctx, "plain").await;
+        let deputy = verified_session(&ctx, "deputy").await;
+        let helper = verified_session(&ctx, "helper").await;
+        let (_client, server) = tokio::io::duplex(1024);
+        let conn = Connection::new_with_peer(server, ctx.clone(), "192.0.2.7:1".into());
+        for session in [&plain, &deputy, &helper] {
+            assert_eq!(conn.stale_login_reason(session).await, None);
+        }
+
+        // Banned, demoted, or granted a role in that window.
+        let id = ctx.auth.account_id("plain").await.unwrap().unwrap();
+        ctx.auth
+            .set_ban(&id, unix_now() as i64 + 1000, "spam", "sysop")
+            .await
+            .unwrap();
+        let reason = conn.stale_login_reason(&plain).await.unwrap();
+        assert!(reason.starts_with("banned until") && reason.ends_with("spam"), "{reason}");
+        ctx.auth.update_account("deputy", 1, 0, 0).await.unwrap();
+        assert_eq!(
+            conn.stale_login_reason(&deputy).await.as_deref(),
+            Some(policy::PRIVILEGES_CHANGED)
+        );
+        let role = ctx
+            .roles
+            .create("Mod", Privileges::USER_KICK, 5, None)
+            .await
+            .unwrap();
+        let helper_id = ctx.auth.account_id("helper").await.unwrap().unwrap();
+        ctx.roles.assign(&helper_id, role.id).await.unwrap();
+        assert_eq!(
+            conn.stale_login_reason(&helper).await.as_deref(),
+            Some(policy::PRIVILEGES_CHANGED)
+        );
+    }
+
+    #[tokio::test]
+    async fn max_users_keeps_counting_sessions_older_than_the_ttl() {
+        let (ctx, dir) = test_ctx().await;
+        let mut inner = Arc::try_unwrap(ctx).ok().expect("sole owner of a fresh ctx");
+        let pool = kdx_storage::connect(&dir.path().join("test.db")).await.unwrap();
+        // A tiny session TTL that every session below outlives at once. (The
+        // connection's idle timeout has a 60 s floor, so they stay online.)
+        inner.auth = AuthManager::new(pool, Duration::from_millis(1));
+        let ctx = Arc::new(inner);
+        ctx.settings
+            .update("Test Server".into(), String::new(), String::new(), 1)
+            .await
+            .unwrap();
+
+        let (client1, server1) = tokio::io::duplex(8192);
+        let conn1 = tokio::spawn(Connection::new(server1, ctx.clone()).run());
+        let mut client1 = client_framed(client1);
+        let mut seq1 = 0;
+        do_handshake(&mut client1, &mut seq1).await;
+        let first = do_login(&mut client1, &mut seq1, "phraq", "s3cret").await;
+        assert!(first.success);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        // Age doesn't end a live session (expiring it here, or in a periodic
+        // sweep, used to drop it from the `max_users` count).
+        assert!(ctx.auth.validate(Uuid::from_bytes(first.session_id)).is_some());
+        assert_eq!(ctx.auth.live_session_count(), 1);
+
+        let (client2, server2) = tokio::io::duplex(8192);
+        let conn2 = tokio::spawn(Connection::new(server2, ctx.clone()).run());
+        let mut client2 = client_framed(client2);
+        let mut seq2 = 0;
+        do_handshake(&mut client2, &mut seq2).await;
+        let second = do_login(&mut client2, &mut seq2, "phraq", "s3cret").await;
+        assert!(!second.success);
+        assert_eq!(second.message, "server is full");
+
+        drop(client2);
+        let _ = conn2.await;
+        hang_up(client1, seq1, conn1).await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_reaches_a_login_in_flight() {
+        let (ctx, _dir) = test_ctx().await;
+        let (mut client, mut seq, conn, challenge) = pending_login(&ctx, "unknown", "phraq").await;
+        // The server starts shutting down while the proof is outstanding.
+        assert_eq!(ctx.presence.disconnect_all("goodnight").await, 0);
+
+        let result = answer_challenge(&mut client, &mut seq, "phraq", "s3cret", &challenge).await;
+        assert!(result.success, "{}", result.message);
+        assert_eq!(disconnect_reason(&mut client).await, "goodnight");
+        conn.await.unwrap().unwrap();
+        assert_eq!(ctx.auth.live_session_count(), 0);
     }
 }
