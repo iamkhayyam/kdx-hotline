@@ -1757,10 +1757,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
     /// their reply is the thing a test or client might act on next, and the
     /// write should be durable before that reply lands.
     fn record_history(&self, actor: Option<String>, action: &'static str, detail: String) {
-        let ctx = self.ctx.clone();
-        tokio::spawn(async move {
-            let _ = ctx.history.record(unix_now(), actor.as_deref(), action, &detail).await;
-        });
+        // Bounded queue to the history writer task: never blocks, drops
+        // (and counts) when full; actor/detail are truncated by the log.
+        self.ctx.history.record_detached(unix_now(), actor.as_deref(), action, &detail);
     }
 
     async fn send_error(&mut self, message: &str) -> Result<(), ProtocolError> {
