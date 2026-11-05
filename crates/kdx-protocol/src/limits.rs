@@ -37,7 +37,7 @@ mod tests {
         assert_eq!(max_request_payload(PacketType::FileTransferData), MAX_REASSEMBLED_PAYLOAD);
         assert_eq!(max_request_payload(PacketType::FileTransferStart), MAX_TRANSFER_START_PAYLOAD);
         assert_eq!(max_request_payload(PacketType::ChatMessage), MAX_CONTROL_PAYLOAD);
-        assert!(MAX_CONTROL_PAYLOAD < MAX_TRANSFER_START_PAYLOAD);
-        assert!(MAX_TRANSFER_START_PAYLOAD < MAX_REASSEMBLED_PAYLOAD);
+        const { assert!(MAX_CONTROL_PAYLOAD < MAX_TRANSFER_START_PAYLOAD) };
+        const { assert!(MAX_TRANSFER_START_PAYLOAD < MAX_REASSEMBLED_PAYLOAD) };
     }
 }
