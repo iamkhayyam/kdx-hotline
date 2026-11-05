@@ -6,6 +6,7 @@ mod codec;
 mod flags;
 mod fragment;
 mod header;
+pub mod limits;
 pub mod messages;
 mod packet_type;
 
@@ -13,6 +14,7 @@ pub use codec::{KdxCodec, KdxFrame, DEFAULT_MAX_FRAME_PAYLOAD};
 pub use flags::{PacketFlags, Priority};
 pub use fragment::{fragment, Reassembler};
 pub use header::{PacketHeader, HEADER_LEN, MAGIC, PROTOCOL_VERSION};
+pub use limits::{max_request_payload, MAX_CONTROL_PAYLOAD, MAX_REASSEMBLED_PAYLOAD, MAX_TRANSFER_START_PAYLOAD};
 pub use packet_type::PacketType;
 
 /// Errors arising from framing, parsing, or fragment reassembly.

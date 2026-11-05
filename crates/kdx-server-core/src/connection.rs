@@ -66,8 +66,8 @@ pub const AUTH_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long an open fragment group may sit incomplete before the connection
 /// is dropped (memory-exhaustion guard, paired with the size cap below).
 pub const REASSEMBLY_TIMEOUT: Duration = Duration::from_secs(30);
-/// Cap on a reassembled logical payload.
-pub const MAX_REASSEMBLED_PAYLOAD: usize = 4 * 1024 * 1024;
+/// Cap on a reassembled logical payload (shared with clients).
+pub const MAX_REASSEMBLED_PAYLOAD: usize = kdx_protocol::MAX_REASSEMBLED_PAYLOAD;
 /// Feature bits the server currently supports (none defined yet).
 pub const SERVER_FEATURES: u16 = 0;
 /// Failed login attempts allowed before the connection is dropped.
@@ -88,10 +88,10 @@ pub const FAREWELL_TIMEOUT: Duration = Duration::from_secs(5);
 /// above the stock client's 30 s keepalive ping.
 pub const MIN_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 /// Cap on a reassembled inbound control message (everything but transfers).
-pub const MAX_CONTROL_PAYLOAD: usize = 64 * 1024;
+pub const MAX_CONTROL_PAYLOAD: usize = kdx_protocol::MAX_CONTROL_PAYLOAD;
 /// Cap on a reassembled inbound `FileTransferStart`, which carries a resume
 /// bitmap that can outgrow `MAX_CONTROL_PAYLOAD` for large files.
-pub const MAX_TRANSFER_START_PAYLOAD: usize = 1024 * 1024;
+pub const MAX_TRANSFER_START_PAYLOAD: usize = kdx_protocol::MAX_TRANSFER_START_PAYLOAD;
 /// Error reply for a request refused by a per-command rate limit.
 const SLOW_DOWN: &str = "rate limit exceeded: slow down";
 
@@ -2750,11 +2750,8 @@ async fn sleep_until_opt(deadline: Option<tokio::time::Instant>) {
 /// the full cap, a transfer request room for its resume bitmap, and every
 /// other message the control-message cap.
 fn reassembly_cap(packet_type: PacketType) -> usize {
-    match packet_type {
-        PacketType::FileTransferData => MAX_REASSEMBLED_PAYLOAD,
-        PacketType::FileTransferStart => MAX_TRANSFER_START_PAYLOAD,
-        _ => MAX_CONTROL_PAYLOAD,
-    }
+    // Shared with clients so they refuse to send what we'd reject.
+    kdx_protocol::max_request_payload(packet_type)
 }
 
 async fn timeout_at<F: std::future::Future>(
