@@ -1,19 +1,24 @@
 //! Directory of live rooms. Rooms are created on demand (privilege
-//! permitting) and a default lobby always exists.
+//! permitting) and a default lobby always exists. Every other room is
+//! evicted once its last member leaves, and the total is capped
+//! (`limits::MAX_ROOMS`).
+
+use std::collections::HashSet;
 
 use dashmap::DashMap;
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
 use super::room::{spawn_room, Member, RoomCommand, RoomError};
-// Re-export so `RoomError` (used as this manager's set_flags result) is
-// reachable from the `chat` module even for callers that only imported
-// the manager.
 use crate::auth::Privileges;
+use crate::limits;
 
 pub const DEFAULT_ROOM: &str = "lobby";
-/// Room names are user input; keep them sane.
-const MAX_ROOM_NAME: usize = 64;
+/// Name prefix reserved for invite-only private rooms (`ChatInvite`). A
+/// public `join` never creates a room under it.
+pub const PRIVATE_ROOM_PREFIX: &str = "priv-";
+/// How often `join` retries after losing a race with an eviction.
+const JOIN_ATTEMPTS: usize = 3;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum JoinError {
@@ -21,18 +26,23 @@ pub enum JoinError {
     InvalidName,
     #[error("room does not exist and you lack CHAT_CREATE_ROOM")]
     CannotCreate,
+    #[error("you were not invited to that room")]
+    NotInvited,
+    #[error("the server has too many chat rooms")]
+    TooManyRooms,
     #[error(transparent)]
     Room(#[from] RoomError),
     #[error("room actor unavailable")]
     Unavailable,
 }
 
-/// A room's manager-side entry: its command sender plus whether it should be
-/// dropped once empty (a private, invite-created chat) rather than persist
-/// like the lobby or an admin-created named room.
+/// A room's manager-side entry: its command sender, and for a private
+/// (invite-created) room, who may join it.
 struct RoomEntry {
     tx: mpsc::Sender<RoomCommand>,
-    temporary: bool,
+    /// Invite-only: only usernames in `invited` may join.
+    private: bool,
+    invited: HashSet<String>,
 }
 
 pub struct RoomManager {
@@ -45,6 +55,13 @@ impl Default for RoomManager {
     }
 }
 
+fn check_name(room: &str) -> Result<(), JoinError> {
+    if room.is_empty() || room.len() > limits::MAX_NAME_LEN {
+        return Err(JoinError::InvalidName);
+    }
+    Ok(())
+}
+
 impl RoomManager {
     pub fn new() -> Self {
         let rooms = DashMap::new();
@@ -52,69 +69,116 @@ impl RoomManager {
             DEFAULT_ROOM.to_string(),
             RoomEntry {
                 tx: spawn_room(DEFAULT_ROOM.to_string()),
-                temporary: false,
+                private: false,
+                invited: HashSet::new(),
             },
         );
         Self { rooms }
     }
 
-    /// Join `member` to `room`, creating it (as a permanent, publicly-listed
-    /// room) if allowed. Returns the room's command sender for subsequent
-    /// messages/leave.
+    /// Join `member` to `room`, creating it (as a public room) if allowed.
+    /// Private rooms admit only invited usernames, and a name under the
+    /// private prefix is never created here. Returns the room's command
+    /// sender for subsequent messages/leave.
     pub async fn join(
         &self,
         room: &str,
         member: Member,
     ) -> Result<mpsc::Sender<RoomCommand>, JoinError> {
-        if room.is_empty() || room.len() > MAX_ROOM_NAME {
-            return Err(JoinError::InvalidName);
-        }
-        let tx = match self.rooms.get(room) {
-            Some(existing) => existing.tx.clone(),
-            None => {
-                if !member.privileges.contains(Privileges::CHAT_CREATE_ROOM) {
-                    return Err(JoinError::CannotCreate);
+        check_name(room)?;
+        for _ in 0..JOIN_ATTEMPTS {
+            // Copy what we need out of the entry so no shard guard is held
+            // across an await (or across the `create` below).
+            let existing = self.rooms.get(room).map(|e| {
+                let allowed = !e.private || e.invited.contains(&member.username);
+                (e.tx.clone(), allowed)
+            });
+            let tx = match existing {
+                Some((_, false)) => return Err(JoinError::NotInvited),
+                Some((tx, true)) => tx,
+                None => {
+                    if room.starts_with(PRIVATE_ROOM_PREFIX) {
+                        return Err(JoinError::NotInvited);
+                    }
+                    if !member.privileges.contains(Privileges::CHAT_CREATE_ROOM) {
+                        return Err(JoinError::CannotCreate);
+                    }
+                    self.create(room, false, None)?
                 }
-                self.rooms
-                    .entry(room.to_string())
-                    .or_insert_with(|| RoomEntry {
-                        tx: spawn_room(room.to_string()),
-                        temporary: false,
-                    })
-                    .tx
-                    .clone()
+            };
+            match self.do_join(&tx, member.clone()).await {
+                Err(JoinError::Room(RoomError::Closed)) => self.forget(room, &tx),
+                result => return result.map(|()| tx),
             }
-        };
-        self.do_join(&tx, member).await?;
-        Ok(tx)
+        }
+        Err(JoinError::Unavailable)
     }
 
     /// Create (if missing) and join a private, invite-only room — bypassing
     /// `CHAT_CREATE_ROOM`, since starting a private chat is not the same
-    /// privilege as founding a persistent public room. The room is marked
-    /// temporary: once its last member leaves, `leave` drops it so its actor
-    /// task winds down (mirrors real KDX's private chats vanishing when
-    /// empty). Callers should pick a room name unlikely to collide with a
-    /// user-typed public room (a UUID, say).
+    /// privilege as founding a public room. The creator is on the room's
+    /// invite list (so they can rejoin); add others with [`Self::invite`].
+    /// Like every non-lobby room it is dropped once its last member leaves.
+    /// Callers should pick a name under [`PRIVATE_ROOM_PREFIX`] that can't
+    /// collide (a UUID, say).
     pub async fn join_private(
         &self,
         room: &str,
         member: Member,
     ) -> Result<mpsc::Sender<RoomCommand>, JoinError> {
-        if room.is_empty() || room.len() > MAX_ROOM_NAME {
-            return Err(JoinError::InvalidName);
+        check_name(room)?;
+        for _ in 0..JOIN_ATTEMPTS {
+            let tx = self.create(room, true, Some(&member.username))?;
+            match self.do_join(&tx, member.clone()).await {
+                Err(JoinError::Room(RoomError::Closed)) => self.forget(room, &tx),
+                result => return result.map(|()| tx),
+            }
         }
-        let tx = self
+        Err(JoinError::Unavailable)
+    }
+
+    /// Allow `username` to join the private room `room`. Returns `false` if
+    /// there's no such private room.
+    pub fn invite(&self, room: &str, username: &str) -> bool {
+        match self.rooms.get_mut(room) {
+            Some(mut entry) if entry.private => {
+                entry.invited.insert(username.to_owned());
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// The room's sender, creating the room if it doesn't exist (subject to
+    /// `MAX_ROOMS`). `invitee` is added to a private room's invite list.
+    fn create(
+        &self,
+        room: &str,
+        private: bool,
+        invitee: Option<&str>,
+    ) -> Result<mpsc::Sender<RoomCommand>, JoinError> {
+        // `len()` locks every shard, so call it with no guard held.
+        if !self.rooms.contains_key(room) && self.rooms.len() >= limits::MAX_ROOMS {
+            return Err(JoinError::TooManyRooms);
+        }
+        let mut entry = self
             .rooms
             .entry(room.to_string())
             .or_insert_with(|| RoomEntry {
                 tx: spawn_room(room.to_string()),
-                temporary: true,
-            })
-            .tx
-            .clone();
-        self.do_join(&tx, member).await?;
-        Ok(tx)
+                private,
+                invited: HashSet::new(),
+            });
+        if let Some(name) = invitee {
+            entry.invited.insert(name.to_owned());
+        }
+        Ok(entry.tx.clone())
+    }
+
+    /// Drop `room` from the directory if it is still the instance behind
+    /// `tx` (never a same-named room created since).
+    fn forget(&self, room: &str, tx: &mpsc::Sender<RoomCommand>) {
+        self.rooms.remove_if(room, |_, e| e.tx.same_channel(tx));
     }
 
     async fn do_join(
@@ -131,8 +195,9 @@ impl RoomManager {
     }
 
     /// Change `room`'s admin-configurable flags on behalf of the member with
-    /// `session_id`. The room actor enforces `CHAT_SET_TOPIC` on the caller;
-    /// non-members receive `NotMember`.
+    /// `session_id`. The room actor enforces `CHAT_SET_TOPIC` (and
+    /// SERVER_ADMIN for the lobby) on the caller; non-members receive
+    /// `NotMember`.
     pub async fn set_flags(
         &self,
         room: &str,
@@ -157,35 +222,24 @@ impl RoomManager {
         rx.await.map_err(|_| RoomError::NotMember)?
     }
 
-    /// Best-effort leave used on disconnect cleanup. If `room` is temporary
-    /// and this was its last member, drops the manager's own sender so the
-    /// room actor's channel closes and its task exits.
+    /// Leave `room` (also used on disconnect cleanup). If this emptied a
+    /// room other than the lobby, the room is closed and dropped so its
+    /// actor task winds down.
     pub async fn leave(&self, room: &str, session_id: Uuid) {
-        let Some(entry) = self.rooms.get(room) else {
+        let Some(tx) = self.rooms.get(room).map(|e| e.tx.clone()) else {
             return;
         };
-        let tx = entry.tx.clone();
-        let temporary = entry.temporary;
-        drop(entry); // release the DashMap shard lock before any `.remove()`
-
         let _ = tx.send(RoomCommand::Leave { session_id }).await;
-
-        if temporary {
-            let (reply, rx) = oneshot::channel();
-            if tx.send(RoomCommand::MemberCount { reply }).await.is_ok() {
-                if let Ok(0) = rx.await {
-                    // Check-then-remove has an ABA hazard: between our
-                    // MemberCount reply and this call, the same room name
-                    // could in principle have been evicted and recreated
-                    // (e.g. by a concurrent `leave`/`join_private` pair). A
-                    // plain `remove(room)` matches by key alone and would
-                    // delete whatever now sits there — possibly a brand-new,
-                    // non-empty room. `remove_if` makes the removal atomic
-                    // with a same-instance check, so we only ever remove the
-                    // exact entry we just measured as empty.
-                    self.rooms.remove_if(room, |_, e| e.tx.same_channel(&tx));
-                }
-            }
+        if room == DEFAULT_ROOM {
+            return;
+        }
+        // The actor closes itself only if empty, so a join racing this
+        // eviction is refused (and retried against a fresh room) rather
+        // than landing in a room nobody can find. `remove_if` only drops
+        // the exact instance we closed, never a same-named successor.
+        let (reply, rx) = oneshot::channel();
+        if tx.send(RoomCommand::CloseIfEmpty { reply }).await.is_ok() && rx.await == Ok(true) {
+            self.forget(room, &tx);
         }
     }
 }
@@ -379,5 +433,105 @@ mod tests {
         // touch the fresh room.
         mgr.rooms.remove_if("priv-4", |_, e| e.tx.same_channel(&stale_tx));
         assert!(mgr.rooms.contains_key("priv-4"), "fresh room must survive a stale eviction attempt");
+    }
+
+    #[tokio::test]
+    async fn empty_public_room_is_evicted_on_last_leave() {
+        let mgr = RoomManager::new();
+        let (power, _rx) = member("power", BaseClass::PowerUser);
+        let power_id = power.session_id;
+        mgr.join("hideout", power).await.unwrap();
+        assert!(mgr.rooms.contains_key("hideout"));
+        mgr.leave("hideout", power_id).await;
+        assert!(!mgr.rooms.contains_key("hideout"), "empty room should be evicted");
+    }
+
+    #[tokio::test]
+    async fn lobby_is_never_evicted() {
+        let mgr = RoomManager::new();
+        let (m, _rx) = member("user", BaseClass::User);
+        let id = m.session_id;
+        mgr.join(DEFAULT_ROOM, m).await.unwrap();
+        mgr.leave(DEFAULT_ROOM, id).await;
+        assert!(mgr.rooms.contains_key(DEFAULT_ROOM));
+        let (again, _rx2) = member("user", BaseClass::User);
+        assert!(mgr.join(DEFAULT_ROOM, again).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn room_count_is_capped() {
+        let mgr = RoomManager::new();
+        let (power, _rx) = member("power", BaseClass::PowerUser);
+        // The lobby counts toward the cap.
+        for i in 1..limits::MAX_ROOMS {
+            let m = Member {
+                session_id: Uuid::new_v4(),
+                ..power.clone()
+            };
+            mgr.join(&format!("room-{i}"), m).await.unwrap();
+        }
+        assert_eq!(
+            mgr.join("one-too-many", power.clone()).await.unwrap_err(),
+            JoinError::TooManyRooms
+        );
+        assert_eq!(
+            mgr.join_private("priv-x", power.clone()).await.unwrap_err(),
+            JoinError::TooManyRooms
+        );
+        // Existing rooms stay joinable.
+        assert!(mgr.join("room-1", power).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn private_room_admits_only_invitees() {
+        let mgr = RoomManager::new();
+        let (alice, _rx_a) = member("alice", BaseClass::User);
+        let alice_id = alice.session_id;
+        mgr.join_private("priv-5", alice).await.unwrap();
+        assert!(mgr.invite("priv-5", "bob"));
+
+        // An uninvited user (even one who may create rooms) is refused.
+        let (carol, _rx_c) = member("carol", BaseClass::Admin);
+        assert_eq!(mgr.join("priv-5", carol).await.unwrap_err(), JoinError::NotInvited);
+
+        // The invitee gets in, and the creator may rejoin after leaving.
+        let (bob, _rx_b) = member("bob", BaseClass::User);
+        assert!(mgr.join("priv-5", bob).await.is_ok());
+        mgr.leave("priv-5", alice_id).await;
+        let (alice_again, _rx_a2) = member("alice", BaseClass::User);
+        assert!(mgr.join("priv-5", alice_again).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn public_join_never_creates_a_private_name() {
+        let mgr = RoomManager::new();
+        let (admin, _rx) = member("admin", BaseClass::Admin);
+        assert_eq!(mgr.join("priv-gone", admin).await.unwrap_err(), JoinError::NotInvited);
+        assert!(!mgr.rooms.contains_key("priv-gone"));
+        assert!(!mgr.invite(DEFAULT_ROOM, "anyone"), "public rooms have no invite list");
+    }
+
+    #[tokio::test]
+    async fn join_racing_an_eviction_lands_in_a_live_room() {
+        let mgr = RoomManager::new();
+        let (power, _rx) = member("power", BaseClass::PowerUser);
+        mgr.join("den", power.clone()).await.unwrap();
+        let old_tx = mgr.rooms.get("den").unwrap().tx.clone();
+        // Simulate an eviction that closed the actor but hasn't removed the
+        // directory entry yet.
+        old_tx
+            .send(RoomCommand::Leave {
+                session_id: power.session_id,
+            })
+            .await
+            .unwrap();
+        let (reply, rx) = oneshot::channel();
+        old_tx.send(RoomCommand::CloseIfEmpty { reply }).await.unwrap();
+        assert!(rx.await.unwrap());
+
+        let (user, _rx2) = member("user", BaseClass::PowerUser);
+        let tx = mgr.join("den", user).await.unwrap();
+        assert!(!tx.same_channel(&old_tx), "must not join the closed room");
+        assert!(mgr.rooms.get("den").unwrap().tx.same_channel(&tx));
     }
 }

@@ -3,15 +3,25 @@
 //! room actor pattern); connections join on authentication and leave on
 //! disconnect, and every join/leave is broadcast live to all present
 //! connections via their outbound channel.
+//!
+//! Each entry also carries a non-lossy kill signal: `disconnect` and
+//! `disconnect_all` fire it instead of queueing a frame on the (bounded,
+//! best-effort) outbound channel, so a kick reaches a session even when its
+//! queue is full or it has stopped reading.
+//!
+//! Peer addresses are only shown to sessions that may act on them (those
+//! that joined with `sees_addresses`, i.e. USER_KICK holders): broadcasts
+//! are encoded per recipient, and `list`/`get` return the full entry for
+//! the caller to redact (see [`redact_address`]).
 
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use bytes::Bytes;
 use kdx_protocol::messages::PresenceChange;
 use kdx_protocol::messages::PresenceEntry as WireEntry;
 use kdx_protocol::{PacketFlags, PacketType};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc::error::TrySendError;
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::Instant;
 use uuid::Uuid;
 
@@ -27,7 +37,9 @@ pub enum PresenceCommand {
         username: String,
         class: u8,
         address: String,
+        sees_addresses: bool,
         tx: mpsc::Sender<Outbound>,
+        kill: watch::Sender<Option<String>>,
     },
     Leave {
         session_id: Uuid,
@@ -43,11 +55,12 @@ pub enum PresenceCommand {
         name: String,
         description: String,
     },
-    /// Full roster, sorted by username.
+    /// Full roster, sorted by username (addresses included).
     List {
         reply: oneshot::Sender<Vec<WireEntry>>,
     },
-    /// One user's entry, if online (case-sensitive exact username match).
+    /// One user's entry, if online (case-sensitive exact username match;
+    /// address included).
     Get {
         username: String,
         reply: oneshot::Sender<Option<WireEntry>>,
@@ -59,9 +72,10 @@ pub enum PresenceCommand {
         outbound: Outbound,
         reply: oneshot::Sender<usize>,
     },
-    /// Forcibly disconnect every connection of `username`: push a `Disconnect`
-    /// frame carrying `reason`, which the target's dispatch loop sends and then
-    /// closes on. Replies with the number of sessions signalled.
+    /// Forcibly disconnect every connection of `username` by firing its kill
+    /// signal with `reason`; the target's dispatch loop sends a `Disconnect`
+    /// frame carrying it and closes. Replies with the number of sessions
+    /// signalled.
     Disconnect {
         username: String,
         reason: String,
@@ -90,7 +104,10 @@ struct Entry {
     address: String,
     name: String,
     description: String,
+    /// Whether this session may see other users' addresses in broadcasts.
+    sees_addresses: bool,
     tx: mpsc::Sender<Outbound>,
+    kill: watch::Sender<Option<String>>,
 }
 
 impl Entry {
@@ -103,6 +120,32 @@ impl Entry {
             address: self.address.clone(),
             name: self.name.clone(),
             description: self.description.clone(),
+        }
+    }
+}
+
+/// Blank the peer address of `entry` — what a viewer without USER_KICK sees.
+pub fn redact_address(entry: &mut WireEntry) {
+    entry.address.clear();
+}
+
+/// The receiving end of a session's kill signal (see [`Presence::join`]).
+pub struct KillSignal {
+    rx: watch::Receiver<Option<String>>,
+}
+
+impl KillSignal {
+    /// Resolves once the session has been told to disconnect, yielding the
+    /// reason. Also resolves — with `None` — if presence dropped the session
+    /// (or shut down), since nothing could reach it any more. Cancel-safe.
+    pub async fn fired(&mut self) -> Option<String> {
+        loop {
+            if let Some(reason) = self.rx.borrow_and_update().clone() {
+                return Some(reason);
+            }
+            if self.rx.changed().await.is_err() {
+                return self.rx.borrow().clone();
+            }
         }
     }
 }
@@ -125,20 +168,25 @@ impl Presence {
         tokio::spawn(async move {
             let mut entries: HashMap<Uuid, Entry> = HashMap::new();
             while let Some(command) = rx.recv().await {
-                handle(&mut entries, command).await;
+                handle(&mut entries, command);
             }
         });
         Self { tx }
     }
 
+    /// Add a session to the roster. `sees_addresses` controls whether the
+    /// presence broadcasts it receives carry other users' addresses. Returns
+    /// the session's kill signal, which `disconnect`/`disconnect_all` fire.
     pub async fn join(
         &self,
         session_id: Uuid,
         username: String,
         class: u8,
         address: String,
+        sees_addresses: bool,
         tx: mpsc::Sender<Outbound>,
-    ) {
+    ) -> KillSignal {
+        let (kill, rx) = watch::channel(None);
         let _ = self
             .tx
             .send(PresenceCommand::Join {
@@ -146,17 +194,22 @@ impl Presence {
                 username,
                 class,
                 address,
+                sees_addresses,
                 tx,
+                kill,
             })
             .await;
+        KillSignal { rx }
     }
 
     pub async fn leave(&self, session_id: Uuid) {
         let _ = self.tx.send(PresenceCommand::Leave { session_id }).await;
     }
 
-    pub async fn touch(&self, session_id: Uuid) {
-        let _ = self.tx.send(PresenceCommand::Touch { session_id }).await;
+    /// Reset the idle clock. Never waits: if the presence queue is full the
+    /// touch is simply skipped (it only feeds the "idle" column).
+    pub fn touch(&self, session_id: Uuid) {
+        let _ = self.tx.try_send(PresenceCommand::Touch { session_id });
     }
 
     /// Set the display name / description of one session (`/name`, `/desc`).
@@ -171,6 +224,8 @@ impl Presence {
             .await;
     }
 
+    /// The full roster, addresses included — redact before showing it to a
+    /// viewer without USER_KICK.
     pub async fn list(&self) -> Vec<WireEntry> {
         let (reply, rx) = oneshot::channel();
         if self.tx.send(PresenceCommand::List { reply }).await.is_err() {
@@ -179,6 +234,8 @@ impl Presence {
         rx.await.unwrap_or_default()
     }
 
+    /// One user's entry, address included — redact before showing it to a
+    /// viewer without USER_KICK.
     pub async fn get(&self, username: &str) -> Option<WireEntry> {
         let (reply, rx) = oneshot::channel();
         if self
@@ -215,9 +272,11 @@ impl Presence {
     }
 
     /// Forcibly disconnect every connection of `username`, delivering `reason`.
-    /// Returns the number of sessions signalled (0 = offline). The target's
-    /// dispatch loop closes after sending the `Disconnect` frame, which runs
-    /// the usual room-leave / presence-leave / session-end cleanup.
+    /// Returns the number of sessions signalled (0 = offline). The signal
+    /// can't be lost to a full queue: the target's dispatch loop polls it
+    /// ahead of everything else, sends a `Disconnect` frame carrying
+    /// `reason`, closes, and runs the usual room-leave / presence-leave /
+    /// session-end cleanup.
     pub async fn disconnect(&self, username: &str, reason: &str) -> usize {
         let (reply, rx) = oneshot::channel();
         if self
@@ -269,14 +328,16 @@ impl Presence {
     }
 }
 
-async fn handle(entries: &mut HashMap<Uuid, Entry>, command: PresenceCommand) {
+fn handle(entries: &mut HashMap<Uuid, Entry>, command: PresenceCommand) {
     match command {
         PresenceCommand::Join {
             session_id,
             username,
             class,
             address,
+            sees_addresses,
             tx,
+            kill,
         } => {
             let now = Instant::now();
             let entry = Entry {
@@ -287,37 +348,28 @@ async fn handle(entries: &mut HashMap<Uuid, Entry>, command: PresenceCommand) {
                 address,
                 name: String::new(),
                 description: String::new(),
+                sees_addresses,
                 tx,
+                kill,
             };
+            let wire = entry.to_wire(now);
             entries.insert(session_id, entry);
-            let wire = entries[&session_id].to_wire(now);
             // Broadcast to everyone *except* the joining connection — it
             // doesn't need to be told about its own presence (its login
             // response already established that), and this avoids a race
             // where the self-notification arrives interleaved with whatever
             // the client immediately requests next.
-            broadcast_except(
+            broadcast(
                 entries,
-                session_id,
+                Some(session_id),
                 PresenceChange {
                     entry: wire,
                     online: true,
                 },
-            )
-            .await;
+            );
         }
         PresenceCommand::Leave { session_id } => {
-            if let Some(entry) = entries.remove(&session_id) {
-                let wire = entry.to_wire(Instant::now());
-                broadcast(
-                    entries,
-                    PresenceChange {
-                        entry: wire,
-                        online: false,
-                    },
-                )
-                .await;
-            }
+            remove(entries, vec![session_id]);
         }
         PresenceCommand::Touch { session_id } => {
             if let Some(entry) = entries.get_mut(&session_id) {
@@ -336,12 +388,12 @@ async fn handle(entries: &mut HashMap<Uuid, Entry>, command: PresenceCommand) {
                 let wire = entry.to_wire(Instant::now());
                 broadcast(
                     entries,
+                    None,
                     PresenceChange {
                         entry: wire,
                         online: true,
                     },
-                )
-                .await;
+                );
             }
         }
         PresenceCommand::List { reply } => {
@@ -363,12 +415,8 @@ async fn handle(entries: &mut HashMap<Uuid, Entry>, command: PresenceCommand) {
             outbound,
             reply,
         } => {
-            let mut reached = 0;
-            for entry in entries.values().filter(|e| e.username == username) {
-                if entry.tx.try_send(outbound.clone()).is_ok() {
-                    reached += 1;
-                }
-            }
+            let (reached, dead) = try_send_where(entries, &outbound, |e| e.username == username);
+            remove(entries, dead);
             let _ = reply.send(reached);
         }
         PresenceCommand::Disconnect {
@@ -376,70 +424,121 @@ async fn handle(entries: &mut HashMap<Uuid, Entry>, command: PresenceCommand) {
             reason,
             reply,
         } => {
-            let payload = Bytes::copy_from_slice(reason.as_bytes());
-            let mut reached = 0;
-            for entry in entries.values().filter(|e| e.username == username) {
-                let signal = Outbound {
-                    packet_type: PacketType::Disconnect,
-                    flags: PacketFlags::empty(),
-                    payload: payload.clone(),
-                };
-                if entry.tx.try_send(signal).is_ok() {
-                    reached += 1;
-                }
-            }
+            let (reached, dead) = kill_where(entries, &reason, |e| e.username == username);
+            remove(entries, dead);
             let _ = reply.send(reached);
         }
         PresenceCommand::BroadcastAll { outbound, reply } => {
-            let mut reached = 0;
-            for entry in entries.values() {
-                if entry.tx.try_send(outbound.clone()).is_ok() {
-                    reached += 1;
-                }
-            }
+            let (reached, dead) = try_send_where(entries, &outbound, |_| true);
+            remove(entries, dead);
             let _ = reply.send(reached);
         }
         PresenceCommand::DisconnectAll { reason, reply } => {
-            let payload = Bytes::copy_from_slice(reason.as_bytes());
-            let mut reached = 0;
-            for entry in entries.values() {
-                let signal = Outbound {
-                    packet_type: PacketType::Disconnect,
-                    flags: PacketFlags::empty(),
-                    payload: payload.clone(),
-                };
-                if entry.tx.try_send(signal).is_ok() {
-                    reached += 1;
-                }
-            }
+            let (reached, dead) = kill_where(entries, &reason, |_| true);
+            remove(entries, dead);
             let _ = reply.send(reached);
         }
     }
 }
 
-async fn broadcast(entries: &HashMap<Uuid, Entry>, change: PresenceChange) {
-    broadcast_filtered(entries, None, change).await;
-}
-
-async fn broadcast_except(entries: &HashMap<Uuid, Entry>, exclude: Uuid, change: PresenceChange) {
-    broadcast_filtered(entries, Some(exclude), change).await;
-}
-
-async fn broadcast_filtered(
+/// Try-send `outbound` to every entry matching `filter`. Returns how many
+/// accepted it, and the entries whose connection is gone (channel closed).
+fn try_send_where(
     entries: &HashMap<Uuid, Entry>,
-    exclude: Option<Uuid>,
-    change: PresenceChange,
-) {
-    let payload = change.encode();
-    for (session_id, entry) in entries {
-        if Some(*session_id) == exclude {
-            continue;
+    outbound: &Outbound,
+    filter: impl Fn(&Entry) -> bool,
+) -> (usize, Vec<Uuid>) {
+    let mut reached = 0;
+    let mut dead = Vec::new();
+    for (session_id, entry) in entries.iter().filter(|(_, e)| filter(e)) {
+        match entry.tx.try_send(outbound.clone()) {
+            Ok(()) => reached += 1,
+            Err(TrySendError::Full(_)) => {}
+            Err(TrySendError::Closed(_)) => dead.push(*session_id),
         }
-        let _ = entry.tx.try_send(Outbound {
-            packet_type: PacketType::PresenceChange,
-            flags: PacketFlags::empty(),
-            payload: payload.clone(),
-        });
+    }
+    (reached, dead)
+}
+
+/// Fire the kill signal of every entry matching `filter`. Returns how many
+/// live sessions were signalled, and the entries whose connection is gone.
+fn kill_where(
+    entries: &HashMap<Uuid, Entry>,
+    reason: &str,
+    filter: impl Fn(&Entry) -> bool,
+) -> (usize, Vec<Uuid>) {
+    let mut reached = 0;
+    let mut dead = Vec::new();
+    for (session_id, entry) in entries.iter().filter(|(_, e)| filter(e)) {
+        // Fails only when the receiver (the connection's dispatch loop) is
+        // gone.
+        if entry.kill.send(Some(reason.to_owned())).is_ok() {
+            reached += 1;
+        } else {
+            dead.push(*session_id);
+        }
+    }
+    (reached, dead)
+}
+
+/// Remove `gone` entries and broadcast each one going offline. Entries found
+/// dead while broadcasting are removed (and announced) in turn.
+fn remove(entries: &mut HashMap<Uuid, Entry>, gone: Vec<Uuid>) {
+    let now = Instant::now();
+    for session_id in gone {
+        if let Some(entry) = entries.remove(&session_id) {
+            broadcast(
+                entries,
+                None,
+                PresenceChange {
+                    entry: entry.to_wire(now),
+                    online: false,
+                },
+            );
+        }
+    }
+}
+
+/// Send `change` to every entry except `exclude`, encoded per recipient:
+/// only sessions that may see addresses get the subject's address.
+/// Recipients whose connection is gone are removed (and announced) too.
+fn broadcast(entries: &mut HashMap<Uuid, Entry>, exclude: Option<Uuid>, change: PresenceChange) {
+    let mut pending = vec![(exclude, change)];
+    while let Some((exclude, mut change)) = pending.pop() {
+        let full = change.encode();
+        redact_address(&mut change.entry);
+        let redacted = change.encode();
+        let mut dead = Vec::new();
+        for (session_id, entry) in entries.iter() {
+            if Some(*session_id) == exclude {
+                continue;
+            }
+            let payload = if entry.sees_addresses {
+                full.clone()
+            } else {
+                redacted.clone()
+            };
+            let outbound = Outbound {
+                packet_type: PacketType::PresenceChange,
+                flags: PacketFlags::empty(),
+                payload,
+            };
+            if let Err(TrySendError::Closed(_)) = entry.tx.try_send(outbound) {
+                dead.push(*session_id);
+            }
+        }
+        let now = Instant::now();
+        for session_id in dead {
+            if let Some(gone) = entries.remove(&session_id) {
+                pending.push((
+                    None,
+                    PresenceChange {
+                        entry: gone.to_wire(now),
+                        online: false,
+                    },
+                ));
+            }
+        }
     }
 }
 
@@ -453,23 +552,36 @@ pub fn unix_now() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
     use tokio::sync::mpsc::channel;
 
     fn member_channel() -> (mpsc::Sender<Outbound>, mpsc::Receiver<Outbound>) {
         channel(16)
     }
 
+    /// Join with no address visibility; the kill signal is returned so the
+    /// caller can keep the session "alive" (dropping it marks the session
+    /// as gone for `disconnect`).
+    async fn join(
+        presence: &Presence,
+        id: Uuid,
+        username: &str,
+        class: u8,
+        address: &str,
+        tx: mpsc::Sender<Outbound>,
+    ) -> KillSignal {
+        presence
+            .join(id, username.into(), class, address.into(), false, tx)
+            .await
+    }
+
     #[tokio::test]
     async fn join_then_list() {
         let presence = Presence::spawn();
         let (tx_a, _rx_a) = member_channel();
-        presence
-            .join(Uuid::new_v4(), "alice".into(), 1, "1.2.3.4:1".into(), tx_a)
-            .await;
+        let _ka = join(&presence, Uuid::new_v4(), "alice", 1, "1.2.3.4:1", tx_a).await;
         let (tx_b, _rx_b) = member_channel();
-        presence
-            .join(Uuid::new_v4(), "bob".into(), 2, "1.2.3.4:2".into(), tx_b)
-            .await;
+        let _kb = join(&presence, Uuid::new_v4(), "bob", 2, "1.2.3.4:2", tx_b).await;
 
         let roster = presence.list().await;
         assert_eq!(roster.len(), 2);
@@ -482,7 +594,7 @@ mod tests {
         let presence = Presence::spawn();
         let id = Uuid::new_v4();
         let (tx, _rx) = member_channel();
-        presence.join(id, "alice".into(), 1, "addr".into(), tx).await;
+        let _k = join(&presence, id, "alice", 1, "addr", tx).await;
         assert_eq!(presence.list().await.len(), 1);
         presence.leave(id).await;
         assert!(presence.list().await.is_empty());
@@ -493,11 +605,11 @@ mod tests {
         let presence = Presence::spawn();
         let id_a = Uuid::new_v4();
         let (tx_a, mut rx_a) = member_channel();
-        presence.join(id_a, "alice".into(), 1, "addr".into(), tx_a).await;
+        let _ka = join(&presence, id_a, "alice", 1, "addr", tx_a).await;
 
         let id_b = Uuid::new_v4();
         let (tx_b, mut rx_b) = member_channel();
-        presence.join(id_b, "bob".into(), 2, "addr2".into(), tx_b).await;
+        let _kb = join(&presence, id_b, "bob", 2, "addr2", tx_b).await;
 
         // Alice sees bob's join (but never her own).
         let first = rx_a.recv().await.unwrap();
@@ -523,7 +635,7 @@ mod tests {
     async fn get_finds_one_user_case_sensitive() {
         let presence = Presence::spawn();
         let (tx, _rx) = member_channel();
-        presence.join(Uuid::new_v4(), "phraq".into(), 2, "a".into(), tx).await;
+        let _k = join(&presence, Uuid::new_v4(), "phraq", 2, "a", tx).await;
 
         assert!(presence.get("phraq").await.is_some());
         assert!(presence.get("Phraq").await.is_none());
@@ -535,7 +647,7 @@ mod tests {
         let presence = Presence::spawn();
         let id = Uuid::new_v4();
         let (tx, _rx) = member_channel();
-        presence.join(id, "alice".into(), 1, "addr".into(), tx).await;
+        let _k = join(&presence, id, "alice", 1, "addr", tx).await;
         // Round-trip through the actor once so we know Join was actually
         // processed (and last_active captured) before advancing the clock —
         // join()/touch() only guarantee the command was *enqueued*.
@@ -545,7 +657,7 @@ mod tests {
         let before = presence.get("alice").await.unwrap();
         assert!(before.idle_secs >= 30);
 
-        presence.touch(id).await;
+        presence.touch(id);
         let after = presence.get("alice").await.unwrap();
         assert!(after.idle_secs < before.idle_secs);
     }
@@ -554,9 +666,9 @@ mod tests {
     async fn broadcast_all_reaches_every_session() {
         let presence = Presence::spawn();
         let (tx_a, mut rx_a) = member_channel();
-        presence.join(Uuid::new_v4(), "alice".into(), 1, "a".into(), tx_a).await;
+        let _ka = join(&presence, Uuid::new_v4(), "alice", 1, "a", tx_a).await;
         let (tx_b, mut rx_b) = member_channel();
-        presence.join(Uuid::new_v4(), "bob".into(), 1, "b".into(), tx_b).await;
+        let _kb = join(&presence, Uuid::new_v4(), "bob", 1, "b", tx_b).await;
         // Drain each one's join-broadcast-of-the-other before asserting.
         rx_a.recv().await.unwrap();
 
@@ -574,18 +686,91 @@ mod tests {
     #[tokio::test]
     async fn disconnect_all_signals_every_session_including_caller() {
         let presence = Presence::spawn();
-        let (tx_a, mut rx_a) = member_channel();
-        presence.join(Uuid::new_v4(), "alice".into(), 1, "a".into(), tx_a).await;
-        let (tx_b, mut rx_b) = member_channel();
-        presence.join(Uuid::new_v4(), "bob".into(), 1, "b".into(), tx_b).await;
-        rx_a.recv().await.unwrap(); // the join broadcast
+        let (tx_a, _rx_a) = member_channel();
+        let mut ka = join(&presence, Uuid::new_v4(), "alice", 1, "a", tx_a).await;
+        let (tx_b, _rx_b) = member_channel();
+        let mut kb = join(&presence, Uuid::new_v4(), "bob", 1, "b", tx_b).await;
 
         let reached = presence.disconnect_all("server is shutting down").await;
         assert_eq!(reached, 2);
-        let a = rx_a.recv().await.unwrap();
-        assert_eq!(a.packet_type, PacketType::Disconnect);
-        assert_eq!(a.payload, Bytes::from_static(b"server is shutting down"));
-        let b = rx_b.recv().await.unwrap();
-        assert_eq!(b.packet_type, PacketType::Disconnect);
+        assert_eq!(ka.fired().await.as_deref(), Some("server is shutting down"));
+        assert_eq!(kb.fired().await.as_deref(), Some("server is shutting down"));
+    }
+
+    #[tokio::test]
+    async fn disconnect_reaches_a_session_whose_queue_is_full() {
+        let presence = Presence::spawn();
+        let (tx, _rx) = channel(1);
+        let mut kill = join(&presence, Uuid::new_v4(), "stuck", 1, "a", tx).await;
+        // Fill the outbound queue: further try_sends fail with Full.
+        for _ in 0..4 {
+            presence
+                .broadcast_all(Outbound {
+                    packet_type: PacketType::Info,
+                    flags: PacketFlags::empty(),
+                    payload: Bytes::from_static(b"spam"),
+                })
+                .await;
+        }
+        assert_eq!(presence.disconnect("stuck", "bye").await, 1);
+        assert_eq!(kill.fired().await.as_deref(), Some("bye"));
+        // The entry stays until the connection's own cleanup leaves.
+        assert!(presence.get("stuck").await.is_some());
+    }
+
+    #[tokio::test]
+    async fn dead_sessions_are_dropped_not_counted() {
+        let presence = Presence::spawn();
+        let (tx_a, mut rx_a) = member_channel();
+        let _ka = join(&presence, Uuid::new_v4(), "alice", 1, "a", tx_a).await;
+
+        // Bob's connection vanished without leaving: its outbound receiver
+        // and kill signal are gone.
+        let (tx_b, rx_b) = member_channel();
+        let kb = join(&presence, Uuid::new_v4(), "bob", 1, "b", tx_b).await;
+        rx_a.recv().await.unwrap(); // bob's join
+        drop(rx_b);
+        drop(kb);
+
+        assert_eq!(presence.disconnect("bob", "bye").await, 0, "nobody left to signal");
+        assert!(presence.get("bob").await.is_none(), "ghost dropped");
+        let change = PresenceChange::decode(&rx_a.recv().await.unwrap().payload).unwrap();
+        assert!(!change.online);
+        assert_eq!(change.entry.username, "bob");
+
+        // Same for a delivery to a closed channel.
+        let (tx_c, rx_c) = member_channel();
+        let _kc = join(&presence, Uuid::new_v4(), "carol", 1, "c", tx_c).await;
+        rx_a.recv().await.unwrap(); // carol's join
+        drop(rx_c);
+        let outbound = Outbound {
+            packet_type: PacketType::Info,
+            flags: PacketFlags::empty(),
+            payload: Bytes::from_static(b"hi"),
+        };
+        assert_eq!(presence.deliver("carol", outbound).await, 0);
+        assert!(presence.get("carol").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn broadcast_addresses_only_reach_privileged_viewers() {
+        let presence = Presence::spawn();
+        let (tx_admin, mut rx_admin) = member_channel();
+        let _k1 = presence
+            .join(Uuid::new_v4(), "admin".into(), 3, "10.0.0.1:1".into(), true, tx_admin)
+            .await;
+        let (tx_user, mut rx_user) = member_channel();
+        let _k2 = join(&presence, Uuid::new_v4(), "user", 1, "10.0.0.2:2", tx_user).await;
+        // The admin saw the user's join with the address.
+        let change = PresenceChange::decode(&rx_admin.recv().await.unwrap().payload).unwrap();
+        assert_eq!(change.entry.address, "10.0.0.2:2");
+
+        let (tx_late, _rx_late) = member_channel();
+        let _k3 = join(&presence, Uuid::new_v4(), "late", 1, "10.0.0.3:3", tx_late).await;
+        let to_admin = PresenceChange::decode(&rx_admin.recv().await.unwrap().payload).unwrap();
+        let to_user = PresenceChange::decode(&rx_user.recv().await.unwrap().payload).unwrap();
+        assert_eq!(to_admin.entry.address, "10.0.0.3:3");
+        assert_eq!(to_user.entry.username, "late");
+        assert!(to_user.entry.address.is_empty(), "address leaked to a plain user");
     }
 }

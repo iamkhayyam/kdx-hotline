@@ -35,7 +35,7 @@ use kdx_protocol::messages::{
     UserInfoResponse, TRANSFER_HASH_MISMATCH, TRANSFER_VERIFIED,
 };
 use kdx_protocol::{
-    KdxCodec, KdxFrame, PacketFlags, PacketHeader, PacketType, ProtocolError, Reassembler,
+    KdxCodec, KdxFrame, PacketFlags, PacketType, ProtocolError, Reassembler,
     PROTOCOL_VERSION,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -54,6 +54,9 @@ use crate::presence::{unix_now, Presence};
 use crate::settings::ServerSettings;
 use crate::tracker::Tracker;
 use crate::transfer::{resume_id_from_wire, ActiveUpload, TransferError, TransferManager};
+use crate::chat::flood::FloodGate;
+use crate::presence::KillSignal;
+use crate::transfer::{ActiveDownload, DownloadChunk};
 
 /// How long the client has to send `HandshakeInit` after connecting.
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -72,6 +75,24 @@ pub const MAX_AUTH_ATTEMPTS: u8 = 3;
 /// Depth of a connection's outbound event queue. Room broadcasts to a full
 /// queue are dropped for that member rather than stalling the room.
 pub const OUTBOUND_QUEUE: usize = 128;
+
+/// How long writing one outbound message (all of its frames) may take before
+/// the peer is considered stuck and the connection is dropped.
+pub const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Budget for the parting words of a server-initiated close (queued events,
+/// then the `Disconnect` reason), so a peer that stopped reading can't hold
+/// up a kick.
+pub const FAREWELL_TIMEOUT: Duration = Duration::from_secs(5);
+/// Floor for the post-login idle timeout (`session_ttl_secs`), comfortably
+/// above the stock client's 30 s keepalive ping.
+pub const MIN_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+/// Cap on a reassembled inbound control message (everything but transfers).
+pub const MAX_CONTROL_PAYLOAD: usize = 64 * 1024;
+/// Cap on a reassembled inbound `FileTransferStart`, which carries a resume
+/// bitmap that can outgrow `MAX_CONTROL_PAYLOAD` for large files.
+pub const MAX_TRANSFER_START_PAYLOAD: usize = 1024 * 1024;
+/// Error reply for a request refused by a per-command rate limit.
+const SLOW_DOWN: &str = "rate limit exceeded: slow down";
 
 /// Cap on search results returned in one `FileSearchResponse`.
 const FILE_SEARCH_LIMIT: usize = 200;
@@ -126,6 +147,15 @@ pub enum ConnectionError {
     Auth(#[from] crate::auth::AuthError),
     #[error("transfer failure: {0}")]
     Transfer(#[from] TransferError),
+    #[error("write to peer timed out")]
+    WriteTimeout,
+    #[error("no activity within the idle timeout")]
+    IdleTimeout,
+    /// Internal to `send`: the message can't be framed for any client (over
+    /// `MAX_REASSEMBLED_PAYLOAD`). `send` answers with an `Error` reply
+    /// instead, so this never ends a connection.
+    #[error("outbound message of {len} bytes exceeds the reassembly cap")]
+    MessageTooLarge { len: usize },
 }
 
 /// Drives one client connection from handshake through active dispatch.
@@ -325,69 +355,129 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
     }
 
     async fn dispatch_loop(&mut self) -> Result<(), ConnectionError> {
+        let session = self.session.as_ref().expect("authed in dispatch").clone();
+        // Armed before anything is registered, so every way out of here —
+        // an error, a panic, or this task being dropped — unregisters the
+        // session (see `SessionGuard`).
+        let mut guard = SessionGuard {
+            ctx: self.ctx.clone(),
+            session_id: session.id,
+            joined: HashMap::new(),
+            armed: true,
+        };
         // Outbound events (room broadcasts etc.) flow through this channel;
         // its sender is what we hand to room actors on join.
         let (outbound_tx, mut outbound_rx) = mpsc::channel::<Outbound>(OUTBOUND_QUEUE);
-        let mut joined: HashMap<String, mpsc::Sender<RoomCommand>> = HashMap::new();
-        // One upload at a time per connection; the chunk stream is inherently
-        // serialized on the socket anyway.
-        let mut upload: Option<ActiveUpload> = None;
 
         // Join the server-wide presence roster for the User List / User Info
         // windows; every authenticated connection is visible here regardless
-        // of which chat rooms it's in.
-        {
-            let session = self.session.as_ref().expect("authed in dispatch");
-            self.ctx
-                .presence
-                .join(
-                    session.id,
-                    session.username.clone(),
-                    session.class as u8,
-                    self.peer_addr.clone(),
-                    outbound_tx.clone(),
-                )
-                .await;
-        }
+        // of which chat rooms it's in. Only sessions that may act on peers
+        // (USER_KICK) see their addresses. The returned kill signal is how
+        // kicks, bans and shutdown reach this connection.
+        let mut kill = self
+            .ctx
+            .presence
+            .join(
+                session.id,
+                session.username.clone(),
+                session.class as u8,
+                self.peer_addr.clone(),
+                session.privileges.contains(Privileges::USER_KICK),
+                outbound_tx.clone(),
+            )
+            .await;
+
+        let result = self
+            .dispatch_inner(&mut guard.joined, &outbound_tx, &mut outbound_rx, &mut kill)
+            .await;
+        // Cleanup regardless of how the loop ended: leave rooms, presence,
+        // and end the session.
+        guard.cleanup().await;
+        result
+    }
+
+    /// The dispatch loop proper. Every way out of it — `break`, `?`, an
+    /// explicit `return` — lands back in `dispatch_loop`, which then runs the
+    /// session cleanup.
+    async fn dispatch_inner(
+        &mut self,
+        joined: &mut HashMap<String, mpsc::Sender<RoomCommand>>,
+        outbound_tx: &mpsc::Sender<Outbound>,
+        outbound_rx: &mut mpsc::Receiver<Outbound>,
+        kill: &mut KillSignal,
+    ) -> Result<(), ConnectionError> {
+        // One upload at a time per connection; the chunk stream is inherently
+        // serialized on the socket anyway.
+        let mut upload: Option<ActiveUpload> = None;
+        // The download being streamed, pumped one chunk per loop turn below
+        // the kill and event branches, so a kick never waits on it.
+        let mut download: Option<DownloadPump> = None;
+        let mut rate = RateLimits::new();
+        // `session_ttl_secs` is the idle session lifetime: every inbound
+        // frame (the stock client pings every 30 s) pushes this out.
+        let idle_timeout = self.ctx.auth.session_ttl().max(MIN_IDLE_TIMEOUT);
+        let mut idle_deadline = tokio::time::Instant::now() + idle_timeout;
+        // Fixed when a fragment group opens, so neither trickled fragments
+        // nor outbound traffic can extend it.
+        let mut reassembly_deadline: Option<tokio::time::Instant> = None;
 
         enum Next {
+            Killed(Option<String>),
             Event(Outbound),
             Frame(Option<Result<KdxFrame, ProtocolError>>),
             ReassemblyTimedOut,
+            IdleTimedOut,
+            Download(Box<Pulled>),
         }
 
-        let result = loop {
+        loop {
             let next = {
-                let reassembling = self.reassembler.is_reassembling();
+                // Over its inbound budget, the peer is simply read more
+                // slowly; kills and events keep flowing meanwhile.
+                let throttled_until = rate.inbound.ready_at();
                 let framed = &mut self.framed;
                 tokio::select! {
                     biased;
+                    reason = kill.fired() => Next::Killed(reason),
                     // Senders never all drop while we hold outbound_tx.
                     event = outbound_rx.recv() => Next::Event(event.expect("outbound channel open")),
+                    _ = sleep_until_opt(reassembly_deadline) => Next::ReassemblyTimedOut,
+                    _ = tokio::time::sleep_until(idle_deadline) => Next::IdleTimedOut,
                     next = async {
-                        if reassembling {
-                            // A fragment group is open: the peer must finish
-                            // it promptly.
-                            match timeout(REASSEMBLY_TIMEOUT, framed.next()).await {
-                                Ok(item) => Next::Frame(item),
-                                Err(_) => Next::ReassemblyTimedOut,
-                            }
-                        } else {
-                            Next::Frame(framed.next().await)
+                        if let Some(at) = throttled_until {
+                            tokio::time::sleep_until(at).await;
                         }
-                    } => next,
+                        framed.next().await
+                    } => Next::Frame(next),
+                    pulled = next_download(&mut download) => Next::Download(Box::new(pulled)),
                 }
             };
 
             let frame_or_eof = match next {
+                Next::Killed(reason) => {
+                    // Kicked, banned, or the server is shutting down: flush
+                    // what's already queued (e.g. the shutdown notice), send
+                    // the reason, then close so the cleanup runs.
+                    debug!("disconnected by server (admin action)");
+                    self.farewell(outbound_rx, reason).await;
+                    break Ok(());
+                }
                 Next::Event(event) => {
-                    // A `Disconnect` event is the presence actor kicking this
-                    // connection (admin disconnect / ban): send the reason,
-                    // then close so the normal cleanup path runs.
+                    // An event too big for any client to reassemble is
+                    // dropped, never fatal.
+                    if event.payload.len() > MAX_REASSEMBLED_PAYLOAD {
+                        warn!(
+                            packet_type = ?event.packet_type,
+                            len = event.payload.len(),
+                            "dropping oversized outbound event"
+                        );
+                        continue;
+                    }
+                    // A `Disconnect` event closes the connection once sent.
                     let closing = event.packet_type == PacketType::Disconnect;
                     self.send(event.packet_type, event.flags, event.payload).await?;
                     if closing {
-                        debug!("disconnected by server (admin action)");
+                        debug!("disconnected by server");
                         break Ok(());
                     }
                     continue;
@@ -396,6 +486,16 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                     self.reassembler.abort();
                     break Err(ConnectionError::ReassemblyTimeout);
                 }
+                Next::IdleTimedOut => {
+                    debug!("idle timeout");
+                    self.farewell(outbound_rx, Some("idle timeout".into())).await;
+                    break Err(ConnectionError::IdleTimeout);
+                }
+                Next::Download(pulled) => {
+                    let (stream, chunk) = *pulled;
+                    self.pump_download(&mut download, stream, chunk?).await?;
+                    continue;
+                }
                 Next::Frame(item) => item,
             };
 
@@ -403,14 +503,29 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                 break Ok(()); // clean EOF
             };
 
-            let Some(frame) = self.reassembler.push(frame, MAX_REASSEMBLED_PAYLOAD)? else {
+            // Any inbound frame is activity.
+            idle_deadline = tokio::time::Instant::now() + idle_timeout;
+            // Everything but the data of an accepted upload spends inbound
+            // budget.
+            if !(frame.header.packet_type == PacketType::FileTransferData && upload.is_some()) {
+                rate.inbound.allow();
+            }
+
+            let cap = reassembly_cap(frame.header.packet_type);
+            let pushed = self.reassembler.push(frame, cap)?;
+            if !self.reassembler.is_reassembling() {
+                reassembly_deadline = None;
+            } else if reassembly_deadline.is_none() {
+                reassembly_deadline = Some(tokio::time::Instant::now() + REASSEMBLY_TIMEOUT);
+            }
+            let Some(frame) = pushed else {
                 continue; // mid-group fragment
             };
 
             match frame.header.packet_type {
                 PacketType::Ping => {
                     let session_id = self.session.as_ref().expect("authed").id;
-                    self.ctx.presence.touch(session_id).await;
+                    self.ctx.presence.touch(session_id);
                     self.send(PacketType::Pong, PacketFlags::empty(), frame.payload)
                         .await?;
                 }
@@ -421,11 +536,37 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                 PacketType::SetIdentity => {
                     let req = SetIdentity::decode(&frame.payload)?;
                     let session_id = self.session.as_ref().expect("authed").id;
+                    let checked = crate::limits::check_len(
+                        "name",
+                        &req.name,
+                        crate::limits::MAX_NICK_LEN,
+                    )
+                    .and_then(|()| {
+                        crate::limits::check_len(
+                            "description",
+                            &req.description,
+                            crate::limits::MAX_DESCRIPTION_LEN,
+                        )
+                    });
+                    if let Err(message) = checked {
+                        self.send_error(&message).await?;
+                        continue;
+                    }
+                    // Every change is broadcast to every user online.
+                    if !rate.identity.allow() {
+                        self.send_error(SLOW_DOWN).await?;
+                        continue;
+                    }
                     self.ctx.presence.set_identity(session_id, req.name, req.description).await;
                 }
                 PacketType::PresenceListRequest => {
                     PresenceListRequest::decode(&frame.payload)?;
-                    let users = self.ctx.presence.list().await;
+                    let privs = self.session.as_ref().expect("authed").privileges;
+                    let mut users = self.ctx.presence.list().await;
+                    // Peer addresses are only for those who may act on them.
+                    if !privs.contains(Privileges::USER_KICK) {
+                        users.iter_mut().for_each(crate::presence::redact_address);
+                    }
                     let response = PresenceListResponse { users };
                     self.send(
                         PacketType::PresenceListResponse,
@@ -456,8 +597,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                 }
                 PacketType::UserInfoRequest => {
                     let request = UserInfoRequest::decode(&frame.payload)?;
+                    let privs = self.session.as_ref().expect("authed").privileges;
                     match self.ctx.presence.get(&request.username).await {
-                        Some(entry) => {
+                        Some(mut entry) => {
+                            if !privs.contains(Privileges::USER_KICK) {
+                                crate::presence::redact_address(&mut entry);
+                            }
                             let response = UserInfoResponse { entry };
                             self.send(
                                 PacketType::UserInfoResponse,
@@ -476,7 +621,27 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                         self.send_error("missing CHAT_PRIVATE privilege").await?;
                         continue;
                     }
-                    self.ctx.presence.touch(session.id).await;
+                    let checked = crate::limits::check_len(
+                        "recipient",
+                        &send.to,
+                        crate::limits::MAX_USERNAME_LEN,
+                    )
+                    .and_then(|()| {
+                        crate::limits::check_len(
+                            "message",
+                            &send.text,
+                            crate::limits::MAX_CHAT_TEXT_LEN,
+                        )
+                    });
+                    if let Err(message) = checked {
+                        self.send_error(&message).await?;
+                        continue;
+                    }
+                    if !rate.private.allow() {
+                        self.send_error(SLOW_DOWN).await?;
+                        continue;
+                    }
+                    self.ctx.presence.touch(session.id);
                     let msg = PrivateMessage {
                         from: session.username.clone(),
                         to: send.to.clone(),
@@ -506,6 +671,17 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                 }
                 PacketType::ChatJoin => {
                     let join = ChatJoin::decode(&frame.payload)?;
+                    // Each join is announced to the room.
+                    if !rate.join.allow() {
+                        self.send_error(SLOW_DOWN).await?;
+                        continue;
+                    }
+                    if !joined.contains_key(&join.room)
+                        && joined.len() >= crate::limits::MAX_JOINED_ROOMS_PER_CONNECTION
+                    {
+                        self.send_error("you are in too many chat rooms").await?;
+                        continue;
+                    }
                     let session = self.session.as_ref().expect("authed in dispatch");
                     let member = Member {
                         session_id: session.id,
@@ -532,10 +708,28 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                         self.send_error("cannot invite yourself").await?;
                         continue;
                     }
-                    // A UUID-named room can't collide with a user-typed public
-                    // room name, and marks it temporary in RoomManager (evicted
-                    // once its last member leaves).
-                    let room_id = format!("priv-{}", Uuid::new_v4());
+                    if let Err(message) = crate::limits::check_len(
+                        "recipient",
+                        &invite.to,
+                        crate::limits::MAX_USERNAME_LEN,
+                    ) {
+                        self.send_error(&message).await?;
+                        continue;
+                    }
+                    if joined.len() >= crate::limits::MAX_JOINED_ROOMS_PER_CONNECTION {
+                        self.send_error("you are in too many chat rooms").await?;
+                        continue;
+                    }
+                    // Each invite creates a room and pings another user.
+                    if !rate.invite.allow() {
+                        self.send_error(SLOW_DOWN).await?;
+                        continue;
+                    }
+                    // A UUID-named room under the private prefix can't collide
+                    // with a user-typed public room name; RoomManager admits
+                    // only the inviter and invitee, and evicts the room once
+                    // its last member leaves.
+                    let room_id = format!("{}{}", crate::chat::PRIVATE_ROOM_PREFIX, Uuid::new_v4());
                     let member = Member {
                         session_id: session.id,
                         username: session.username.clone(),
@@ -551,6 +745,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                         }
                     };
                     joined.insert(room_id.clone(), handle);
+                    self.ctx.rooms.invite(&room_id, &invite.to);
 
                     let invited = ChatInvited {
                         from: session.username.clone(),
@@ -596,13 +791,32 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                         self.send_error("missing CHAT_SEND privilege").await?;
                         continue;
                     }
-                    self.ctx.presence.touch(session.id).await;
+                    if let Err(message) = crate::limits::check_len(
+                        "message",
+                        &send.text,
+                        crate::limits::MAX_CHAT_TEXT_LEN,
+                    ) {
+                        self.send_error(&message).await?;
+                        continue;
+                    }
+                    self.ctx.presence.touch(session.id);
                     match joined.get(&send.room) {
                         Some(handle) => {
+                            // Per connection, not per membership, so leaving
+                            // and rejoining doesn't refill it.
+                            if !rate.chat.allow() {
+                                self.send(
+                                    PacketType::Warning,
+                                    PacketFlags::SYSTEM_MESSAGE,
+                                    Bytes::from_static(b"flood protection: slow down"),
+                                )
+                                .await?;
+                                continue;
+                            }
                             let _ = handle
                                 .send(RoomCommand::Message {
                                     session_id: session.id,
-                                    flags: send.flags,
+                                    flags: send.flags & kdx_protocol::messages::CHAT_ACTION,
                                     text: send.text,
                                 })
                                 .await;
@@ -613,6 +827,18 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                 PacketType::ChatTopicSet => {
                     let topic = ChatTopic::decode(&frame.payload)?;
                     let session_id = self.session.as_ref().expect("authed").id;
+                    if let Err(message) = crate::limits::check_len(
+                        "topic",
+                        &topic.topic,
+                        crate::limits::MAX_TOPIC_LEN,
+                    ) {
+                        self.send_error(&message).await?;
+                        continue;
+                    }
+                    if !rate.room_admin.allow() {
+                        self.send_error(SLOW_DOWN).await?;
+                        continue;
+                    }
                     match joined.get(&topic.room) {
                         Some(handle) => {
                             let (reply, rx) = oneshot::channel();
@@ -633,6 +859,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                 PacketType::ChatRoomFlags => {
                     let flags = WireChatRoomFlags::decode(&frame.payload)?;
                     let session_id = self.session.as_ref().expect("authed").id;
+                    if !rate.room_admin.allow() {
+                        self.send_error(SLOW_DOWN).await?;
+                        continue;
+                    }
                     // Route through the manager (not the joined map) so we
                     // return the same NotMember/NoPrivilege errors regardless
                     // of whether this connection's copy has an in-memory
@@ -853,7 +1083,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                         )
                         .await
                     {
-                        Ok((mut stream, accept)) => {
+                        Ok((stream, accept)) => {
                             let msg = TransferAccept {
                                 transfer_id: accept.transfer_id,
                                 chunk_size: accept.chunk_size,
@@ -868,7 +1098,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                                 msg.encode(),
                             )
                             .await?;
-                            self.stream_download(&mut stream).await?;
+                            download = Some(DownloadPump::new(stream));
                         }
                         Err(e) => {
                             if e.is_internal() {
@@ -1580,6 +1810,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                         continue;
                     }
                     let admin_name = session.username.clone();
+                    if let Err(message) = crate::limits::check_len(
+                        "shutdown message",
+                        &shutdown.message,
+                        crate::limits::MAX_BROADCAST_LEN,
+                    ) {
+                        self.send_error(&message).await?;
+                        continue;
+                    }
                     let message = if shutdown.message.trim().is_empty() {
                         "the server is shutting down".to_string()
                     } else {
@@ -1598,9 +1836,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                     self.ctx.presence.broadcast_all(notice).await;
                     self.ctx.presence.disconnect_all(&message).await;
                     // Stop the accept loop; already-open connections (this one
-                    // included) close individually as their queued Disconnect
-                    // event above is processed on the next select iteration.
-                    self.ctx.shutdown.notify_waiters();
+                    // included) close individually as their kill signal fires
+                    // on the next select iteration. `notify_one` stores a
+                    // permit, so the stop isn't lost if the accept loop isn't
+                    // parked in `notified()` at this instant.
+                    self.ctx.shutdown.notify_one();
                 }
                 PacketType::NewsgroupListRequest => {
                     NewsgroupListRequest::decode(&frame.payload)?;
@@ -1819,19 +2059,68 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                     .await?;
                 }
             }
-        };
-
-        // Cleanup regardless of how the loop ended: leave rooms, presence,
-        // and end the session.
-        if let Some(session) = &self.session {
-            for (room, _handle) in joined {
-                self.ctx.rooms.leave(&room, session.id).await;
-                debug!(room, "left on disconnect");
-            }
-            self.ctx.presence.leave(session.id).await;
-            self.ctx.auth.end_session(session.id);
         }
-        result
+    }
+
+    /// Parting words of a server-initiated close: flush events already
+    /// queued (e.g. a shutdown notice), then a `Disconnect` carrying
+    /// `reason`. Best effort, bounded by `FAREWELL_TIMEOUT` so a peer that
+    /// stopped reading can't hold the close up.
+    async fn farewell(&mut self, outbound_rx: &mut mpsc::Receiver<Outbound>, reason: Option<String>) {
+        let flush = async {
+            while let Ok(event) = outbound_rx.try_recv() {
+                if event.packet_type == PacketType::Disconnect
+                    || event.payload.len() > MAX_REASSEMBLED_PAYLOAD
+                {
+                    continue;
+                }
+                self.send(event.packet_type, event.flags, event.payload).await?;
+            }
+            if let Some(reason) = reason {
+                self.send(PacketType::Disconnect, PacketFlags::empty(), Bytes::from(reason))
+                    .await?;
+            }
+            Ok::<(), ConnectionError>(())
+        };
+        match timeout(FAREWELL_TIMEOUT, flush).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => debug!(error = %e, "farewell not delivered"),
+            Err(_) => debug!("farewell timed out"),
+        }
+    }
+
+    /// Handle one pulled download chunk: send it and queue the next pull, or
+    /// end the transfer once the stream is exhausted.
+    async fn pump_download(
+        &mut self,
+        download: &mut Option<DownloadPump>,
+        stream: ActiveDownload,
+        chunk: Option<DownloadChunk>,
+    ) -> Result<(), ConnectionError> {
+        let transfer_id = *stream.id().as_bytes();
+        match chunk {
+            Some(chunk) => {
+                *download = Some(DownloadPump::new(stream));
+                let data = TransferData {
+                    transfer_id,
+                    chunk_index: chunk.index,
+                    chunk_hash: chunk.hash,
+                    data: chunk.data,
+                };
+                self.send_fragmented(PacketType::FileTransferData, PacketFlags::empty(), data.encode())
+                    .await
+            }
+            None => {
+                *download = None;
+                let end = TransferEnd {
+                    transfer_id,
+                    status: TRANSFER_VERIFIED,
+                    message: "verified".into(),
+                };
+                self.send(PacketType::FileTransferEnd, PacketFlags::TRANSFER_END, end.encode())
+                    .await
+            }
+        }
     }
 
     /// Fire-and-forget an audit-log entry on a detached task, used only for
@@ -1849,7 +2138,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
         self.ctx.history.record_detached(unix_now(), actor.as_deref(), action, &detail);
     }
 
-    async fn send_error(&mut self, message: &str) -> Result<(), ProtocolError> {
+    async fn send_error(&mut self, message: &str) -> Result<(), ConnectionError> {
         self.send(
             PacketType::Error,
             PacketFlags::SYSTEM_MESSAGE,
@@ -2063,42 +2352,54 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
         Ok(())
     }
 
-    /// Stream every chunk the client still needs, then the terminal
-    /// `TransferEnd`. Runs inline in the dispatch loop — one transfer at a
-    /// time per connection, matching the upload model.
-    async fn stream_download(
-        &mut self,
-        stream: &mut crate::transfer::ActiveDownload,
-    ) -> Result<(), ConnectionError> {
-        let transfer_id = *stream.id().as_bytes();
-        while let Some(chunk) = stream.next_chunk().await? {
-            let data = TransferData {
-                transfer_id,
-                chunk_index: chunk.index,
-                chunk_hash: chunk.hash,
-                data: chunk.data,
-            };
-            self.send_fragmented(PacketType::FileTransferData, PacketFlags::empty(), data.encode())
-                .await?;
-        }
-        let end = TransferEnd {
-            transfer_id,
-            status: TRANSFER_VERIFIED,
-            message: "verified".into(),
-        };
-        self.send(PacketType::FileTransferEnd, PacketFlags::TRANSFER_END, end.encode())
-            .await?;
-        Ok(())
-    }
-
-    /// Send a payload, fragmenting it across frames when it exceeds the frame
-    /// cap (download chunks can be larger than one frame).
+    /// Same as [`Connection::send`] (which fragments on its own); kept for
+    /// the download pump's call site.
     async fn send_fragmented(
         &mut self,
         packet_type: PacketType,
         flags: PacketFlags,
         payload: Bytes,
-    ) -> Result<(), ProtocolError> {
+    ) -> Result<(), ConnectionError> {
+        self.send(packet_type, flags, payload).await
+    }
+
+    /// Send one logical message, fragmenting it across frames when it's over
+    /// the frame cap. A payload over `MAX_REASSEMBLED_PAYLOAD` (more than any
+    /// client reassembles) is answered with a short `Error` reply instead, so
+    /// handlers can keep using `?`: only a failed or timed-out write
+    /// (`WriteTimeout`) is an error.
+    async fn send(
+        &mut self,
+        packet_type: PacketType,
+        flags: PacketFlags,
+        payload: Bytes,
+    ) -> Result<(), ConnectionError> {
+        match self.write_message(packet_type, flags, payload).await {
+            Err(ConnectionError::MessageTooLarge { len }) => {
+                warn!(?packet_type, len, "outbound message too large; sending an error instead");
+                self.write_message(
+                    PacketType::Error,
+                    PacketFlags::SYSTEM_MESSAGE,
+                    Bytes::from_static(b"reply too large to send"),
+                )
+                .await
+            }
+            other => other,
+        }
+    }
+
+    /// Frame `payload` (fragmenting as needed) and write it within
+    /// `WRITE_TIMEOUT`. Refuses payloads over `MAX_REASSEMBLED_PAYLOAD` with
+    /// `MessageTooLarge` before writing anything.
+    async fn write_message(
+        &mut self,
+        packet_type: PacketType,
+        flags: PacketFlags,
+        payload: Bytes,
+    ) -> Result<(), ConnectionError> {
+        if payload.len() > MAX_REASSEMBLED_PAYLOAD {
+            return Err(ConnectionError::MessageTooLarge { len: payload.len() });
+        }
         let mut seq = self.next_sequence;
         let frames = kdx_protocol::fragment(
             packet_type,
@@ -2112,27 +2413,147 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
             },
         );
         self.next_sequence = seq;
-        for frame in frames {
-            self.framed.send(frame).await?;
-        }
+        let framed = &mut self.framed;
+        let write = async move {
+            for frame in frames {
+                framed.feed(frame).await?;
+            }
+            framed.flush().await
+        };
+        timeout(WRITE_TIMEOUT, write)
+            .await
+            .map_err(|_| ConnectionError::WriteTimeout)??;
         Ok(())
     }
+}
 
-    async fn send(
-        &mut self,
-        packet_type: PacketType,
-        flags: PacketFlags,
-        payload: Bytes,
-    ) -> Result<(), ProtocolError> {
-        let header = PacketHeader {
-            version: PROTOCOL_VERSION,
-            packet_type,
-            flags,
-            sequence: self.next_sequence,
-            length: payload.len() as u32,
-        };
-        self.next_sequence = self.next_sequence.wrapping_add(1);
-        self.framed.send(KdxFrame { header, payload }).await
+/// Unregisters an authenticated session — leaves its chat rooms and the
+/// presence roster, ends the auth session — however the dispatch loop ends.
+/// The normal path awaits [`SessionGuard::cleanup`]; if the task panics or
+/// is dropped mid-loop, `Drop` hands the same cleanup to a fresh task.
+struct SessionGuard {
+    ctx: Arc<ServerCtx>,
+    session_id: Uuid,
+    /// Rooms this connection is in, by name.
+    joined: HashMap<String, mpsc::Sender<RoomCommand>>,
+    armed: bool,
+}
+
+impl SessionGuard {
+    async fn cleanup(&mut self) {
+        let rooms: Vec<String> = self.joined.keys().cloned().collect();
+        unregister_session(&self.ctx, self.session_id, &rooms).await;
+        self.joined.clear();
+        self.armed = false;
+    }
+}
+
+impl Drop for SessionGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // Stop the session validating right away, even if no runtime is left
+        // to run the rest.
+        self.ctx.auth.end_session(self.session_id);
+        let ctx = self.ctx.clone();
+        let session_id = self.session_id;
+        let rooms: Vec<String> = self.joined.drain().map(|(room, _)| room).collect();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move { unregister_session(&ctx, session_id, &rooms).await });
+        }
+    }
+}
+
+async fn unregister_session(ctx: &ServerCtx, session_id: Uuid, rooms: &[String]) {
+    for room in rooms {
+        ctx.rooms.leave(room, session_id).await;
+        debug!(room, "left on disconnect");
+    }
+    ctx.presence.leave(session_id).await;
+    ctx.auth.end_session(session_id);
+}
+
+/// Per-connection request budgets. They live as long as the connection — not
+/// a room membership — so leaving and rejoining a room can't reset them.
+struct RateLimits {
+    /// Every inbound frame except accepted upload data. Over budget, the
+    /// connection is simply read more slowly.
+    inbound: FloodGate,
+    /// Room chat lines (answered with the "flood protection" warning).
+    chat: FloodGate,
+    /// Private messages.
+    private: FloodGate,
+    /// `SetIdentity`: each change is broadcast to every user online.
+    identity: FloodGate,
+    /// `ChatJoin`: each join is announced to the room.
+    join: FloodGate,
+    /// `ChatInvite`: each creates a room and pings another user.
+    invite: FloodGate,
+    /// Topic and room-flag changes, announced to the room.
+    room_admin: FloodGate,
+}
+
+impl RateLimits {
+    fn new() -> Self {
+        Self {
+            inbound: FloodGate::new(50, 20.0),
+            chat: FloodGate::new(5, 1.0),
+            private: FloodGate::new(10, 3.0),
+            identity: FloodGate::new(3, 0.2),
+            join: FloodGate::new(10, 2.0),
+            invite: FloodGate::new(3, 0.1),
+            room_admin: FloodGate::new(5, 1.0),
+        }
+    }
+}
+
+/// What one pull of a download stream yields: the stream back, plus the
+/// next chunk (`None` once complete).
+type Pulled = (ActiveDownload, Result<Option<DownloadChunk>, TransferError>);
+
+/// A download being streamed to the client. The pending pull owns the
+/// stream and persists across dispatch turns, so a throttle sleep or disk
+/// read in progress is never lost when another select branch wins.
+struct DownloadPump {
+    pull: std::pin::Pin<Box<dyn std::future::Future<Output = Pulled> + Send>>,
+}
+
+impl DownloadPump {
+    fn new(mut stream: ActiveDownload) -> Self {
+        Self {
+            pull: Box::pin(async move {
+                let chunk = stream.next_chunk().await;
+                (stream, chunk)
+            }),
+        }
+    }
+}
+
+/// The next pulled chunk of the active download; pending forever if there
+/// is none. Cancel-safe: the pull itself lives in the `DownloadPump`.
+async fn next_download(download: &mut Option<DownloadPump>) -> Pulled {
+    match download {
+        Some(pump) => pump.pull.as_mut().await,
+        None => std::future::pending().await,
+    }
+}
+
+async fn sleep_until_opt(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(at) => tokio::time::sleep_until(at).await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Largest reassembled payload accepted for `packet_type`: upload data gets
+/// the full cap, a transfer request room for its resume bitmap, and every
+/// other message the control-message cap.
+fn reassembly_cap(packet_type: PacketType) -> usize {
+    match packet_type {
+        PacketType::FileTransferData => MAX_REASSEMBLED_PAYLOAD,
+        PacketType::FileTransferStart => MAX_TRANSFER_START_PAYLOAD,
+        _ => MAX_CONTROL_PAYLOAD,
     }
 }
 
@@ -2192,6 +2613,7 @@ mod tests {
     use super::*;
     use crate::auth::Privileges;
     use kdx_crypto::{client_response, hash_password};
+    use kdx_protocol::PacketHeader;
     use kdx_storage::accounts;
 
     async fn test_ctx() -> (Arc<ServerCtx>, tempfile::TempDir) {
@@ -2637,5 +3059,637 @@ mod tests {
             .await
             .unwrap();
         conn.await.unwrap().unwrap();
+    }
+
+    /// Core loop: framing, cleanup, kill signal, timeouts, rate limits,
+    /// room caps and address redaction.
+    mod core_loop {
+        use super::*;
+        use kdx_protocol::messages::{ChatUserList, PresenceChange, DIRECTION_DOWNLOAD};
+        use sha2::Digest;
+        use tokio::io::DuplexStream;
+        use tokio::task::JoinHandle;
+        use tokio::time::Instant;
+
+        type Client = Framed<DuplexStream, KdxCodec>;
+
+        /// Connect over a `capacity`-byte duplex pipe presenting `peer` as
+        /// the network address, and log in as `username`.
+        async fn connect_as(
+            ctx: &Arc<ServerCtx>,
+            capacity: usize,
+            peer: &str,
+            username: &str,
+        ) -> (Client, u32, JoinHandle<Result<(), ConnectionError>>, AuthResult) {
+            let (client, server) = tokio::io::duplex(capacity);
+            let conn = tokio::spawn(
+                Connection::new_with_peer(server, ctx.clone(), peer.to_string()).run(),
+            );
+            let mut client = client_framed(client);
+            let mut seq = 0;
+            do_handshake(&mut client, &mut seq).await;
+            let login = do_login(&mut client, &mut seq, username, "s3cret").await;
+            assert!(login.success, "{}", login.message);
+            (client, seq, conn, login)
+        }
+
+        /// Read frames until one whole logical message is reassembled.
+        async fn recv_logical(client: &mut Client, reasm: &mut Reassembler) -> KdxFrame {
+            loop {
+                let frame = client.next().await.expect("stream open").expect("valid frame");
+                if let Some(whole) = reasm.push(frame, MAX_REASSEMBLED_PAYLOAD).unwrap() {
+                    return whole;
+                }
+            }
+        }
+
+        /// The next whole message of `packet_type`, skipping everything else.
+        async fn recv_type(client: &mut Client, packet_type: PacketType) -> KdxFrame {
+            let mut reasm = Reassembler::default();
+            loop {
+                let frame = recv_logical(client, &mut reasm).await;
+                if frame.header.packet_type == packet_type {
+                    return frame;
+                }
+            }
+        }
+
+        async fn request(client: &mut Client, seq: &mut u32, packet_type: PacketType, payload: Bytes) {
+            client
+                .send(client_frame(packet_type, bump(seq), payload))
+                .await
+                .unwrap();
+        }
+
+        async fn ping(client: &mut Client, seq: &mut u32) {
+            request(client, seq, PacketType::Ping, Bytes::new()).await;
+            recv_type(client, PacketType::Pong).await;
+        }
+
+        fn chat_join(room: &str) -> Bytes {
+            ChatJoin { room: room.into() }.encode()
+        }
+
+        fn error_text(frame: &KdxFrame) -> String {
+            assert_eq!(frame.header.packet_type, PacketType::Error);
+            String::from_utf8_lossy(&frame.payload).into_owned()
+        }
+
+        #[tokio::test]
+        async fn send_fragments_large_messages_and_refuses_oversized_ones() {
+            let (ctx, _dir) = test_ctx().await;
+            let (client, server) = tokio::io::duplex(64 * 1024);
+            let mut conn = Connection::new(server, ctx);
+            let mut client = client_framed(client);
+
+            let big = Bytes::from(vec![7u8; 40 * 1024]);
+            let (sent, got) = tokio::time::timeout(Duration::from_secs(10), async {
+                tokio::join!(
+                    conn.send(PacketType::Info, PacketFlags::SYSTEM_MESSAGE, big.clone()),
+                    recv_type(&mut client, PacketType::Info)
+                )
+            })
+            .await
+            .expect("a 40 KiB message must arrive");
+            sent.unwrap();
+            assert_eq!(got.payload, big);
+
+            // Beyond what any client reassembles: an Error reply instead,
+            // and the connection carries on.
+            let huge = Bytes::from(vec![0u8; MAX_REASSEMBLED_PAYLOAD + 1]);
+            let mut reasm = Reassembler::default();
+            let (sent, got) = tokio::join!(
+                conn.send(PacketType::Info, PacketFlags::SYSTEM_MESSAGE, huge),
+                recv_logical(&mut client, &mut reasm)
+            );
+            sent.unwrap();
+            assert!(error_text(&got).contains("too large"));
+        }
+
+        #[tokio::test]
+        async fn oversized_identity_and_chat_are_refused_and_peers_survive() {
+            let (ctx, _dir) = test_ctx().await;
+            let (mut a, mut a_seq, conn_a, _) = connect_as(&ctx, 64 * 1024, "unknown", "phraq").await;
+            let (mut b, mut b_seq, conn_b, _) = connect_as(&ctx, 64 * 1024, "unknown", "phraq").await;
+            request(&mut a, &mut a_seq, PacketType::ChatJoin, chat_join("lobby")).await;
+            request(&mut b, &mut b_seq, PacketType::ChatJoin, chat_join("lobby")).await;
+            ping(&mut a, &mut a_seq).await;
+            ping(&mut b, &mut b_seq).await;
+
+            // One maximal frame whose PresenceChange broadcast would not fit
+            // in a frame.
+            let identity = SetIdentity {
+                name: "n".repeat(16_350),
+                description: String::new(),
+            };
+            request(&mut a, &mut a_seq, PacketType::SetIdentity, identity.encode()).await;
+            let err = recv_type(&mut a, PacketType::Error).await;
+            assert!(error_text(&err).contains("name too long"));
+
+            // One maximal frame whose ChatEvent would not fit in a frame.
+            let line = ChatSend {
+                room: "lobby".into(),
+                flags: 0,
+                text: "x".repeat(16_370),
+            };
+            request(&mut a, &mut a_seq, PacketType::ChatMessage, line.encode()).await;
+            let err = recv_type(&mut a, PacketType::Error).await;
+            assert!(error_text(&err).contains("message too long"));
+
+            // Both connections are alive and still listed.
+            ping(&mut b, &mut b_seq).await;
+            ping(&mut a, &mut a_seq).await;
+            assert_eq!(ctx.presence.list().await.len(), 2);
+
+            for (client, seq) in [(&mut a, &mut a_seq), (&mut b, &mut b_seq)] {
+                request(client, seq, PacketType::Disconnect, Bytes::new()).await;
+            }
+            conn_a.await.unwrap().unwrap();
+            conn_b.await.unwrap().unwrap();
+        }
+
+        #[tokio::test]
+        async fn presence_list_larger_than_a_frame_is_delivered() {
+            let (ctx, _dir) = test_ctx().await;
+            let mut keep = Vec::new();
+            for i in 0..600 {
+                let (tx, rx) = mpsc::channel(1);
+                let kill = ctx
+                    .presence
+                    .join(
+                        Uuid::new_v4(),
+                        format!("ghost-user-number-{i:04}"),
+                        1,
+                        "10.0.0.1:1".into(),
+                        false,
+                        tx,
+                    )
+                    .await;
+                keep.push((rx, kill));
+            }
+            let (mut client, mut seq, conn, _) = connect_as(&ctx, 64 * 1024, "unknown", "phraq").await;
+            request(&mut client, &mut seq, PacketType::PresenceListRequest, PresenceListRequest.encode())
+                .await;
+            let frame = recv_type(&mut client, PacketType::PresenceListResponse).await;
+            assert!(frame.payload.len() > kdx_protocol::DEFAULT_MAX_FRAME_PAYLOAD as usize);
+            let list = PresenceListResponse::decode(&frame.payload).unwrap();
+            assert_eq!(list.users.len(), 601);
+
+            ping(&mut client, &mut seq).await;
+            request(&mut client, &mut seq, PacketType::Disconnect, Bytes::new()).await;
+            conn.await.unwrap().unwrap();
+        }
+
+        #[tokio::test]
+        async fn malformed_packet_still_runs_session_cleanup() {
+            let (ctx, _dir) = test_ctx().await;
+            let (mut a, mut seq, conn, login) = connect_as(&ctx, 64 * 1024, "unknown", "phraq").await;
+            let session_id = Uuid::from_bytes(login.session_id);
+            request(&mut a, &mut seq, PacketType::ChatJoin, chat_join("hideout")).await;
+            request(&mut a, &mut seq, PacketType::ChatJoin, Bytes::from_static(&[0xFF])).await;
+            assert!(conn.await.unwrap().is_err());
+
+            assert!(ctx.presence.list().await.is_empty(), "ghost left in presence");
+            assert!(ctx.auth.validate(session_id).is_none(), "session leaked");
+
+            // The room no longer holds the dead member.
+            let (mut b, mut b_seq, conn_b, _) = connect_as(&ctx, 64 * 1024, "unknown", "phraq").await;
+            request(&mut b, &mut b_seq, PacketType::ChatJoin, chat_join("hideout")).await;
+            let frame = recv_type(&mut b, PacketType::ChatUserList).await;
+            let list = ChatUserList::decode(&frame.payload).unwrap();
+            assert_eq!(list.users, vec!["phraq".to_string()]);
+            request(&mut b, &mut b_seq, PacketType::Disconnect, Bytes::new()).await;
+            conn_b.await.unwrap().unwrap();
+        }
+
+        #[tokio::test]
+        async fn kick_reaches_a_client_that_stopped_reading() {
+            let (ctx, _dir) = test_ctx().await;
+            // `_client` stays open but is never read again.
+            let (_client, _seq, conn, _) = connect_as(&ctx, 1024, "unknown", "phraq").await;
+            tokio::time::pause();
+            // Fill the socket, then the connection's event queue.
+            for _ in 0..(OUTBOUND_QUEUE + 64) {
+                ctx.presence
+                    .broadcast_all(Outbound {
+                        packet_type: PacketType::Info,
+                        flags: PacketFlags::SYSTEM_MESSAGE,
+                        payload: Bytes::from(vec![b'x'; 512]),
+                    })
+                    .await;
+            }
+            assert_eq!(ctx.presence.disconnect("phraq", "bye").await, 1);
+            let start = Instant::now();
+            tokio::time::timeout(Duration::from_secs(300), conn)
+                .await
+                .expect("a stuck, kicked connection must end")
+                .unwrap()
+                .ok();
+            assert!(start.elapsed() <= WRITE_TIMEOUT + FAREWELL_TIMEOUT);
+            assert!(ctx.presence.list().await.is_empty());
+        }
+
+        /// `test_ctx` with downloads throttled to `rate` bytes/sec.
+        async fn throttled_ctx(rate: u64) -> (Arc<ServerCtx>, tempfile::TempDir) {
+            let (ctx, dir) = test_ctx().await;
+            let mut inner = Arc::try_unwrap(ctx).ok().expect("sole owner of a fresh ctx");
+            let pool = kdx_storage::connect(&dir.path().join("test.db")).await.unwrap();
+            inner.transfers = TransferManager::new(
+                pool,
+                crate::transfer::TransferConfig {
+                    files_root: dir.path().join("files"),
+                    max_upload_bytes_per_sec: 0,
+                    max_download_bytes_per_sec: rate,
+                },
+            )
+            .await
+            .unwrap();
+            (Arc::new(inner), dir)
+        }
+
+        async fn seed_file(ctx: &ServerCtx, dir: &std::path::Path, name: &str, len: usize) {
+            let data: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+            let path = dir.join("files").join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, &data).unwrap();
+            let sha: [u8; 32] = sha2::Sha256::digest(&data).into();
+            let root = ctx.tree.resolve("/").await.unwrap();
+            ctx.tree
+                .add_file(&root.id, name, len as u64, &sha, path.to_str().unwrap())
+                .await
+                .unwrap();
+        }
+
+        #[tokio::test]
+        async fn kick_lands_mid_download_without_waiting_for_it() {
+            // 1 MiB at 64 KiB/s: about 15 s of streaming.
+            let (ctx, dir) = throttled_ctx(64 * 1024).await;
+            seed_file(&ctx, dir.path(), "big.bin", 1024 * 1024).await;
+            let (mut client, mut seq, conn, _) = connect_as(&ctx, 256 * 1024, "unknown", "phraq").await;
+            let download = TransferRequest {
+                direction: DIRECTION_DOWNLOAD,
+                path: "/".into(),
+                name: "big.bin".into(),
+                size: 0,
+                chunk_size: 32 * 1024,
+                sha256: [0; 32],
+                resume_id: [0; 16],
+                have_bitmap: vec![],
+            };
+            request(&mut client, &mut seq, PacketType::FileTransferStart, download.encode()).await;
+            let accept = recv_type(&mut client, PacketType::FileTransferStart).await;
+            assert_eq!(TransferAccept::decode(&accept.payload).unwrap().total_chunks, 32);
+
+            tokio::time::pause();
+            let start = Instant::now();
+            let kicker = {
+                let ctx = ctx.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    ctx.presence.disconnect("phraq", "bye").await
+                })
+            };
+            let mut reasm = Reassembler::default();
+            let mut chunks = 0;
+            loop {
+                let frame = recv_logical(&mut client, &mut reasm).await;
+                match frame.header.packet_type {
+                    PacketType::FileTransferData => chunks += 1,
+                    PacketType::Disconnect => {
+                        assert_eq!(&frame.payload[..], b"bye");
+                        break;
+                    }
+                    PacketType::FileTransferEnd => panic!("download finished before the kick landed"),
+                    _ => {}
+                }
+            }
+            assert_eq!(kicker.await.unwrap(), 1);
+            assert!(chunks < 32, "kick waited for the download ({chunks} chunks)");
+            assert!(start.elapsed() < Duration::from_secs(3));
+            conn.await.unwrap().unwrap();
+            assert!(ctx.presence.list().await.is_empty());
+        }
+
+        #[tokio::test]
+        async fn download_still_completes_when_unthrottled() {
+            let (ctx, dir) = test_ctx().await;
+            seed_file(&ctx, dir.path(), "small.bin", 100 * 1024).await;
+            let (mut client, mut seq, conn, _) = connect_as(&ctx, 64 * 1024, "unknown", "phraq").await;
+            let download = TransferRequest {
+                direction: DIRECTION_DOWNLOAD,
+                path: "/".into(),
+                name: "small.bin".into(),
+                size: 0,
+                chunk_size: 32 * 1024,
+                sha256: [0; 32],
+                resume_id: [0; 16],
+                have_bitmap: vec![],
+            };
+            request(&mut client, &mut seq, PacketType::FileTransferStart, download.encode()).await;
+            let mut reasm = Reassembler::default();
+            let mut bytes = 0;
+            loop {
+                let frame = recv_logical(&mut client, &mut reasm).await;
+                match frame.header.packet_type {
+                    PacketType::FileTransferData => {
+                        bytes += TransferData::decode(&frame.payload).unwrap().data.len();
+                    }
+                    PacketType::FileTransferEnd => break,
+                    _ => {}
+                }
+            }
+            assert_eq!(bytes, 100 * 1024);
+            ping(&mut client, &mut seq).await;
+            request(&mut client, &mut seq, PacketType::Disconnect, Bytes::new()).await;
+            conn.await.unwrap().unwrap();
+        }
+
+        #[tokio::test]
+        async fn reassembly_deadline_is_fixed_when_the_group_opens() {
+            let (ctx, _dir) = test_ctx().await;
+            let (mut client, mut seq, conn, _) = connect_as(&ctx, 64 * 1024, "unknown", "phraq").await;
+            tokio::time::pause();
+            let start = Instant::now();
+            let fragment = |sequence: u32| KdxFrame {
+                header: PacketHeader {
+                    version: PROTOCOL_VERSION,
+                    packet_type: PacketType::ChatMessage,
+                    flags: PacketFlags::FRAGMENTED | PacketFlags::MORE_FRAGMENTS,
+                    sequence,
+                    length: 4,
+                },
+                payload: Bytes::from_static(b"abcd"),
+            };
+            client.send(fragment(bump(&mut seq))).await.unwrap();
+            // A trickled fragment must not extend the deadline.
+            tokio::time::sleep(Duration::from_secs(20)).await;
+            client.send(fragment(bump(&mut seq))).await.unwrap();
+            let result = tokio::time::timeout(Duration::from_secs(25), conn)
+                .await
+                .expect("the group should expire 30 s after it opened");
+            assert!(matches!(result.unwrap(), Err(ConnectionError::ReassemblyTimeout)));
+            let elapsed = start.elapsed();
+            assert!(elapsed >= REASSEMBLY_TIMEOUT && elapsed < REASSEMBLY_TIMEOUT + Duration::from_secs(1));
+            assert!(ctx.presence.list().await.is_empty());
+        }
+
+        #[tokio::test]
+        async fn control_messages_have_a_smaller_reassembly_cap() {
+            let (ctx, _dir) = test_ctx().await;
+            let (mut client, mut seq, conn, _) = connect_as(&ctx, 256 * 1024, "unknown", "phraq").await;
+            let frames = kdx_protocol::fragment(
+                PacketType::Ping,
+                PacketFlags::empty(),
+                Bytes::from(vec![0u8; MAX_CONTROL_PAYLOAD + 1]),
+                kdx_protocol::DEFAULT_MAX_FRAME_PAYLOAD,
+                || bump(&mut seq),
+            );
+            for frame in frames {
+                if client.send(frame).await.is_err() {
+                    break;
+                }
+            }
+            assert!(matches!(
+                conn.await.unwrap(),
+                Err(ConnectionError::Protocol(ProtocolError::ReassemblyTooLarge { .. }))
+            ));
+            assert!(ctx.presence.list().await.is_empty());
+        }
+
+        #[tokio::test]
+        async fn idle_session_is_closed_after_the_session_ttl() {
+            let (ctx, _dir) = test_ctx().await; // 60 s session TTL
+            let (mut client, mut seq, conn, login) = connect_as(&ctx, 64 * 1024, "unknown", "phraq").await;
+            let session_id = Uuid::from_bytes(login.session_id);
+            tokio::time::pause();
+            // Pings keep it alive well past one TTL.
+            for _ in 0..3 {
+                tokio::time::sleep(Duration::from_secs(40)).await;
+                ping(&mut client, &mut seq).await;
+            }
+            let start = Instant::now();
+            let bye = tokio::time::timeout(
+                Duration::from_secs(300),
+                recv_type(&mut client, PacketType::Disconnect),
+            )
+            .await
+            .expect("an idle session must be closed");
+            assert_eq!(&bye.payload[..], b"idle timeout");
+            assert!(start.elapsed() >= Duration::from_secs(59));
+            assert!(matches!(conn.await.unwrap(), Err(ConnectionError::IdleTimeout)));
+            assert!(ctx.presence.list().await.is_empty());
+            assert!(ctx.auth.validate(session_id).is_none());
+        }
+
+        #[tokio::test]
+        async fn inbound_flood_is_paced_not_dropped() {
+            let (ctx, _dir) = test_ctx().await;
+            let (mut client, mut seq, conn, _) = connect_as(&ctx, 256 * 1024, "unknown", "phraq").await;
+            tokio::time::pause();
+            let start = Instant::now();
+            for _ in 0..70 {
+                client
+                    .feed(client_frame(PacketType::Ping, bump(&mut seq), Bytes::new()))
+                    .await
+                    .unwrap();
+            }
+            client.flush().await.unwrap();
+            for _ in 0..70 {
+                recv_type(&mut client, PacketType::Pong).await;
+            }
+            // 50 ride the burst; the other 20 are read at 20/s.
+            let elapsed = start.elapsed();
+            assert!(elapsed >= Duration::from_millis(950), "{elapsed:?}");
+            request(&mut client, &mut seq, PacketType::Disconnect, Bytes::new()).await;
+            conn.await.unwrap().unwrap();
+        }
+
+        #[tokio::test]
+        async fn identity_changes_are_rate_limited() {
+            let (ctx, _dir) = test_ctx().await;
+            let (mut a, mut a_seq, conn_a, _) = connect_as(&ctx, 64 * 1024, "unknown", "phraq").await;
+            let (mut b, mut b_seq, conn_b, _) = connect_as(&ctx, 64 * 1024, "unknown", "phraq").await;
+            tokio::time::pause();
+            for i in 0..5 {
+                let identity = SetIdentity {
+                    name: format!("nick{i}"),
+                    description: String::new(),
+                };
+                request(&mut a, &mut a_seq, PacketType::SetIdentity, identity.encode()).await;
+            }
+            for _ in 0..2 {
+                let err = recv_type(&mut a, PacketType::Error).await;
+                assert!(error_text(&err).contains("slow down"));
+            }
+            // Everything the presence actor broadcast is queued for b before
+            // this round-trip returns; b writes queued events ahead of the
+            // Pong.
+            ctx.presence.list().await;
+            request(&mut b, &mut b_seq, PacketType::Ping, Bytes::new()).await;
+            let mut reasm = Reassembler::default();
+            let mut renames = 0;
+            loop {
+                let frame = recv_logical(&mut b, &mut reasm).await;
+                match frame.header.packet_type {
+                    PacketType::PresenceChange => {
+                        let change = PresenceChange::decode(&frame.payload).unwrap();
+                        if change.entry.name.starts_with("nick") {
+                            renames += 1;
+                        }
+                    }
+                    PacketType::Pong => break,
+                    _ => {}
+                }
+            }
+            assert_eq!(renames, 3, "only the burst should be broadcast");
+            for (client, seq) in [(&mut a, &mut a_seq), (&mut b, &mut b_seq)] {
+                request(client, seq, PacketType::Disconnect, Bytes::new()).await;
+            }
+            conn_a.await.unwrap().unwrap();
+            conn_b.await.unwrap().unwrap();
+        }
+
+        #[tokio::test]
+        async fn chat_flood_gate_survives_leaving_and_rejoining() {
+            let (ctx, _dir) = test_ctx().await;
+            let (mut client, mut seq, conn, _) = connect_as(&ctx, 256 * 1024, "unknown", "phraq").await;
+            tokio::time::pause();
+            let line = |text: &str| {
+                ChatSend {
+                    room: "lobby".into(),
+                    flags: 0,
+                    text: text.into(),
+                }
+                .encode()
+            };
+            request(&mut client, &mut seq, PacketType::ChatJoin, chat_join("lobby")).await;
+            for i in 0..5 {
+                request(&mut client, &mut seq, PacketType::ChatMessage, line(&format!("spam {i}"))).await;
+            }
+            // Leaving and rejoining used to hand out a fresh flood gate.
+            let leave = ChatLeave {
+                room: "lobby".into(),
+            };
+            request(&mut client, &mut seq, PacketType::ChatLeave, leave.encode()).await;
+            request(&mut client, &mut seq, PacketType::ChatJoin, chat_join("lobby")).await;
+            request(&mut client, &mut seq, PacketType::ChatMessage, line("one more")).await;
+            let warning = recv_type(&mut client, PacketType::Warning).await;
+            assert!(String::from_utf8_lossy(&warning.payload).contains("flood"));
+            request(&mut client, &mut seq, PacketType::Disconnect, Bytes::new()).await;
+            conn.await.unwrap().unwrap();
+        }
+
+        #[tokio::test]
+        async fn joined_rooms_per_connection_are_capped() {
+            let (ctx, _dir) = test_ctx().await;
+            let (mut client, mut seq, conn, _) = connect_as(&ctx, 1024 * 1024, "unknown", "phraq").await;
+            tokio::time::pause();
+            let cap = crate::limits::MAX_JOINED_ROOMS_PER_CONNECTION;
+            for i in 0..=cap {
+                request(&mut client, &mut seq, PacketType::ChatJoin, chat_join(&format!("room-{i}"))).await;
+                // Stay under the join rate limit.
+                tokio::time::sleep(Duration::from_millis(600)).await;
+            }
+            request(&mut client, &mut seq, PacketType::Ping, Bytes::new()).await;
+            let mut errors = Vec::new();
+            let mut reasm = Reassembler::default();
+            loop {
+                let frame = recv_logical(&mut client, &mut reasm).await;
+                match frame.header.packet_type {
+                    PacketType::Error => errors.push(error_text(&frame)),
+                    PacketType::Pong => break,
+                    _ => {}
+                }
+            }
+            assert_eq!(errors.len(), 1, "{errors:?}");
+            assert!(errors[0].contains("too many chat rooms"));
+            request(&mut client, &mut seq, PacketType::Disconnect, Bytes::new()).await;
+            conn.await.unwrap().unwrap();
+        }
+
+        #[tokio::test]
+        async fn addresses_are_only_shown_to_user_kick_holders() {
+            let (ctx, _dir) = admin_test_ctx().await;
+            let (mut sysop, mut s_seq, conn_s, _) = connect_as(&ctx, 64 * 1024, "10.0.0.1:1111", "sysop").await;
+            let (mut plain, mut p_seq, conn_p, _) = connect_as(&ctx, 64 * 1024, "10.0.0.9:9999", "plain").await;
+
+            // The admin sees the plain user's address in the join broadcast.
+            let change = recv_type(&mut sysop, PacketType::PresenceChange).await;
+            let change = PresenceChange::decode(&change.payload).unwrap();
+            assert_eq!(change.entry.username, "plain");
+            assert_eq!(change.entry.address, "10.0.0.9:9999");
+
+            // The plain user sees no addresses: roster, user info, broadcasts.
+            request(&mut plain, &mut p_seq, PacketType::PresenceListRequest, PresenceListRequest.encode())
+                .await;
+            let frame = recv_type(&mut plain, PacketType::PresenceListResponse).await;
+            let roster = PresenceListResponse::decode(&frame.payload).unwrap();
+            assert_eq!(roster.users.len(), 2);
+            assert!(roster.users.iter().all(|u| u.address.is_empty()), "{roster:?}");
+
+            let info = UserInfoRequest {
+                username: "sysop".into(),
+            };
+            request(&mut plain, &mut p_seq, PacketType::UserInfoRequest, info.encode()).await;
+            let frame = recv_type(&mut plain, PacketType::UserInfoResponse).await;
+            assert!(UserInfoResponse::decode(&frame.payload).unwrap().entry.address.is_empty());
+
+            let identity = SetIdentity {
+                name: "The Sysop".into(),
+                description: String::new(),
+            };
+            request(&mut sysop, &mut s_seq, PacketType::SetIdentity, identity.encode()).await;
+            let frame = recv_type(&mut plain, PacketType::PresenceChange).await;
+            let change = PresenceChange::decode(&frame.payload).unwrap();
+            assert_eq!(change.entry.name, "The Sysop");
+            assert!(change.entry.address.is_empty());
+
+            // The admin still sees them everywhere.
+            let info = UserInfoRequest {
+                username: "plain".into(),
+            };
+            request(&mut sysop, &mut s_seq, PacketType::UserInfoRequest, info.encode()).await;
+            let frame = recv_type(&mut sysop, PacketType::UserInfoResponse).await;
+            assert_eq!(UserInfoResponse::decode(&frame.payload).unwrap().entry.address, "10.0.0.9:9999");
+            request(&mut sysop, &mut s_seq, PacketType::ConnectionListRequest, ConnectionListRequest.encode())
+                .await;
+            let frame = recv_type(&mut sysop, PacketType::ConnectionListResponse).await;
+            let conns = ConnectionListResponse::decode(&frame.payload).unwrap();
+            assert!(conns.connections.iter().any(|c| c.address == "10.0.0.9:9999"));
+
+            for (client, seq) in [(&mut sysop, &mut s_seq), (&mut plain, &mut p_seq)] {
+                request(client, seq, PacketType::Disconnect, Bytes::new()).await;
+            }
+            conn_s.await.unwrap().unwrap();
+            conn_p.await.unwrap().unwrap();
+        }
+
+        #[tokio::test]
+        async fn shutdown_notice_is_flushed_and_the_stop_is_not_lost() {
+            let (ctx, _dir) = admin_test_ctx().await;
+            let (mut sysop, mut seq, conn, _) = connect_as(&ctx, 64 * 1024, "unknown", "sysop").await;
+            let shutdown = AdminShutdown {
+                message: "goodnight".into(),
+            };
+            request(&mut sysop, &mut seq, PacketType::AdminShutdown, shutdown.encode()).await;
+            // The notice is flushed ahead of the Disconnect.
+            let mut reasm = Reassembler::default();
+            let mut saw_notice = false;
+            loop {
+                let frame = recv_logical(&mut sysop, &mut reasm).await;
+                match frame.header.packet_type {
+                    PacketType::Info if &frame.payload[..] == b"goodnight" => saw_notice = true,
+                    PacketType::Disconnect => break,
+                    _ => {}
+                }
+            }
+            assert!(saw_notice);
+            conn.await.unwrap().unwrap();
+            // Nobody was parked in `notified()` when the admin asked; the
+            // stop must still be waiting for the accept loop.
+            tokio::time::timeout(Duration::from_secs(5), ctx.shutdown.notified())
+                .await
+                .expect("shutdown request was lost");
+        }
     }
 }
