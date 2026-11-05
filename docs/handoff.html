@@ -552,7 +552,7 @@ checksum    <span class="g">2</span>  <span class="c">CRC32C-folded — framing 
         </div>
         <div class="card">
           <h3>Download ↓</h3>
-          <p>The <strong>client</strong> holds the resume state: a <code>.kdxpart</code> sidecar next to the partial file records the bitmap. On resume the client sends its bitmap and the server streams only the missing chunks; the whole-file hash is checked before <code>.part</code> is renamed to the final name.</p>
+          <p>The <strong>client</strong> holds the resume state: a <code>.kdxpart</code> sidecar beside the partial bytes, both in the client's data directory (<code>transfers/</code>), records the bitmap. On resume the client sends its bitmap and the server streams only the missing chunks; the whole-file hash is checked before the file is moved to the chosen destination.</p>
         </div>
       </div>
       <p>The chunk grid in the Transfers window is a direct view of this bitmap — the visualization and the resume mechanism are the same bytes.</p>

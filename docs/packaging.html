@@ -159,6 +159,7 @@
       <li><a href="#questions">Open questions</a></li>
       <li><a href="#server">Server — kdxd</a></li>
       <li><a href="#client">Client — KDX.app</a></li>
+      <li><a href="#macos">macOS — App Sandbox, signing &amp; notarization</a></li>
       <li><a href="#readme">README</a></li>
       <li><a href="#order">Suggested order of work</a></li>
     </ol>
@@ -214,7 +215,10 @@
       <div class="state-row"><span class="field">copyright</span><span class="present">© 2024–2026 theusual ✓</span></div>
       <div class="state-row"><span class="field">category</span><span class="present">SocialNetworking ✓</span></div>
       <div class="state-row"><span class="field">macOS min version</span><span class="present">10.15 ✓</span></div>
-      <div class="state-row"><span class="field">entitlements</span><span class="present">entitlements.plist ✓</span></div>
+      <div class="state-row"><span class="field">entitlements</span><span class="present">entitlements.plist — App Sandbox ✓</span></div>
+      <div class="state-row"><span class="field">signingIdentity</span><span class="present">"-" (ad-hoc; Developer ID via env) ✓</span></div>
+      <div class="state-row"><span class="field">hardenedRuntime</span><span class="present">true ✓</span></div>
+      <div class="state-row"><span class="field">container migration</span><span class="present">container-migration.plist ✓</span></div>
     </div>
   </div>
   <div class="state-card" style="margin-bottom:1.5rem;">
@@ -363,15 +367,16 @@
   <div class="task-group">
     <div class="task">
       <div class="task-head"><strong>Create <code>apps/kdx-client/src-tauri/entitlements.plist</code></strong></div>
-      <p>Required for macOS app sandboxing and network access. KDX needs outbound TCP connections only.</p>
+      <p>Enables the macOS App Sandbox. KDX needs outbound TCP connections and the files the user picks — nothing else. See <a href="#macos">macOS — App Sandbox, signing &amp; notarization</a>.</p>
       <pre><span class="cm">&lt;?xml version="1.0" encoding="UTF-8"?&gt;</span>
 &lt;!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
   "http://www.apple.com/DTDs/PropertyList-1.0.dtd"&gt;
 &lt;plist version="1.0"&gt;&lt;dict&gt;
+  &lt;key&gt;com.apple.security.app-sandbox&lt;/key&gt;&lt;true/&gt;
   &lt;key&gt;com.apple.security.network.client&lt;/key&gt;&lt;true/&gt;
   &lt;key&gt;com.apple.security.files.user-selected.read-write&lt;/key&gt;&lt;true/&gt;
 &lt;/dict&gt;&lt;/plist&gt;</pre>
-      <p><code>files.user-selected.read-write</code> is needed for the file-open/save dialogs used in upload and download. Add other entitlements only if sandboxing requires it at build time.</p>
+      <p><code>files.user-selected.read-write</code> covers the native Open/Save dialogs used by upload and download. A unit test (<code>src/bundle_tests.rs</code>) pins this exact set, so widening it is a deliberate, reviewed change.</p>
     </div>
   </div>
 
@@ -384,6 +389,96 @@
     <div class="task">
       <div class="task-head"><strong>Linux (AppImage + deb)</strong> <span class="badge badge-skip">stretch</span></div>
       <p>Add <code>"linux": { "deb": { "depends": [] } }</code>. Requires a Linux runner. Add <code>"appimage"</code> and <code>"deb"</code> to <code>targets</code>.</p>
+    </div>
+  </div>
+
+  <!-- macOS sandbox / signing -->
+  <h2 id="macos">macOS — App Sandbox, signing &amp; notarization</h2>
+
+  <h3>1. App Sandbox <span class="badge badge-done">done</span> <span class="badge badge-open">needs a macOS check</span></h3>
+  <div class="task-group">
+    <div class="task">
+      <div class="task-head"><strong>Entitlements</strong></div>
+      <p><code>com.apple.security.app-sandbox</code> — run sandboxed. <code>com.apple.security.network.client</code> — outbound TCP to KDX servers (DNS included). <code>com.apple.security.files.user-selected.read-write</code> — the one file picked in the native Open (upload) or Save (download) dialog.</p>
+      <p>Deliberately <em>not</em> <code>files.downloads.read-write</code>: the Save dialog merely <em>starts</em> in <code>~/Downloads</code> (Tauri's <code>download_dir()</code>, which inside the sandbox is the container's <code>Downloads</code> symlink to the real folder); the dialog's own grant covers the file the user picks, wherever it is. Granting the whole Downloads folder would let a compromised webview read and overwrite every file in it. No <code>cs.*</code> hardened-runtime exceptions are needed either: WebKit's JIT runs in Apple's WebContent process, not in KDX.</p>
+    </div>
+    <div class="task">
+      <div class="task-head"><strong>Where KDX writes</strong></div>
+      <p>Only inside its container (<code>~/Library/Containers/net.kdx.hotline.client/Data/</code>) or to a dialog-chosen file:</p>
+      <pre><span class="cm"># Tauri app_data_dir (= ClientConfig::data_dir), inside the container:</span>
+Library/Application Support/net.kdx.hotline.client/known_hosts.toml      <span class="cm"># TOFU pins</span>
+Library/Application Support/net.kdx.hotline.client/transfers/&lt;id&gt;.kdxdata <span class="cm"># partial download bytes (dir mode 0700)</span>
+Library/Application Support/net.kdx.hotline.client/transfers/&lt;id&gt;.kdxpart <span class="cm"># its resume sidecar</span>
+<span class="cm"># WKWebView storage (Address Book bookmarks, settings, window geometry):</span>
+Library/WebKit/net.kdx.hotline.client/
+<span class="cm"># Address Book passwords: login keychain, generic-password items</span>
+<span class="cm">#   service "net.kdx.hotline.client", account "bookmark:&lt;uuid&gt;"</span></pre>
+      <p>Downloads used to stage <code>&lt;file&gt;.kdxdata</code> / <code>&lt;file&gt;.kdxpart</code> <em>beside</em> the chosen file and rename into place — impossible under the sandbox, which grants the chosen file but not its siblings. client-core now keeps both in <code>transfers/</code> (named by a hash of server, remote path and destination, so choosing the same file again resumes, across restarts), hashes the whole partial, and only then moves the verified file to the destination: a <code>rename</code> when it is on the same volume (normally the case for <code>~/Downloads</code>); otherwise a hash-checked copy via a hidden temp file beside it, or — when the sandbox refuses that temp file — straight into the chosen file. Partials untouched for 7 days are deleted on connect. Downloaded files carry the <code>com.apple.quarantine</code> attribute (the sandbox adds it), so Gatekeeper still vets anything executable a server sent.</p>
+    </div>
+    <div class="task">
+      <div class="task-head"><strong>Upgrading from an unsandboxed build</strong></div>
+      <p>A sandboxed app no longer sees <code>~/Library/Application Support/net.kdx.hotline.client</code> or <code>~/Library/WebKit/net.kdx.hotline.client</code>. <code>container-migration.plist</code> (bundled as <code>Contents/Resources/container-migration.plist</code> via <code>bundle.macOS.files</code>) makes macOS <em>move</em> both into the container on the first sandboxed launch, keeping pinned server keys (otherwise every server would be a first-contact prompt again), bookmarks and settings. Keychain items need no migration. Downgrading to an unsandboxed build afterwards starts from empty state.</p>
+    </div>
+    <div class="task">
+      <div class="task-head"><strong>Keychain under the sandbox</strong></div>
+      <p>The <code>keyring</code> crate's <code>apple-native</code> backend (v3.6) uses the file-based keychain API (<code>SecKeychainCopyDomainDefault</code> + <code>SecKeychainAddGenericPassword</code>/<code>FindGenericPassword</code>) on the user's default (login) keychain. A sandboxed app may create and read its own items there without extra entitlements; the item's access list names the app's code signature. Consequences: with ad-hoc signing every rebuild is a different signature, so macOS asks once ("KDX wants to use … in your keychain" → Always Allow) after each update; a Developer ID build keeps one identity and doesn't ask. If the keychain is unavailable or refuses, saving reports "not saved" and login asks for the password — the app keeps working.</p>
+    </div>
+  </div>
+
+  <h3>2. Code signing <span class="badge badge-done">ad-hoc</span> <span class="badge badge-todo">Developer ID</span></h3>
+  <div class="task-group">
+    <div class="task">
+      <div class="task-head"><strong>Entitlements only apply to a signed bundle</strong></div>
+      <p><code>tauri.conf.json</code> sets <code>bundle.macOS.signingIdentity</code> to <code>"-"</code>, so every <code>cargo tauri build</code> (local and CI) ad-hoc signs <code>KDX.app</code> with <code>--options runtime</code> and <code>entitlements.plist</code>: the sandbox is active even without an Apple Developer account. <code>cargo tauri dev</code> and <code>cargo run -p kdx-client</code> run an unsigned binary — <strong>unsandboxed</strong>; test sandbox behaviour with a bundled build.</p>
+      <p>An ad-hoc signed app downloaded from the internet is still blocked by Gatekeeper (not notarized): the user opens it once via System Settings → Privacy &amp; Security → <em>Open Anyway</em>.</p>
+    </div>
+    <div class="task">
+      <div class="task-head"><strong>Developer ID (for distribution)</strong></div>
+      <p>The environment overrides the config's <code>"-"</code>. In CI, add repository secrets and pass them to the <em>Build client bundle (macOS app)</em> step only when set (an empty <code>APPLE_CERTIFICATE</code> makes Tauri try to import an empty certificate):</p>
+      <pre><span class="key">APPLE_CERTIFICATE</span>           <span class="cm"># base64 of the "Developer ID Application" .p12</span>
+<span class="key">APPLE_CERTIFICATE_PASSWORD</span>  <span class="cm"># its export password</span>
+<span class="key">APPLE_SIGNING_IDENTITY</span>      <span class="cm"># "Developer ID Application: Name (TEAMID)"</span></pre>
+      <p>Locally, with the certificate in your login keychain: <code>APPLE_SIGNING_IDENTITY="Developer ID Application: Name (TEAMID)" cargo tauri build --bundles app</code>.</p>
+    </div>
+  </div>
+
+  <h3>3. Notarization <span class="badge badge-todo">needs an Apple account</span></h3>
+  <div class="task-group">
+    <div class="task">
+      <div class="task-head"><strong>Tauri notarizes the .app when credentials are present</strong></div>
+      <p>Requires a Developer ID signature and the hardened runtime (<code>hardenedRuntime: true</code>, set). Provide either an Apple ID or an App Store Connect API key:</p>
+      <pre><span class="key">APPLE_ID</span> + <span class="key">APPLE_PASSWORD</span> <span class="cm">(app-specific password)</span> + <span class="key">APPLE_TEAM_ID</span>
+<span class="cm"># or</span>
+<span class="key">APPLE_API_ISSUER</span> + <span class="key">APPLE_API_KEY</span> + <span class="key">APPLE_API_KEY_PATH</span> <span class="cm">(the .p8)</span></pre>
+      <p>Tauri submits, waits and staples the ticket to <code>KDX.app</code>. The release workflow builds the dmg separately (<code>bundle_dmg.sh</code>), so notarize and staple the dmg too:</p>
+      <pre><span class="cmd">xcrun notarytool submit KDX_0.1.0_aarch64.dmg --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_PASSWORD" --wait</span>
+<span class="cmd">xcrun stapler staple KDX_0.1.0_aarch64.dmg</span></pre>
+    </div>
+    <div class="task">
+      <div class="task-head"><strong>Verify a build</strong></div>
+      <pre><span class="cmd">codesign -d --entitlements - --xml target/release/bundle/macos/KDX.app | plutil -p -</span>   <span class="cm"># the three entitlements</span>
+<span class="cmd">codesign -dvv target/release/bundle/macos/KDX.app</span>            <span class="cm"># flags=0x10002(adhoc,runtime) or Authority=Developer ID…</span>
+<span class="cmd">codesign --verify --deep --strict --verbose=2 target/release/bundle/macos/KDX.app</span>
+<span class="cmd">ls target/release/bundle/macos/KDX.app/Contents/Resources/container-migration.plist</span>
+<span class="cmd">spctl -a -vv target/release/bundle/macos/KDX.app</span>             <span class="cm"># "accepted, source=Notarized Developer ID" (notarized builds only)</span></pre>
+      <p>While it runs, Activity Monitor (View → Columns → Sandbox) shows <em>Yes</em> for KDX.</p>
+    </div>
+  </div>
+
+  <h3>4. Manual macOS checklist <span class="badge badge-open">open</span></h3>
+  <div class="task-group">
+    <div class="task">
+      <div class="task-head"><strong>Run on a bundled (signed) build, before tagging a release</strong></div>
+      <p>1. Fresh install (no <code>~/Library/Containers/net.kdx.hotline.client</code>): launch; Activity Monitor shows Sandbox = Yes; connect to a server, accept its key; <code>known_hosts.toml</code> appears under <code>~/Library/Containers/net.kdx.hotline.client/Data/Library/Application Support/net.kdx.hotline.client/</code>.</p>
+      <p>2. Download to the suggested <code>~/Downloads</code> location: the Save dialog opens in Downloads; while it runs, nothing appears in Downloads and <code>…/transfers/</code> holds one <code>.kdxdata</code> + one <code>.kdxpart</code>; afterwards the file is in Downloads, byte-identical (<code>shasum -a 256</code> against the server copy), <code>transfers/</code> is empty, and <code>xattr</code> shows <code>com.apple.quarantine</code>.</p>
+      <p>3. Download over an existing file (confirm "Replace" in the dialog): the old file is replaced.</p>
+      <p>4. Download to an external / other-volume disk (USB stick, disk image: <code>hdiutil create -size 200m -fs APFS -volname KDXT /tmp/kdxt.dmg &amp;&amp; hdiutil attach /tmp/kdxt.dmg</code>): completes, no <code>.*.kdxtmp</code> file left on that volume, <code>transfers/</code> empty. Repeat with an exFAT volume.</p>
+      <p>5. Resume: start a large download, Cancel in the Transfers window; quit KDX; relaunch, reconnect, download the same file to the same place (no file exists there yet, so no Replace prompt): progress starts partway and the result is byte-identical. Also with the network dropped mid-download.</p>
+      <p>6. Upload a file from <code>~/Documents</code> and from an external volume via the Open dialog: both succeed.</p>
+      <p>7. Address Book: save a bookmark with a password; quit and relaunch; log in with it without typing the password. Keychain Access shows a generic password "net.kdx.hotline.client" / "bookmark:…" in the login keychain. Delete the bookmark: the item is gone. After installing a rebuilt (ad-hoc) copy, the one-time keychain prompt appears and Always Allow works.</p>
+      <p>8. Upgrade from an unsandboxed build (e.g. v0.1.0 from the release page, with a pinned server, a bookmark and changed settings): install the sandboxed build over it and launch — the server connects without a first-contact prompt, bookmarks and settings are intact, and <code>~/Library/Application Support/net.kdx.hotline.client</code> has moved into the container.</p>
+      <p>9. Console.app, filter "Sandbox" / process KDX, during all of the above: no <code>deny(1) file-write-create</code> or <code>file-read-data</code> violations — except, for a destination on another volume, one refused hidden <code>.&lt;hex&gt;.kdxtmp</code> beside the chosen file (KDX then writes the chosen file in place; the download still succeeds).</p>
+      <p>10. A stale partial (cancel a download, then set its files' modification time 8 days back with <code>touch -t</code>) is gone after the next connect.</p>
     </div>
   </div>
 

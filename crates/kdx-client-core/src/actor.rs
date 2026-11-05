@@ -42,7 +42,7 @@
 
 use std::collections::{HashSet, VecDeque};
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -97,8 +97,9 @@ use crate::event::{
 };
 use crate::handle::{ClientHandle, Command, Password, Session};
 use crate::transfer::{
-    bitmap_bytes, choose_chunk_size, chunk_len, data_path_for, hash_download, prepare_upload,
-    progress_bitmap, validate_geometry, ChunkBitmap, PreparedUpload, Sidecar, DEFAULT_CHUNK_SIZE,
+    bitmap_bytes, choose_chunk_size, chunk_len, create_transfers_dir, hash_download,
+    prepare_upload, progress_bitmap, publish_download, validate_geometry, ChunkBitmap,
+    PartialPaths, PreparedUpload, Publish, Sidecar, DEFAULT_CHUNK_SIZE,
 };
 
 #[cfg(test)]
@@ -141,6 +142,13 @@ pub(crate) struct ActorOptions {
     /// `host:port`, recorded in download sidecars so a resume is only
     /// attempted against the same server.
     pub server_id: String,
+    /// Where partial downloads and their resume sidecars live
+    /// (`<data_dir>/transfers`). Downloads are refused without one: nothing
+    /// is ever staged beside the destination.
+    pub transfers_dir: Option<PathBuf>,
+    /// How a verified download is moved into place (tests force the copy
+    /// fallbacks).
+    pub publish: Publish,
 }
 
 impl Default for ActorOptions {
@@ -150,6 +158,8 @@ impl Default for ActorOptions {
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
             write_timeout: DEFAULT_WRITE_TIMEOUT,
             server_id: String::new(),
+            transfers_dir: None,
+            publish: Publish::Auto,
         }
     }
 }
@@ -310,7 +320,8 @@ enum Stage {
     AwaitingAccept { deadline: Instant },
     /// Accepted; data flowing.
     Running,
-    /// All data received; verifying the whole-file hash (downloads only).
+    /// All data received; verifying the whole-file hash, then moving the
+    /// verified file to its destination (downloads only).
     Verifying,
 }
 
@@ -351,12 +362,16 @@ struct UploadJob {
 
 struct DownloadJob {
     remote_path: String,
+    /// The destination; written only once, by the verified file.
     local: PathBuf,
-    data_path: PathBuf,
+    /// The partial's bytes and resume sidecar (in the transfers directory).
+    /// Boxed to keep `Job`'s variants of similar size.
+    partial: Box<PartialPaths>,
     expected_size: Option<u64>,
     requested_chunk: u32,
-    /// Resume state that matched this server and remote path at request
-    /// time; consumed (and checked against the accept) on the first accept.
+    /// Resume state that matched this server, remote path and destination
+    /// at request time; consumed (and checked against the accept) on the
+    /// first accept.
     resume: Option<Sidecar>,
     /// Geometry has been accepted at least once (identity known).
     accepted: bool,
@@ -385,11 +400,18 @@ enum Blocking {
         gen: u64,
         task: JoinHandle<Result<[u8; 32], ClientError>>,
     },
+    /// Moving a verified download to its destination (a copy can take a
+    /// while across filesystems).
+    Publish {
+        gen: u64,
+        task: JoinHandle<Result<(), ClientError>>,
+    },
 }
 
 enum BlockingDone {
     UploadPrep(u64, Result<PreparedUpload, ClientError>),
     Verify(u64, Result<[u8; 32], ClientError>),
+    Publish(u64, Result<(), ClientError>),
 }
 
 async fn poll_blocking(slot: &mut Option<Blocking>) -> BlockingDone {
@@ -399,6 +421,7 @@ async fn poll_blocking(slot: &mut Option<Blocking>) -> BlockingDone {
     match slot {
         Some(Blocking::UploadPrep { gen, task }) => BlockingDone::UploadPrep(*gen, flat(task.await)),
         Some(Blocking::Verify { gen, task }) => BlockingDone::Verify(*gen, flat(task.await)),
+        Some(Blocking::Publish { gen, task }) => BlockingDone::Publish(*gen, flat(task.await)),
         None => std::future::pending().await,
     }
 }
@@ -1796,16 +1819,18 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
                 if let Some(task) = job.sidecar_task.take() {
                     let _ = task.await;
                 }
+                // The partial lives in the transfers directory; the
+                // destination is never touched here.
                 if job.accepted {
                     match cleanup {
                         Cleanup::Keep => {
                             let sidecar = job.sidecar(&self.opts.server_id);
-                            let local = job.local.clone();
-                            let _ = tokio::task::spawn_blocking(move || sidecar.write(&local)).await;
+                            let path = job.partial.sidecar.clone();
+                            let _ = tokio::task::spawn_blocking(move || sidecar.write(&path)).await;
                         }
                         Cleanup::Discard => {
-                            let _ = tokio::fs::remove_file(&job.data_path).await;
-                            let _ = tokio::fs::remove_file(Sidecar::path_for(&job.local)).await;
+                            let _ = tokio::fs::remove_file(&job.partial.data).await;
+                            let _ = tokio::fs::remove_file(&job.partial.sidecar).await;
                         }
                     }
                 }
@@ -1834,6 +1859,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
             },
             BlockingDone::Verify(gen, result) if self.is_current(gen) => {
                 self.finish_download(result).await
+            }
+            BlockingDone::Publish(gen, result) if self.is_current(gen) => {
+                self.download_published(result).await
             }
             _ => {} // a cancelled transfer's leftover work
         }
@@ -1911,7 +1939,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
             job.last_sidecar = now;
             job.sidecar_task = Some(spawn_sidecar_write(
                 job.sidecar(&self.opts.server_id),
-                job.local.clone(),
+                job.partial.sidecar.clone(),
             ));
         }
         self.maybe_emit_progress(false).await;
@@ -2269,16 +2297,22 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
             let _ = reply.send(Err(ClientError::InvalidInput("file is too large".into())));
             return Ok(());
         }
+        let Some(transfers_dir) = self.opts.transfers_dir.as_deref() else {
+            let _ = reply.send(Err(ClientError::InvalidInput(
+                "downloads need a data directory".into(),
+            )));
+            return Ok(());
+        };
 
-        // Resume only from a sidecar for this server and remote file whose
-        // data file is still there.
-        let data_path = data_path_for(&local);
+        // Resume only from a sidecar for this server, remote file and
+        // destination whose data file is still there.
+        let partial = PartialPaths::new(transfers_dir, &self.opts.server_id, &remote_path, &local);
         let resume = {
-            let (local, data_path) = (local.clone(), data_path.clone());
+            let partial = partial.clone();
             tokio::task::spawn_blocking(move || {
-                std::fs::metadata(&data_path)
+                std::fs::metadata(&partial.data)
                     .is_ok_and(|m| m.is_file())
-                    .then(|| Sidecar::read(&local))
+                    .then(|| Sidecar::read(&partial.sidecar))
                     .flatten()
             })
             .await
@@ -2288,6 +2322,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
         let resume = resume.filter(|sc| {
             sc.server == self.opts.server_id
                 && sc.remote == remote_path
+                && sc.destination == local
                 && expected_size.is_none_or(|s| s == sc.size)
         });
         let requested_chunk = match (&resume, expected_size) {
@@ -2332,7 +2367,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
             job: Job::Download(DownloadJob {
                 remote_path,
                 local,
-                data_path,
+                partial: Box::new(partial),
                 expected_size,
                 requested_chunk,
                 resume,
@@ -2421,13 +2456,27 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
             };
             have.resize(job.total as usize, false);
             let fresh = have.not_any();
-            let opened = tokio::fs::OpenOptions::new()
-                .create(true)
-                .read(true)
-                .write(true)
-                .truncate(fresh)
-                .open(&job.data_path)
-                .await;
+            // The partial goes in the transfers directory; nothing is
+            // created at (or beside) the destination until it verifies.
+            let dir = job.partial.data.parent().map(Path::to_path_buf);
+            let created = match dir {
+                Some(dir) => tokio::task::spawn_blocking(move || create_transfers_dir(&dir))
+                    .await
+                    .unwrap_or_else(|e| Err(io::Error::other(e))),
+                None => Ok(()),
+            };
+            let opened = match created {
+                Ok(()) => {
+                    tokio::fs::OpenOptions::new()
+                        .create(true)
+                        .read(true)
+                        .write(true)
+                        .truncate(fresh)
+                        .open(&job.partial.data)
+                        .await
+                }
+                Err(e) => Err(e),
+            };
             match opened {
                 Ok(file) => job.file = Some(file),
                 Err(e) => {
@@ -2440,7 +2489,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
             // Record the identity straight away so an interruption resumes.
             job.unsaved_chunks = 0;
             job.last_sidecar = Instant::now();
-            job.sidecar_task = Some(spawn_sidecar_write(job.sidecar(&server_id), job.local.clone()));
+            job.sidecar_task = Some(spawn_sidecar_write(
+                job.sidecar(&server_id),
+                job.partial.sidecar.clone(),
+            ));
         }
         *stage = Stage::Running;
         self.maybe_emit_progress(true).await;
@@ -2509,14 +2561,20 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
         // blocking pool while the actor keeps serving commands.
         drop(job.file.take());
         *stage = Stage::Verifying;
-        let (path, size, cancel) = (job.data_path.clone(), job.size, cancel.clone());
+        let (path, size, cancel) = (job.partial.data.clone(), job.size, cancel.clone());
         let task = tokio::task::spawn_blocking(move || hash_download(&path, size, &cancel));
         self.blocking = Some(Blocking::Verify { gen, task });
         self.maybe_emit_progress(true).await;
     }
 
+    /// The whole-file hash is in: on a match, move the file to its
+    /// destination off the actor (a copy across filesystems can take a
+    /// while); otherwise fail.
     async fn finish_download(&mut self, result: Result<[u8; 32], ClientError>) {
+        let publish = self.opts.publish;
         let Some(Transfer {
+            gen,
+            cancel,
             job: Job::Download(job),
             ..
         }) = self.transfer.as_mut()
@@ -2530,23 +2588,49 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
                 ClientError::Transfer("downloaded file hash mismatch".into()),
                 Cleanup::Discard,
             )),
-            Err(e @ ClientError::Io(_)) => Some((e, Cleanup::Keep)),
-            Err(e) => Some((e, Cleanup::Discard)),
+            Err(e) => Some(verify_failure(e)),
         };
-        let sidecar_task = job.sidecar_task.take();
-        let (data_path, local, id) = (job.data_path.clone(), job.local.clone(), job.id);
-        if let Some(task) = sidecar_task {
+        // No sidecar write may land after the sidecar is removed on success.
+        if let Some(task) = job.sidecar_task.take() {
             let _ = task.await;
         }
         if let Some((err, cleanup)) = failure {
             self.fail_transfer(err, cleanup).await;
             return;
         }
-        if let Err(e) = tokio::fs::rename(&data_path, &local).await {
-            self.fail_transfer(ClientError::Io(e), Cleanup::Keep).await;
+        let gen = *gen;
+        let (data, local, size, sha256, cancel) = (
+            job.partial.data.clone(),
+            job.local.clone(),
+            job.size,
+            job.sha256,
+            cancel.clone(),
+        );
+        let task = tokio::task::spawn_blocking(move || {
+            publish_download(&data, &local, size, &sha256, publish, &cancel)
+        });
+        self.blocking = Some(Blocking::Publish { gen, task });
+    }
+
+    /// The verified file has reached its destination (or couldn't).
+    async fn download_published(&mut self, result: Result<(), ClientError>) {
+        let Some(Transfer {
+            job: Job::Download(job),
+            ..
+        }) = self.transfer.as_mut()
+        else {
+            return;
+        };
+        if let Err(e) = result {
+            // An I/O failure (destination not writable, disk full) keeps the
+            // verified partial for a retry; bytes that no longer match their
+            // hash are discarded.
+            let (err, cleanup) = verify_failure(e);
+            self.fail_transfer(err, cleanup).await;
             return;
         }
-        let _ = tokio::fs::remove_file(Sidecar::path_for(&local)).await;
+        let (sidecar, id) = (job.partial.sidecar.clone(), job.id);
+        let _ = tokio::fs::remove_file(&sidecar).await;
         let Some(mut transfer) = self.transfer.take() else {
             return;
         };
@@ -2748,6 +2832,7 @@ impl DownloadJob {
         Sidecar {
             server: server.to_string(),
             remote: self.remote_path.clone(),
+            destination: self.local.clone(),
             transfer_id: self.id,
             size: self.size,
             chunk_size: self.chunk_size,
@@ -2768,12 +2853,22 @@ fn bitmap_vec(bits: &ChunkBitmap) -> Vec<u8> {
     bits.into_vec()
 }
 
-fn spawn_sidecar_write(sidecar: Sidecar, local: PathBuf) -> JoinHandle<()> {
+fn spawn_sidecar_write(sidecar: Sidecar, path: PathBuf) -> JoinHandle<()> {
     tokio::task::spawn_blocking(move || {
-        if let Err(e) = sidecar.write(&local) {
+        if let Err(e) = sidecar.write(&path) {
             warn!("could not save download resume state: {e}");
         }
     })
+}
+
+/// How a failed verification or publish settles the partial: an I/O error
+/// keeps it (and its resume state) for a retry; anything else means the
+/// bytes can't be trusted and a retry must start from scratch.
+fn verify_failure(e: ClientError) -> (ClientError, Cleanup) {
+    match e {
+        e @ ClientError::Io(_) => (e, Cleanup::Keep),
+        e => (e, Cleanup::Discard),
+    }
 }
 
 /// Write `data` at `offset` and wait for it to reach the OS.

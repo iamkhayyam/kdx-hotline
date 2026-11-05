@@ -73,6 +73,10 @@ pub struct FileListDto {
     pub entries: Vec<FileEntryDto>,
 }
 
+/// The client's state directory: `known_hosts.toml` and (under
+/// `transfers/`) partial downloads. Tauri's app_data_dir, which under the
+/// macOS App Sandbox resolves inside the app's container — the only place
+/// besides a dialog-chosen file that the app writes to.
 fn data_dir<R: Runtime>(app: &AppHandle<R>) -> Result<PathBuf, CmdError> {
     app.path().app_data_dir().map_err(CmdError::msg)
 }
@@ -624,6 +628,11 @@ fn transfer_error(e: ClientError) -> CmdError {
 /// dialog. The dialog opens in the Downloads folder with the server's name
 /// reduced to a safe basename (no directories, UNC paths, bidi tricks or
 /// reserved device names). Resolves `false` if the user cancelled.
+///
+/// Sandbox-safe: the dialog grants write access to the chosen file only, and
+/// client-core writes nothing else there — partial bytes and resume state
+/// stay in [`data_dir`] until the verified file is moved into place.
+/// Choosing the same file again resumes an interrupted download.
 #[tauri::command]
 pub async fn download<R: Runtime>(
     app: AppHandle<R>,

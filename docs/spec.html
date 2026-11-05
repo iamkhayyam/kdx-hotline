@@ -868,9 +868,18 @@
       <p>Each side maintains a <code>BitVec&lt;u8, Lsb0&gt;</code> with one bit per chunk — set when that chunk is confirmed received. The bitmap travels in resume requests so the sender can skip already-confirmed chunks. Serialized to bytes (LSB-first bit order) for the sidecar and wire.</p>
 
       <h3>Resume sidecar (.kdxpart)</h3>
-      <p>When a download is interrupted, the client writes a <code>.kdxpart</code> file next to the partial download (e.g. <code>report.pdf.kdxpart</code>). On the next attempt, the client reads this sidecar, validates that the transfer parameters match, and resumes from the first unconfirmed chunk.</p>
+      <p>A download's partial bytes and its resume sidecar live in the client's own data directory, <strong>never beside the destination</strong> (a sandboxed macOS app may write only the file its save dialog returned, not that file's siblings):</p>
+      <pre><span class="c">&lt;data_dir&gt;/transfers/&lt;id&gt;.kdxdata   # bytes received so far, at their chunk offsets</span>
+<span class="c">&lt;data_dir&gt;/transfers/&lt;id&gt;.kdxpart   # resume sidecar (rewritten atomically every 64 chunks / 2 s)</span>
+<span class="c"># &lt;id&gt; = first 16 bytes, lowercase hex, of SHA-256("kdx-partial-download-v1" ‖ server ‖ remote ‖ destination),</span>
+<span class="c">#        each field as a u64 big-endian length + its bytes; server = "host:port"</span></pre>
+      <p>The id is stable, so asking for the same remote file from the same server to the same local path again — after a cancel, a dropped connection or an app restart — reads the sidecar and resumes from the confirmed chunks. A sidecar is trusted only if its server, remote path and destination match the request and the server's accept describes the same file (size, SHA-256, chunk size); anything else starts fresh.</p>
 
-      <pre><span class="c"># .kdxpart line format (key=value, one field per line)</span>
+      <pre><span class="c"># .kdxpart line format (key=value, one field per line; version 3)</span>
+<span class="g">version</span>=3
+<span class="g">server</span>=&lt;base64&gt;                           <span class="c"># "host:port" the partial came from</span>
+<span class="g">remote</span>=&lt;base64&gt;                           <span class="c"># remote /dir/name path</span>
+<span class="g">destination</span>=&lt;base64&gt;                      <span class="c"># local path the verified file goes to</span>
 <span class="g">id</span>=550e8400-e29b-41d4-a716-446655440000   <span class="c"># UUID of the transfer session</span>
 <span class="g">size</span>=10485760                             <span class="c"># total file size in bytes</span>
 <span class="g">chunk_size</span>=32768                          <span class="c"># negotiated chunk size</span>
@@ -878,8 +887,8 @@
 <span class="g">bitmap</span>=&lt;base64&gt;                           <span class="c"># confirmed-chunk bitmap (bytes, base64)</span></pre>
 
       <div class="note green">
-        <span class="lbl">Integrity on resume</span>
-        The sidecar carries the expected SHA-256 of the whole file. After a resumed download completes, the client verifies the hash before removing the sidecar. A mismatch indicates corruption; the sidecar is preserved so the transfer can retry.
+        <span class="lbl">Integrity and publishing</span>
+        When every chunk is in, the client hashes the whole partial (exactly <code>size</code> bytes). Only on a match is the file moved to the destination: a rename on the same filesystem; otherwise a copy that re-hashes the bytes on the way, is fsynced, and goes through a hidden temp file beside the destination that is renamed over it — or, when no such temp file may be created (sandbox), straight into the destination, removing it again if the copy fails. A whole-file mismatch discards the partial and its sidecar (a retry starts from scratch); an I/O failure keeps them for a retry. Cancelling keeps the resume state. Partials untouched for <code>ClientConfig::stale_partial_age</code> (default 7 days) are deleted when the client connects.
       </div>
 
       <h3>Upload path</h3>
