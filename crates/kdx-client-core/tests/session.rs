@@ -733,7 +733,22 @@ async fn plain_user_cannot_generate_catalog() {
 
 #[tokio::test]
 async fn tracker_lists_the_self_registered_server() {
-    let ts = TestServer::start().await;
+    // kdxd lists itself only under a configured `public_host`.
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("kdx.db");
+    let config = kdxd::Config {
+        bind: "127.0.0.1:0".parse().unwrap(),
+        database: db_path.clone(),
+        files_root: dir.path().join("files"),
+        public_host: Some("127.0.0.1".into()),
+        ..kdxd::Config::default()
+    };
+    let server = kdxd::serve(config).await.unwrap();
+    let ts = TestServer {
+        server,
+        dir,
+        db_path,
+    };
     ts.seed_account("phraq", "pw", 1).await;
 
     let (client, mut events, _dd) = ts.connect_client().await;

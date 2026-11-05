@@ -24,6 +24,12 @@ toml = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 thiserror = { workspace = true }
+# TCP keepalive on accepted sockets (tokio already pulls this in with "all").
+socket2 = { version = "0.6", features = ["all"] }
+
+[target.'cfg(unix)'.dependencies]
+# umask, geteuid and termios (no-echo password prompt).
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = { workspace = true }
@@ -32,3 +38,5 @@ tokio-util = { workspace = true }
 futures-util = { workspace = true }
 uuid = { workspace = true }
 sha2 = { workspace = true }
+sqlx = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
