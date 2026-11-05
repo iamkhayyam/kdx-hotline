@@ -661,28 +661,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                         self.send_error("missing FILE_LIST privilege").await?;
                         continue;
                     }
-                    match self.ctx.tree.list(&request.path, &session).await {
-                        Ok(entries) => {
-                            let response = FileListResponse {
-                                path: request.path,
-                                entries: entries
-                                    .into_iter()
-                                    .map(|e| FileEntry {
-                                        name: e.name,
-                                        kind: e.kind.as_u8(),
-                                        size: e.size,
-                                    })
-                                    .collect(),
-                            };
-                            self.send(
-                                PacketType::FileListResponse,
-                                PacketFlags::empty(),
-                                response.encode(),
-                            )
-                            .await?;
-                        }
-                        Err(e) => self.send_error(&e.to_string()).await?,
-                    }
+                    self.reply_file_list(&request.path, &session).await?;
                 }
                 PacketType::FileInfoRequest => {
                     let req = FileInfoRequest::decode(&frame.payload)?;
@@ -711,7 +690,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                             )
                             .await?;
                         }
-                        Err(e) => self.send_error(&e.to_string()).await?,
+                        Err(e) => self.send_error(&e.client_message()).await?,
                     }
                 }
                 PacketType::FileCreateFolder => {
@@ -742,18 +721,21 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                             read,
                             write,
                             req.owner.as_deref(),
+                            &session,
                         )
                         .await
                     {
                         Ok(_) => self.reply_file_list(&req.path, &session).await?,
-                        Err(e) => self.send_error(&e.to_string()).await?,
+                        Err(e) => self.send_error(&e.client_message()).await?,
                     }
                 }
                 PacketType::FileDelete => {
                     let req = FileDelete::decode(&frame.payload)?;
                     let session = self.session.as_ref().expect("authed").clone();
-                    if !session.privileges.contains(Privileges::FILE_MANAGE_TREE) {
-                        self.send_error("missing FILE_MANAGE_TREE privilege").await?;
+                    // Folder deletes also need FILE_MANAGE_TREE; the tree
+                    // checks that, since only it knows the node's kind.
+                    if !session.privileges.contains(Privileges::FILE_DELETE) {
+                        self.send_error("missing FILE_DELETE privilege").await?;
                         continue;
                     }
                     match self.ctx.tree.delete(&req.path, &session).await {
@@ -762,7 +744,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                             let parent = parent_path(&req.path);
                             self.reply_file_list(&parent, &session).await?;
                         }
-                        Err(e) => self.send_error(&e.to_string()).await?,
+                        Err(e) => self.send_error(&e.client_message()).await?,
                     }
                 }
                 PacketType::FileMove => {
@@ -774,7 +756,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                     }
                     match self.ctx.tree.move_node(&req.path, &req.dest_path, &session).await {
                         Ok(()) => self.reply_file_list(&req.dest_path, &session).await?,
-                        Err(e) => self.send_error(&e.to_string()).await?,
+                        Err(e) => self.send_error(&e.client_message()).await?,
                     }
                 }
                 PacketType::FileAlias => {
@@ -791,7 +773,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                         .await
                     {
                         Ok(_) => self.reply_file_list(&req.dest_path, &session).await?,
-                        Err(e) => self.send_error(&e.to_string()).await?,
+                        Err(e) => self.send_error(&e.client_message()).await?,
                     }
                 }
                 PacketType::FileGenerateCatalog => {
@@ -819,6 +801,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                         self.send_error("missing FILE_LIST privilege").await?;
                         continue;
                     }
+                    let max_query = crate::limits::MAX_SEARCH_QUERY_LEN;
+                    if let Err(msg) = crate::limits::check_len("search query", &req.query, max_query) {
+                        self.send_error(&msg).await?;
+                        continue;
+                    }
                     match self.ctx.tree.search(&req.query, class, FILE_SEARCH_LIMIT).await {
                         Ok(hits) => {
                             let response = FileSearchResponse {
@@ -839,7 +826,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                             )
                             .await?;
                         }
-                        Err(e) => self.send_error(&e.to_string()).await?,
+                        Err(e) => self.send_error(&e.client_message()).await?,
                     }
                 }
                 PacketType::FileTransferStart if is_download(&frame.payload) => {
@@ -1822,21 +1809,40 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
         Ok(())
     }
 
-    /// List `path` for `class` and send it as a `FileListResponse` — the reply
-    /// to a successful folder create/delete so the Files window re-renders.
+    /// List `path` for `session` and send it as a `FileListResponse` — the
+    /// reply to `FileListRequest` and to a successful tree mutation so the
+    /// Files window re-renders. At most `limits::MAX_FILE_LIST_ENTRIES`
+    /// entries, and no more than half the reassembly cap in total, so the
+    /// reply always fits its `u16` count and one logical payload.
     async fn reply_file_list(&mut self, path: &str, session: &Session) -> Result<(), ConnectionError> {
-        match self.ctx.tree.list(path, &session).await {
+        match self.ctx.tree.list(path, session).await {
             Ok(entries) => {
+                let total = entries.len();
+                let mut budget = MAX_REASSEMBLED_PAYLOAD / 2;
+                let max_entries = crate::limits::MAX_FILE_LIST_ENTRIES;
+                let mut wire = Vec::with_capacity(total.min(max_entries));
+                for e in entries {
+                    // name (u16 length + bytes) + kind + size
+                    let cost = 2 + e.name.len() + 1 + 8;
+                    if wire.len() == max_entries || cost > budget {
+                        break;
+                    }
+                    if e.name.len() > u16::MAX as usize {
+                        continue; // unencodable; only a pre-validation row could be this long
+                    }
+                    budget -= cost;
+                    wire.push(FileEntry {
+                        name: e.name,
+                        kind: e.kind.as_u8(),
+                        size: e.size,
+                    });
+                }
+                if wire.len() < total {
+                    warn!(path, total, sent = wire.len(), "file listing truncated");
+                }
                 let response = FileListResponse {
                     path: path.to_owned(),
-                    entries: entries
-                        .into_iter()
-                        .map(|e| FileEntry {
-                            name: e.name,
-                            kind: e.kind.as_u8(),
-                            size: e.size,
-                        })
-                        .collect(),
+                    entries: wire,
                 };
                 self.send(
                     PacketType::FileListResponse,
@@ -1845,7 +1851,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                 )
                 .await?;
             }
-            Err(e) => self.send_error(&e.to_string()).await?,
+            Err(e) => self.send_error(&e.client_message()).await?,
         }
         Ok(())
     }
