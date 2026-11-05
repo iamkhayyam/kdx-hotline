@@ -7,6 +7,7 @@
 
 import { inTauri, getCurrentWindow } from "./bridge.js";
 import { isRegistered, isOpen, toggle } from "./wm.js";
+import { esc } from "./html.js";
 
 // Order mirrors the real KDX client's left strip.
 const FEATURES = [
@@ -93,7 +94,7 @@ export function buildButtonBar(mount, handlers) {
     btn.dataset.id = f.id;
     btn.innerHTML =
       '<span class="bb-icon"></span>' +
-      `<span class="bb-label">${f.label}</span>` +
+      `<span class="bb-label">${esc(f.label)}</span>` +
       (f.led ? '<span class="wonderlight" id="wl-messages"></span>' : "");
     btn.addEventListener("click", () => {
       if (btn.disabled) return;

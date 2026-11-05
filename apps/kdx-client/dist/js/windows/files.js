@@ -1,5 +1,6 @@
-import { invoke, pickFile, pickSave } from "../bridge.js";
+import { invoke } from "../bridge.js";
 import { showMenu } from "../menu.js";
+import { esc, num, plainText, errorText } from "../html.js";
 
 const KINDS = { 0: "[DIR]", 1: "[FILE]", 2: "[DROP]", 3: "[UP]", 4: "[→]" };
 const KIND_NAME = { 0: "folder", 1: "file", 2: "drop box", 3: "upload folder", 4: "alias" };
@@ -8,10 +9,7 @@ const CLASS_NAME = ["guest", "user", "power user", "admin"];
 
 export function buildFiles() {
   const body = document.createElement("div");
-  body.style.flex = "1";
-  body.style.display = "flex";
-  body.style.flexDirection = "column";
-  body.style.minHeight = "0";
+  body.className = "col-fill";
   body.innerHTML = `
     <div class="pathbar">
       <span class="path" id="f-path">/</span>
@@ -39,8 +37,8 @@ export function buildFiles() {
         </select>
       </div>
       <div class="f-mkrow">
-        <label class="f-mklbl">Read<select id="f-mk-read">${classOptions(0)}</select></label>
-        <label class="f-mklbl">Write<select id="f-mk-write">${classOptions(1)}</select></label>
+        <label class="f-mklbl">Read<select id="f-mk-read">${classOptionsHtml(0)}</select></label>
+        <label class="f-mklbl">Write<select id="f-mk-write">${classOptionsHtml(1)}</select></label>
       </div>
       <div class="f-mkrow">
         <label class="f-mklbl wide">Owner (optional, for drop boxes)<input id="f-mk-owner" placeholder="login" spellcheck="false" autocomplete="off" /></label>
@@ -51,7 +49,7 @@ export function buildFiles() {
     </form>
     <div class="f-info hidden" id="f-info"></div>
     <div class="f-move-banner hidden" id="f-move-banner"></div>
-    <div class="win-body" style="flex:1" id="f-list"></div>`;
+    <div class="win-body grow" id="f-list"></div>`;
 
   const pathEl = body.querySelector("#f-path");
   const listEl = body.querySelector("#f-list");
@@ -81,7 +79,7 @@ export function buildFiles() {
       entries = res.entries;
       render();
     } catch (err) {
-      listEl.innerHTML = `<div class="empty">${escapeHtml(err.message || String(err))}</div>`;
+      listEl.innerHTML = `<div class="empty">${esc(errorText(err))}</div>`;
     }
   }
 
@@ -99,8 +97,7 @@ export function buildFiles() {
     }
     const table = document.createElement("table");
     table.className = "files";
-    table.innerHTML =
-      "<thead><tr><th>Name</th><th style='text-align:right'>Size</th></tr></thead>";
+    table.innerHTML = '<thead><tr><th>Name</th><th class="num">Size</th></tr></thead>';
     const tb = document.createElement("tbody");
     for (const e of shown) {
       const tr = document.createElement("tr");
@@ -110,8 +107,8 @@ export function buildFiles() {
       // folders) show em-dash.
       const showSize = e.kind === KIND_FILE || (e.kind === KIND_ALIAS && e.size > 0);
       tr.innerHTML =
-        `<td class="fname"><span class="kind">${KINDS[e.kind] || "[?]"}</span>${escapeHtml(e.name)}</td>` +
-        `<td class="fsize">${showSize ? fmtSize(e.size) : "—"}</td>`;
+        `<td class="fname"><span class="kind">${esc(KINDS[e.kind] || "[?]")}</span>${esc(plainText(e.name))}</td>` +
+        `<td class="fsize">${showSize ? esc(fmtSize(e.size)) : "—"}</td>`;
       tr.addEventListener("click", () => onEntry(e));
       tr.addEventListener("contextmenu", (ev) => {
         ev.preventDefault();
@@ -146,16 +143,15 @@ export function buildFiles() {
     }
     const table = document.createElement("table");
     table.className = "files";
-    table.innerHTML =
-      "<thead><tr><th>Name</th><th>Path</th><th style='text-align:right'>Size</th></tr></thead>";
+    table.innerHTML = '<thead><tr><th>Name</th><th>Path</th><th class="num">Size</th></tr></thead>';
     const tb = document.createElement("tbody");
     for (const e of searchHits) {
       const tr = document.createElement("tr");
       if (e.kind === KIND_DROPBOX) tr.className = "dropbox";
       tr.innerHTML =
-        `<td class="fname"><span class="kind">${KINDS[e.kind] || "[?]"}</span>${escapeHtml(e.name)}</td>` +
-        `<td class="fmeta">${escapeHtml(e.path)}</td>` +
-        `<td class="fsize">${e.kind === KIND_FILE ? fmtSize(e.size) : "—"}</td>`;
+        `<td class="fname"><span class="kind">${esc(KINDS[e.kind] || "[?]")}</span>${esc(plainText(e.name))}</td>` +
+        `<td class="fmeta">${esc(plainText(e.path))}</td>` +
+        `<td class="fsize">${e.kind === KIND_FILE ? esc(fmtSize(e.size)) : "—"}</td>`;
       tr.addEventListener("click", () => onSearchHit(e));
       tb.appendChild(tr);
     }
@@ -166,7 +162,7 @@ export function buildFiles() {
 
   function onSearchHit(e) {
     if (e.kind === KIND_FILE) {
-      downloadEntryAt(e.path, e.name);
+      downloadEntryAt(e.path);
       return;
     }
     exitSearch();
@@ -203,21 +199,35 @@ export function buildFiles() {
   }
 
   async function downloadEntry(e) {
-    await downloadEntryAt(joinPath(cwd, e.name), e.name);
+    await downloadEntryAt(joinPath(cwd, e.name));
   }
 
-  async function downloadEntryAt(remotePath, name) {
-    const dest = await pickSave(name);
-    if (!dest) return;
-    invoke("download", { remotePath, local: dest }).catch(() => {});
+  // The Save dialog runs on the Rust side: it opens in Downloads with the
+  // server's name reduced to a safe basename, and the webview never names a
+  // local path. Progress shows in File Transfers.
+  async function downloadEntryAt(remotePath) {
+    try {
+      await invoke("download", { remotePath });
+    } catch (err) {
+      showError(err);
+    }
+  }
+
+  /** Show an error in the info strip (as text, never markup). */
+  function showError(err) {
+    const div = document.createElement("div");
+    div.className = "err";
+    div.textContent = errorText(err);
+    infoEl.replaceChildren(div);
+    infoEl.classList.remove("hidden");
   }
 
   async function showInfo(e) {
     infoEl.innerHTML =
-      `<span class="kind">${KINDS[e.kind] || "[?]"}</span> ` +
-      `<b>${escapeHtml(e.name)}</b> — ${KIND_NAME[e.kind] || "?"}` +
-      (e.kind === KIND_FILE ? ` · ${fmtSize(e.size)}` : "") +
-      ` · <span class="f-info-path">${escapeHtml(joinPath(cwd, e.name))}</span>` +
+      `<span class="kind">${esc(KINDS[e.kind] || "[?]")}</span> ` +
+      `<b>${esc(plainText(e.name))}</b> — ${esc(KIND_NAME[e.kind] || "?")}` +
+      (e.kind === KIND_FILE ? ` · ${esc(fmtSize(e.size))}` : "") +
+      ` · <span class="f-info-path">${esc(plainText(joinPath(cwd, e.name)))}</span>` +
       ` <button class="mini" id="f-info-close">×</button>`;
     infoEl.classList.remove("hidden");
     infoEl.querySelector("#f-info-close").onclick = () => infoEl.classList.add("hidden");
@@ -227,27 +237,29 @@ export function buildFiles() {
       const cls = ["guest", "user", "power", "admin"];
       const itemTag = { 1: "[UL]", 2: "[DB]" }[info.kind] || (info.name.match(/\[([a-z]+)\]\s*$/i) || [])[1] || "";
       infoEl.innerHTML =
-        `<span class="kind">${KINDS[info.kind] || "[?]"}</span> ` +
-        `<b>${escapeHtml(info.name)}</b> — ${KIND_NAME[info.kind] || "?"}` +
-        (info.kind === 1 ? ` · ${fmtSize(info.size)}` : "") +
+        `<span class="kind">${esc(KINDS[info.kind] || "[?]")}</span> ` +
+        `<b>${esc(plainText(info.name))}</b> — ${esc(KIND_NAME[info.kind] || "?")}` +
+        (info.kind === 1 ? ` · ${esc(fmtSize(info.size))}` : "") +
         ` <button class="mini" id="f-info-close">×</button>` +
         `<div class="f-info-grid">` +
-        `<span>Read</span><span>${cls[info.min_read_class] || info.min_read_class}</span>` +
-        `<span>Write</span><span>${cls[info.min_write_class] || info.min_write_class}</span>` +
-        (itemTag ? `<span>Access</span><span>${itemTag}</span>` : "") +
-        (info.owner ? `<span>Owner</span><span>${escapeHtml(info.owner)}</span>` : "") +
-        (info.sha256 ? `<span>SHA-256</span><span class="f-info-hash">${info.sha256}</span>` : "") +
+        `<span>Read</span><span>${esc(cls[info.min_read_class] || info.min_read_class)}</span>` +
+        `<span>Write</span><span>${esc(cls[info.min_write_class] || info.min_write_class)}</span>` +
+        (itemTag ? `<span>Access</span><span>${esc(itemTag)}</span>` : "") +
+        (info.owner ? `<span>Owner</span><span>${esc(info.owner)}</span>` : "") +
+        (info.sha256 ? `<span>SHA-256</span><span class="f-info-hash">${esc(info.sha256)}</span>` : "") +
         `</div>`;
       infoEl.querySelector("#f-info-close").onclick = () => infoEl.classList.add("hidden");
     } catch (err) {
-      infoEl.innerHTML = infoEl.innerHTML +
-        `<div class="err">${escapeHtml(err.message || String(err))}</div>`;
+      const div = document.createElement("div");
+      div.className = "err";
+      div.textContent = errorText(err);
+      infoEl.appendChild(div);
     }
   }
 
   async function deleteEntry(e) {
     const kind = KIND_NAME[e.kind] || "item";
-    if (!confirm(`Delete ${kind} “${e.name}”${e.kind !== KIND_FILE ? " and everything in it" : ""}?`)) {
+    if (!confirm(`Delete ${kind} “${plainText(e.name)}”${e.kind !== KIND_FILE ? " and everything in it" : ""}?`)) {
       return;
     }
     try {
@@ -257,8 +269,7 @@ export function buildFiles() {
       infoEl.classList.add("hidden");
       render();
     } catch (err) {
-      infoEl.innerHTML = `<span class="err">${escapeHtml(err.message || String(err))}</span>`;
-      infoEl.classList.remove("hidden");
+      showError(err);
     }
   }
 
@@ -279,8 +290,8 @@ export function buildFiles() {
     const verb = pending.op === "alias" ? "Aliasing" : "Moving";
     const doLabel = pending.op === "alias" ? "Alias Here" : "Move Here";
     moveBanner.innerHTML =
-      `${verb} <b>${escapeHtml(pending.name)}</b> — ` +
-      `<button class="mini" id="f-op-do">${doLabel}</button>` +
+      `${esc(verb)} <b>${esc(plainText(pending.name))}</b> — ` +
+      `<button class="mini" id="f-op-do">${esc(doLabel)}</button>` +
       `<button class="mini" id="f-op-cancel">Cancel</button>`;
     moveBanner.classList.remove("hidden");
     moveBanner.querySelector("#f-op-do").onclick = async () => {
@@ -295,7 +306,7 @@ export function buildFiles() {
         renderPendingBanner();
         render();
       } catch (err) {
-        moveBanner.innerHTML = `<span class="err">${escapeHtml(err.message || String(err))}</span> ` +
+        moveBanner.innerHTML = `<span class="err">${esc(errorText(err))}</span> ` +
           `<button class="mini" id="f-op-cancel">Cancel</button>`;
         moveBanner.querySelector("#f-op-cancel").onclick = () => {
           pending = null;
@@ -317,10 +328,13 @@ export function buildFiles() {
     refresh();
   };
   body.querySelector("#f-refresh").onclick = refresh;
+  // The Open dialog runs on the Rust side too.
   body.querySelector("#f-upload").onclick = async () => {
-    const path = await pickFile();
-    if (!path) return;
-    invoke("upload", { local: path, remoteDir: cwd }).catch(() => {});
+    try {
+      await invoke("upload", { remoteDir: cwd });
+    } catch (err) {
+      showError(err);
+    }
   };
 
   // Search — a catalog-wide lookup, distinct from the type-to-filter box
@@ -343,7 +357,7 @@ export function buildFiles() {
       const count = await invoke("generate_catalog");
       searchStatus.textContent = `catalog ready — ${count} entries indexed`;
     } catch (err) {
-      searchStatus.textContent = escapeHtml(err.message || String(err));
+      searchStatus.textContent = errorText(err);
     }
   };
   searchbar.addEventListener("submit", async (ev) => {
@@ -356,7 +370,7 @@ export function buildFiles() {
       render();
     } catch (err) {
       searchHits = [];
-      searchStatus.textContent = escapeHtml(err.message || String(err));
+      searchStatus.textContent = errorText(err);
       render();
     }
   });
@@ -388,16 +402,16 @@ export function buildFiles() {
       mkform.classList.add("hidden");
       render();
     } catch (err) {
-      body.querySelector("#f-mk-result").textContent = escapeHtml(err.message || String(err));
+      body.querySelector("#f-mk-result").textContent = errorText(err);
     }
   });
 
   return { body, refresh };
 }
 
-function classOptions(selected) {
+function classOptionsHtml(selected) {
   return CLASS_NAME.map(
-    (name, i) => `<option value="${i}"${i === selected ? " selected" : ""}>${name}</option>`
+    (name, i) => `<option value="${num(i)}"${i === selected ? " selected" : ""}>${esc(name)}</option>`
   ).join("");
 }
 
@@ -412,7 +426,4 @@ function fmtSize(n) {
   if (n < 1024) return n + " B";
   if (n < 1024 * 1024) return (n / 1024).toFixed(1) + " KB";
   return (n / 1024 / 1024).toFixed(1) + " MB";
-}
-function escapeHtml(s) {
-  return s.replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" })[c]);
 }

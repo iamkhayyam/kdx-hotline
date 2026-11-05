@@ -4,6 +4,7 @@
 // the server enforces it and errors otherwise.
 
 import { invoke } from "../bridge.js";
+import { esc, num, errorText } from "../html.js";
 
 export function buildIpRules() {
   const body = document.createElement("div");
@@ -48,7 +49,7 @@ export function buildIpRules() {
       rules = await invoke("list_ip_rules");
       render();
     } catch (err) {
-      listEl.innerHTML = `<div class="empty">${esc(err.message || String(err))}</div>`;
+      listEl.innerHTML = `<div class="empty">${esc(errorText(err))}</div>`;
     }
   }
 
@@ -73,11 +74,11 @@ export function buildIpRules() {
     for (const r of shown) {
       const tr = document.createElement("tr");
       tr.innerHTML =
-        `<td class="fsize">${r.position}</td>` +
+        `<td class="fsize">${num(r.position)}</td>` +
         `<td class="fsize">${esc(r.action)}</td>` +
         `<td class="fname">${esc(r.cidr)}</td>` +
         `<td class="fmeta">${esc(r.note || "")}</td>` +
-        `<td class="fsize"><button class="mini danger" data-id="${esc(r.id)}">delete</button></td>`;
+        `<td class="fsize"><button class="mini danger">delete</button></td>`;
       const btn = tr.querySelector("button");
       btn.addEventListener("click", async (e) => {
         e.stopPropagation();
@@ -86,7 +87,7 @@ export function buildIpRules() {
           rules = await invoke("delete_ip_rule", { id: r.id });
           render();
         } catch (err) {
-          alert(err.message || String(err));
+          alert(errorText(err));
         }
       });
       tb.appendChild(tr);
@@ -135,13 +136,9 @@ export function buildIpRules() {
       closeEditor();
       render();
     } catch (err) {
-      result.textContent = esc(err.message || String(err));
+      result.textContent = errorText(err);
     }
   });
 
   return { body, refresh };
-}
-
-function esc(s) {
-  return String(s).replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" })[c]);
 }

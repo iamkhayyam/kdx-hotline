@@ -2,6 +2,7 @@
 // (mirrors the reference: "Refresh button", account/class/login/idle/address).
 
 import { invoke } from "../bridge.js";
+import { errorText } from "../html.js";
 
 const CLASS_NAME = ["guest", "user", "power user", "admin"];
 
@@ -45,7 +46,7 @@ export function buildUserInfo() {
       if (hasName) $("#ui-name-val").textContent = info.name;
       if (hasDesc) $("#ui-desc-val").textContent = info.description;
     } catch (err) {
-      $("#ui-empty").textContent = `${username}: ${err.message || err}`;
+      $("#ui-empty").textContent = `${username}: ${errorText(err)}`;
       $("#ui-empty").classList.remove("hidden");
       $("#ui-detail").classList.add("hidden");
     }

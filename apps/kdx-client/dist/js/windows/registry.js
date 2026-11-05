@@ -4,10 +4,21 @@
 // point (main.js) dispatches on the ?win= query param: "main" mounts the
 // launcher, anything else calls mountFeature(id) from here.
 
-import { inTauri, getCurrentWindow, onKdxEvent, onUi, emitUi } from "../bridge.js";
+import {
+  inTauri,
+  getCurrentWindow,
+  onKdxEvent,
+  onUi,
+  emitUi,
+  holdKdxEvents,
+  releaseKdxEvents,
+  replayKdxEvent,
+  listenersReady,
+} from "../bridge.js";
 import { register } from "../wm.js";
 import { update, updateTransfer } from "../store.js";
 import { mountChrome } from "../chrome.js";
+import { applySession, hydrateSession } from "../session.js";
 import { applySettings, loadSettings } from "./settings.js";
 
 import { buildConnect } from "./connect.js";
@@ -77,9 +88,15 @@ export function mountFeature(id) {
   applySettings(loadSettings());
   const f = FEATURES.find((x) => x.id === id);
   if (!f) {
-    document.body.innerHTML = `<div class="empty">unknown window: ${id}</div>`;
+    const empty = document.createElement("div");
+    empty.className = "empty";
+    empty.textContent = `unknown window: ${id}`;
+    document.body.replaceChildren(empty);
     return;
   }
+  // Apply no server event before we know the session (who "me" is, which
+  // connection generation is current).
+  holdKdxEvents();
   const tagRef = {};
   const api = f.mount(tagRef);
   const chrome = mountChrome(document.getElementById("desktop"), {
@@ -88,6 +105,22 @@ export function mountFeature(id) {
     body: api.body,
   });
   tagRef.set = chrome.setTag;
+
+  onUi((msg) => {
+    if (msg.to !== id && msg.to !== "*") return;
+    if (msg.action === "session") applySession(msg);
+    else if (msg.action === "kdx-replay") replayKdxEvent(msg.ev);
+  });
+
+  // Hydrate (windows opened after login never saw the session broadcast),
+  // then tell the launcher we're listening so it flushes anything it queued
+  // for us while we were opening.
+  hydrateSession()
+    .then((session) => api.afterHydrate && api.afterHydrate(session))
+    .catch((e) => console.error("hydrate failed", e))
+    .then(() => releaseKdxEvents())
+    .then(() => listenersReady())
+    .then(() => emitUi("main", "ready", { label: id }));
 }
 
 // ---- per-window entry logic ----
@@ -113,12 +146,12 @@ function mountChat(tagRef) {
         api.onChat(ev);
         break;
       case "user_list":
-        api.onUsers(ev.users);
-        update({ users: ev.users });
-        if (tagRef.set) tagRef.set(userCountTag(ev.users.length));
+        // Only the room on screen (or a private room we just created by
+        // inviting someone) — see rooms.js.
+        if (api.onUserList(ev) && tagRef.set) tagRef.set(userCountTag(ev.users.length));
         break;
       case "topic":
-        api.onTopic(ev.topic);
+        api.onTopic(ev);
         break;
       case "chat_invited":
         api.onInvited(ev);
@@ -133,15 +166,17 @@ function mountChat(tagRef) {
         api.onChat({ sender: "", text: ev.text, timestamp: Date.now() / 1000, flags: 2 });
         break;
       case "disconnected":
-        update({ connection: "offline", session: null, users: [], topic: "" });
+        update({ connection: "offline", session: null });
+        api.onDisconnected();
+        if (tagRef.set) tagRef.set(userCountTag(0));
         break;
     }
   });
   onUi((msg) => {
     if (msg.to !== "chat" && msg.to !== "*") return;
-    if (msg.action === "session") update({ connection: "online", session: msg.session, server: msg.server });
+    if (msg.action === "invite") api.invite(msg.user);
   });
-  return { body: api.body, initialTag: userCountTag(0) };
+  return { body: api.body, initialTag: userCountTag(0), afterHydrate: api.afterHydrate };
 }
 
 function userCountTag(n) {
@@ -215,7 +250,6 @@ function mountMessages(tagRef) {
   onKdxEvent((ev) => {
     if (ev.type === "private_message") {
       api.onMessage(ev);
-      emitUi("main", "set-led", { unread: api.unread });
     } else if (ev.type === "disconnected") {
       update({ connection: "offline", session: null });
     }
@@ -223,7 +257,6 @@ function mountMessages(tagRef) {
   onUi((msg) => {
     if (msg.to !== "messages" && msg.to !== "*") return;
     if (msg.action === "open-with") api.openWith(msg.user);
-    else if (msg.action === "session") update({ connection: "online", session: msg.session, server: msg.server });
   });
   return { body: api.body };
 }
@@ -273,10 +306,6 @@ function mountConnections(tagRef) {
 
 function mountNews(tagRef) {
   const api = buildNews();
-  onUi((msg) => {
-    if (msg.to !== "news" && msg.to !== "*") return;
-    if (msg.action === "session") update({ connection: "online", session: msg.session, server: msg.server });
-  });
   api.refresh();
   return { body: api.body };
 }

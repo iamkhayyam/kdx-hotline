@@ -1,3 +1,68 @@
+/// Every app command. Declaring them in an ACL app manifest makes Tauri check
+/// custom commands against capabilities too (not just plugin commands), so
+/// each window can only invoke what capabilities/commands.json grants it —
+/// e.g. only Files may upload/download, only Connect may trust a key.
+/// Keep in sync with `generate_handler!` in src/lib.rs.
+const COMMANDS: &[&str] = &[
+    "connect",
+    "trust",
+    "login",
+    "get_session",
+    "save_secret",
+    "delete_secret",
+    "join_room",
+    "leave_room",
+    "send_chat",
+    "set_topic",
+    "list_files",
+    "create_folder",
+    "delete_path",
+    "move_path",
+    "alias_path",
+    "generate_catalog",
+    "search_files",
+    "list_users",
+    "list_servers",
+    "get_server_settings",
+    "update_server_settings",
+    "broadcast",
+    "shutdown_server",
+    "list_history",
+    "list_ip_rules",
+    "create_ip_rule",
+    "delete_ip_rule",
+    "list_connections",
+    "set_room_flags",
+    "get_user_info",
+    "send_private",
+    "invite_to_chat",
+    "upload",
+    "download",
+    "disconnect",
+    "list_roles",
+    "create_role",
+    "update_role",
+    "delete_role",
+    "assign_role",
+    "unassign_role",
+    "account_roles",
+    "disconnect_user",
+    "list_accounts",
+    "create_account",
+    "update_account",
+    "list_newsgroups",
+    "create_newsgroup",
+    "list_thread",
+    "create_post",
+    "delete_post",
+    "get_file_info",
+    "set_identity",
+];
+
 fn main() {
-    tauri_build::build()
+    tauri_build::try_build(
+        tauri_build::Attributes::new()
+            .app_manifest(tauri_build::AppManifest::new().commands(COMMANDS)),
+    )
+    .expect("failed to run tauri-build");
 }

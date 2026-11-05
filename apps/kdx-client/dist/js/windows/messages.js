@@ -1,9 +1,14 @@
 // Messages — private (direct) messages. One window, many conversations: a
 // left pane of people (the bar turns red on unread) and a right transcript +
 // input for the selected person. Mirrors the original KDX Messages window.
+//
+// Bounded (convos.js) and incremental: a PM appends one row/line instead of
+// rebuilding the window, so a flood can't freeze it.
 
 import { invoke, emitUi } from "../bridge.js";
 import { getState } from "../store.js";
+import { errorText } from "../html.js";
+import { createConversations, MAX_LINES } from "../convos.js";
 
 export function buildMessages() {
   const body = document.createElement("div");
@@ -25,56 +30,108 @@ export function buildMessages() {
   const withEl = $("#msg-with");
   const entry = $("#msg-entry");
 
-  // username -> { lines: [{from, text, ts}], unread: bool }
-  const convos = new Map();
+  const convos = createConversations();
+  const rows = new Map(); // user -> row element
   let active = null;
+  let lastUnread = -1;
 
-  function ensure(user) {
-    if (!convos.has(user)) convos.set(user, { lines: [], unread: false });
-    return convos.get(user);
+  function me() {
+    const s = getState().session;
+    return s && s.username;
   }
 
-  function totalUnread() {
-    let n = 0;
-    for (const c of convos.values()) if (c.unread) n++;
-    return n;
+  function syncLed() {
+    const n = convos.unreadCount();
+    if (n !== lastUnread) {
+      lastUnread = n;
+      emitUi("main", "set-led", { unread: n });
+    }
   }
 
-  function renderPeople() {
-    peopleEl.innerHTML = "";
-    for (const [user, c] of convos) {
-      const row = document.createElement("div");
-      row.className = "msg-person" + (c.unread ? " unread" : "") + (user === active ? " active" : "");
-      row.innerHTML = `<span class="msg-bar"></span><span class="msg-who">${esc(user)}</span>`;
+  function rowFor(user) {
+    let row = rows.get(user);
+    if (!row) {
+      row = document.createElement("div");
+      row.className = "msg-person";
+      const bar = document.createElement("span");
+      bar.className = "msg-bar";
+      const who = document.createElement("span");
+      who.className = "msg-who";
+      who.textContent = user;
+      row.append(bar, who);
       row.addEventListener("click", () => select(user));
       peopleEl.appendChild(row);
+      rows.set(user, row);
     }
-    emitUi("main", "set-led", { unread: totalUnread() });
+    return row;
+  }
+
+  function paintRow(user) {
+    const c = convos.get(user);
+    if (!c) return;
+    const row = rowFor(user);
+    row.classList.toggle("unread", c.unread);
+    row.classList.toggle("active", user === active);
+  }
+
+  function dropRows(users) {
+    for (const u of users) {
+      const row = rows.get(u);
+      if (row) row.remove();
+      rows.delete(u);
+    }
+  }
+
+  function lineEl(l) {
+    const div = document.createElement("div");
+    div.className = "chat-line" + (l.from === me() ? " pm-mine" : "");
+    const ts = document.createElement("span");
+    ts.className = "ts";
+    ts.textContent = hhmm(l.ts);
+    const nick = document.createElement("span");
+    nick.className = "nick";
+    nick.textContent = `<${l.from}>`;
+    div.append(ts, nick, document.createTextNode(" " + l.text));
+    return div;
+  }
+
+  function appendLine(l) {
+    scrollEl.appendChild(lineEl(l));
+    while (scrollEl.children.length > MAX_LINES) scrollEl.removeChild(scrollEl.firstChild);
+    scrollEl.scrollTop = scrollEl.scrollHeight;
   }
 
   function renderThread() {
-    scrollEl.innerHTML = "";
+    scrollEl.textContent = "";
     if (!active) return;
-    const me = getState().session && getState().session.username;
-    for (const l of ensure(active).lines) {
-      const div = document.createElement("div");
-      const mine = l.from === me;
-      div.className = "chat-line" + (mine ? " pm-mine" : "");
-      div.innerHTML = `<span class="ts">${hhmm(l.ts)}</span><span class="nick">&lt;${esc(l.from)}&gt;</span> ${esc(l.text)}`;
-      scrollEl.appendChild(div);
-    }
+    const c = convos.get(active);
+    if (!c) return;
+    const frag = document.createDocumentFragment();
+    for (const l of c.lines) frag.appendChild(lineEl(l));
+    scrollEl.appendChild(frag);
     scrollEl.scrollTop = scrollEl.scrollHeight;
   }
 
   function select(user) {
+    const previous = active;
     active = user;
-    const c = ensure(user);
-    c.unread = false;
+    dropRows(convos.ensure(user, user).evicted);
+    convos.markRead(user);
     withEl.textContent = "conversation with " + user;
     entry.disabled = false;
-    renderPeople();
+    if (previous && previous !== user) paintRow(previous);
+    paintRow(user);
     renderThread();
+    syncLed();
     entry.focus();
+  }
+
+  function addLine(user, line, unread) {
+    const r = convos.add(user, line, { unread, active });
+    dropRows(r.evicted);
+    paintRow(user);
+    if (user === active) appendLine(line);
+    syncLed();
   }
 
   entry.addEventListener("keydown", async (e) => {
@@ -82,12 +139,11 @@ export function buildMessages() {
     const text = entry.value;
     if (!text.trim()) return;
     entry.value = "";
+    const to = active;
     try {
-      await invoke("send_private", { to: active, text });
+      await invoke("send_private", { to, text });
     } catch (err) {
-      const c = ensure(active);
-      c.lines.push({ from: "!", text: "failed: " + (err.message || err), ts: Date.now() / 1000 });
-      renderThread();
+      addLine(to, { from: "!", text: "failed: " + errorText(err), ts: Date.now() / 1000 }, false);
     }
   });
 
@@ -95,22 +151,19 @@ export function buildMessages() {
     body,
     /** Handle an incoming/echoed private message event. */
     onMessage(ev) {
-      const me = getState().session && getState().session.username;
-      // The other party in this conversation.
-      const other = ev.from === me ? ev.to : ev.from;
-      const c = ensure(other);
-      c.lines.push({ from: ev.from, text: ev.text, ts: ev.timestamp });
-      if (other !== active && ev.from !== me) c.unread = true;
-      renderPeople();
-      if (other === active) renderThread();
+      const self = me();
+      // The other party: for the echo of our own message, the recipient.
+      const mine = !!self && ev.from === self;
+      const other = mine ? ev.to : ev.from;
+      if (typeof other !== "string" || !other) return;
+      addLine(other, { from: ev.from, text: String(ev.text ?? ""), ts: ev.timestamp }, !mine && other !== active);
     },
     /** Open (or focus) a conversation with `user` — used from User List. */
     openWith(user) {
-      ensure(user);
-      select(user);
+      if (typeof user === "string" && user) select(user);
     },
     get unread() {
-      return totalUnread();
+      return convos.unreadCount();
     },
   };
 }
@@ -118,7 +171,4 @@ export function buildMessages() {
 function hhmm(ts) {
   const d = new Date(ts * 1000);
   return String(d.getHours()).padStart(2, "0") + ":" + String(d.getMinutes()).padStart(2, "0");
-}
-function esc(s) {
-  return String(s).replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" })[c]);
 }
