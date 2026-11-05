@@ -639,9 +639,17 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
 
             // Any inbound frame is activity.
             idle_deadline = tokio::time::Instant::now() + idle_timeout;
-            // Everything but the data of an accepted upload spends inbound
-            // budget.
-            if !(frame.header.packet_type == PacketType::FileTransferData && upload.is_some()) {
+            // Everything but an accepted upload's traffic spends inbound
+            // budget. That traffic is its data frames plus the Ping barrier
+            // the client sends after each chunk (to correlate per-chunk
+            // errors); pacing those would cap uploads at ~20 chunks/s. A
+            // Ping is a same-size echo, so exempting it amplifies nothing.
+            let upload_traffic = upload.is_some()
+                && matches!(
+                    frame.header.packet_type,
+                    PacketType::FileTransferData | PacketType::Ping
+                );
+            if !upload_traffic {
                 rate.inbound.allow();
             }
 
@@ -4160,6 +4168,45 @@ mod tests {
             // 50 ride the burst; the other 20 are read at 20/s.
             let elapsed = start.elapsed();
             assert!(elapsed >= Duration::from_millis(950), "{elapsed:?}");
+            request(&mut client, &mut seq, PacketType::Disconnect, Bytes::new()).await;
+            conn.await.unwrap().unwrap();
+        }
+
+        #[tokio::test]
+        async fn upload_chunk_barriers_are_not_paced() {
+            // The client follows every upload chunk with a Ping barrier; with
+            // an upload active those must not be throttled like a flood.
+            let (ctx, _dir) = test_ctx().await;
+            let (mut client, mut seq, conn, _) = connect_as(&ctx, 256 * 1024, "unknown", "phraq").await;
+            let data = vec![5u8; 64 * 1024];
+            let upload = TransferRequest {
+                direction: kdx_protocol::messages::DIRECTION_UPLOAD,
+                path: "/".into(),
+                name: "up.bin".into(),
+                size: data.len() as u64,
+                chunk_size: 4096,
+                sha256: sha2::Sha256::digest(&data).into(),
+                resume_id: [0; 16],
+                have_bitmap: vec![],
+            };
+            request(&mut client, &mut seq, PacketType::FileTransferStart, upload.encode()).await;
+            recv_type(&mut client, PacketType::FileTransferStart).await;
+
+            tokio::time::pause();
+            let start = Instant::now();
+            for _ in 0..200 {
+                client
+                    .feed(client_frame(PacketType::Ping, bump(&mut seq), Bytes::new()))
+                    .await
+                    .unwrap();
+            }
+            client.flush().await.unwrap();
+            for _ in 0..200 {
+                recv_type(&mut client, PacketType::Pong).await;
+            }
+            // Paced, 150 pings past the burst would take 7.5 s.
+            let elapsed = start.elapsed();
+            assert!(elapsed < Duration::from_millis(500), "{elapsed:?}");
             request(&mut client, &mut seq, PacketType::Disconnect, Bytes::new()).await;
             conn.await.unwrap().unwrap();
         }
